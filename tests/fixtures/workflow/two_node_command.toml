@@ -1,0 +1,50 @@
+# Phase 1 end-to-end fixture: two nodes, both `runner = "command"`.
+#
+# `docs/design/workflow-builder/05-phase-plan.md` W7 — the e2e fixture is a
+# plain-process kvdag, not a fake `claude`: the managed-agent path is closed to
+# a stub by construction, so `runner = "command"` (a declared node field, not a
+# test-only escape hatch) is what makes this deterministic, offline, and free.
+#
+# The stub-path placeholder in each `command` is substituted by the test with
+# the absolute path of `tests/fixtures/workflow/node_stub.sh`. Node dirs live
+# under `KARVEX_WORKFLOW_RUNS_DIR`, so nothing is written next to this file.
+
+name = "e2e-two-node-command"
+description = "stub plan -> stub implement, both bound as plain processes"
+contract = """
+Reply only through result.json. Never edit files outside your node dir.
+"""
+max_depth = 3
+max_nodes = 24
+
+[[arg]]
+name = "goal"
+required = true
+description = "what to build"
+
+[[node]]
+key = "plan"
+label = "Plan"
+kind = "agent"
+runner = "command"
+command = ["/bin/sh", "@STUB@", "report", '{"plan":"stub plan for the e2e"}']
+demand = "standard"
+prompt_template = "Produce an implementation plan for: {{goal}}"
+output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
+
+[[node]]
+key = "implement"
+label = "Implement"
+kind = "agent"
+runner = "command"
+command = ["/bin/sh", "@STUB@", "report", '{"report":"stub implementation report"}']
+demand = "standard"
+prompt_template = "Implement this plan:\n{{plan}}"
+output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }
+
+[[edge]]
+from = "plan"
+to = "implement"
+kind = "data"
+payload = "summary"
+port = "plan"

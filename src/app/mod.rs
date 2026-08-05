@@ -24,6 +24,9 @@ pub mod state;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+pub(crate) mod workflow;
+#[cfg(feature = "workflow")]
+pub(crate) mod workflow_store;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -147,6 +150,13 @@ pub struct App {
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    /// The workflow engine and everything the runtime needs to keep it fed.
+    /// Pure data; `src/app/workflow.rs` owns every transition on it.
+    pub(crate) workflow: workflow::WorkflowRuntimeState,
+    /// The workflow database, opened lazily on first `workflow.*` use
+    /// (`03-storage-schema.md` §2).
+    #[cfg(feature = "workflow")]
+    pub(crate) workflow_store: workflow_store::WorkflowStoreHandle,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -160,6 +170,8 @@ pub(crate) enum LoopEvent {
     RawInput(crate::raw_input::RawInputEvent),
     InputClosed,
     RenderRequested,
+    /// The workflow engine's clock is due.
+    WorkflowTick,
 }
 
 struct SyncOutputGuard;
@@ -587,6 +599,7 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                dag: state::DagViewState::default(),
             },
             drag: None,
             workspace_press: None,
@@ -683,6 +696,7 @@ impl App {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            run_graph: None,
         };
 
         state.terminals = restored_terminals;
@@ -772,6 +786,9 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
+            workflow: workflow::WorkflowRuntimeState::new(workflow::engine_config(config)),
+            #[cfg(feature = "workflow")]
+            workflow_store: workflow_store::WorkflowStoreHandle::default(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }
@@ -1096,6 +1113,7 @@ impl App {
             }
 
             let next_deadline = self.next_loop_deadline(now, needs_render);
+            let workflow_tick_deadline = self.workflow_tick_deadline();
             let event = {
                 let input_rx = self.input_rx.as_mut();
                 tokio::select! {
@@ -1112,6 +1130,7 @@ impl App {
                         None => LoopEvent::InputClosed,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = sleep_until_or_pending(workflow_tick_deadline) => LoopEvent::WorkflowTick,
                     _ = self.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
@@ -1138,6 +1157,11 @@ impl App {
                 }
                 LoopEvent::RenderRequested => {
                     if self.render_dirty.is_pending() {
+                        needs_render = true;
+                    }
+                }
+                LoopEvent::WorkflowTick => {
+                    if self.tick_workflow_engine(Instant::now()) {
                         needs_render = true;
                     }
                 }
@@ -1852,6 +1876,9 @@ impl App {
             }
             Mode::Navigator => {
                 input::handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event);
+            }
+            Mode::WorkflowDag => {
+                self.handle_workflow_dag_key(key_event);
             }
             Mode::Terminal => {
                 // Should not be called in terminal mode.

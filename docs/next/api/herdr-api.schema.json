@@ -723,6 +723,124 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/event/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/event/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/event/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_finished",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/event/$defs/WorkflowRunNodeInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_node_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/event/$defs/WorkflowRunNodeInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_node_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "seq": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "summary": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_node_output_checkpoint",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "path",
+                "seq",
+                "summary"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -753,7 +871,13 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "workflow_run_started",
+            "workflow_run_updated",
+            "workflow_run_finished",
+            "workflow_node_created",
+            "workflow_node_updated",
+            "workflow_node_output_checkpoint"
           ],
           "type": "string"
         },
@@ -1067,6 +1191,340 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "WorkflowDemand": {
+          "description": "How demanding a node's work is; drives the tier's model/effort mapping.",
+          "enum": [
+            "peak",
+            "critical",
+            "standard",
+            "light"
+          ],
+          "type": "string"
+        },
+        "WorkflowEvidence": {
+          "description": "Which completion signal was accepted for a node\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §4.3).",
+          "enum": [
+            "self_report",
+            "hook",
+            "detection",
+            "restored"
+          ],
+          "type": "string"
+        },
+        "WorkflowNodeStatus": {
+          "enum": [
+            "pending",
+            "ready",
+            "running",
+            "needs_attention",
+            "blocked",
+            "succeeded",
+            "failed",
+            "skipped",
+            "restored",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "WorkflowRunInfo": {
+          "properties": {
+            "args": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "ended_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "failure": true,
+            "nodes_done": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "nodes_total": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "started_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "$ref": "#/schemas/event/$defs/WorkflowRunStatus"
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tier": {
+              "$ref": "#/schemas/event/$defs/WorkflowTier"
+            },
+            "total_tokens": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_tool_uses": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version_id": {
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "run_id",
+            "workflow_id",
+            "version_id",
+            "tier",
+            "status",
+            "started_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunNodeInfo": {
+          "properties": {
+            "agent_session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "attempt": {
+              "default": 1,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocker": true,
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "demand": {
+              "$ref": "#/schemas/event/$defs/WorkflowDemand"
+            },
+            "depth": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "duration_ms": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "effort": {
+              "type": "string"
+            },
+            "ended_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "evidence": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/WorkflowEvidence"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "node_dir": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "node_key": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parent_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "started_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/schemas/event/$defs/WorkflowNodeStatus"
+            },
+            "succession": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/WorkflowSuccession"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "terminal_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool_uses": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_tokens": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "watchdog_interventions": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path",
+            "node_key",
+            "status",
+            "demand",
+            "model",
+            "effort"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunStatus": {
+          "enum": [
+            "pending",
+            "running",
+            "paused",
+            "succeeded",
+            "failed",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "WorkflowSuccession": {
+          "description": "Every closing node records exactly one of these\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §3.3).",
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "satisfied",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                },
+                "resume_when": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "blocked",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "reason",
+                "resume_when"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "evidence": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "no_followup",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "evidence"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "WorkflowTier": {
+          "description": "The run's cost/quality tier.",
+          "enum": [
+            "auto",
+            "max",
+            "high",
+            "medium",
+            "low"
+          ],
+          "type": "string"
         },
         "WorkspaceInfo": {
           "properties": {
@@ -4001,6 +4459,78 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.run.started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.run.updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.run.finished",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.node.created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.node.updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.node.output_checkpoint",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -4099,6 +4629,217 @@
             "bottom-right"
           ],
           "type": "string"
+        },
+        "WorkflowCreateParams": {
+          "properties": {
+            "definition": {
+              "$ref": "#/schemas/request/$defs/WorkflowDefinitionDocument"
+            }
+          },
+          "required": [
+            "definition"
+          ],
+          "type": "object"
+        },
+        "WorkflowDefinitionDocument": {
+          "description": "A kvdag definition document: TOML or JSON, in the shape\n`docs/design/workflow-builder/05-phase-plan.md` §4 documents. See the\nmodule doc for why this is opaque text rather than a typed node/edge tree.",
+          "properties": {
+            "format": {
+              "$ref": "#/schemas/request/$defs/WorkflowDefinitionFormat"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "format",
+            "text"
+          ],
+          "type": "object"
+        },
+        "WorkflowDefinitionFormat": {
+          "description": "Wire format of a [`WorkflowDefinitionDocument`]'s text.",
+          "enum": [
+            "toml",
+            "json"
+          ],
+          "type": "string"
+        },
+        "WorkflowNodeReportParams": {
+          "description": "The node self-report contract\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §4.3): token-\nauthenticated with `KARVEX_WORKFLOW_NODE_TOKEN`, precedence 1 of the three\ncompletion signals.",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "result": true,
+            "run_id": {
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "path",
+            "token",
+            "result"
+          ],
+          "type": "object"
+        },
+        "WorkflowNodeSteerParams": {
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "path",
+            "text"
+          ],
+          "type": "object"
+        },
+        "WorkflowNodeTarget": {
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "path"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunListParams": {
+          "properties": {
+            "limit": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunParams": {
+          "properties": {
+            "args": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Materialised into `workflow_run.args`; fills the declared `ArgSpec`\nnamespace (`kvx workflow run start … --arg k=v`).",
+              "type": "object"
+            },
+            "tier": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/WorkflowTier"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Defaults to the workflow's `default_tier`."
+            },
+            "version": {
+              "description": "Defaults to the workflow's head version.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunTarget": {
+          "properties": {
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        },
+        "WorkflowTarget": {
+          "properties": {
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workflow_id"
+          ],
+          "type": "object"
+        },
+        "WorkflowTier": {
+          "description": "The run's cost/quality tier.",
+          "enum": [
+            "auto",
+            "max",
+            "high",
+            "medium",
+            "low"
+          ],
+          "type": "string"
+        },
+        "WorkflowVersionCreateParams": {
+          "properties": {
+            "change_summary": {
+              "default": "",
+              "type": "string"
+            },
+            "definition": {
+              "$ref": "#/schemas/request/$defs/WorkflowDefinitionDocument"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workflow_id",
+            "definition"
+          ],
+          "type": "object"
+        },
+        "WorkflowVersionTarget": {
+          "properties": {
+            "version_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version_id"
+          ],
+          "type": "object"
         },
         "WorkspaceCreateParams": {
           "properties": {
@@ -5821,6 +6562,230 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.version.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowVersionCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.version.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowVersionTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.run",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.run.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.run.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.run.cancel",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.node.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowNodeTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.node.steer",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowNodeSteerParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.node.interrupt",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowNodeTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.node.report",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowNodeReportParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.node.restart",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowNodeTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -6936,6 +7901,124 @@
                 "layout"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_finished",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_node_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_node_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "seq": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "summary": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_node_output_checkpoint",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "path",
+                "seq",
+                "summary"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -6981,7 +8064,13 @@
             "pane_exited",
             "pane_agent_detected",
             "pane_agent_status_changed",
-            "layout_updated"
+            "layout_updated",
+            "workflow_run_started",
+            "workflow_run_updated",
+            "workflow_run_finished",
+            "workflow_node_created",
+            "workflow_node_updated",
+            "workflow_node_output_checkpoint"
           ],
           "type": "string"
         },
@@ -7130,6 +8219,262 @@
           },
           "required": [
             "messages"
+          ],
+          "type": "object"
+        },
+        "KvdagEdgeInfo": {
+          "properties": {
+            "condition": true,
+            "from": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowEdgeKind"
+            },
+            "payload": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowEdgePayload"
+            },
+            "port": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to",
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        "KvdagNodeInfo": {
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "demand": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowDemand"
+            },
+            "expand_allow": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "expand_max": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "is_template": {
+              "default": false,
+              "type": "boolean"
+            },
+            "isolation": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowIsolation"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowNodeKind"
+            },
+            "label": {
+              "type": "string"
+            },
+            "max_attempts": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "node_key": {
+              "type": "string"
+            },
+            "output_schema": true,
+            "prompt_template": {
+              "type": "string"
+            },
+            "role": {
+              "default": "",
+              "type": "string"
+            },
+            "runner": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowRunner"
+            },
+            "system_contract": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "node_key",
+            "label",
+            "kind",
+            "runner",
+            "demand",
+            "prompt_template",
+            "output_schema",
+            "max_attempts",
+            "isolation"
+          ],
+          "type": "object"
+        },
+        "KvdagVersionDetail": {
+          "properties": {
+            "args": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkflowArgSpec"
+              },
+              "type": "array"
+            },
+            "change_summary": {
+              "default": "",
+              "type": "string"
+            },
+            "contract": {
+              "default": "",
+              "type": "string"
+            },
+            "created_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "edges": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/KvdagEdgeInfo"
+              },
+              "type": "array"
+            },
+            "max_depth": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_nodes": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "nodes": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/KvdagNodeInfo"
+              },
+              "type": "array"
+            },
+            "origin": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowVersionOrigin"
+            },
+            "parent_version_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "spec_digest": {
+              "type": "string"
+            },
+            "version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version_id": {
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version_id",
+            "workflow_id",
+            "version",
+            "origin",
+            "max_depth",
+            "max_nodes",
+            "spec_digest",
+            "created_at_unix_ms",
+            "nodes",
+            "edges"
+          ],
+          "type": "object"
+        },
+        "KvdagVersionSummary": {
+          "properties": {
+            "change_summary": {
+              "default": "",
+              "type": "string"
+            },
+            "created_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_depth": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_nodes": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "origin": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowVersionOrigin"
+            },
+            "parent_version_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "spec_digest": {
+              "type": "string"
+            },
+            "version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version_id": {
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version_id",
+            "workflow_id",
+            "version",
+            "origin",
+            "spec_digest",
+            "max_depth",
+            "max_nodes",
+            "created_at_unix_ms"
           ],
           "type": "object"
         },
@@ -9645,6 +10990,255 @@
             {
               "properties": {
                 "type": {
+                  "const": "workflow_list",
+                  "type": "string"
+                },
+                "workflows": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/WorkflowSummary"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workflows"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow_get",
+                  "type": "string"
+                },
+                "versions": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/KvdagVersionSummary"
+                  },
+                  "type": "array"
+                },
+                "workflow": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowSummary"
+                }
+              },
+              "required": [
+                "type",
+                "workflow",
+                "versions"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow_created",
+                  "type": "string"
+                },
+                "version": {
+                  "$ref": "#/schemas/success_response/$defs/KvdagVersionSummary"
+                },
+                "workflow": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowSummary"
+                }
+              },
+              "required": [
+                "type",
+                "workflow",
+                "version"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow_version_created",
+                  "type": "string"
+                },
+                "version": {
+                  "$ref": "#/schemas/success_response/$defs/KvdagVersionSummary"
+                },
+                "workflow": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowSummary"
+                }
+              },
+              "required": [
+                "type",
+                "workflow",
+                "version"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow_version_get",
+                  "type": "string"
+                },
+                "version": {
+                  "$ref": "#/schemas/success_response/$defs/KvdagVersionDetail"
+                }
+              },
+              "required": [
+                "type",
+                "version"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "graph": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunGraph"
+                },
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_get",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run",
+                "graph"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "runs": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "workflow_run_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "runs"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
+                },
+                "type": {
+                  "const": "workflow_run_cancelled",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+                },
+                "type": {
+                  "const": "workflow_node_get",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+                },
+                "type": {
+                  "const": "workflow_node_steered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+                },
+                "type": {
+                  "const": "workflow_node_interrupted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+                },
+                "type": {
+                  "const": "workflow_node_reported",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+                },
+                "type": {
+                  "const": "workflow_node_restarted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "ok",
                   "type": "string"
                 }
@@ -9786,6 +11380,521 @@
             "agent_status"
           ],
           "type": "object"
+        },
+        "WorkflowArgSpec": {
+          "properties": {
+            "default": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "description": {
+              "default": "",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "required": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "WorkflowDemand": {
+          "description": "How demanding a node's work is; drives the tier's model/effort mapping.",
+          "enum": [
+            "peak",
+            "critical",
+            "standard",
+            "light"
+          ],
+          "type": "string"
+        },
+        "WorkflowEdgeKind": {
+          "enum": [
+            "sequence",
+            "data",
+            "conditional"
+          ],
+          "type": "string"
+        },
+        "WorkflowEdgePayload": {
+          "description": "How much of the source node's checkpoint is handed to the target.",
+          "enum": [
+            "none",
+            "summary",
+            "full"
+          ],
+          "type": "string"
+        },
+        "WorkflowEvidence": {
+          "description": "Which completion signal was accepted for a node\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §4.3).",
+          "enum": [
+            "self_report",
+            "hook",
+            "detection",
+            "restored"
+          ],
+          "type": "string"
+        },
+        "WorkflowIsolation": {
+          "description": "Working-directory isolation for a node's pane.",
+          "enum": [
+            "none",
+            "worktree"
+          ],
+          "type": "string"
+        },
+        "WorkflowNodeKind": {
+          "description": "What a node *is*. Orthogonal to [`WorkflowRunner`], which selects how it\nis bound to a process.",
+          "enum": [
+            "agent",
+            "internal",
+            "gate",
+            "monitor"
+          ],
+          "type": "string"
+        },
+        "WorkflowNodeStatus": {
+          "enum": [
+            "pending",
+            "ready",
+            "running",
+            "needs_attention",
+            "blocked",
+            "succeeded",
+            "failed",
+            "skipped",
+            "restored",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "WorkflowRunEdgeInfo": {
+          "properties": {
+            "condition_result": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "fired": {
+              "default": false,
+              "type": "boolean"
+            },
+            "from": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowEdgeKind"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunGraph": {
+          "properties": {
+            "edges": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkflowRunEdgeInfo"
+              },
+              "type": "array"
+            },
+            "nodes": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "nodes",
+            "edges"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunInfo": {
+          "properties": {
+            "args": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "ended_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "failure": true,
+            "nodes_done": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "nodes_total": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "started_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowRunStatus"
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tier": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowTier"
+            },
+            "total_tokens": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_tool_uses": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version_id": {
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "run_id",
+            "workflow_id",
+            "version_id",
+            "tier",
+            "status",
+            "started_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunNodeInfo": {
+          "properties": {
+            "agent_session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "attempt": {
+              "default": 1,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocker": true,
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "demand": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowDemand"
+            },
+            "depth": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "duration_ms": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "effort": {
+              "type": "string"
+            },
+            "ended_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "evidence": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowEvidence"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "node_dir": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "node_key": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parent_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "started_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowNodeStatus"
+            },
+            "succession": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowSuccession"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "terminal_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool_uses": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_tokens": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "watchdog_interventions": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path",
+            "node_key",
+            "status",
+            "demand",
+            "model",
+            "effort"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunStatus": {
+          "enum": [
+            "pending",
+            "running",
+            "paused",
+            "succeeded",
+            "failed",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "WorkflowRunner": {
+          "description": "Selects the binding the spawner uses for a node.",
+          "enum": [
+            "agent",
+            "command"
+          ],
+          "type": "string"
+        },
+        "WorkflowSuccession": {
+          "description": "Every closing node records exactly one of these\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §3.3).",
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "satisfied",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                },
+                "resume_when": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "blocked",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "reason",
+                "resume_when"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "evidence": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "no_followup",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "evidence"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "WorkflowSummary": {
+          "properties": {
+            "archived": {
+              "default": false,
+              "type": "boolean"
+            },
+            "created_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "default_tier": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowTier"
+            },
+            "description": {
+              "default": "",
+              "type": "string"
+            },
+            "head_version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "head_version_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "updated_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workflow_id",
+            "name",
+            "default_tier",
+            "created_at_unix_ms",
+            "updated_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkflowTier": {
+          "description": "The run's cost/quality tier.",
+          "enum": [
+            "auto",
+            "max",
+            "high",
+            "medium",
+            "low"
+          ],
+          "type": "string"
+        },
+        "WorkflowVersionOrigin": {
+          "description": "How a kvdag version came to exist.",
+          "enum": [
+            "authored",
+            "imported",
+            "self_improvement",
+            "restore_rewrite"
+          ],
+          "type": "string"
         },
         "WorkspaceInfo": {
           "properties": {

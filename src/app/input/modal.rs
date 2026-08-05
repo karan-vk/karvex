@@ -466,6 +466,14 @@ pub(super) const RELEASE_NOTES_ACTIONS: &[ModalActionSpec<ModalAction>] = &[Moda
     bindings: &[ModalKeyBinding::Enter, ModalKeyBinding::Esc],
 }];
 
+/// The workflow DAG overlay closes on `Esc` through the same `leave_modal`
+/// path as every other overlay, so it returns to the terminal (or to navigate
+/// mode when no workspace is open) instead of inventing its own exit.
+pub(super) const WORKFLOW_DAG_ACTIONS: &[ModalActionSpec<ModalAction>] = &[ModalActionSpec {
+    action: ModalAction::Close,
+    bindings: &[ModalKeyBinding::Esc],
+}];
+
 pub(super) const RENAME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
     ModalActionSpec {
         action: ModalAction::Save,

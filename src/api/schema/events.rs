@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::common::{AgentStatus, ReadSource};
 use super::panes::{PaneInfo, PaneReadResult, PaneScrollInfo};
 use super::tabs::TabInfo;
+use super::workflows::{WorkflowRunInfo, WorkflowRunNodeInfo};
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::WorktreeInfo;
 
@@ -82,6 +83,18 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    #[serde(rename = "workflow.run.started")]
+    WorkflowRunStarted {},
+    #[serde(rename = "workflow.run.updated")]
+    WorkflowRunUpdated {},
+    #[serde(rename = "workflow.run.finished")]
+    WorkflowRunFinished {},
+    #[serde(rename = "workflow.node.created")]
+    WorkflowNodeCreated {},
+    #[serde(rename = "workflow.node.updated")]
+    WorkflowNodeUpdated {},
+    #[serde(rename = "workflow.node.output_checkpoint")]
+    WorkflowNodeOutputCheckpoint {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -218,6 +231,12 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     LayoutUpdated,
+    WorkflowRunStarted,
+    WorkflowRunUpdated,
+    WorkflowRunFinished,
+    WorkflowNodeCreated,
+    WorkflowNodeUpdated,
+    WorkflowNodeOutputCheckpoint,
 }
 
 impl EventKind {
@@ -249,6 +268,12 @@ impl EventKind {
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
+            EventKind::WorkflowRunStarted => "workflow.run.started",
+            EventKind::WorkflowRunUpdated => "workflow.run.updated",
+            EventKind::WorkflowRunFinished => "workflow.run.finished",
+            EventKind::WorkflowNodeCreated => "workflow.node.created",
+            EventKind::WorkflowNodeUpdated => "workflow.node.updated",
+            EventKind::WorkflowNodeOutputCheckpoint => "workflow.node.output_checkpoint",
         }
     }
 }
@@ -281,6 +306,12 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
+    EventKind::WorkflowRunStarted,
+    EventKind::WorkflowRunUpdated,
+    EventKind::WorkflowRunFinished,
+    EventKind::WorkflowNodeCreated,
+    EventKind::WorkflowNodeUpdated,
+    EventKind::WorkflowNodeOutputCheckpoint,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -355,6 +386,165 @@ mod known_event_name_tests {
         assert!(!names.contains(&"workspace.metadata_updated"));
         assert!(!names.contains(&"pane.updated"));
         assert!(names.contains(&"pane.moved"));
+    }
+}
+
+#[cfg(test)]
+mod workflow_event_tests {
+    use super::*;
+    use crate::api::schema::workflows::{
+        WorkflowDemand, WorkflowNodeStatus, WorkflowRunStatus, WorkflowTier,
+    };
+    use crate::api::schema::{Method, Request};
+
+    fn run() -> WorkflowRunInfo {
+        WorkflowRunInfo {
+            run_id: "workflow_run:1".into(),
+            workflow_id: "workflow:1".into(),
+            version_id: "kvdag_version:1".into(),
+            tier: WorkflowTier::Auto,
+            status: WorkflowRunStatus::Running,
+            args: HashMap::new(),
+            workspace_id: Some("w_1".into()),
+            tab_id: Some("w_1:1".into()),
+            started_at_unix_ms: 1,
+            ended_at_unix_ms: None,
+            total_tokens: 0,
+            total_tool_uses: 0,
+            nodes_total: 1,
+            nodes_done: 0,
+            failure: None,
+        }
+    }
+
+    fn node() -> WorkflowRunNodeInfo {
+        WorkflowRunNodeInfo {
+            path: "plan".into(),
+            node_key: "plan".into(),
+            parent_path: None,
+            depth: 0,
+            status: WorkflowNodeStatus::Running,
+            demand: WorkflowDemand::Standard,
+            model: "sonnet".into(),
+            effort: "low".into(),
+            attempt: 1,
+            pane_id: Some("w_1-2".into()),
+            terminal_id: Some("term_1".into()),
+            agent_session_id: None,
+            cwd: None,
+            node_dir: None,
+            started_at_unix_ms: Some(1),
+            ended_at_unix_ms: None,
+            total_tokens: 0,
+            tool_uses: 0,
+            duration_ms: 0,
+            evidence: None,
+            succession: None,
+            blocker: None,
+            watchdog_interventions: 0,
+        }
+    }
+
+    /// `EventEnvelope.event` serialises via `EventKind`'s derived
+    /// `rename_all = "snake_case"` (e.g. `"workflow_run_started"`), same as
+    /// every existing `EventKind`; `dot_name()` is the separate mapping used
+    /// by `known_event_names()`/`plugin_hook_event_names()`, not the wire
+    /// field. This test exercises both.
+    #[test]
+    fn workflow_events_round_trip_and_dot_names_match() {
+        for (event, dot_name) in [
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowRunStarted,
+                    data: EventData::WorkflowRunStarted { run: run() },
+                },
+                "workflow.run.started",
+            ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowRunUpdated,
+                    data: EventData::WorkflowRunUpdated { run: run() },
+                },
+                "workflow.run.updated",
+            ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowRunFinished,
+                    data: EventData::WorkflowRunFinished { run: run() },
+                },
+                "workflow.run.finished",
+            ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowNodeCreated,
+                    data: EventData::WorkflowNodeCreated {
+                        run_id: "workflow_run:1".into(),
+                        node: node(),
+                    },
+                },
+                "workflow.node.created",
+            ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowNodeUpdated,
+                    data: EventData::WorkflowNodeUpdated {
+                        run_id: "workflow_run:1".into(),
+                        node: node(),
+                    },
+                },
+                "workflow.node.updated",
+            ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowNodeOutputCheckpoint,
+                    data: EventData::WorkflowNodeOutputCheckpoint {
+                        run_id: "workflow_run:1".into(),
+                        path: "plan".into(),
+                        seq: 1,
+                        summary: "produced a plan".into(),
+                    },
+                },
+                "workflow.node.output_checkpoint",
+            ),
+        ] {
+            assert_eq!(event.event.dot_name(), dot_name);
+            let json = serde_json::to_value(&event).unwrap();
+            let restored: EventEnvelope = serde_json::from_value(json).unwrap();
+            assert_eq!(restored, event);
+        }
+    }
+
+    #[test]
+    fn workflow_event_subscriptions_use_dot_names() {
+        let request = Request {
+            id: "sub_workflow".into(),
+            method: Method::EventsSubscribe(EventsSubscribeParams {
+                subscriptions: vec![
+                    Subscription::WorkflowRunStarted {},
+                    Subscription::WorkflowRunUpdated {},
+                    Subscription::WorkflowRunFinished {},
+                    Subscription::WorkflowNodeCreated {},
+                    Subscription::WorkflowNodeUpdated {},
+                    Subscription::WorkflowNodeOutputCheckpoint {},
+                ],
+            }),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        for dot_name in [
+            "workflow.run.started",
+            "workflow.run.updated",
+            "workflow.run.finished",
+            "workflow.node.created",
+            "workflow.node.updated",
+            "workflow.node.output_checkpoint",
+        ] {
+            assert!(
+                json.contains(&format!("\"type\":\"{dot_name}\"")),
+                "missing subscription type {dot_name} in {json}"
+            );
+        }
+        let restored: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, request);
     }
 }
 
@@ -552,5 +742,28 @@ pub enum EventData {
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,
+    },
+    WorkflowRunStarted {
+        run: WorkflowRunInfo,
+    },
+    WorkflowRunUpdated {
+        run: WorkflowRunInfo,
+    },
+    WorkflowRunFinished {
+        run: WorkflowRunInfo,
+    },
+    WorkflowNodeCreated {
+        run_id: String,
+        node: WorkflowRunNodeInfo,
+    },
+    WorkflowNodeUpdated {
+        run_id: String,
+        node: WorkflowRunNodeInfo,
+    },
+    WorkflowNodeOutputCheckpoint {
+        run_id: String,
+        path: String,
+        seq: u64,
+        summary: String,
     },
 }

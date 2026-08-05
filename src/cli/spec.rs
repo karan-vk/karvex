@@ -42,7 +42,8 @@ pub(super) fn command() -> Command {
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
-        .subcommand(plugin_command());
+        .subcommand(plugin_command())
+        .subcommand(workflow_command());
     configure_help(command, true)
 }
 
@@ -866,6 +867,94 @@ fn plugin_command() -> Command {
         )
 }
 
+fn workflow_command() -> Command {
+    Command::new("workflow")
+        .about("Manage kvdag workflow definitions and runs")
+        .subcommand(Command::new("list").about("List workflows"))
+        .subcommand(id_command("show", "target", "Show a workflow"))
+        .subcommand(
+            Command::new("create")
+                .about("Create a workflow from a definition document")
+                .arg(path_option("file", "PATH").required(true))
+                .arg(option("name", "NAME")),
+        )
+        .subcommand(
+            Command::new("update")
+                .about("Author a new version of a workflow from a definition document")
+                .arg(required("target", "TARGET"))
+                .arg(path_option("file", "PATH").required(true))
+                .arg(option("change-summary", "TEXT")),
+        )
+        .subcommand(workflow_run_command())
+        .subcommand(workflow_node_command())
+}
+
+fn workflow_run_command() -> Command {
+    Command::new("run")
+        .about("Manage workflow runs")
+        .subcommand(
+            Command::new("start")
+                .about("Start a workflow run")
+                .arg(required("target", "TARGET"))
+                .arg(option("tier", "TIER").value_parser(["auto", "max", "high", "medium", "low"]))
+                .arg(repeatable_option("arg", "KEY=VALUE"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("List runs for a workflow")
+                .arg(required("target", "TARGET"))
+                .arg(option("limit", "N")),
+        )
+        .subcommand(
+            Command::new("show")
+                .about("Show a workflow run")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("cancel")
+                .about("Cancel a workflow run")
+                .arg(required("run_id", "RUN_ID")),
+        )
+}
+
+fn workflow_node_command() -> Command {
+    Command::new("node")
+        .about("Inspect and steer workflow run nodes")
+        .subcommand(
+            Command::new("show")
+                .about("Show a workflow run node")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(required("path", "PATH"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("steer")
+                .about("Steer a running workflow node")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(required("path", "PATH"))
+                .arg(required("text", "TEXT").num_args(1..)),
+        )
+        .subcommand(
+            Command::new("interrupt")
+                .about("Interrupt a running workflow node")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(required("path", "PATH")),
+        )
+        .subcommand(
+            Command::new("restart")
+                .about("Restart a workflow node")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(required("path", "PATH")),
+        )
+        .subcommand(
+            Command::new("complete")
+                .about("Report a node's structured result (used by the node itself)")
+                .arg(path_option("result-file", "PATH")),
+        )
+}
+
 fn current_pane_args() -> [Arg; 2] {
     [option("pane", "ID"), flag("current")]
 }
@@ -1312,6 +1401,45 @@ mod tests {
                 "next: kvx pane run <PANE_ID> <COMMAND> sends text and Enter in one call"
             ),
             "pane send-text is missing its next-step hint: {pane_send_text}"
+        );
+    }
+
+    /// The W5 "hand-maintained trio" parity check
+    /// (`docs/design/workflow-builder/05-phase-plan.md`): every `kvx
+    /// workflow` verb the manual parser (`src/cli/workflow.rs`) recognizes
+    /// must have a matching leaf subcommand in this clap tree, and vice
+    /// versa, or the two silently drift. The third leg — that `cli.rs`'s
+    /// top-level dispatch actually routes `"workflow"` into that parser —
+    /// is covered separately by
+    /// `cli::tests::workflow_command_is_dispatched_without_reaching_the_network`,
+    /// and the `run start`/`run list` name-collision case the grammar note
+    /// exists to prevent is covered by
+    /// `cli::workflow::tests::workflow_named_list_is_reachable_through_run_start_and_run_list`.
+    #[test]
+    fn workflow_verbs_match_between_manual_parser_and_spec() {
+        let cmd = super::command();
+        let workflow = command_path(&cmd, &["workflow"]);
+
+        let mut spec_paths = Vec::new();
+        collect_subcommand_paths(workflow, &mut Vec::new(), &mut spec_paths);
+        // Drop the "run"/"node" namespace nodes themselves: they group verbs
+        // for help/completion but are not verbs `VERB_PATHS` enumerates.
+        let mut spec_leaf_paths: Vec<Vec<String>> = spec_paths
+            .into_iter()
+            .filter(|path| !matches!(path.as_slice(), [group] if group == "run" || group == "node"))
+            .collect();
+        spec_leaf_paths.sort();
+
+        let mut manual_paths: Vec<Vec<String>> = crate::cli::workflow::VERB_PATHS
+            .iter()
+            .map(|path| path.iter().map(|segment| segment.to_string()).collect())
+            .collect();
+        manual_paths.sort();
+
+        assert_eq!(
+            spec_leaf_paths, manual_paths,
+            "kvx workflow verbs drifted between the manual parser (src/cli/workflow.rs) \
+             and the clap spec (src/cli/spec.rs)"
         );
     }
 

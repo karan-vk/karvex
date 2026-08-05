@@ -208,6 +208,32 @@ impl ActiveSubscription {
                 event_kind: crate::api::schema::EventKind::LayoutUpdated,
                 last_sequence: 0,
             })),
+            Subscription::WorkflowRunStarted {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowRunStarted,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowRunUpdated {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowRunUpdated,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowRunFinished {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowRunFinished,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowNodeCreated {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowNodeCreated,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowNodeUpdated {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowNodeUpdated,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowNodeOutputCheckpoint {} => {
+                Ok(Self::Event(ActiveEventSubscription {
+                    event_kind: crate::api::schema::EventKind::WorkflowNodeOutputCheckpoint,
+                    last_sequence: 0,
+                }))
+            }
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,

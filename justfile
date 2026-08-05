@@ -26,14 +26,23 @@ lint:
 [unix]
 ci filter='all()': lint
     cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    just check-no-workflow
     just integration-assets-test
     just plugin-marketplace-test
 
+# Lint and test with the workflow feature off, so the feature-off build stays working
+[unix]
+check-no-workflow:
+    cargo clippy --locked --no-default-features --all-targets -- -D warnings
+    cargo nextest run --locked --no-default-features --status-level fail --final-status-level fail --failure-output final --success-output never
+
+# --no-default-features on purpose: this lint exists to catch cfg(windows) errors in karvex's own
+# code, not to cross-build SurrealDB and aws-lc-sys for MSVC from Linux.
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
 [unix]
 windows-lint:
     rustup target add x86_64-pc-windows-msvc
-    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin kvx --locked --target x86_64-pc-windows-msvc -- -D warnings
+    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin kvx --locked --no-default-features --target x86_64-pc-windows-msvc -- -D warnings
 
 # Check formatting + run unit tests + Windows target lint + maintenance script tests
 [unix]

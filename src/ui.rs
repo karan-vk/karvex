@@ -7,6 +7,7 @@ use ratatui::{
 
 mod dialogs;
 mod keybind_help;
+mod line_cells;
 mod menus;
 mod mobile;
 mod navigator;
@@ -21,6 +22,7 @@ mod tab_surface;
 mod tabs;
 mod text;
 mod widgets;
+mod workflow_dag;
 
 use self::dialogs::{
     render_confirm_close_overlay, render_new_linked_worktree_overlay,
@@ -63,6 +65,8 @@ pub(crate) use self::tab_surface::{
     compute_tab_surface, render_tab_surface, resize_tab_surface, TabSurfaceLayout,
 };
 use self::tabs::render_tab_bar;
+use self::workflow_dag::{compute_workflow_dag_view, render_workflow_dag};
+pub(crate) use self::workflow_dag::{workflow_dag_neighbour, DagNavDirection};
 pub(crate) use self::{
     dialogs::{
         confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
@@ -304,6 +308,11 @@ fn compute_view_internal(
         })
         .unwrap_or_default();
 
+    // Layout runs here, once, and only while the overlay is open; render and
+    // the mouse hit-test then share exactly this geometry
+    // (`docs/design/workflow-builder/04-kvdag-and-execution.md` §8).
+    let dag = compute_workflow_dag_view(app, area);
+
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
@@ -319,6 +328,7 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
+        dag,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -367,6 +377,10 @@ fn compute_mobile_view(
         .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
         .unwrap_or_default();
 
+    // The overlay is full-bleed, so it lays out against the whole area on a
+    // narrow terminal exactly as it does on a wide one.
+    let dag = compute_workflow_dag_view(app, area);
+
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
@@ -382,6 +396,7 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
+        dag,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -457,6 +472,7 @@ pub fn render_with_runtime_registry(
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+        Mode::WorkflowDag => render_workflow_dag(app, frame, frame.area()),
         Mode::Terminal => {}
     }
 }
@@ -1379,6 +1395,35 @@ mod tests {
         let grab = scrollbar_thumb_grab_offset(metrics, track, row).expect("grab");
 
         assert_eq!(scrollbar_offset_from_drag_row(metrics, track, row, grab), 7);
+    }
+
+    #[test]
+    fn workflow_dag_overlay_renders_from_the_stored_geometry_alone() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::WorkflowDag;
+
+        let area = Rect::new(0, 0, 80, 24);
+        compute_view(&mut app, area);
+
+        // `render` takes `&AppState`: the shared borrow below is what proves it
+        // cannot mutate state, and the geometry it draws from was computed above.
+        let app = &app;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        let screen = (0..area.height)
+            .map(|row| buffer_row_text(terminal.backend().buffer(), area, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("workflow run"), "{screen}");
+        // No run is being followed yet, so the overlay shows its empty state
+        // and its hint bar rather than stale nodes.
+        assert!(screen.contains("no workflow run to show"), "{screen}");
+        assert!(screen.contains("esc"), "{screen}");
+        assert!(app.view.dag.is_empty());
     }
 
     fn buffer_row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {

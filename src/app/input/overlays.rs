@@ -190,6 +190,28 @@ impl App {
             return true;
         }
 
+        if self.state.mode == Mode::WorkflowDag {
+            // Hit-testing reads the rectangles the renderer drew this frame
+            // (`docs/design/workflow-builder/04-kvdag-and-execution.md` §8), so
+            // there is no second geometry to keep in sync. The overlay is
+            // full-bleed, so every mouse event in this mode belongs to it.
+            match mouse.kind {
+                MouseEventKind::Moved => {
+                    if let Some(idx) = self.state.view.dag.node_at(mouse.column, mouse.row) {
+                        self.state.view.dag.selected = Some(idx);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(idx) = self.state.view.dag.node_at(mouse.column, mouse.row) {
+                        self.state.view.dag.selected = Some(idx);
+                        self.focus_workflow_dag_node();
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         if self.state.mode == Mode::KeybindHelp {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)

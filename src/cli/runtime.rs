@@ -1,7 +1,9 @@
 use crate::api::schema::{
     EmptyParams, Method, PaneFocusDirectionParams, PaneMoveParams, PaneRenameParams,
     PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget, PaneZoomParams, Request,
-    TabCreateParams, TabListParams, TabRenameParams, TabTarget, WorkspaceCreateParams,
+    TabCreateParams, TabListParams, TabRenameParams, TabTarget, WorkflowCreateParams,
+    WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRunListParams,
+    WorkflowRunTarget, WorkflowTarget, WorkflowVersionCreateParams, WorkspaceCreateParams,
     WorkspaceRenameParams, WorkspaceTarget, WorktreeCreateParams, WorktreeListParams,
     WorktreeOpenParams, WorktreeRemoveParams,
 };
@@ -119,4 +121,62 @@ pub(super) fn pane_move(params: PaneMoveParams) -> std::io::Result<i32> {
 
 pub(super) fn pane_close(pane_id: String) -> std::io::Result<i32> {
     print_method_response("cli:pane:close", Method::PaneClose(PaneTarget { pane_id }))
+}
+
+pub(super) fn workflow_list() -> std::io::Result<i32> {
+    print_method_response(
+        "cli:workflow:list",
+        Method::WorkflowList(EmptyParams::default()),
+    )
+}
+
+pub(super) fn workflow_get(workflow_id: String) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:workflow:get",
+        Method::WorkflowGet(WorkflowTarget { workflow_id }),
+    )
+}
+
+pub(super) fn workflow_create(params: WorkflowCreateParams) -> std::io::Result<i32> {
+    print_method_response("cli:workflow:create", Method::WorkflowCreate(params))
+}
+
+pub(super) fn workflow_version_create(params: WorkflowVersionCreateParams) -> std::io::Result<i32> {
+    print_method_response("cli:workflow:update", Method::WorkflowVersionCreate(params))
+}
+
+pub(super) fn workflow_run_list(params: WorkflowRunListParams) -> std::io::Result<i32> {
+    print_method_response("cli:workflow:run:list", Method::WorkflowRunList(params))
+}
+
+pub(super) fn workflow_run_cancel(run_id: String) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:workflow:run:cancel",
+        Method::WorkflowRunCancel(WorkflowRunTarget { run_id }),
+    )
+}
+
+pub(super) fn workflow_node_steer(params: WorkflowNodeSteerParams) -> std::io::Result<i32> {
+    print_method_response("cli:workflow:node:steer", Method::WorkflowNodeSteer(params))
+}
+
+pub(super) fn workflow_node_interrupt(run_id: String, path: String) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:workflow:node:interrupt",
+        Method::WorkflowNodeInterrupt(WorkflowNodeTarget { run_id, path }),
+    )
+}
+
+pub(super) fn workflow_node_restart(run_id: String, path: String) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:workflow:node:restart",
+        Method::WorkflowNodeRestart(WorkflowNodeTarget { run_id, path }),
+    )
+}
+
+pub(super) fn workflow_node_report(params: WorkflowNodeReportParams) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:workflow:node:complete",
+        Method::WorkflowNodeReport(params),
+    )
 }

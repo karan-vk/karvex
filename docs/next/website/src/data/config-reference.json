@@ -1148,6 +1148,36 @@
           "description": "While prefix mode is active, temporarily switch the host input source to an ASCII-capable mode so prefix commands are read as ASCII even when an IME is active, then restore the previous input source when prefix mode exits. On macOS this selects the ASCII-capable keyboard layout; on Windows it switches the IME to English (ASCII) input. Windows support is currently limited to the Korean IME; with an IME for any other language, the input source is left unchanged. macOS and Windows only; a no-op elsewhere and a best-effort no-op if the switch fails."
         }
       ]
+    },
+    {
+      "id": "workflow",
+      "title": "Workflow",
+      "keys": [
+        {
+          "key": "workflow.max_parallel_nodes",
+          "type": "integer",
+          "default": "4",
+          "description": "Maximum number of run nodes executing concurrently within a single workflow run."
+        },
+        {
+          "key": "workflow.retention_runs",
+          "type": "integer",
+          "default": "50",
+          "description": "Number of most recent runs kept per workflow; older runs are pruned whole."
+        },
+        {
+          "key": "workflow.stuck_threshold",
+          "type": "integer",
+          "default": "3",
+          "description": "Consecutive anti-stuck watchdog ticks with no material progress on a node before it is escalated as a local loop."
+        },
+        {
+          "key": "workflow.drift_threshold",
+          "type": "integer",
+          "default": "5",
+          "description": "Anti-stuck watchdog ticks with progress observed but no movement toward the output schema before a node is re-prompted for goal drift."
+        }
+      ]
     }
   ]
 }

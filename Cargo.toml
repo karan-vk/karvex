@@ -23,6 +23,10 @@ include = [
 name = "kvx"
 path = "src/main.rs"
 
+[features]
+default = ["workflow"]
+workflow = ["dep:surrealdb", "dep:surrealdb-types"]
+
 [dependencies]
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }
@@ -42,6 +46,14 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
 sha2 = "0.10"
+# Embedded only: the crate default features pull a WebSocket + TLS client stack
+# for talking to a remote SurrealDB server, which karvex never does. kv-mem is
+# kept so store and engine tests run with no disk I/O.
+surrealdb = { version = "3", default-features = false, features = [
+    "kv-surrealkv",
+    "kv-mem",
+], optional = true }
+surrealdb-types = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.8"
 tracing = "0.1.44"

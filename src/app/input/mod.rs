@@ -62,13 +62,15 @@ pub(crate) use self::{
 };
 use self::{
     modal::{
-        modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS, RELEASE_NOTES_ACTIONS,
+        leave_modal, modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS,
+        RELEASE_NOTES_ACTIONS, WORKFLOW_DAG_ACTIONS,
     },
     mouse::MouseAction,
     settings::SettingsAction,
 };
 use super::state::{AppState, Mode};
 use super::App;
+use crate::ui::DagNavDirection;
 
 // ---------------------------------------------------------------------------
 // Key handling
@@ -117,6 +119,7 @@ impl App {
                 Mode::Navigator => {
                     handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
                 }
+                Mode::WorkflowDag => self.handle_workflow_dag_key(key_event),
                 Mode::Terminal => unreachable!(),
             },
         }
@@ -243,6 +246,13 @@ impl App {
                 insert_keybind_help_query_text(&mut self.state, text);
                 true
             }
+            Mode::WorkflowDag => {
+                if self.state.view.dag.steer.is_none() {
+                    return false;
+                }
+                self.insert_workflow_dag_steer_text(text);
+                true
+            }
             Mode::Copy => {
                 let Some(prompt) = self
                     .state
@@ -259,6 +269,124 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// Key handling for the live workflow DAG overlay
+    /// (`docs/design/workflow-builder/05-phase-plan.md` W6). Navigation is
+    /// graph-aware and runs off the geometry stored by the view-computation
+    /// pass, so it can never select a node the frame did not draw.
+    pub(crate) fn handle_workflow_dag_key(&mut self, key: KeyEvent) {
+        if self.state.view.dag.steer.is_some() {
+            self.handle_workflow_dag_steer_key(key);
+            return;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.move_workflow_dag_selection(DagNavDirection::Down)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.move_workflow_dag_selection(DagNavDirection::Up)
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.move_workflow_dag_selection(DagNavDirection::Left)
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.move_workflow_dag_selection(DagNavDirection::Right)
+            }
+            KeyCode::Enter => self.focus_workflow_dag_node(),
+            KeyCode::Char('s') => self.open_workflow_dag_steer(),
+            _ => {
+                if let Some(ModalAction::Close) = modal_action_from_key(&key, WORKFLOW_DAG_ACTIONS)
+                {
+                    leave_modal(&mut self.state);
+                }
+            }
+        }
+    }
+
+    fn handle_workflow_dag_steer_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.state.view.dag.steer = None,
+            KeyCode::Enter => self.submit_workflow_dag_steer(),
+            KeyCode::Backspace => {
+                if let Some(text) = self.state.view.dag.steer.as_mut() {
+                    text.pop();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(text) = self.state.view.dag.steer.as_mut() {
+                    text.clear();
+                }
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_workflow_dag_steer_text(&character.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn insert_workflow_dag_steer_text(&mut self, text: &str) {
+        if let Some(steer) = self.state.view.dag.steer.as_mut() {
+            steer.extend(text.chars().filter(|character| !character.is_control()));
+        }
+    }
+
+    fn move_workflow_dag_selection(&mut self, direction: DagNavDirection) {
+        if let Some(idx) = crate::ui::workflow_dag_neighbour(&self.state.view.dag, direction) {
+            self.state.view.dag.selected = Some(idx);
+        }
+    }
+
+    fn open_workflow_dag_steer(&mut self) {
+        if self.state.view.dag.run_id.is_empty() || self.state.view.dag.selected_node().is_none() {
+            return;
+        }
+        self.state.view.dag.steer = Some(String::new());
+    }
+
+    fn submit_workflow_dag_steer(&mut self) {
+        let Some(text) = self.state.view.dag.steer.take() else {
+            return;
+        };
+        let text = text.trim().to_string();
+        let run_id = self.state.view.dag.run_id.clone();
+        let Some(path) = self
+            .state
+            .view
+            .dag
+            .selected_node()
+            .map(|node| node.path.clone())
+        else {
+            return;
+        };
+        if text.is_empty() || run_id.is_empty() {
+            return;
+        }
+        self.dispatch_runtime_mutation(
+            "tui.workflow.node.steer",
+            crate::api::schema::Method::WorkflowNodeSteer(
+                crate::api::schema::WorkflowNodeSteerParams { run_id, path, text },
+            ),
+        );
+    }
+
+    /// Opens the selected node's teammate. The overlay is full-bleed, so
+    /// focusing a pane means leaving the overlay behind it.
+    pub(super) fn focus_workflow_dag_node(&mut self) {
+        let Some(pane) = self
+            .state
+            .view
+            .dag
+            .selected_node()
+            .and_then(|node| node.pane_id.clone())
+        else {
+            return;
+        };
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&pane) else {
+            return;
+        };
+        self.focus_pane_internal_via_api(ws_idx, pane_id);
+        leave_modal(&mut self.state);
     }
 
     pub(crate) fn handle_onboarding_key(&mut self, key: KeyEvent) {
@@ -719,6 +847,7 @@ pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
             .is_some_and(|open| open.search_focused),
         Mode::Navigator => state.navigator.search_focused,
         Mode::KeybindHelp => state.keybind_help.search_focused,
+        Mode::WorkflowDag => state.view.dag.steer.is_some(),
         Mode::Copy => state
             .copy_mode
             .as_ref()
@@ -1012,5 +1141,177 @@ mod tests {
 
         state.mode = Mode::ConfirmClose;
         assert!(!modal_paste_target_active(&state));
+
+        state.mode = Mode::WorkflowDag;
+        assert!(!modal_paste_target_active(&state));
+        state.view.dag.steer = Some(String::new());
+        assert!(modal_paste_target_active(&state));
+    }
+
+    // ── workflow DAG overlay (`05-phase-plan.md` W6, step 4c) ───────────────
+
+    fn dag_node(
+        idx: usize,
+        path: &str,
+        successors: Vec<crate::workflow::model::RunNodeIdx>,
+        predecessors: Vec<crate::workflow::model::RunNodeIdx>,
+    ) -> crate::app::state::DagNodeView {
+        crate::app::state::DagNodeView {
+            idx: crate::workflow::model::RunNodeIdx(idx),
+            path: path.to_string(),
+            label: path.to_string(),
+            status: crate::workflow::model::NodeStatus::Running,
+            model: "sonnet".into(),
+            effort: "low".into(),
+            attempt: 1,
+            usage: crate::workflow::model::NodeUsage::default(),
+            summary: None,
+            blocker: None,
+            pane_id: None,
+            successors,
+            predecessors,
+        }
+    }
+
+    /// Two stacked boxes, laid out the way the view-computation pass would
+    /// store them.
+    fn dag_view() -> crate::app::state::DagViewState {
+        use crate::workflow::layout::{DagLayout, LayoutRect};
+        use crate::workflow::model::RunNodeIdx;
+        use ratatui::layout::Rect;
+
+        crate::app::state::DagViewState {
+            run_id: "workflow_run:1".into(),
+            run_status: Some(crate::workflow::model::RunStatus::Running),
+            header_rect: Rect::new(0, 0, 80, 1),
+            graph_rect: Rect::new(0, 1, 80, 18),
+            detail_rect: Rect::new(0, 19, 80, 4),
+            footer_rect: Rect::new(0, 23, 80, 1),
+            layout: DagLayout {
+                nodes: vec![
+                    (RunNodeIdx(0), LayoutRect::new(0, 1, 22, 3)),
+                    (RunNodeIdx(1), LayoutRect::new(0, 6, 22, 3)),
+                ],
+                edge_cells: std::collections::HashMap::new(),
+            },
+            nodes: vec![
+                dag_node(0, "plan", vec![RunNodeIdx(1)], Vec::new()),
+                dag_node(1, "build", Vec::new(), vec![RunNodeIdx(0)]),
+            ],
+            selected: Some(RunNodeIdx(0)),
+            steer: None,
+        }
+    }
+
+    #[test]
+    fn workflow_dag_keys_navigate_the_graph_and_escape_closes_the_overlay() {
+        let mut app = test_app();
+        app.state.mode = Mode::WorkflowDag;
+        app.state.view.dag = dag_view();
+
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.state.view.dag.selected,
+            Some(crate::workflow::model::RunNodeIdx(1))
+        );
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.state.view.dag.selected,
+            Some(crate::workflow::model::RunNodeIdx(0))
+        );
+
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn workflow_dag_steer_line_collects_text_and_escape_only_closes_the_line() {
+        let mut app = test_app();
+        app.state.mode = Mode::WorkflowDag;
+        app.state.view.dag = dag_view();
+
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state.view.dag.steer.as_deref(), Some(""));
+
+        for character in "hi".chars() {
+            app.handle_workflow_dag_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(app.state.view.dag.steer.as_deref(), Some("hi"));
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.state.view.dag.steer.as_deref(), Some("h"));
+
+        // Escape dismisses the steer line, not the overlay.
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state.view.dag.steer, None);
+        assert_eq!(app.state.mode, Mode::WorkflowDag);
+    }
+
+    #[test]
+    fn workflow_dag_steer_needs_a_run_and_a_selection() {
+        let mut app = test_app();
+        app.state.mode = Mode::WorkflowDag;
+        app.state.view.dag = crate::app::state::DagViewState::default();
+
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state.view.dag.steer, None);
+    }
+
+    #[test]
+    fn workflow_dag_click_selects_exactly_the_node_the_frame_drew() {
+        let mut app = test_app();
+        app.state.mode = Mode::WorkflowDag;
+        app.state.view.dag = dag_view();
+
+        // Every cell of every stored box selects that box, and the mouse event
+        // never escapes the overlay.
+        for (idx, rect) in app.state.view.dag.layout.nodes.clone() {
+            for row in rect.y..rect.bottom() {
+                for column in rect.x..rect.right() {
+                    app.state.view.dag.selected = None;
+                    let handled = app.handle_overlay_mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    assert!(handled);
+                    assert_eq!(app.state.view.dag.selected, Some(idx), "({column},{row})");
+                }
+            }
+        }
+
+        // A click in the gap between boxes hits nothing.
+        app.state.view.dag.selected = None;
+        assert!(app.handle_overlay_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.state.view.dag.selected, None);
+    }
+
+    #[test]
+    fn workflow_dag_mode_round_trips_through_the_view_computation() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::WorkflowDag;
+
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        crate::ui::compute_view(&mut app, area);
+        assert_eq!(app.view.dag.header_rect.width, area.width);
+        assert_eq!(app.view.dag.footer_rect.bottom(), area.bottom());
+
+        leave_modal(&mut app);
+        assert_eq!(app.mode, Mode::Terminal);
+
+        // Leaving the overlay leaves no geometry behind for a later hit-test.
+        crate::ui::compute_view(&mut app, area);
+        assert_eq!(app.view.dag, crate::app::state::DagViewState::default());
     }
 }

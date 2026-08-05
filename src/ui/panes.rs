@@ -6,6 +6,7 @@ use ratatui::{
     Frame,
 };
 
+use super::line_cells::{line_cell_symbol, LineCell};
 use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
 #[cfg(test)]
 use super::text::display_width;
@@ -434,14 +435,6 @@ pub(super) fn render_popup_pane(
     rt.render(frame, inner, !pane_is_scrolled_back(rt));
 }
 
-#[derive(Clone, Copy, Default)]
-struct LineCell {
-    up: bool,
-    down: bool,
-    left: bool,
-    right: bool,
-}
-
 fn render_pane_borders(
     app: &AppState,
     ws: &crate::workspace::Workspace,
@@ -661,27 +654,6 @@ fn render_pane_border_titles(
             end_x.saturating_sub(start_x) as usize,
             style,
         );
-    }
-}
-
-fn line_cell_symbol(line: LineCell) -> &'static str {
-    match (line.up, line.down, line.left, line.right) {
-        (true, true, true, true) => "┼",
-        (true, true, true, false) => "┤",
-        (true, true, false, true) => "├",
-        (true, false, true, true) => "┴",
-        (false, true, true, true) => "┬",
-        (true, true, false, false) | (true, false, false, false) | (false, true, false, false) => {
-            "│"
-        }
-        (false, false, true, true) | (false, false, true, false) | (false, false, false, true) => {
-            "─"
-        }
-        (false, true, false, true) => "┌",
-        (false, true, true, false) => "┐",
-        (true, false, false, true) => "└",
-        (true, false, true, false) => "┘",
-        _ => "",
     }
 }
 
