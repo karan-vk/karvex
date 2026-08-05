@@ -18,6 +18,10 @@ use super::plugins::{
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
+use super::workflows::{
+    KvdagVersionDetail, KvdagVersionSummary, WorkflowRunGraph, WorkflowRunInfo,
+    WorkflowRunNodeInfo, WorkflowSummary,
+};
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
 
@@ -244,6 +248,52 @@ pub enum ResponseResult {
     ConfigReload {
         status: crate::config::ConfigReloadStatus,
         diagnostics: Vec<String>,
+    },
+    WorkflowList {
+        workflows: Vec<WorkflowSummary>,
+    },
+    WorkflowGet {
+        workflow: WorkflowSummary,
+        versions: Vec<KvdagVersionSummary>,
+    },
+    WorkflowCreated {
+        workflow: WorkflowSummary,
+        version: KvdagVersionSummary,
+    },
+    WorkflowVersionCreated {
+        workflow: WorkflowSummary,
+        version: KvdagVersionSummary,
+    },
+    WorkflowVersionGet {
+        version: KvdagVersionDetail,
+    },
+    WorkflowRunStarted {
+        run: WorkflowRunInfo,
+    },
+    WorkflowRunGet {
+        run: WorkflowRunInfo,
+        graph: WorkflowRunGraph,
+    },
+    WorkflowRunList {
+        runs: Vec<WorkflowRunInfo>,
+    },
+    WorkflowRunCancelled {
+        run: WorkflowRunInfo,
+    },
+    WorkflowNodeGet {
+        node: WorkflowRunNodeInfo,
+    },
+    WorkflowNodeSteered {
+        node: WorkflowRunNodeInfo,
+    },
+    WorkflowNodeInterrupted {
+        node: WorkflowRunNodeInfo,
+    },
+    WorkflowNodeReported {
+        node: WorkflowRunNodeInfo,
+    },
+    WorkflowNodeRestarted {
+        node: WorkflowRunNodeInfo,
     },
     Ok {},
 }

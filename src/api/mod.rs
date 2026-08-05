@@ -76,6 +76,14 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PluginPaneOpen(_)
             | Method::PluginPaneFocus(_)
             | Method::PluginPaneClose(_)
+            | Method::WorkflowCreate(_)
+            | Method::WorkflowVersionCreate(_)
+            | Method::WorkflowRun(_)
+            | Method::WorkflowRunCancel(_)
+            | Method::WorkflowNodeSteer(_)
+            | Method::WorkflowNodeInterrupt(_)
+            | Method::WorkflowNodeReport(_)
+            | Method::WorkflowNodeRestart(_)
     )
 }
 

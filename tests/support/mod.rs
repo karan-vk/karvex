@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod jsonrpc;
+
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
@@ -16,6 +18,17 @@ static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".karvex-test-owner-pid";
 pub const CURRENT_PROTOCOL: u32 = 19;
+
+/// Config/state subdirectory the binary under test actually reads. Debug builds
+/// resolve to `karvex-dev`, so a test that writes `config.toml` under `karvex/`
+/// is silently ignored by the binary it is trying to configure.
+pub fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "karvex-dev"
+    } else {
+        "karvex"
+    }
+}
 
 pub fn register_spawned_karvex_pid(pid: Option<u32>) {
     let Some(pid) = pid else {

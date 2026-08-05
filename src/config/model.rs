@@ -322,6 +322,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub workflow: WorkflowConfig,
 }
 
 #[derive(Debug)]
@@ -962,6 +963,24 @@ pub struct ExperimentalConfig {
     pub switch_ascii_input_source_in_prefix: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct WorkflowConfig {
+    /// Maximum number of run nodes executing concurrently within a single
+    /// workflow run. Default: 4.
+    pub max_parallel_nodes: usize,
+    /// Number of most recent runs kept per workflow; older runs are pruned
+    /// whole. Default: 50.
+    pub retention_runs: usize,
+    /// Consecutive anti-stuck watchdog ticks with no material progress on a
+    /// node before it is escalated as a local loop. Default: 3.
+    pub stuck_threshold: usize,
+    /// Anti-stuck watchdog ticks with progress observed but no movement
+    /// toward the output schema before a node is re-prompted for goal drift.
+    /// Default: 5.
+    pub drift_threshold: usize,
+}
+
 impl Default for KeysConfig {
     fn default() -> Self {
         Self {
@@ -1149,6 +1168,17 @@ impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
             scrollback_limit_bytes: DEFAULT_SCROLLBACK_LIMIT_BYTES,
+        }
+    }
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel_nodes: 4,
+            retention_runs: 50,
+            stuck_threshold: 3,
+            drift_threshold: 5,
         }
     }
 }
@@ -1815,5 +1845,30 @@ scrollback_lines = 12345
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.advanced.scrollback_limit_bytes, 12345);
+    }
+
+    #[test]
+    fn workflow_config_defaults() {
+        let config = Config::default();
+        assert_eq!(config.workflow.max_parallel_nodes, 4);
+        assert_eq!(config.workflow.retention_runs, 50);
+        assert_eq!(config.workflow.stuck_threshold, 3);
+        assert_eq!(config.workflow.drift_threshold, 5);
+    }
+
+    #[test]
+    fn workflow_config_parses() {
+        let toml = r#"
+[workflow]
+max_parallel_nodes = 8
+retention_runs = 100
+stuck_threshold = 6
+drift_threshold = 10
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.workflow.max_parallel_nodes, 8);
+        assert_eq!(config.workflow.retention_runs, 100);
+        assert_eq!(config.workflow.stuck_threshold, 6);
+        assert_eq!(config.workflow.drift_threshold, 10);
     }
 }

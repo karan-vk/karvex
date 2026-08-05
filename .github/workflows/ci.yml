@@ -55,7 +55,9 @@ jobs:
           - os: windows-latest
             kind: windows
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # The workflow feature adds SurrealDB (~257 crates) to both the default and
+    # the --no-default-features leg of `just ci`.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -123,9 +125,21 @@ jobs:
           restore-keys: |
             zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-
 
+      # cmake and a C toolchain are mandatory on every leg: surrealdb-core pulls
+      # aws-lc-sys unconditionally via jsonwebtoken.
       - name: Install macOS build tools
         if: runner.os == 'macOS'
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install Windows build tools
+        if: runner.os == 'Windows'
+        run: choco install cmake ninja --yes --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
 
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

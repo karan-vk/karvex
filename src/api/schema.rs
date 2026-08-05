@@ -10,6 +10,7 @@ pub mod response;
 pub mod server;
 pub mod session;
 pub mod tabs;
+pub mod workflows;
 pub mod workspaces;
 pub mod worktrees;
 
@@ -23,6 +24,7 @@ pub use response::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
+pub use workflows::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
@@ -235,6 +237,34 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+    #[serde(rename = "workflow.list")]
+    WorkflowList(EmptyParams),
+    #[serde(rename = "workflow.get")]
+    WorkflowGet(WorkflowTarget),
+    #[serde(rename = "workflow.create")]
+    WorkflowCreate(WorkflowCreateParams),
+    #[serde(rename = "workflow.version.create")]
+    WorkflowVersionCreate(WorkflowVersionCreateParams),
+    #[serde(rename = "workflow.version.get")]
+    WorkflowVersionGet(WorkflowVersionTarget),
+    #[serde(rename = "workflow.run")]
+    WorkflowRun(WorkflowRunParams),
+    #[serde(rename = "workflow.run.get")]
+    WorkflowRunGet(WorkflowRunTarget),
+    #[serde(rename = "workflow.run.list")]
+    WorkflowRunList(WorkflowRunListParams),
+    #[serde(rename = "workflow.run.cancel")]
+    WorkflowRunCancel(WorkflowRunTarget),
+    #[serde(rename = "workflow.node.get")]
+    WorkflowNodeGet(WorkflowNodeTarget),
+    #[serde(rename = "workflow.node.steer")]
+    WorkflowNodeSteer(WorkflowNodeSteerParams),
+    #[serde(rename = "workflow.node.interrupt")]
+    WorkflowNodeInterrupt(WorkflowNodeTarget),
+    #[serde(rename = "workflow.node.report")]
+    WorkflowNodeReport(WorkflowNodeReportParams),
+    #[serde(rename = "workflow.node.restart")]
+    WorkflowNodeRestart(WorkflowNodeTarget),
 }
 
 #[cfg(test)]

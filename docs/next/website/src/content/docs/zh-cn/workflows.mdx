@@ -1,0 +1,168 @@
+---
+title: 工作流
+description: 定义多智能体 kvdag,将每个节点作为 Karvex 托管的队友运行,并在 DAG 视图中实时查看执行过程。
+---
+
+工作流是一个已保存、有版本管理的 **kvdag**:一个由节点(任务)组成的有向无环图,节点之间通过边传递结果。运行一个工作流会把每个节点都启动为一个真实的终端窗格 ── 通常是一个 `claude` 队友 ── 并协调它们,直到每条分支都得出结果。
+
+工作流适合那种你想定义一次、反复运行的多步骤、多智能体任务,比如计划 → 实现 → 审查。如果只是想让已经在运行的智能体之间做一次性的脚本化协作,请改用 [智能体自动化](/zh-cn/docs/agent-automation/)。
+
+## 什么是工作流
+
+**工作流** 是一个或多个 **kvdag 版本** ── 不可变的图定义 ── 的命名容器。`kvx workflow create` 创建第一个版本;`kvx workflow update` 在其基础上创建新版本。编辑操作从不就地修改某个版本,总是产生一个新版本,因此过去的运行始终可以对照它实际运行时所用的版本进行复现。
+
+**运行 (run)** 取一个 kvdag 版本,填入声明的运行参数,然后执行该图。每个节点都会成为一个 **运行节点 (run node)** ── 一个拥有自己的状态、模型/努力等级分配、窗格绑定和结果的实例。一旦某个节点的所有入边都已解析,它就会开始;彼此独立的节点会在配置的并发上限内并行运行。条件边的条件求值为 false 时该边即为死边;所有入边都是死边的节点会变为 `skipped`,而不会阻塞图的其余部分 ── 这就是工作流无需脚本语言即可分支的方式。
+
+一次运行只有在每个节点都已解析完毕、并记录下接下来会发生什么之后才算结束,而不是仅仅因为已经没有可调度的节点了。如果某个节点结束时既没有解析出后继边、也没有记录阻塞原因、也没有明确证据表明后面不会再有动作,运行就会暂停,并指出具体是哪个节点导致的,而不是默默地报告成功。
+
+## 定义格式
+
+`kvx workflow create` 和 `kvx workflow update` 会读取一个 TOML 或 JSON 格式的定义文档 ── 由文件扩展名决定格式。TOML 更便于手动编辑:
+
+```toml
+name = "ship-feature"
+description = "plan → implement → review"
+contract = """
+Reply only through result.json. Never edit files outside your node dir unless the task says so.
+"""
+max_depth = 3
+max_nodes = 24
+
+# Declared run-argument namespace. Without this, `{{goal}}` below has no inbound
+# edge port to resolve against and workflow.create rejects the document.
+[[arg]]
+name = "goal"
+required = true
+description = "what to build"
+
+[[node]]
+key = "plan"
+label = "Plan"
+kind = "agent"
+runner = "agent"          # `claude` teammate; "command" runs `command` as a plain process
+demand = "critical"
+prompt_template = "Produce an implementation plan for: {{goal}}"
+output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
+
+[[node]]
+key = "implement"
+label = "Implement"
+kind = "agent"
+demand = "peak"
+prompt_template = "Implement this plan:\n{{plan}}"
+output_schema = { type = "object", required = ["changed_files","report"], properties = { changed_files = { type = "array" }, report = { type = "string" } } }
+
+[[edge]]
+from = "plan"
+to = "implement"
+kind = "data"
+payload = "summary"
+port = "plan"
+```
+
+`contract` 会被添加到每个节点系统提示词的开头 ── 把跨节点的通用规则写在这里,而不是在每个节点里重复。`max_depth` 和 `max_nodes` 是该图的增长上限;此阶段的运行会严格执行上面定义的这些节点,所以这两个字段要等到后续版本加入节点驱动的动态扩展之后才会真正起作用。
+
+每个 `[[arg]]` 在运行参数命名空间中声明一个条目,在运行时通过 `--arg name=value` 填入。`prompt_template` 中的每个 `{{name}}` 占位符都必须能解析到某个已声明的参数或某条入边的 `port` ── `workflow.create` 会在文档被运行之前就拒绝含有未解析占位符的文档,而启动运行时则会单独拒绝缺少默认值的必填参数。
+
+每个 `[[node]]` 都需要唯一的 `key`、`label` 和 `prompt_template`。`output_schema` 是一个 JSON Schema,节点的结果必须先通过它的校验才能被判定为成功。`kind` 默认是 `"agent"`;其他种类(`internal`、`gate`、`monitor`)目前可以被接受,但它们的调度行为会在后续版本中提供。`runner` 决定节点的进程如何被启动 ── 参见下文的节点运行方式。`demand`(`peak`、`critical`、`standard` 或 `light`,默认 `standard`)会把运行的等级映射到每个节点的模型和努力等级分配上。
+
+每个 `[[edge]]` 连接一个 `from` 节点和一个 `to` 节点。`kind` 可以是 `sequence`(要求源节点成功)、`data`(要求源节点成功且其结果通过校验)或 `conditional`(对源节点的结果求值 `condition`;为 false 时该边即为死边)。`payload` 控制目标节点能拿到源节点检查点的多少内容:`none`、`summary`(默认)或 `full`。`port` 指定该边的负载要填入目标节点 `prompt_template` 中的哪个 `{{slot}}`。
+
+带上声明的参数运行它:
+
+```bash
+kvx workflow run start ship-feature --arg goal="add dark mode"
+```
+
+要手动编辑已保存的工作流,用新的定义文件运行 `kvx workflow update`。这会创建一个新的 kvdag 版本,而不是就地修改你所基于的那个版本,因此过去的每次运行都仍然可以对照它实际运行时所用的版本进行复现。
+
+## 节点运行方式
+
+`runner` 独立于 `kind`,决定节点的进程如何被启动:
+
+| `runner` | 进程 | 启动确认 | 引导输入 | 完成方式 |
+| --- | --- | --- | --- | --- |
+| `agent`(默认) | 窗格内的 `claude`,以运行解析出的模型和努力等级启动 | 必须在启动时限内以已检测到的智能体身份出现,否则启动本身即被判定为失败 | 通过与 `agent.prompt` 相同的已验证路径投递 | 下文节点契约中三种信号之一 |
+| `command` | 节点自己的 `command` argv,作为普通进程运行 | 无 ── 窗格只是一个已启动的进程 | 以原始窗格文本投递 | 仅自我上报 |
+
+`command` 节点需要 `command = ["...", ...]` ── 一个 argv 列表,绝不能是 shell 字符串。它会得到和 `agent` 节点相同的 `KARVEX_WORKFLOW_*` 环境变量,因此也能以同样的方式调用 `kvx workflow node complete`,但它没有回合结束钩子,也没有屏幕检测:唯一能让它完成的,是节点自己上报。
+
+## 节点契约
+
+每个节点都在自己专属的目录 `<run dir>/<instance path>/` 中运行:
+
+| 文件 | 由谁写入 | 内容 |
+| --- | --- | --- |
+| `task.md` | Karvex | 渲染好的提示词:工作流契约、节点角色、任务,以及 `inputs/` 下各文件的路径 |
+| `inputs/<port>.json` | Karvex | 每个入边端口对应的上游检查点负载,一个端口一个文件 |
+| `output_schema.json` | Karvex | `result.json` 必须满足的 JSON Schema |
+| `result.json` | 节点自身 | 其结构化结果 |
+| `artifacts/` | 节点自身 | 被 `result.json` 的 `artifacts` 数组引用的文件 |
+
+写入 `result.json` 后运行以下命令来完成节点:
+
+```bash
+kvx workflow node complete
+kvx workflow node complete --result-file <path>   # defaults to ./result.json in the node directory
+```
+
+该命令会从节点窗格上已经设置好的环境变量 `KARVEX_WORKFLOW_RUN_ID`、`KARVEX_WORKFLOW_NODE_PATH`、`KARVEX_WORKFLOW_NODE_DIR`、`KARVEX_WORKFLOW_NODE_TOKEN` 中读取信息,因此该命令不需要任何位置参数。请在 `result.json` 中包含一个 `summary` 字符串 ── 下游节点和运行历史看到的正是这个字符串 ── 并把任何内联不下的内容放进 `artifacts` 数组,指向 `./artifacts/` 下的路径。
+
+这种自我上报是三种完成信号中优先级最高的,按优先级排序如下:
+
+| 优先级 | 信号 | 适用对象 | 记录为 |
+| --- | --- | --- | --- |
+| 1 | 自我上报 ── 节点调用 `kvx workflow node complete` | `agent` 和 `command` 节点 | `self_report` |
+| 2 | 回合结束 ── 内置的 Claude 钩子报告窗格的回合已结束,随后 Karvex 读取 `result.json` | 仅 `agent` 节点 | `hook` |
+| 3 | 检测 ── 窗格连续多次被判定为 idle,且存在有效的 `result.json` | 仅 `agent` 节点 | `detection` |
+
+:::caution[仅凭 idle 永远不够]
+如果一个节点的窗格进入 idle 之前,从未生成过能通过 `output_schema.json` 校验的 `result.json`,它就不会完成。它会转为 `needs_attention`,并且只要它停留在这个状态,运行就不会报告成功。请始终通过 `kvx workflow node complete` 来完成节点,或者确保你的智能体做的最后一件事就是写出一个有效的结果。
+:::
+
+无效的结果会得到一次自动的纠正性再提示,其中会引用具体的 schema 错误;如果仍然无效,节点会以同样的方式转为 `needs_attention`。
+
+## 命令
+
+```bash
+kvx workflow list
+kvx workflow show <name|id>
+kvx workflow create --file <definition.toml|json> [--name <name>]
+kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>]
+```
+
+`create` 和 `update` 都会从 `--file` 读取前面介绍过的定义文档;扩展名决定是 TOML 还是 JSON。`update` 会创建一个新的 kvdag 版本,而不是编辑当前版本。
+
+```bash
+kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
+kvx workflow run list <name|id> [--limit N]
+kvx workflow run show <run_id> [--json]
+kvx workflow run cancel <run_id>
+```
+
+`run` 是一个命名空间,不是用来选择工作流的参数:`start`、`list`、`show`、`cancel` 各自带有自己的参数,所以工作流即使叫 `list` 也不会和子命令冲突。`--tier` 默认使用该工作流自己的默认等级;为每个已声明的运行参数重复使用 `--arg`。`run cancel` 会取消运行中剩余的节点并关闭它们的窗格。
+
+```bash
+kvx workflow node show <run_id> <path> [--json]
+kvx workflow node steer <run_id> <path> <text>
+kvx workflow node interrupt <run_id> <path>
+kvx workflow node restart <run_id> <path>
+kvx workflow node complete [--result-file <path>]
+```
+
+`<path>` 是节点的实例路径,例如 `plan` 或 `research/2/verify` ── 会显示在 `run show` 和 DAG 视图中。`steer` 会以和下文 DAG 视图中的引导输入相同的方式,向正在运行的节点注入文本。`interrupt` 发送一个转义键,在不结束节点的情况下停止其当前回合。`restart` 会关闭节点的窗格,增加其尝试次数,并从 `task.md` 重新启动。`node complete` 是节点对自己运行的唯一命令 ── 参见前文的节点契约。
+
+## DAG 视图
+
+从 Karvex 的 TUI 打开某次运行的 DAG 视图,即可实时观察其执行:节点框按图的层级排布,边绘制在节点之间,详情条会显示当前选中节点的状态、模型、用量、最近一次检查点的摘要以及任何阻塞信息。
+
+| 输入 | 动作 |
+| --- | --- |
+| `h` / `j` / `k` / `l` 或方向键 | 将选中项移动到该方向上相邻的节点 |
+| `Enter`,或点击某个节点 | 聚焦该节点的窗格,离开 DAG 视图 |
+| `s` | 为选中节点打开一行引导输入;输入内容后按 `Enter` 以 `kvx workflow node steer` 发送 |
+| `Esc`(引导输入行处于打开状态时) | 不发送,直接关闭引导输入行 |
+| `Esc`(其他情况下) | 离开 DAG 视图 |
+| 移动鼠标 | 选中项跟随指针移动 |
+
+该视图是这次运行的只读投影:节点状态、位置和边全部来自 CLI 和 JSON API 所报告的同一张运行图。聚焦某个节点窗格所走的路径,和在 Karvex 中聚焦任何其他窗格完全相同,因此离开 DAG 视图之后,你看到的仍然是刚才选中的那个队友。

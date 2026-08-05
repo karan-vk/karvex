@@ -22,6 +22,7 @@ mod server_not_running;
 mod spec;
 mod status;
 mod tab;
+mod workflow;
 mod workspace;
 mod worktree;
 
@@ -100,6 +101,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "plugin" => plugin::run_plugin_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
+        "workflow" => workflow::run_workflow_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };
 
@@ -1120,5 +1122,23 @@ mod tests {
             &client,
         );
         assert!(!super::server_not_running::was_reported(&mapped));
+    }
+
+    /// Part of the W5 "manual parser / spec.rs / cli.rs dispatch" parity
+    /// concern (`docs/design/workflow-builder/05-phase-plan.md`): confirms
+    /// the top-level `"workflow"` arm in `maybe_run` actually routes into
+    /// `cli::workflow::run_workflow_command` rather than falling through to
+    /// `CommandOutcome::NotCli`. An unrecognized `kvx workflow` subcommand
+    /// short-circuits to a usage message before any network call, so this
+    /// stays a pure dispatch-routing test.
+    #[test]
+    fn workflow_command_is_dispatched_without_reaching_the_network() {
+        let outcome = super::maybe_run(&[
+            "kvx".to_string(),
+            "workflow".to_string(),
+            "not-a-real-verb".to_string(),
+        ])
+        .unwrap();
+        assert!(matches!(outcome, super::CommandOutcome::Handled(2)));
     }
 }

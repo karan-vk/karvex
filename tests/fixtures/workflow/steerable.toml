@@ -1,0 +1,33 @@
+# Phase 1 end-to-end fixture for steering
+# (`docs/design/workflow-builder/04-kvdag-and-execution.md` §5).
+#
+# One long-lived `runner = "command"` node that never reports, so it stays
+# Running while the test steers it. For a command runner the binder delivers a
+# steer with `pane.send_text` and journals `delivery: "raw"` — `agent.prompt` is
+# not attempted, so the stub never has to impersonate a detected agent.
+#
+# The stub-path placeholder in `command` is substituted by the test with the
+# absolute path of `tests/fixtures/workflow/node_stub.sh`.
+
+name = "e2e-steerable"
+description = "a long-running plain-process node that can be steered"
+contract = """
+Reply only through result.json.
+"""
+max_depth = 3
+max_nodes = 24
+
+[[arg]]
+name = "goal"
+required = true
+description = "what to build"
+
+[[node]]
+key = "worker"
+label = "Worker"
+kind = "agent"
+runner = "command"
+command = ["/bin/sh", "@STUB@", "idle"]
+demand = "standard"
+prompt_template = "Work on: {{goal}}"
+output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }

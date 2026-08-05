@@ -185,6 +185,28 @@ impl App {
                     context.focused_pane_id = Some(pane_id.clone());
                     context
                 }),
+            // Not yet in `PLUGIN_HOOK_EVENT_KINDS`
+            // (`docs/design/workflow-builder/05-phase-plan.md` W3 scopes
+            // plugin-hook wiring out of Phase 1), so `run_plugin_event_hooks`
+            // never reaches this match with these variants today. Arms exist
+            // only to keep this match exhaustive, following the same
+            // workspace/pane lookup pattern as the arms above.
+            EventData::WorkflowRunStarted { run }
+            | EventData::WorkflowRunUpdated { run }
+            | EventData::WorkflowRunFinished { run } => run
+                .workspace_id
+                .as_deref()
+                .and_then(|workspace_id| {
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)
+                })
+                .unwrap_or_else(|| empty_plugin_context(correlation_id)),
+            EventData::WorkflowNodeCreated { node, .. }
+            | EventData::WorkflowNodeUpdated { node, .. } => node
+                .pane_id
+                .as_deref()
+                .and_then(|pane_id| self.plugin_context_for_public_pane_id(pane_id, correlation_id))
+                .unwrap_or_else(|| empty_plugin_context(correlation_id)),
+            EventData::WorkflowNodeOutputCheckpoint { .. } => empty_plugin_context(correlation_id),
         }
     }
 

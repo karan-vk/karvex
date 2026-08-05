@@ -11,6 +11,7 @@ pub(crate) mod plugins;
 mod responses;
 mod session;
 mod tabs;
+mod workflows;
 mod workspaces;
 mod worktrees;
 
@@ -1160,6 +1161,42 @@ impl App {
             }
             Method::PluginPaneClose(params) => {
                 return self.handle_plugin_pane_close(request.id, params);
+            }
+            Method::WorkflowList(_) => return self.handle_workflow_list(request.id),
+            Method::WorkflowGet(target) => return self.handle_workflow_get(request.id, target),
+            Method::WorkflowCreate(params) => {
+                return self.handle_workflow_create(request.id, params);
+            }
+            Method::WorkflowVersionCreate(params) => {
+                return self.handle_workflow_version_create(request.id, params);
+            }
+            Method::WorkflowVersionGet(target) => {
+                return self.handle_workflow_version_get(request.id, target);
+            }
+            Method::WorkflowRun(params) => return self.handle_workflow_run(request.id, params),
+            Method::WorkflowRunGet(target) => {
+                return self.handle_workflow_run_get(request.id, target);
+            }
+            Method::WorkflowRunList(params) => {
+                return self.handle_workflow_run_list(request.id, params);
+            }
+            Method::WorkflowRunCancel(target) => {
+                return self.handle_workflow_run_cancel(request.id, target);
+            }
+            Method::WorkflowNodeGet(target) => {
+                return self.handle_workflow_node_get(request.id, target);
+            }
+            Method::WorkflowNodeSteer(params) => {
+                return self.handle_workflow_node_steer(request.id, params);
+            }
+            Method::WorkflowNodeInterrupt(target) => {
+                return self.handle_workflow_node_interrupt(request.id, target);
+            }
+            Method::WorkflowNodeReport(params) => {
+                return self.handle_workflow_node_report(request.id, params);
+            }
+            Method::WorkflowNodeRestart(target) => {
+                return self.handle_workflow_node_restart(request.id, target);
             }
             _ => {
                 return responses::encode_error(

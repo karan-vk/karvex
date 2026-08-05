@@ -797,6 +797,90 @@ pub enum ViewLayout {
     Mobile,
 }
 
+/// One node of the DAG overlay's projection of a run graph.
+///
+/// The overlay never holds a second mutable graph
+/// (`docs/design/workflow-builder/00-overview.md` D9): this is a read-only
+/// snapshot taken in the view-computation pass, so `render_workflow_dag` needs
+/// nothing but `ViewState` to draw a frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagNodeView {
+    pub idx: crate::workflow::model::RunNodeIdx,
+    /// Instance path — the node's stable identity and the `workflow.node.*`
+    /// selector.
+    pub path: String,
+    pub label: String,
+    pub status: crate::workflow::model::NodeStatus,
+    pub model: String,
+    pub effort: String,
+    pub attempt: u8,
+    pub usage: crate::workflow::model::NodeUsage,
+    /// Latest checkpoint summary, when the node has produced a result.
+    pub summary: Option<String>,
+    /// `reason — resume when …` for a node whose succession is blocked.
+    pub blocker: Option<String>,
+    /// Public pane id of the node's teammate, once it has been bound.
+    pub pane_id: Option<String>,
+    pub successors: Vec<crate::workflow::model::RunNodeIdx>,
+    pub predecessors: Vec<crate::workflow::model::RunNodeIdx>,
+}
+
+/// The DAG overlay's view state.
+///
+/// Layout runs once per frame in `compute_view_internal`; the renderer and the
+/// mouse hit-test then read exactly the rectangles stored here, so what is
+/// clickable can never disagree with what was drawn
+/// (`docs/design/workflow-builder/04-kvdag-and-execution.md` §8).
+///
+/// `selected` and `steer` are the overlay's own interaction state rather than
+/// derived geometry. They live here — not in the run's server-side state —
+/// because selection and text entry are client concerns, and they are carried
+/// across frames by `compute_workflow_dag_view` since `ViewState` is rebuilt
+/// wholesale.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DagViewState {
+    /// Empty when no run is being projected; also the `workflow.node.*`
+    /// `run_id` for steering.
+    pub run_id: String,
+    pub run_status: Option<crate::workflow::model::RunStatus>,
+    pub header_rect: Rect,
+    pub graph_rect: Rect,
+    pub detail_rect: Rect,
+    pub footer_rect: Rect,
+    pub layout: crate::workflow::layout::DagLayout,
+    pub nodes: Vec<DagNodeView>,
+    pub selected: Option<crate::workflow::model::RunNodeIdx>,
+    /// `Some` while the steer input line is open; the pending text.
+    pub steer: Option<String>,
+}
+
+impl DagViewState {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub(crate) fn node(&self, idx: crate::workflow::model::RunNodeIdx) -> Option<&DagNodeView> {
+        self.nodes.iter().find(|node| node.idx == idx)
+    }
+
+    pub(crate) fn selected_node(&self) -> Option<&DagNodeView> {
+        self.selected.and_then(|idx| self.node(idx))
+    }
+
+    /// Hit-test against the stored geometry — the same rectangles the renderer
+    /// drew this frame.
+    pub(crate) fn node_at(&self, col: u16, row: u16) -> Option<crate::workflow::model::RunNodeIdx> {
+        self.layout.node_at(col, row)
+    }
+
+    pub(crate) fn rect_of(
+        &self,
+        idx: crate::workflow::model::RunNodeIdx,
+    ) -> Option<crate::workflow::layout::LayoutRect> {
+        self.layout.rect_of(idx)
+    }
+}
+
 pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
@@ -812,6 +896,7 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+    pub dag: DagViewState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -836,11 +921,17 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+    /// The live workflow DAG overlay
+    /// (`docs/design/workflow-builder/05-phase-plan.md` W6).
+    WorkflowDag,
 }
 
 impl Mode {
     pub(crate) fn mouse_motion_changes_view(self) -> bool {
-        matches!(self, Self::GlobalMenu | Self::ContextMenu | Self::Navigator)
+        matches!(
+            self,
+            Self::GlobalMenu | Self::ContextMenu | Self::Navigator | Self::WorkflowDag
+        )
     }
 
     /// Whether keys in this mode are commands/navigation (an ASCII input source is wanted) rather
@@ -850,9 +941,9 @@ impl Mode {
     /// `sync_prefix_input_source` (gated by `switch_ascii_input_source_in_prefix`) so multi-level
     /// prefix commands keep ASCII until they return to the terminal.
     ///
-    /// Known limitation: the search boxes in `Navigator` and `KeybindHelp` are also held on ASCII,
-    /// since this `Mode`-level predicate can't see `search_focused` (non-ASCII filtering there
-    /// would need a runtime check).
+    /// Known limitation: the search boxes in `Navigator` and `KeybindHelp`, and the steer input
+    /// line in `WorkflowDag`, are also held on ASCII, since this `Mode`-level predicate can't see
+    /// their focus flags (non-ASCII filtering there would need a runtime check).
     pub(crate) fn wants_ascii_input(self) -> bool {
         matches!(
             self,
@@ -866,6 +957,7 @@ impl Mode {
                 | Mode::ContextMenu
                 | Mode::GlobalMenu
                 | Mode::KeybindHelp
+                | Mode::WorkflowDag
         )
     }
 }
@@ -1598,6 +1690,11 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// The active run's graph, mirrored from `App`'s `WorkflowRuntimeState` so
+    /// the DAG overlay can be computed and drawn from `AppState` alone. Boxed
+    /// because it is `None` for every karvex that never runs a workflow, and
+    /// `AppState` is moved on handoff.
+    pub(crate) run_graph: Option<Box<crate::workflow::model::RunGraph>>,
 }
 
 impl AppState {
@@ -1683,6 +1780,28 @@ impl AppState {
         } else {
             (24, 80)
         }
+    }
+
+    /// The run graph the DAG overlay projects, or `None` when no run is being
+    /// followed.
+    ///
+    /// This is the single seam between the overlay and the workflow runtime.
+    /// `WorkflowRuntimeState` hangs off `App`, which the view computation and
+    /// `render` never see — both take `AppState` — so `App` mirrors the graph
+    /// into [`AppState::run_graph`] after every engine step. Layout,
+    /// hit-testing, navigation, and steering are all driven off whatever this
+    /// returns.
+    pub(crate) fn workflow_run_graph(&self) -> Option<&crate::workflow::model::RunGraph> {
+        self.run_graph.as_deref()
+    }
+
+    /// Replaces the mirrored run graph. Only `src/app/workflow.rs` calls this,
+    /// immediately after the engine produced a batch of effects.
+    pub(crate) fn set_workflow_run_graph(
+        &mut self,
+        graph: Option<crate::workflow::model::RunGraph>,
+    ) {
+        self.run_graph = graph.map(Box::new);
     }
 
     /// Returns true when the given (workspace, tab, pane) refers to the
@@ -1845,6 +1964,7 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                dag: DagViewState::default(),
             },
             drag: None,
             workspace_press: None,
@@ -1950,6 +2070,7 @@ impl AppState {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            run_graph: None,
         }
     }
 

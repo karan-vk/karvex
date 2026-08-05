@@ -437,6 +437,20 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PluginPaneOpen(_) => "plugin.pane.open",
         Method::PluginPaneFocus(_) => "plugin.pane.focus",
         Method::PluginPaneClose(_) => "plugin.pane.close",
+        Method::WorkflowList(_) => "workflow.list",
+        Method::WorkflowGet(_) => "workflow.get",
+        Method::WorkflowCreate(_) => "workflow.create",
+        Method::WorkflowVersionCreate(_) => "workflow.version.create",
+        Method::WorkflowVersionGet(_) => "workflow.version.get",
+        Method::WorkflowRun(_) => "workflow.run",
+        Method::WorkflowRunGet(_) => "workflow.run.get",
+        Method::WorkflowRunList(_) => "workflow.run.list",
+        Method::WorkflowRunCancel(_) => "workflow.run.cancel",
+        Method::WorkflowNodeGet(_) => "workflow.node.get",
+        Method::WorkflowNodeSteer(_) => "workflow.node.steer",
+        Method::WorkflowNodeInterrupt(_) => "workflow.node.interrupt",
+        Method::WorkflowNodeReport(_) => "workflow.node.report",
+        Method::WorkflowNodeRestart(_) => "workflow.node.restart",
     }
 }
 
