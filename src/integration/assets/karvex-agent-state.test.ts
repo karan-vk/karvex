@@ -7,10 +7,10 @@ import { join } from "node:path";
 const originalPlatform = process.platform;
 const originalCreateConnection = net.createConnection;
 const originalEnvironment = {
-  HERDR_ENV: process.env.HERDR_ENV,
-  HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
-  HERDR_PANE_ID: process.env.HERDR_PANE_ID,
-  HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
+  KARVEX_ENV: process.env.KARVEX_ENV,
+  KARVEX_OMP_IDLE_DEBOUNCE_MS: process.env.KARVEX_OMP_IDLE_DEBOUNCE_MS,
+  KARVEX_PANE_ID: process.env.KARVEX_PANE_ID,
+  KARVEX_SOCKET_PATH: process.env.KARVEX_SOCKET_PATH,
 };
 
 let server: Server | undefined;
@@ -44,17 +44,17 @@ afterEach(async () => {
 });
 
 const integrations = [
-  { name: "Pi", modulePath: "./pi/herdr-agent-state.ts" },
-  { name: "Oh My Pi", modulePath: "./omp/herdr-agent-state.ts" },
+  { name: "Pi", modulePath: "./pi/karvex-agent-state.ts" },
+  { name: "Oh My Pi", modulePath: "./omp/karvex-agent-state.ts" },
 ] as const;
 
 const socketPlugins = [
   {
     name: "OpenCode",
-    modulePath: "./opencode/herdr-agent-state.js",
+    modulePath: "./opencode/karvex-agent-state.js",
     sessionID: "opencode-session",
   },
-  { name: "Kilo", modulePath: "./kilo/herdr-agent-state.js", sessionID: "kilo-session" },
+  { name: "Kilo", modulePath: "./kilo/karvex-agent-state.js", sessionID: "kilo-session" },
 ] as const;
 
 function importFresh(modulePath: string) {
@@ -85,9 +85,9 @@ function createExtensionHarness() {
 }
 
 function configureIntegrationEnvironment(recordingSocketPath: string) {
-  process.env.HERDR_ENV = "1";
-  process.env.HERDR_SOCKET_PATH = recordingSocketPath;
-  process.env.HERDR_PANE_ID = "test:p1";
+  process.env.KARVEX_ENV = "1";
+  process.env.KARVEX_SOCKET_PATH = recordingSocketPath;
+  process.env.KARVEX_PANE_ID = "test:p1";
 }
 
 function captureConnectionEndpoint() {
@@ -100,7 +100,7 @@ function captureConnectionEndpoint() {
 }
 
 async function startRecordingServer(name: string): Promise<unknown[]> {
-  const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
+  const recordingSocketPath = join(tmpdir(), `karvex-${name}-${process.pid}.sock`);
   socketPath = recordingSocketPath;
   await rm(recordingSocketPath, { force: true });
 
@@ -129,13 +129,13 @@ async function startRecordingServer(name: string): Promise<unknown[]> {
 
 for (const socketPlugin of socketPlugins) {
   test(`${socketPlugin.name} maps the Windows socket marker path to a named pipe endpoint`, async () => {
-    const markerPath = `herdr-${socketPlugin.name.toLowerCase()}-${process.pid}.sock`;
+    const markerPath = `karvex-${socketPlugin.name.toLowerCase()}-${process.pid}.sock`;
     configureIntegrationEnvironment(markerPath);
     Object.defineProperty(process, "platform", { value: "win32" });
     const connectedEndpoint = captureConnectionEndpoint();
 
-    const { HerdrAgentStatePlugin } = await importFresh(socketPlugin.modulePath);
-    const plugin = await HerdrAgentStatePlugin();
+    const { KarvexAgentStatePlugin } = await importFresh(socketPlugin.modulePath);
+    const plugin = await KarvexAgentStatePlugin();
     await plugin.event({
       event: {
         type: "session.updated",
@@ -147,19 +147,19 @@ for (const socketPlugin of socketPlugins) {
   });
 }
 
-test("OpenCode stays disabled without the Herdr socket environment", async () => {
-  process.env.HERDR_ENV = "1";
-  process.env.HERDR_PANE_ID = "test:p1";
-  delete process.env.HERDR_SOCKET_PATH;
+test("OpenCode stays disabled without the Karvex socket environment", async () => {
+  process.env.KARVEX_ENV = "1";
+  process.env.KARVEX_PANE_ID = "test:p1";
+  delete process.env.KARVEX_SOCKET_PATH;
 
-  const { HerdrAgentStatePlugin } = await importFresh("./opencode/herdr-agent-state.js");
+  const { KarvexAgentStatePlugin } = await importFresh("./opencode/karvex-agent-state.js");
 
-  expect(await HerdrAgentStatePlugin()).toEqual({});
+  expect(await KarvexAgentStatePlugin()).toEqual({});
 });
 
 for (const integration of integrations) {
   test(`${integration.name} maps the Windows socket marker path to a named pipe endpoint`, async () => {
-    const markerPath = `herdr-${integration.name.toLowerCase().replaceAll(" ", "-")}-${process.pid}.sock`;
+    const markerPath = `karvex-${integration.name.toLowerCase().replaceAll(" ", "-")}-${process.pid}.sock`;
     configureIntegrationEnvironment(markerPath);
     Object.defineProperty(process, "platform", { value: "win32" });
     const connectedEndpoint = captureConnectionEndpoint();
@@ -230,7 +230,7 @@ for (const integration of integrations) {
 }
 
 test("OMP accepts POSIX and Windows session paths", async () => {
-  const { isAbsoluteSessionPath } = await importFresh("./omp/herdr-agent-state.ts");
+  const { isAbsoluteSessionPath } = await importFresh("./omp/karvex-agent-state.ts");
 
   expect(isAbsoluteSessionPath("/tmp/omp-session.jsonl")).toBe(true);
   expect(isAbsoluteSessionPath("C:\\Users\\User\\.omp\\agent\\sessions\\omp-session.jsonl")).toBe(
@@ -243,7 +243,7 @@ test("OMP accepts POSIX and Windows session paths", async () => {
 test("Pi reports idle only after the agent settles", async () => {
   const requests = await startRecordingServer("pi-settled");
   const { handlers, pi } = createExtensionHarness();
-  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  const { default: install } = await importFresh("./pi/karvex-agent-state.ts");
   install(pi);
 
   expect(completionHandlers(handlers)).toEqual(["agent_settled"]);
@@ -273,7 +273,7 @@ test("Pi reports idle only after the agent settles", async () => {
 test("Pi ignores RPC sessions even when UI APIs are available", async () => {
   const requests = await startRecordingServer("pi-rpc");
   const { handlers, pi } = createExtensionHarness();
-  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  const { default: install } = await importFresh("./pi/karvex-agent-state.ts");
   install(pi);
 
   const context = {
@@ -292,7 +292,7 @@ test("Pi ignores RPC sessions even when UI APIs are available", async () => {
 test("Pi settlement preserves explicit blocked-state precedence", async () => {
   const requests = await startRecordingServer("pi-settled-blocked");
   const { eventHandlers, handlers, pi } = createExtensionHarness();
-  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  const { default: install } = await importFresh("./pi/karvex-agent-state.ts");
   install(pi);
 
   let idle = true;
@@ -302,7 +302,7 @@ test("Pi settlement preserves explicit blocked-state precedence", async () => {
   idle = false;
   handlers.get("agent_start")?.({}, context);
   await waitFor(() => requestStates(requests).length === 2);
-  eventHandlers.get("herdr:blocked")?.({ active: true, label: "approval" }, context);
+  eventHandlers.get("karvex:blocked")?.({ active: true, label: "approval" }, context);
   await waitFor(() => requestStates(requests).length === 3);
 
   idle = true;
@@ -310,7 +310,7 @@ test("Pi settlement preserves explicit blocked-state precedence", async () => {
   await Bun.sleep(25);
   expect(requestStates(requests)).toEqual(["idle", "working", "blocked"]);
 
-  eventHandlers.get("herdr:blocked")?.({ active: false }, context);
+  eventHandlers.get("karvex:blocked")?.({ active: false }, context);
   await waitFor(() => requestStates(requests).length === 4);
   expect(requestStates(requests)).toEqual(["idle", "working", "blocked", "idle"]);
 });
@@ -319,7 +319,7 @@ test("Pi reports the session replacement source", async () => {
   const requests = await startRecordingServer("pi-session-source");
   const { handlers, pi } = createExtensionHarness();
 
-  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  const { default: install } = await importFresh("./pi/karvex-agent-state.ts");
   install(pi);
 
   const sessionStart = handlers.get("session_start");
@@ -351,7 +351,7 @@ test("Pi reports the session replacement source", async () => {
 });
 
 test("Pi waits for a replacement session report before publishing state", async () => {
-  const recordingSocketPath = join(tmpdir(), `herdr-pi-session-order-${process.pid}.sock`);
+  const recordingSocketPath = join(tmpdir(), `karvex-pi-session-order-${process.pid}.sock`);
   socketPath = recordingSocketPath;
   await rm(recordingSocketPath, { force: true });
 
@@ -383,7 +383,7 @@ test("Pi waits for a replacement session report before publishing state", async 
 
   configureIntegrationEnvironment(recordingSocketPath);
   const { handlers, pi } = createExtensionHarness();
-  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  const { default: install } = await importFresh("./pi/karvex-agent-state.ts");
   install(pi);
 
   const sessionStart = handlers.get("session_start");
@@ -427,7 +427,7 @@ test("Pi waits for a replacement session report before publishing state", async 
 });
 
 async function startDroppedFirstResponseServer(name: string) {
-  const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
+  const recordingSocketPath = join(tmpdir(), `karvex-${name}-${process.pid}.sock`);
   socketPath = recordingSocketPath;
   await rm(recordingSocketPath, { force: true });
 
@@ -470,10 +470,10 @@ async function startDroppedFirstResponseServer(name: string) {
 
 test("Oh My Pi retries working before a queued idle state", async () => {
   const { attemptedRequests } = await startDroppedFirstResponseServer("omp-retry");
-  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  process.env.KARVEX_OMP_IDLE_DEBOUNCE_MS = "0";
   const { handlers, pi } = createExtensionHarness();
 
-  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  const { default: install } = await importFresh("./omp/karvex-agent-state.ts");
   install(pi);
 
   const context = {
@@ -503,7 +503,7 @@ test("Pi retries working state after an unanswered socket attempt", async () => 
     await startDroppedFirstResponseServer("pi-retry");
   const { handlers, pi } = createExtensionHarness();
 
-  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  const { default: install } = await importFresh("./pi/karvex-agent-state.ts");
   install(pi);
 
   const sessionStart = handlers.get("session_start");

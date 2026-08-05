@@ -62,7 +62,7 @@ impl App {
                 })
             })
             .ok_or_else(|| {
-                "Herdr worktree actions require a workspace inside a Git work tree.".to_string()
+                "Karvex worktree actions require a workspace inside a Git work tree.".to_string()
             })?;
         let source_checkout_path = existing_membership
             .as_ref()
@@ -133,7 +133,7 @@ impl App {
             .is_some_and(|space| space.is_linked_worktree)
         {
             self.state.config_diagnostic =
-                Some("This workspace is not a Herdr-managed worktree checkout.".into());
+                Some("This workspace is not a Karvex-managed worktree checkout.".into());
             return;
         }
         let Some(space) = ws.worktree_space().cloned() else {
@@ -1024,7 +1024,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("karvex-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
@@ -1046,8 +1046,8 @@ mod tests {
         let repo = unique_temp_path(name);
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "herdr@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Herdr Test"]);
+        run_git(&repo, &["config", "user.email", "karvex@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Karvex Test"]);
         std::fs::write(repo.join("README.md"), "test\n").unwrap();
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
@@ -1139,13 +1139,13 @@ mod tests {
         app.state.name_input_replace_on_type = true;
         app.state.worktree_create = Some(WorktreeCreateState {
             source_workspace_id: "source".into(),
-            source_checkout_path: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
             source_existing_membership: None,
-            source_repo_root: "/repo/herdr".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: "generated-branch".into(),
-            checkout_path: "/repo/herdr-generated-branch".into(),
+            checkout_path: "/repo/karvex-generated-branch".into(),
             error: None,
             creating: false,
         });
@@ -1169,13 +1169,13 @@ mod tests {
         app.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id: "source".into(),
             source_existing_membership: None,
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             entries: vec![
                 WorktreeOpenEntry {
-                    path: "/repo/herdr-main".into(),
+                    path: "/repo/karvex-main".into(),
                     branch: Some("main".into()),
                     is_linked_worktree: false,
                     already_open_ws_idx: None,
@@ -1206,10 +1206,10 @@ mod tests {
         app.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id: "source".into(),
             source_existing_membership: None,
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             entries: Vec::new(),
             selected: 0,
             query: String::new(),
@@ -1235,18 +1235,18 @@ mod tests {
             crate::workspace::Workspace::test_new("main"),
             crate::workspace::Workspace::test_new("issue"),
         ];
-        app.state.workspaces[1].identity_cwd = "/repo/herdr-issue".into();
+        app.state.workspaces[1].identity_cwd = "/repo/karvex-issue".into();
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id: app.state.workspaces[0].id.clone(),
             source_existing_membership: None,
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             entries: vec![WorktreeOpenEntry {
-                path: "/repo/herdr-issue".into(),
+                path: "/repo/karvex-issue".into(),
                 branch: Some("worktree/issue".into()),
                 is_linked_worktree: true,
                 already_open_ws_idx: Some(1),
@@ -1267,7 +1267,7 @@ mod tests {
         assert_eq!(target_membership.key, "repo-key");
         assert_eq!(
             target_membership.checkout_path,
-            std::path::PathBuf::from("/repo/herdr-issue")
+            std::path::PathBuf::from("/repo/karvex-issue")
         );
         assert!(target_membership.is_linked_worktree);
     }
@@ -1282,19 +1282,19 @@ mod tests {
         let source_workspace_id = app.state.workspaces[0].id.clone();
         let source_membership = crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
+            checkout_path: "/repo/karvex".into(),
             is_linked_worktree: false,
         };
         app.state.workspaces[0].worktree_space = Some(source_membership.clone());
         app.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id,
             source_existing_membership: Some(source_membership),
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             entries: vec![WorktreeOpenEntry {
                 path: checkout.clone(),
                 branch: Some("worktree/open-event".into()),
@@ -1337,10 +1337,10 @@ mod tests {
         app.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id,
             source_existing_membership: None,
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             entries: vec![WorktreeOpenEntry {
                 path: checkout.clone(),
                 branch: Some("worktree/stale-open".into()),
@@ -1388,13 +1388,13 @@ mod tests {
         app.state.worktree_open = Some(WorktreeOpenState {
             source_workspace_id: "source".into(),
             source_existing_membership: None,
-            source_checkout_path: "/repo/herdr".into(),
-            source_repo_root: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             entries: vec![
                 WorktreeOpenEntry {
-                    path: "/repo/herdr".into(),
+                    path: "/repo/karvex".into(),
                     branch: Some("main".into()),
                     is_linked_worktree: false,
                     already_open_ws_idx: Some(0),
@@ -1495,9 +1495,9 @@ mod tests {
         app.state.mode = Mode::Navigate;
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
+            checkout_path: "/repo/karvex-issue".into(),
             is_linked_worktree: true,
         });
 
@@ -1527,11 +1527,11 @@ mod tests {
         app.state.name_input = "issue/137".into();
         app.state.worktree_create = Some(WorktreeCreateState {
             source_workspace_id: "source".into(),
-            source_checkout_path: std::path::PathBuf::from("/repo/herdr"),
+            source_checkout_path: std::path::PathBuf::from("/repo/karvex"),
             source_existing_membership: None,
-            source_repo_root: std::path::PathBuf::from("/repo/herdr"),
+            source_repo_root: std::path::PathBuf::from("/repo/karvex"),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: "old".into(),
             checkout_path: std::path::PathBuf::from("/old"),
             error: Some("old error".into()),
@@ -1544,7 +1544,7 @@ mod tests {
         assert_eq!(create.branch, "issue/137");
         assert_eq!(
             create.checkout_path,
-            std::path::PathBuf::from("/w/herdr/issue-137")
+            std::path::PathBuf::from("/w/karvex/issue-137")
         );
         assert_eq!(create.error, None);
     }
@@ -1557,14 +1557,14 @@ mod tests {
         let source_workspace_id = app.state.workspaces[0].id.clone();
         let source_membership = crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
+            checkout_path: "/repo/karvex".into(),
             is_linked_worktree: false,
         };
         let branch = "issue/195";
         let checkout_path =
-            crate::worktree::default_checkout_path(&app.state.worktree_directory, "herdr", branch);
+            crate::worktree::default_checkout_path(&app.state.worktree_directory, "karvex", branch);
         let checkout_key = crate::worktree::canonical_or_original(&checkout_path);
         app.pending_api_worktree_creates.insert(checkout_key, 1);
         app.state.workspaces[0].worktree_space = Some(source_membership.clone());
@@ -1572,11 +1572,11 @@ mod tests {
         app.state.name_input = branch.into();
         app.state.worktree_create = Some(WorktreeCreateState {
             source_workspace_id,
-            source_checkout_path: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
             source_existing_membership: Some(source_membership),
-            source_repo_root: "/repo/herdr".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: branch.into(),
             checkout_path,
             error: None,
@@ -1616,7 +1616,7 @@ mod tests {
         let source_workspace_id = app.state.workspaces[0].id.clone();
         let source_membership = crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
+            label: "karvex".into(),
             repo_root: repo.clone(),
             checkout_path: repo.clone(),
             is_linked_worktree: false,
@@ -1629,7 +1629,7 @@ mod tests {
             source_checkout_path: repo.clone(),
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             entries: vec![WorktreeOpenEntry {
                 path: checkout.clone(),
                 branch: Some("worktree/open-enter".into()),
@@ -1670,9 +1670,9 @@ mod tests {
         let workspace_id = app.state.workspaces[0].id.clone();
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-issue".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
+            checkout_path: "/repo/karvex-issue".into(),
             is_linked_worktree: true,
         });
         app.open_remove_linked_worktree_confirmation(0);
@@ -1695,7 +1695,7 @@ mod tests {
         let repo = create_committed_repo("app-worktree-create-event-repo");
         let worktree_root = unique_temp_path("app-worktree-create-event-root");
         let branch = "worktree/ui-create-event";
-        let checkout = crate::worktree::default_checkout_path(&worktree_root, "herdr", branch);
+        let checkout = crate::worktree::default_checkout_path(&worktree_root, "karvex", branch);
         run_git(
             &repo,
             &[
@@ -1715,7 +1715,7 @@ mod tests {
         let source_workspace_id = app.state.workspaces[0].id.clone();
         let source_membership = crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
+            label: "karvex".into(),
             repo_root: repo.clone(),
             checkout_path: repo.clone(),
             is_linked_worktree: false,
@@ -1727,7 +1727,7 @@ mod tests {
             source_existing_membership: Some(source_membership),
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: branch.into(),
             checkout_path: checkout.clone(),
             error: None,
@@ -1735,7 +1735,7 @@ mod tests {
         });
         let plugin_root = unique_temp_path("app-worktree-create-plugin");
         std::fs::create_dir_all(&plugin_root).unwrap();
-        let manifest_path = plugin_root.join("herdr-plugin.toml");
+        let manifest_path = plugin_root.join("karvex-plugin.toml");
         std::fs::write(&manifest_path, "id = 'example.ui-worktree-create'\n").unwrap();
         app.state.installed_plugins.insert(
             "example.ui-worktree-create".into(),
@@ -1743,7 +1743,7 @@ mod tests {
                 plugin_id: "example.ui-worktree-create".into(),
                 name: "UI Worktree Create".into(),
                 version: "0.1.0".into(),
-                min_herdr_version: "0.7.0".into(),
+                min_karvex_version: "0.7.0".into(),
                 description: None,
                 manifest_path: manifest_path.display().to_string(),
                 plugin_root: plugin_root.display().to_string(),
@@ -1848,11 +1848,11 @@ mod tests {
         app.state.workspaces[1].identity_cwd = checkout.clone();
         app.state.worktree_create = Some(WorktreeCreateState {
             source_workspace_id,
-            source_checkout_path: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
             source_existing_membership: None,
-            source_repo_root: "/repo/herdr".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: "worktree/create-race".into(),
             checkout_path: checkout.clone(),
             error: None,
@@ -1890,7 +1890,7 @@ mod tests {
         let repo = create_committed_repo("app-worktree-add-repo");
         let worktree_root = unique_temp_path("app-worktree-add-root");
         let branch = "worktree/app-worker";
-        let checkout = crate::worktree::default_checkout_path(&worktree_root, "herdr", branch);
+        let checkout = crate::worktree::default_checkout_path(&worktree_root, "karvex", branch);
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
         app.state.name_input = branch.into();
@@ -1900,7 +1900,7 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: branch.into(),
             checkout_path: checkout.clone(),
             error: None,
@@ -1936,7 +1936,7 @@ mod tests {
         let repo = create_committed_repo("app-worktree-add-existing-branch-repo");
         let worktree_root = unique_temp_path("app-worktree-add-existing-branch-root");
         let branch = "foo";
-        let checkout = crate::worktree::default_checkout_path(&worktree_root, "herdr", branch);
+        let checkout = crate::worktree::default_checkout_path(&worktree_root, "karvex", branch);
         run_git(&repo, &["branch", branch]);
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
@@ -1947,7 +1947,7 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: branch.into(),
             checkout_path: checkout.clone(),
             error: None,
@@ -2062,7 +2062,7 @@ mod tests {
 
         let worktree_root = unique_temp_path("app-worktree-add-from-source-root");
         let branch = "worktree/from-source";
-        let checkout = crate::worktree::default_checkout_path(&worktree_root, "herdr", branch);
+        let checkout = crate::worktree::default_checkout_path(&worktree_root, "karvex", branch);
         let mut app = app_for_worktree_tests();
         app.state.worktree_directory = worktree_root.clone();
         app.state.name_input = branch.into();
@@ -2072,7 +2072,7 @@ mod tests {
             source_existing_membership: None,
             source_repo_root: repo.clone(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: branch.into(),
             checkout_path: checkout.clone(),
             error: None,
@@ -2103,11 +2103,11 @@ mod tests {
 
     #[test]
     fn dirty_worktree_remove_failure_requests_force_confirmation() {
-        let path = std::path::PathBuf::from("/w/herdr/dirty");
+        let path = std::path::PathBuf::from("/w/karvex/dirty");
         let mut app = app_for_worktree_tests();
         app.state.worktree_remove = Some(WorktreeRemoveState {
             workspace_id: "ws".into(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            repo_root: std::path::PathBuf::from("/repo/karvex"),
             path: path.clone(),
             error: None,
             removing: true,
@@ -2122,7 +2122,7 @@ mod tests {
             forced: false,
             api_request: None,
             result: Err(
-                "fatal: '/w/herdr/dirty' contains modified or untracked files, use --force to delete it"
+                "fatal: '/w/karvex/dirty' contains modified or untracked files, use --force to delete it"
                     .into(),
             ),
         });
@@ -2135,11 +2135,11 @@ mod tests {
 
     #[test]
     fn non_dirty_worktree_remove_failure_keeps_error_message() {
-        let path = std::path::PathBuf::from("/w/herdr/missing");
+        let path = std::path::PathBuf::from("/w/karvex/missing");
         let mut app = app_for_worktree_tests();
         app.state.worktree_remove = Some(WorktreeRemoveState {
             workspace_id: "ws".into(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            repo_root: std::path::PathBuf::from("/repo/karvex"),
             path: path.clone(),
             error: None,
             removing: true,
@@ -2153,7 +2153,7 @@ mod tests {
             worktree: None,
             forced: false,
             api_request: None,
-            result: Err("fatal: '/w/herdr/missing' is not a working tree".into()),
+            result: Err("fatal: '/w/karvex/missing' is not a working tree".into()),
         });
 
         let remove = app.state.worktree_remove.unwrap();
@@ -2161,14 +2161,14 @@ mod tests {
         assert!(!remove.force_confirmation);
         assert_eq!(
             remove.error,
-            Some("fatal: '/w/herdr/missing' is not a working tree".into())
+            Some("fatal: '/w/karvex/missing' is not a working tree".into())
         );
     }
 
     #[test]
     fn worktree_remove_finished_focuses_parent_workspace() {
         let mut app = app_for_worktree_tests();
-        let checkout = std::path::PathBuf::from("/repo/herdr-issue");
+        let checkout = std::path::PathBuf::from("/repo/karvex-issue");
         app.state.workspaces = vec![
             crate::workspace::Workspace::test_new("parent"),
             crate::workspace::Workspace::test_new("issue"),
@@ -2176,23 +2176,23 @@ mod tests {
         ];
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
+            checkout_path: "/repo/karvex".into(),
             is_linked_worktree: false,
         });
         app.state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
             checkout_path: checkout.clone(),
             is_linked_worktree: true,
         });
         app.state.workspaces[2].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-sibling".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
+            checkout_path: "/repo/karvex-sibling".into(),
             is_linked_worktree: true,
         });
         let child_id = app.state.workspaces[1].id.clone();
@@ -2201,7 +2201,7 @@ mod tests {
         app.state.selected = 1;
         app.state.worktree_remove = Some(WorktreeRemoveState {
             workspace_id: child_id.clone(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            repo_root: std::path::PathBuf::from("/repo/karvex"),
             path: checkout.clone(),
             error: None,
             removing: true,
@@ -2232,11 +2232,11 @@ mod tests {
         let mut app = app_for_worktree_tests_with_event_hub(event_hub.clone());
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("issue")];
         let internal_workspace_id = app.state.workspaces[0].id.clone();
-        let checkout = std::path::PathBuf::from("/repo/herdr-issue");
+        let checkout = std::path::PathBuf::from("/repo/karvex-issue");
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
             checkout_path: checkout.clone(),
             is_linked_worktree: true,
         });
@@ -2249,11 +2249,11 @@ mod tests {
             is_prunable: false,
             is_linked_worktree: true,
             open_workspace_id: None,
-            label: "herdr".into(),
+            label: "karvex".into(),
         };
         app.state.worktree_remove = Some(WorktreeRemoveState {
             workspace_id: internal_workspace_id.clone(),
-            repo_root: "/repo/herdr".into(),
+            repo_root: "/repo/karvex".into(),
             path: checkout.clone(),
             error: None,
             removing: true,
@@ -2315,7 +2315,7 @@ mod tests {
         let workspace_id = app.state.workspaces[0].id.clone();
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
+            label: "karvex".into(),
             repo_root: repo.clone(),
             checkout_path: checkout.clone(),
             is_linked_worktree: true,

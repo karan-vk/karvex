@@ -475,11 +475,11 @@ mod tests {
     #[test]
     fn tab_width_uses_display_width_for_cjk_labels() {
         let mut ws = Workspace::test_new("test");
-        ws.tabs[0].set_custom_name("提交 herdr 的反馈".into());
+        ws.tabs[0].set_custom_name("提交 karvex 的反馈".into());
 
         assert_eq!(
             tab_width(&ws, 0),
-            display_width_u16("提交 herdr 的反馈") + 4
+            display_width_u16("提交 karvex 的反馈") + 4
         );
     }
 
@@ -487,7 +487,7 @@ mod tests {
     fn tab_bar_renders_trailing_cjk_character() {
         let mut app = AppState::test_new();
         let mut ws = Workspace::test_new("test");
-        ws.tabs[0].set_custom_name("提交 herdr 的反馈".into());
+        ws.tabs[0].set_custom_name("提交 karvex 的反馈".into());
 
         app.active = Some(0);
         app.workspaces = vec![ws];

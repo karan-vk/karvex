@@ -1,11 +1,11 @@
-# installed by herdr
-# managed by herdr; reinstalling or updating the integration overwrites this file.
+# installed by karvex
+# managed by karvex; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
-# HERDR_INTEGRATION_ID=antigravity_cli
-# HERDR_INTEGRATION_VERSION=1
+# KARVEX_INTEGRATION_ID=antigravity_cli
+# KARVEX_INTEGRATION_VERSION=1
 
-# Session-only: this hook reports the Antigravity conversation so Herdr can
-# resume the pane. Lifecycle state comes from Herdr's screen detection.
+# Session-only: this hook reports the Antigravity conversation so Karvex can
+# resume the pane. Lifecycle state comes from Karvex's screen detection.
 
 param([string]$Action = "")
 
@@ -17,8 +17,8 @@ function Exit-Hook {
 }
 
 if ($Action -ne "session") { Exit-Hook }
-if ($env:HERDR_ENV -ne "1") { Exit-Hook }
-if ([string]::IsNullOrWhiteSpace($env:HERDR_PANE_ID)) { Exit-Hook }
+if ($env:KARVEX_ENV -ne "1") { Exit-Hook }
+if ([string]::IsNullOrWhiteSpace($env:KARVEX_PANE_ID)) { Exit-Hook }
 
 $inputText = [Console]::In.ReadToEnd()
 try {
@@ -37,9 +37,9 @@ try {
     $sessionArgs = @(
         "pane",
         "report-agent-session",
-        $env:HERDR_PANE_ID,
+        $env:KARVEX_PANE_ID,
         "--source",
-        "herdr:antigravity_cli",
+        "karvex:antigravity_cli",
         "--agent",
         "agy",
         "--seq",
@@ -50,7 +50,7 @@ try {
     if ($payload.transcriptPath -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.transcriptPath)) {
         $sessionArgs += @("--agent-session-path", "$($payload.transcriptPath)")
     }
-    & herdr @sessionArgs 2>$null | Out-Null
+    & kvx @sessionArgs 2>$null | Out-Null
 } catch {
 }
 

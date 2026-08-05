@@ -25,7 +25,7 @@ ASSET_TARGETS = (
     "macos-x86_64",
     "macos-aarch64",
 )
-EXPECTED_ASSET_NAMES = {target: f"herdr-{target}" for target in ASSET_TARGETS}
+EXPECTED_ASSET_NAMES = {target: f"kvx-{target}" for target in ASSET_TARGETS}
 
 
 @dataclass(frozen=True)

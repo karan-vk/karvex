@@ -43,15 +43,15 @@ beforeEach(() => {
   clients.length = 0;
   requestWaiters.length = 0;
   autoAcknowledge = true;
-  process.env.HERDR_ENV = "1";
-  process.env.HERDR_SOCKET_PATH = "test.sock";
-  process.env.HERDR_PANE_ID = "test:p1";
+  process.env.KARVEX_ENV = "1";
+  process.env.KARVEX_SOCKET_PATH = "test.sock";
+  process.env.KARVEX_PANE_ID = "test:p1";
 });
 
 async function loadPlugin() {
   importCounter += 1;
-  const { HerdrAgentStatePlugin } = await import(`./herdr-agent-state.js?test=${importCounter}`);
-  return HerdrAgentStatePlugin();
+  const { KarvexAgentStatePlugin } = await import(`./karvex-agent-state.js?test=${importCounter}`);
+  return KarvexAgentStatePlugin();
 }
 
 function waitForNextRequest(): Promise<void> {

@@ -14,10 +14,10 @@ static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new()
 static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
-const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
+const RUNTIME_OWNER_MARKER: &str = ".karvex-test-owner-pid";
 pub const CURRENT_PROTOCOL: u32 = 19;
 
-pub fn register_spawned_herdr_pid(pid: Option<u32>) {
+pub fn register_spawned_karvex_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
@@ -27,7 +27,7 @@ pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     registry.insert(pid);
 }
 
-pub fn unregister_spawned_herdr_pid(pid: Option<u32>) {
+pub fn unregister_spawned_karvex_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
@@ -63,7 +63,7 @@ pub fn unregister_runtime_dir(path: &Path) {
 }
 
 #[cfg(target_os = "linux")]
-pub fn herdr_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
+pub fn karvex_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<Vec<u32>> {
     let mut pids = Vec::new();
     for pid in iter_worktree_server_pids()? {
         let Some(process_runtime_dir) = process_runtime_dir(pid)? else {
@@ -371,7 +371,7 @@ pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result
     result
 }
 
-pub fn cleanup_registered_herdr_pids() {
+pub fn cleanup_registered_karvex_pids() {
     let pids: Vec<u32> = {
         let mut registry = pid_registry_lock();
         registry.drain().collect()
@@ -399,12 +399,12 @@ fn ensure_cleanup_hooks() {
 
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
-            cleanup_registered_herdr_pids();
+            cleanup_registered_karvex_pids();
             previous_hook(panic_info);
         }));
 
         let _ = ctrlc::set_handler(|| {
-            cleanup_registered_herdr_pids();
+            cleanup_registered_karvex_pids();
             std::process::exit(130);
         });
 
@@ -459,7 +459,7 @@ fn start_global_watchdog() {
         thread::sleep(WATCHDOG_SCAN_INTERVAL);
 
         if let Err(err) = cleanup_servers_with_missing_runtime_dir() {
-            eprintln!("herdr test cleanup watchdog error: {err}");
+            eprintln!("karvex test cleanup watchdog error: {err}");
         }
     });
 }
@@ -528,7 +528,7 @@ fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
             continue;
         }
 
-        if is_test_herdr_server_process(pid) {
+        if is_test_karvex_server_process(pid) {
             pids.push(pid);
         }
     }
@@ -536,12 +536,12 @@ fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     Ok(pids)
 }
 
-fn is_test_herdr_server_process(pid: u32) -> bool {
+fn is_test_karvex_server_process(pid: u32) -> bool {
     let Some(exe_path) = proc_link_target(pid, "exe") else {
         return false;
     };
 
-    if !is_test_herdr_binary(&exe_path) {
+    if !is_test_karvex_binary(&exe_path) {
         return false;
     }
 
@@ -580,7 +580,7 @@ fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
             return Ok(Some(PathBuf::from(value)));
         }
 
-        if let Some(value) = kv.strip_prefix("HERDR_SOCKET_PATH=") {
+        if let Some(value) = kv.strip_prefix("KARVEX_SOCKET_PATH=") {
             socket_path = Some(PathBuf::from(value));
         }
     }
@@ -605,19 +605,19 @@ fn current_checkout_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn is_test_herdr_binary(path: &Path) -> bool {
-    path.ends_with("target/debug/herdr") && path.starts_with(current_checkout_root())
+fn is_test_karvex_binary(path: &Path) -> bool {
+    path.ends_with("target/debug/kvx") && path.starts_with(current_checkout_root())
 }
 
 extern "C" fn run_atexit_cleanup() {
-    cleanup_registered_herdr_pids();
+    cleanup_registered_karvex_pids();
 }
 
 struct CleanupGuard;
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        cleanup_registered_herdr_pids();
+        cleanup_registered_karvex_pids();
     }
 }
 
@@ -700,7 +700,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "herdr-watchdog-scoping-{label}-{}-{unique}",
+            "karvex-watchdog-scoping-{label}-{}-{unique}",
             std::process::id()
         ))
     }
@@ -730,9 +730,9 @@ mod tests {
 
     #[test]
     fn test_binary_matcher_accepts_current_checkout_debug_binary() {
-        let binary = current_checkout_root().join("target/debug/herdr");
+        let binary = current_checkout_root().join("target/debug/kvx");
         assert!(
-            is_test_herdr_binary(&binary),
+            is_test_karvex_binary(&binary),
             "current checkout debug binary should be considered test-owned"
         );
     }
@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn test_binary_matcher_rejects_installed_binary() {
         assert!(
-            !is_test_herdr_binary(Path::new("/home/can/.local/bin/herdr")),
+            !is_test_karvex_binary(Path::new("/home/can/.local/bin/kvx")),
             "installed binaries must not be considered test-owned"
         );
     }

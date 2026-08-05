@@ -293,7 +293,7 @@ fn stream_set_has_graphics_only_render_impact() {
         .event_tx
         .try_send(AppEvent::UpdateReady {
             version: "9.9.9".into(),
-            install_command: "herdr update".into(),
+            install_command: "kvx update".into(),
         })
         .unwrap();
     let (request, _response_rx) = stream_set_message(

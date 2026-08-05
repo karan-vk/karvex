@@ -32,9 +32,9 @@ foreach ($functionName in @("Prepend-PathEntry", "Update-PathRegistryEntry")) {
     Invoke-Expression $definition.Extent.Text
 }
 
-$pathTestVariable = "HERDR_INSTALLER_PATH_TEST"
+$pathTestVariable = "KARVEX_INSTALLER_PATH_TEST"
 $oldPathTestVariable = [Environment]::GetEnvironmentVariable($pathTestVariable, "Process")
-$testRegistryPath = "Software\HerdrInstallerTests-$([Guid]::NewGuid().ToString('N'))"
+$testRegistryPath = "Software\KarvexInstallerTests-$([Guid]::NewGuid().ToString('N'))"
 $testEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($testRegistryPath)
 if ($null -eq $testEnvironmentKey) {
     throw "unable to create temporary installer test registry key"
@@ -46,17 +46,17 @@ try {
         "%$pathTestVariable%\bin;C:\existing",
         [Microsoft.Win32.RegistryValueKind]::ExpandString
     )
-    $pathChanged = Update-PathRegistryEntry -EnvironmentKey $testEnvironmentKey -Entry "C:\Herdr\bin"
+    $pathChanged = Update-PathRegistryEntry -EnvironmentKey $testEnvironmentKey -Entry "C:\Karvex\bin"
     if (-not $pathChanged) {
         throw "installer PATH update reported no change"
     }
-    if (Update-PathRegistryEntry -EnvironmentKey $testEnvironmentKey -Entry "C:\Herdr\bin") {
+    if (Update-PathRegistryEntry -EnvironmentKey $testEnvironmentKey -Entry "C:\Karvex\bin") {
         throw "installer PATH update was not idempotent"
     }
 
     $options = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
     $rawPath = $testEnvironmentKey.GetValue("Path", $null, $options)
-    $expectedPath = "C:\Herdr\bin;%$pathTestVariable%\bin;C:\existing"
+    $expectedPath = "C:\Karvex\bin;%$pathTestVariable%\bin;C:\existing"
     if ($rawPath -cne $expectedPath) {
         throw "installer changed raw PATH: expected '$expectedPath', got '$rawPath'"
     }
@@ -70,12 +70,12 @@ try {
 }
 
 $archive = (Resolve-Path -LiteralPath $ArchivePath).Path
-$root = Join-Path $env:RUNNER_TEMP ("herdr-installer-test-" + [Guid]::NewGuid().ToString("N"))
+$root = Join-Path $env:RUNNER_TEMP ("karvex-installer-test-" + [Guid]::NewGuid().ToString("N"))
 $webRoot = Join-Path $root "web"
-$herdrHome = Join-Path $root "home"
+$karvexHome = Join-Path $root "home"
 $installDir = Join-Path $root "bin"
 New-Item -ItemType Directory -Force -Path $webRoot | Out-Null
-Copy-Item -LiteralPath $archive -Destination (Join-Path $webRoot "herdr-windows-x86_64.zip")
+Copy-Item -LiteralPath $archive -Destination (Join-Path $webRoot "kvx-windows-x86_64.zip")
 $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -88,7 +88,7 @@ $manifest = @{
     build_id = "installer-test"
     assets = @{
         "windows-x86_64" = @{
-            url = "http://127.0.0.1:$port/herdr-windows-x86_64.zip"
+            url = "http://127.0.0.1:$port/kvx-windows-x86_64.zip"
             sha256 = $hash
             format = "zip"
         }
@@ -98,7 +98,7 @@ $manifestPath = Join-Path $webRoot "preview.json"
 $manifest | Out-File -LiteralPath $manifestPath -Encoding utf8
 
 $server = $null
-$oldHerdrHome = $env:HERDR_HOME
+$oldKarvexHome = $env:HERDR_HOME
 try {
     $server = Start-Process python -ArgumentList @("-m", "http.server", "$port", "--bind", "127.0.0.1", "--directory", $webRoot) -PassThru -WindowStyle Hidden
     $env:HERDR_HOME = Join-Path $root "unused\..\home"
@@ -133,7 +133,7 @@ try {
         }
     }
 
-    $releaseDir = Get-ChildItem -LiteralPath (Join-Path $herdrHome "packages\standalone\releases") -Directory |
+    $releaseDir = Get-ChildItem -LiteralPath (Join-Path $karvexHome "packages\standalone\releases") -Directory |
         Where-Object { -not $_.Name.StartsWith(".staging.") } |
         Select-Object -First 1
     if ($null -eq $releaseDir) {
@@ -201,7 +201,7 @@ try {
         throw "installer accepted a manifest that did not match the updater-selected build"
     }
 } finally {
-    $env:HERDR_HOME = $oldHerdrHome
+    $env:HERDR_HOME = $oldKarvexHome
     if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
     }

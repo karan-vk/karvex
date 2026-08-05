@@ -116,7 +116,7 @@ jobs:
             }
 
             const body = issue.body || '';
-            const translationConfirmationPattern = /^\s*-\s*\[[xX]\]\s*I confirm this is a translation issue in the herdr docs, not a bug report, feature request, or question\.\s*$/m;
+            const translationConfirmationPattern = /^\s*-\s*\[[xX]\]\s*I confirm this is a translation issue in the karvex docs, not a bug report, feature request, or question\.\s*$/m;
             const translationSections = ['### Page', '### Language', '### What is wrong'];
             if (
               translationConfirmationPattern.test(body) &&
@@ -208,7 +208,7 @@ jobs:
               const message = [
                 `hi @${author}, thanks for opening this.`,
                 '',
-                'this bug report has no filled environment details. please edit the environment section with the Herdr version, update channel, operating system, and terminal.',
+                'this bug report has no filled environment details. please edit the environment section with the Karvex version, update channel, operating system, and terminal.',
                 '',
                 'shell and relevant config are optional, but they help when they affect the bug.',
               ].join('\n');
@@ -227,9 +227,9 @@ jobs:
             const message = [
               `hi @${author}, thanks for opening this.`,
               '',
-              'this issue does not appear to use the full bug report template. herdr issues are only for reproducible bugs and maintainer-created or maintainer-converted work items.',
+              'this issue does not appear to use the full bug report template. karvex issues are only for reproducible bugs and maintainer-created or maintainer-converted work items.',
               '',
-              'bug reports must include the reproducible-bug confirmation, current behavior, expected behavior, reproduction, impact, and environment fields with herdr version, update channel, operating system, and terminal.',
+              'bug reports must include the reproducible-bug confirmation, current behavior, expected behavior, reproduction, impact, and environment fields with karvex version, update channel, operating system, and terminal.',
               '',
               'feature requests, ideas, questions, contribution proposals, and direction checks belong in discussions:',
               `https://github.com/${context.repo.owner}/${context.repo.repo}/discussions`,

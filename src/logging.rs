@@ -20,7 +20,7 @@ pub(crate) fn init_file_logging(file_name: &str) {
     };
 
     let filter =
-        EnvFilter::try_from_env("HERDR_LOG").unwrap_or_else(|_| EnvFilter::new("herdr=info"));
+        EnvFilter::try_from_env("KARVEX_LOG").unwrap_or_else(|_| EnvFilter::new("kvx=info"));
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -33,8 +33,8 @@ pub(crate) fn init_file_logging(file_name: &str) {
 pub(crate) fn help_log_paths_summary() -> String {
     let dir = crate::session::data_dir();
     format!(
-        "{} (plus herdr-client.log, herdr-server.log)",
-        dir.join("herdr.log").display()
+        "{} (plus karvex-client.log, karvex-server.log)",
+        dir.join("karvex.log").display()
     )
 }
 
@@ -44,7 +44,7 @@ pub(crate) fn startup(role: &'static str) {
         subsystem = role,
         outcome = "started",
         pid = std::process::id(),
-        "herdr starting"
+        "karvex starting"
     );
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn shutdown(role: &'static str) {
         subsystem = role,
         outcome = "completed",
         pid = std::process::id(),
-        "herdr exiting"
+        "karvex exiting"
     );
 }
 
@@ -587,7 +587,7 @@ mod tests {
 
     fn temp_log_path(name: &str) -> PathBuf {
         let unique = format!(
-            "herdr-logging-tests-{}-{}-{}",
+            "karvex-logging-tests-{}-{}-{}",
             name,
             std::process::id(),
             std::time::SystemTime::now()
@@ -595,15 +595,15 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        std::env::temp_dir().join(unique).join("herdr.log")
+        std::env::temp_dir().join(unique).join("karvex.log")
     }
 
     #[test]
     fn rotated_log_path_appends_numeric_suffix() {
-        let path = PathBuf::from("/tmp/herdr.log");
+        let path = PathBuf::from("/tmp/karvex.log");
         assert_eq!(
             rotated_log_path(&path, 2),
-            PathBuf::from("/tmp/herdr.log.2")
+            PathBuf::from("/tmp/karvex.log.2")
         );
     }
 
@@ -643,7 +643,7 @@ mod tests {
         let dir = path.parent().unwrap().to_path_buf();
         fs::create_dir_all(&dir).unwrap();
 
-        let writer = RotatingFileMakeWriter::new(dir.clone(), "herdr.log", 8, 0).unwrap();
+        let writer = RotatingFileMakeWriter::new(dir.clone(), "karvex.log", 8, 0).unwrap();
         {
             let mut guard = writer.make_writer();
             guard.write_all(b"12345678").unwrap();

@@ -1215,12 +1215,15 @@ mod tests {
     fn clicking_worktree_parent_row_focuses_workspace_without_toggling() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("main"), Workspace::test_new("issue")];
-        for (idx, checkout_path) in ["/repo/herdr", "/repo/herdr-issue"].into_iter().enumerate() {
+        for (idx, checkout_path) in ["/repo/karvex", "/repo/karvex-issue"]
+            .into_iter()
+            .enumerate()
+        {
             app.state.workspaces[idx].worktree_space =
                 Some(crate::workspace::WorktreeSpaceMembership {
                     key: "repo-key".into(),
-                    label: "herdr".into(),
-                    repo_root: "/repo/herdr".into(),
+                    label: "karvex".into(),
+                    repo_root: "/repo/karvex".into(),
                     checkout_path: checkout_path.into(),
                     is_linked_worktree: idx > 0,
                 });
@@ -1249,12 +1252,15 @@ mod tests {
     fn clicking_worktree_parent_chevron_toggles_group_only() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("main"), Workspace::test_new("issue")];
-        for (idx, checkout_path) in ["/repo/herdr", "/repo/herdr-issue"].into_iter().enumerate() {
+        for (idx, checkout_path) in ["/repo/karvex", "/repo/karvex-issue"]
+            .into_iter()
+            .enumerate()
+        {
             app.state.workspaces[idx].worktree_space =
                 Some(crate::workspace::WorktreeSpaceMembership {
                     key: "repo-key".into(),
-                    label: "herdr".into(),
-                    repo_root: "/repo/herdr".into(),
+                    label: "karvex".into(),
+                    repo_root: "/repo/karvex".into(),
                     checkout_path: checkout_path.into(),
                     is_linked_worktree: idx > 0,
                 });
@@ -1292,12 +1298,12 @@ mod tests {
             Workspace::test_new("normal"),
             Workspace::test_new("issue"),
         ];
-        for (idx, checkout_path) in [(0, "/repo/herdr"), (2, "/repo/herdr-issue")] {
+        for (idx, checkout_path) in [(0, "/repo/karvex"), (2, "/repo/karvex-issue")] {
             app.state.workspaces[idx].worktree_space =
                 Some(crate::workspace::WorktreeSpaceMembership {
                     key: "repo-key".into(),
-                    label: "herdr".into(),
-                    repo_root: "/repo/herdr".into(),
+                    label: "karvex".into(),
+                    repo_root: "/repo/karvex".into(),
                     checkout_path: checkout_path.into(),
                     is_linked_worktree: idx != 0,
                 });
@@ -1539,8 +1545,8 @@ mod tests {
         let mut ws = Workspace::test_new(name);
         ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: key.into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
             checkout_path: format!("/repo/{name}").into(),
             is_linked_worktree: name != "main",
         });

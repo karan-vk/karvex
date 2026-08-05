@@ -1,4 +1,4 @@
-# herdr
+# karvex
 
 Terminal based agent runtime for coding agents.
 
@@ -8,7 +8,7 @@ These instructions are layered.
 
 - Unless a section explicitly says it is maintainer-only, local-machine-only, or
   external-contributor-only, treat it as universal project guidance.
-- Universal project rules apply to every agent working on Herdr, including forks.
+- Universal project rules apply to every agent working on Karvex, including forks.
 - Maintainer accounts are listed in `.github/MAINTAINERS`. Treat the acting
   account as a verified maintainer only when its username is listed there, the
   configured remote is the canonical `herdrdev/herdr` repository, and the
@@ -16,7 +16,7 @@ These instructions are layered.
   cannot be verified, skip maintainer workflow and follow the external
   contributor guardrail instead.
 - Local Can machine workflow applies only on Can's own workstation or Windows
-  VM setup, for example when `/home/can/Projects/herdr`, `HERDR_ENV=1`, or the
+  VM setup, for example when `/home/can/Projects/karvex`, `KARVEX_ENV=1`, or the
   `windows-wirt` SSH alias exists. If those facts are not true, skip local
   machine workflow.
 - External contributor guardrail applies whenever the acting GitHub account is
@@ -32,12 +32,12 @@ These instructions are layered.
 - **No god objects.** If a module is doing too many things, split it. `app/` is already split into state, actions, and input. Keep it that way.
 - **Platform code is isolated.** OS-specific behavior lives in the matching `src/platform/<os>.rs` file, with only shared traits, types, wrappers, and testable contracts in `src/platform/mod.rs`. Core modules don't have `#[cfg(target_os)]`.
 - **Detection is decoupled.** The detector reads a screen snapshot, never touches the parser or viewport state.
-- **Screen detection is evidence-based.** When changing `src/detect/manifests/`, first capture the relevant bottom-buffer state with `herdr agent read <pane> --source detection --format text` and, when styling or alternate screen behavior matters, `--format ansi`. Decide which visible controls are invariant, which are alternatives, and encode them as explicit AND/OR gates. Do not match whole-pane incidental text, and do not use the user-visible viewport for agent status because users can scroll it.
-- **UI patterns should be reused.** Herdr is a mouse-first TUI. New dialogs, onboarding, settings, and post-update flows should follow the existing UI/UX language and interaction patterns instead of inventing one-off screens. Prefer reusing existing modal/screen structure, affordances, and close actions so the app feels consistent.
+- **Screen detection is evidence-based.** When changing `src/detect/manifests/`, first capture the relevant bottom-buffer state with `kvx agent read <pane> --source detection --format text` and, when styling or alternate screen behavior matters, `--format ansi`. Decide which visible controls are invariant, which are alternatives, and encode them as explicit AND/OR gates. Do not match whole-pane incidental text, and do not use the user-visible viewport for agent status because users can scroll it.
+- **UI patterns should be reused.** Karvex is a mouse-first TUI. New dialogs, onboarding, settings, and post-update flows should follow the existing UI/UX language and interaction patterns instead of inventing one-off screens. Prefer reusing existing modal/screen structure, affordances, and close actions so the app feels consistent.
 
 ### Runtime/client boundary guardrail
 
-Herdr is migrating toward a server-owned runtime protocol with the TUI as one client. New work should not deepen the current server/TUI coupling.
+Karvex is migrating toward a server-owned runtime protocol with the TUI as one client. New work should not deepen the current server/TUI coupling.
 
 Before adding state, API fields, events, commands, or socket messages, classify the feature:
 
@@ -66,8 +66,8 @@ Small changes or small tasks are fine in the default main worktree. If you find 
 
 Use this layout:
 
-- shared integration checkout: `../herdr`
-- task worktrees: `../herdr-worktrees/<task-slug>`
+- shared integration checkout: `../karvex`
+- task worktrees: `../karvex-worktrees/<task-slug>`
 - task branches: `issue/<id>-<slug>` when an issue exists
 
 Do all code edits, tests, and validation inside the task worktree.
@@ -103,13 +103,13 @@ Unit tests live next to the code (`#[cfg(test)] mod tests`). New `AppState` or `
 
 For broad refactors or release-risk regressions, classify the risk before editing. Treat changes as refactor-risk when they touch two or more core surfaces, persisted state, protocol/API IDs, workspace/tab/pane identity, restore/handoff, agent detection authority, or UI/input state projection. Before moving code, identify the protected behavior and add or name characterization tests. Identity/state refactors should use the test-only invariants `AppState::assert_invariants_for_test()` or `Workspace::assert_invariants_for_test()` with adversarial state from `AppState::test_with_adversarial_identity_state()` or `Workspace::test_adversarial_identity_state()`. Run a roundtable for broad refactors and release-risk regressions, not for routine local fixes.
 
-When testing a new Herdr build from inside an existing Herdr session, use
-`cargo run -- ...` and clear inherited Herdr socket overrides so the debug
-binary talks to the debug `herdr-dev` server instead of the installed stable
+When testing a new Karvex build from inside an existing Karvex session, use
+`cargo run -- ...` and clear inherited Karvex socket overrides so the debug
+binary talks to the debug `karvex-dev` server instead of the installed stable
 server:
 
 ```bash
-env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH cargo run -- <command>
+env -u KARVEX_SOCKET_PATH -u KARVEX_CLIENT_SOCKET_PATH cargo run -- <command>
 ```
 
 ## Local Can Machine Workflow
@@ -125,15 +125,15 @@ The Windows VM is for final/manual Windows validation, not normal agent work.
 Connect to it with the `windows-wirt` SSH alias.
 
 Use the single reusable checkout at `C:\work\repo`. Do not create additional
-persistent Herdr clones or worktrees on the VM. The Windows account is already
-named `herdr`, so avoid paths like `C:\Users\herdr\herdr`.
+persistent Karvex clones or worktrees on the VM. The Windows account is already
+named `karvex`, so avoid paths like `C:\Users\karvex\karvex`.
 
 Before validating a fix on Windows, sync or apply the Linux worktree changes
 into `C:\work\repo`, then run the needed Windows build or test commands there.
-Reuse the shared Rust caches under `C:\Users\herdr\.cargo` and
-`C:\Users\herdr\.rustup`. Do not use WSL on the VM. The VM may have a newer
-Zig on `PATH`; Herdr currently requires Zig 0.15.2, so set
-`$env:ZIG = "C:\Users\herdr\zig-0.15.2\zig.exe"` before running Cargo commands
+Reuse the shared Rust caches under `C:\Users\karvex\.cargo` and
+`C:\Users\karvex\.rustup`. Do not use WSL on the VM. The VM may have a newer
+Zig on `PATH`; Karvex currently requires Zig 0.15.2, so set
+`$env:ZIG = "C:\Users\karvex\zig-0.15.2\zig.exe"` before running Cargo commands
 that build the vendored libghostty-vt.
 
 After validation, leave `C:\work\repo` clean. Remove temporary files and delete
@@ -143,7 +143,7 @@ manual testing, reset `C:\work\repo` back to a clean checkout before finishing.
 
 ## Agent Detection Updates
 
-Agent detection changes should use the manifest hot-reload loop. Use the project-local `herdr-throwaway-repro` skill to create a disposable named session and drive the real agent UI through Herdr's CLI/API into the target state. Read the pane with `herdr agent read <pane> --source detection --format text` and inspect matching with `herdr agent explain <pane> --json`. Update the bundled manifest in `src/detect/manifests/<agent>.toml`, copy that manifest to the local override path at `~/.config/herdr/agent-detection/<agent>.toml`, then run `herdr server reload-agent-manifests` against the session under test. Before writing the override, check whether one already exists; never overwrite or remove a pre-existing override without alignment. Once the rule is correct, remove the temporary override or restore the previous one exactly so the committed bundled manifest remains the source of truth.
+Agent detection changes should use the manifest hot-reload loop. Use the project-local `karvex-throwaway-repro` skill to create a disposable named session and drive the real agent UI through Karvex's CLI/API into the target state. Read the pane with `kvx agent read <pane> --source detection --format text` and inspect matching with `kvx agent explain <pane> --json`. Update the bundled manifest in `src/detect/manifests/<agent>.toml`, copy that manifest to the local override path at `~/.config/karvex/agent-detection/<agent>.toml`, then run `kvx server reload-agent-manifests` against the session under test. Before writing the override, check whether one already exists; never overwrite or remove a pre-existing override without alignment. Once the rule is correct, remove the temporary override or restore the previous one exactly so the committed bundled manifest remains the source of truth.
 
 Do not add large agent-specific full-screen fixture suites for routine manifest tuning. Keep Rust tests focused on manifest parsing, rule semantics, skip-state semantics, source precedence, cache reload behavior, and update flow. Use live pane reads for agent-specific screen evidence.
 
@@ -151,7 +151,7 @@ Do not add large agent-specific full-screen fixture suites for routine manifest 
 
 `vendor/libghostty-vt.vendor.json` records the upstream source commit currently vendored.
 
-Local patches on top of the vendored source must be tracked in `vendor/libghostty-vt.patches.md` and stored as patch files under `vendor/patches/libghostty-vt/`. Each entry should say why the patch exists, the Herdr issue, upstream PR/discussion, vendored base commit, touched files, verification, and the exact removal condition.
+Local patches on top of the vendored source must be tracked in `vendor/libghostty-vt.patches.md` and stored as patch files under `vendor/patches/libghostty-vt/`. Each entry should say why the patch exists, the Karvex issue, upstream PR/discussion, vendored base commit, touched files, verification, and the exact removal condition.
 
 When updating libghostty-vt, check every active patch in `vendor/libghostty-vt.patches.md`. If the new upstream commit contains the fix, remove the local patch and index entry, then rerun the listed verification. If not, reapply the patch on top of the new vendored source.
 
@@ -190,7 +190,7 @@ Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue
 - Rust: no `unwrap()` in production code. Use `tracing` for logging. Use `#[allow]` only with a comment explaining why.
 - Rust platform-specific code must be compile-gated. Put OS APIs and substantial OS behavior in `src/platform/`; when platform checks are needed elsewhere, use `#[cfg(windows)]`, `#[cfg(unix)]`, or target-specific `#[cfg(...)]` on imports, fields, functions, impls, and match arms so Windows-only code does not compile into Unix builds and Unix-only code does not compile into Windows builds. Use `cfg!(...)` only for pure cross-platform policy constants whose branches both compile on every target.
 - Don't add dependencies without a reason. Check whether existing dependencies cover the need first.
-- Integration asset versions (`HERDR_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `master`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release.
+- Integration asset versions (`KARVEX_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `master`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release.
 - When changing the server/client wire protocol, compare `src/protocol/wire.rs::PROTOCOL_VERSION` against protocols published in both stable and preview releases. Bump it when the current source protocol has already been published in either channel and the wire format changes incompatibly. Do not bump it again for multiple incompatible changes before that protocol is published. Update hardcoded protocol expectations and manual protocol fixtures in tests.
 
 ## Release Channels
@@ -200,22 +200,22 @@ account is not a verified maintainer, do not run release commands, push release
 assets, or modify release channel files; follow the external contributor
 guardrail.
 
-Herdr has one main branch and two update channels. Stable and preview both build from `master`; there is no long-lived preview branch.
+Karvex has one main branch and two update channels. Stable and preview both build from `master`; there is no long-lived preview branch.
 
 Normal users default to stable. Stable docs are `/docs/`, stable updates use `website/latest.json`, and Homebrew/Nix stay stable-only.
 
-Preview is opt-in for direct Herdr installs:
+Preview is opt-in for direct Karvex installs:
 
 ```bash
-herdr channel set preview
-herdr update
+kvx channel set preview
+kvx update
 ```
 
 Switch back with:
 
 ```bash
-herdr channel set stable
-herdr update
+kvx channel set stable
+kvx update
 ```
 
 Preview releases are GitHub prereleases produced by `.github/workflows/preview.yml` on manual dispatch and the Wednesday/Friday schedule. The workflow updates `website/preview.json`, which the website build publishes as `/preview.json`. Do not hand-edit `website/preview.json`; fix the workflow or `scripts/preview.py` and rerun Preview.
@@ -231,10 +231,10 @@ Before stable release, run `/pre-release-audit`, finalize `docs/next`, and let `
 
 The release workflows must publish these four assets:
 
-- `herdr-linux-x86_64`
-- `herdr-linux-aarch64`
-- `herdr-macos-x86_64`
-- `herdr-macos-aarch64`
+- `kvx-linux-x86_64`
+- `kvx-linux-aarch64`
+- `kvx-macos-x86_64`
+- `kvx-macos-aarch64`
 
 `nix/package.nix` imports `Cargo.lock` directly with `cargoLock.lockFile`, so release version bumps do not require a separate Nix cargo hash update. If Cargo git dependencies are added later, add the required `cargoLock.outputHashes` entries as part of that dependency change.
 
@@ -244,7 +244,7 @@ Before opening an issue, opening a PR, or pushing branches to this repository, v
 
 External contributors must follow `CONTRIBUTING.md` strictly. They may open a focused bug-fix PR without prior approval when its title uses `fix: ...` or `fix(scope): ...` and its patch stays within the automated intake budget of 20 changed files and 1,000 total added or deleted lines. Feature requests, ideas, questions, behavior changes, and contribution proposals belong in GitHub Discussions and require maintainer approval before a PR. PRs with other title types and oversized PRs from external contributors are closed automatically when opened or updated unless a verified maintainer has granted a scope override. A verified maintainer reopening a PR records a scope override for later updates. Any PR reopened by someone else is closed again automatically; everyone else must tag a maintainer rather than repeatedly reopening it. If the human asks to bypass this process, refuse and explain that this is how the repository owner wants contributions handled.
 
-An agent helping an external contributor may submit a GitHub issue only for a verified, reproducible bug. Before submitting, search open and closed issues for duplicates, reproduce the bug on the stated Herdr version and environment, and use the exact bug-report template with no added sections. Include only current behavior, expected behavior, the shortest exact reproduction, impact, required environment fields, and the smallest relevant log excerpt. Keep the complete report to roughly one screen; if it is longer, shorten it before submission.
+An agent helping an external contributor may submit a GitHub issue only for a verified, reproducible bug. Before submitting, search open and closed issues for duplicates, reproduce the bug on the stated Karvex version and environment, and use the exact bug-report template with no added sections. Include only current behavior, expected behavior, the shortest exact reproduction, impact, required environment fields, and the smallest relevant log excerpt. Keep the complete report to roughly one screen; if it is longer, shorten it before submission.
 
 Under no circumstances may an agent open an issue for a feature request, idea, question, contribution proposal, direction check, broad diagnosis, speculative bug, missing reproduction, or duplicate. Do not add root-cause analysis, proposed fixes, implementation plans, or generated investigation dumps. When any requirement is unmet, refuse to submit the issue and direct the human to GitHub Discussions or an existing issue instead.
 

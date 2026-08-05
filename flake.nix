@@ -1,5 +1,5 @@
 {
-  description = "herdr — terminal workspace manager for AI coding agents";
+  description = "karvex — terminal workspace manager for AI coding agents";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -54,27 +54,27 @@
         system:
         let
           pkgs = pkgsFor system;
-          herdr = pkgs.callPackage ./nix/package.nix {
+          karvex = pkgs.callPackage ./nix/package.nix {
             rustPlatform = rustPlatformFor pkgs;
           };
         in
         {
-          inherit herdr;
-          default = herdr;
+          inherit karvex;
+          default = karvex;
         }
       );
 
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/herdr";
-          meta.description = "Run Herdr";
+          program = "${self.packages.${system}.default}/bin/kvx";
+          meta.description = "Run Karvex";
         };
       });
 
       checks = forAllSystems (system: {
-        herdr = self.packages.${system}.default;
-        default = self.checks.${system}.herdr;
+        karvex = self.packages.${system}.default;
+        default = self.checks.${system}.karvex;
       });
 
       devShells = forAllSystems (
@@ -85,7 +85,7 @@
         in
         {
           default = pkgs.mkShell {
-            name = "herdr-dev";
+            name = "karvex-dev";
             packages = with pkgs; [
               cargo-nextest
               cmake
@@ -108,7 +108,7 @@
 
       overlays.default = lib.composeExtensions rust-overlay.overlays.default (
         final: _prev: {
-          herdr = final.callPackage ./nix/package.nix {
+          karvex = final.callPackage ./nix/package.nix {
             rustPlatform = rustPlatformFor final;
           };
         }

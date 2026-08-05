@@ -1,4 +1,4 @@
-# herdr task runner
+# karvex task runner
 
 # Run tests
 test:
@@ -33,7 +33,7 @@ ci filter='all()': lint
 [unix]
 windows-lint:
     rustup target add x86_64-pc-windows-msvc
-    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin herdr --locked --target x86_64-pc-windows-msvc -- -D warnings
+    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin kvx --locked --target x86_64-pc-windows-msvc -- -D warnings
 
 # Check formatting + run unit tests + Windows target lint + maintenance script tests
 [unix]
@@ -63,8 +63,8 @@ website-build:
 
 # Test bundled agent integration assets
 integration-assets-test:
-    bun test src/integration/assets/herdr-agent-state.test.ts
-    bun test src/integration/assets/opencode/herdr-agent-state.test.ts
+    bun test src/integration/assets/karvex-agent-state.test.ts
+    bun test src/integration/assets/opencode/karvex-agent-state.test.ts
 
 # Run plugin marketplace Worker tests
 plugin-marketplace-test:
@@ -132,7 +132,7 @@ release-prepare version:
     python3 scripts/changelog.py prepare --version {{version}}
     cp CHANGELOG.md docs/next/CHANGELOG.md
     sed -i.bak 's/^version = ".*"/version = "{{version}}"/' Cargo.toml && rm -f Cargo.toml.bak
-    cargo update -p herdr --offline
+    cargo update -p karvex --offline
     just check
     git add CHANGELOG.md docs/next/CHANGELOG.md Cargo.toml Cargo.lock
     git diff --cached --quiet || git commit -m "release: v{{version}}"
@@ -164,8 +164,8 @@ release-publish version:
         exit 1; \
     fi
     just release-docs-check
-    python3 scripts/changelog.py extract --version {{version}} --output /tmp/herdr-release-notes-check.md
-    rm -f /tmp/herdr-release-notes-check.md
+    python3 scripts/changelog.py extract --version {{version}} --output /tmp/karvex-release-notes-check.md
+    rm -f /tmp/karvex-release-notes-check.md
     @local_head="$(git rev-parse HEAD)"; \
     remote_head="$(git rev-parse origin/master)"; \
     if ! git merge-base --is-ancestor "$remote_head" "$local_head"; then \

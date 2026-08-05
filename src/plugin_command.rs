@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn windows_batch_command_captures_output() {
         let path = std::env::temp_dir().join(format!(
-            "herdr-plugin-command-output-{}.cmd",
+            "karvex-plugin-command-output-{}.cmd",
             std::process::id()
         ));
         std::fs::write(&path, "@echo off\r\necho plugin-%1\r\n").expect("write batch fixture");
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn windows_explicit_relative_executable_runs_from_working_directory() {
         let root = std::env::temp_dir().join(format!(
-            "herdr-plugin-relative-command-{}",
+            "karvex-plugin-relative-command-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&root).expect("create relative command fixture");

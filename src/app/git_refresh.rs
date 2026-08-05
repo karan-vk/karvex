@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn git_refresh_deduplicates_workspaces_with_same_cache_key() {
         let repo =
-            std::env::temp_dir().join(format!("herdr-git-refresh-dedupe-{}", std::process::id()));
+            std::env::temp_dir().join(format!("karvex-git-refresh-dedupe-{}", std::process::id()));
         let nested = repo.join("nested");
         let other = repo.join("other");
         std::fs::create_dir_all(&nested).expect("create nested dir");
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn git_refresh_item_collection_does_not_discover_uncached_cwd() {
         let mut app = test_app(&crate::config::Config::default());
-        let cwd = std::env::temp_dir().join(format!("herdr-uncached-cwd-{}", std::process::id()));
+        let cwd = std::env::temp_dir().join(format!("karvex-uncached-cwd-{}", std::process::id()));
         let mut ws = Workspace::test_new("test");
         ws.identity_cwd = cwd.clone();
         ws.tabs.clear();
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn explicit_git_refresh_invalidates_cached_non_git_results() {
         let mut app = test_app(&crate::config::Config::default());
-        let cwd = std::env::temp_dir().join(format!("herdr-git-miss-{}", std::process::id()));
+        let cwd = std::env::temp_dir().join(format!("karvex-git-miss-{}", std::process::id()));
         std::fs::create_dir_all(&cwd).unwrap();
         let (_, entry) = crate::workspace::git_status_snapshot_for_cwd_with_demand(
             &cwd,

@@ -749,7 +749,7 @@ mod tests {
                             label: Some("tests".into()),
                             command: Some(vec!["sh".into(), "-c".into(), "true".into()]),
                             env: std::collections::HashMap::from([(
-                                "HERDR_ROLE".into(),
+                                "KARVEX_ROLE".into(),
                                 "tests".into(),
                             )]),
                             ..Default::default()

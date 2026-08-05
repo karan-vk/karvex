@@ -41,7 +41,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_keyboard_report_all_only_changes_the_current_herdr_stack_entry() {
+    fn host_keyboard_report_all_only_changes_the_current_karvex_stack_entry() {
         let mut output = Vec::new();
 
         set_host_kitty_keyboard_report_all(&mut output, true).unwrap();

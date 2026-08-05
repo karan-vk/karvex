@@ -31,13 +31,13 @@ pub(super) fn run_completion_command(args: &[String]) -> std::io::Result<i32> {
     let mut command = super::spec::command();
     if matches!(shell, Shell::Zsh) {
         let mut output = Vec::new();
-        generate(shell, &mut command, "herdr", &mut output);
+        generate(shell, &mut command, "kvx", &mut output);
         let script = String::from_utf8(output).map_err(|err| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, err.utf8_error())
         })?;
         std::io::stdout().write_all(space_separated_zsh_long_options(&script).as_bytes())?;
     } else {
-        generate(shell, &mut command, "herdr", &mut std::io::stdout());
+        generate(shell, &mut command, "kvx", &mut std::io::stdout());
     }
     Ok(0)
 }
@@ -81,7 +81,7 @@ fn parse_shell(shell: &str) -> Option<Shell> {
 }
 
 fn print_completion_help() {
-    eprintln!("usage: herdr completion <{}>", supported_shells_usage());
+    eprintln!("usage: kvx completion <{}>", supported_shells_usage());
 }
 
 #[cfg(test)]

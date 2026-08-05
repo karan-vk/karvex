@@ -1,21 +1,21 @@
-// installed by herdr
-// managed by herdr; reinstalling or updating the integration overwrites this file.
+// installed by karvex
+// managed by karvex; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
-// HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=8
+// KARVEX_INTEGRATION_ID=pi
+// KARVEX_INTEGRATION_VERSION=8
 // @ts-nocheck
 
 import net from "node:net";
 
-const HERDR_ENV = process.env.HERDR_ENV;
-const socketPath = process.env.HERDR_SOCKET_PATH;
+const KARVEX_ENV = process.env.KARVEX_ENV;
+const socketPath = process.env.KARVEX_SOCKET_PATH;
 const socketEndpoint =
   process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
-const paneId = process.env.HERDR_PANE_ID;
-const source = "herdr:pi";
+const paneId = process.env.KARVEX_PANE_ID;
+const source = "karvex:pi";
 
 function enabled() {
-  return HERDR_ENV === "1" && !!socketPath && !!paneId;
+  return KARVEX_ENV === "1" && !!socketPath && !!paneId;
 }
 
 function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
@@ -204,7 +204,7 @@ export default function (pi) {
     queueState(next.state, next.message);
   }
 
-  pi.events.on("herdr:blocked", (data) => {
+  pi.events.on("karvex:blocked", (data) => {
     if (!rootSession) {
       return;
     }
@@ -223,7 +223,7 @@ export default function (pi) {
   });
 
   pi.on("session_start", async (event, ctx) => {
-    // TUI only: RPC/JSON/print modes are headless (no PTY herdr can display),
+    // TUI only: RPC/JSON/print modes are headless (no PTY karvex can display),
     // and RPC still reports hasUI=true, so mode is the reliable gate.
     if (ctx?.mode !== "tui") {
       return;

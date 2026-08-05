@@ -14,7 +14,7 @@ pub(crate) fn toast_notify_kind(delivery: config::ToastDelivery) -> Option<proto
     match delivery {
         config::ToastDelivery::Terminal => Some(protocol::NotifyKind::Toast),
         config::ToastDelivery::System => Some(protocol::NotifyKind::SystemToast),
-        config::ToastDelivery::Off | config::ToastDelivery::Herdr => None,
+        config::ToastDelivery::Off | config::ToastDelivery::Karvex => None,
     }
 }
 
@@ -94,15 +94,15 @@ mod tests {
         let root = state.workspaces[0].tabs[0].root_pane;
         let terminal_id = state.workspaces[0].terminal_id(root).cloned().unwrap();
         let temp_root = std::env::temp_dir().join(format!(
-            "herdr-forwarded-toast-context-{}-{}",
+            "karvex-forwarded-toast-context-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let stale_cwd = temp_root.join("__herdr_original__");
-        let live_cwd = temp_root.join("__herdr_projects__");
+        let stale_cwd = temp_root.join("__karvex_original__");
+        let live_cwd = temp_root.join("__karvex_projects__");
         std::fs::create_dir_all(&stale_cwd).unwrap();
         std::fs::create_dir_all(&live_cwd).unwrap();
         init_repo(&stale_cwd);
@@ -147,7 +147,7 @@ mod tests {
 
         assert_eq!(
             message.as_deref(),
-            Some("codex finished: __herdr_projects__ · 1")
+            Some("codex finished: __karvex_projects__ · 1")
         );
 
         for (_, runtime) in terminal_runtimes.drain() {

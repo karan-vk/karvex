@@ -323,7 +323,7 @@ fn should_prefer_osc52() -> bool {
 ///
 /// OSC 52 format: `ESC ] 52 ; c ; <base64> BEL`
 ///
-/// Some terminals still only honor BEL-terminated OSC 52 writes, so herdr
+/// Some terminals still only honor BEL-terminated OSC 52 writes, so karvex
 /// emits BEL here even though ST works in newer emulators.
 pub fn write_osc52_bytes(bytes: &[u8]) {
     if !should_prefer_osc52() && crate::platform::write_clipboard(bytes) {

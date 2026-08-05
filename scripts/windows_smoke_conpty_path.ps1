@@ -16,7 +16,7 @@ function Invoke-Checked {
 }
 
 $exe = (Resolve-Path $ExePath).Path
-$fakeDir = Join-Path ([System.IO.Path]::GetTempPath()) "herdr-fake-conpty-$([guid]::NewGuid().ToString('N'))"
+$fakeDir = Join-Path ([System.IO.Path]::GetTempPath()) "karvex-fake-conpty-$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force $fakeDir | Out-Null
 
 $fakeSource = Join-Path $fakeDir "fake_conpty.rs"
@@ -58,12 +58,12 @@ pub extern "system" fn ClosePseudoConsole(_hpc: HANDLE) {}
 Invoke-Checked rustc @("--crate-type", "cdylib", "--edition", "2021", $fakeSource, "-o", $fakeDll)
 
 $oldPath = $env:PATH
-$oldSession = $env:HERDR_SESSION
-$oldSocket = $env:HERDR_SOCKET_PATH
-$oldClientSocket = $env:HERDR_CLIENT_SOCKET_PATH
+$oldSession = $env:KARVEX_SESSION
+$oldSocket = $env:KARVEX_SOCKET_PATH
+$oldClientSocket = $env:KARVEX_CLIENT_SOCKET_PATH
 $env:PATH = "$fakeDir;$oldPath"
-$env:HERDR_SESSION = $Session
-Remove-Item Env:HERDR_SOCKET_PATH, Env:HERDR_CLIENT_SOCKET_PATH -ErrorAction SilentlyContinue
+$env:KARVEX_SESSION = $Session
+Remove-Item Env:KARVEX_SOCKET_PATH, Env:KARVEX_CLIENT_SOCKET_PATH -ErrorAction SilentlyContinue
 
 $server = $null
 try {
@@ -102,7 +102,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($paneId)) {
         throw "workspace create did not return a root pane id: $($created -join "`n")"
     }
-    $marker = "HERDR_CONPTY_SMOKE_OK"
+    $marker = "KARVEX_CONPTY_SMOKE_OK"
     Invoke-Checked $exe @("pane", "run", $paneId, "echo $marker")
 
     $text = ""
@@ -144,19 +144,19 @@ try {
     $global:LASTEXITCODE = 0
     $env:PATH = $oldPath
     if ($null -eq $oldSession) {
-        Remove-Item Env:HERDR_SESSION -ErrorAction SilentlyContinue
+        Remove-Item Env:KARVEX_SESSION -ErrorAction SilentlyContinue
     } else {
-        $env:HERDR_SESSION = $oldSession
+        $env:KARVEX_SESSION = $oldSession
     }
     if ($null -eq $oldSocket) {
-        Remove-Item Env:HERDR_SOCKET_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:KARVEX_SOCKET_PATH -ErrorAction SilentlyContinue
     } else {
-        $env:HERDR_SOCKET_PATH = $oldSocket
+        $env:KARVEX_SOCKET_PATH = $oldSocket
     }
     if ($null -eq $oldClientSocket) {
-        Remove-Item Env:HERDR_CLIENT_SOCKET_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:KARVEX_CLIENT_SOCKET_PATH -ErrorAction SilentlyContinue
     } else {
-        $env:HERDR_CLIENT_SOCKET_PATH = $oldClientSocket
+        $env:KARVEX_CLIENT_SOCKET_PATH = $oldClientSocket
     }
     Remove-Item -Recurse -Force $fakeDir -ErrorAction SilentlyContinue
 }

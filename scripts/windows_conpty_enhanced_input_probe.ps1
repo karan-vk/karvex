@@ -161,12 +161,12 @@ function Send-NativeRecordAndObserve {
 }
 
 $script:Exe = (Resolve-Path $ExePath).Path
-$workDir = Join-Path ([System.IO.Path]::GetTempPath()) "herdr-conpty-input-$([guid]::NewGuid().ToString('N'))"
+$workDir = Join-Path ([System.IO.Path]::GetTempPath()) "karvex-conpty-input-$([guid]::NewGuid().ToString('N'))"
 $probeSource = Join-Path $workDir "probe.rs"
 $script:ProbeExe = Join-Path $workDir "probe.exe"
-$oldSession = $env:HERDR_SESSION
-$oldSocket = $env:HERDR_SOCKET_PATH
-$oldClientSocket = $env:HERDR_CLIENT_SOCKET_PATH
+$oldSession = $env:KARVEX_SESSION
+$oldSocket = $env:KARVEX_SOCKET_PATH
+$oldClientSocket = $env:KARVEX_CLIENT_SOCKET_PATH
 $server = $null
 $report = [ordered]@{}
 $failed = $false
@@ -359,9 +359,9 @@ fn main() {
 
     Invoke-Checked rustc @("--edition", "2021", $probeSource, "-o", $script:ProbeExe)
 
-    $env:HERDR_SESSION = $Session
-    Remove-Item Env:HERDR_SOCKET_PATH -ErrorAction SilentlyContinue
-    Remove-Item Env:HERDR_CLIENT_SOCKET_PATH -ErrorAction SilentlyContinue
+    $env:KARVEX_SESSION = $Session
+    Remove-Item Env:KARVEX_SOCKET_PATH -ErrorAction SilentlyContinue
+    Remove-Item Env:KARVEX_CLIENT_SOCKET_PATH -ErrorAction SilentlyContinue
 
     $os = Get-CimInstance Win32_OperatingSystem
     $report.os = [ordered]@{
@@ -506,19 +506,19 @@ fn main() {
     }
     $global:LASTEXITCODE = 0
     if ($null -eq $oldSession) {
-        Remove-Item Env:HERDR_SESSION -ErrorAction SilentlyContinue
+        Remove-Item Env:KARVEX_SESSION -ErrorAction SilentlyContinue
     } else {
-        $env:HERDR_SESSION = $oldSession
+        $env:KARVEX_SESSION = $oldSession
     }
     if ($null -eq $oldSocket) {
-        Remove-Item Env:HERDR_SOCKET_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:KARVEX_SOCKET_PATH -ErrorAction SilentlyContinue
     } else {
-        $env:HERDR_SOCKET_PATH = $oldSocket
+        $env:KARVEX_SOCKET_PATH = $oldSocket
     }
     if ($null -eq $oldClientSocket) {
-        Remove-Item Env:HERDR_CLIENT_SOCKET_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:KARVEX_CLIENT_SOCKET_PATH -ErrorAction SilentlyContinue
     } else {
-        $env:HERDR_CLIENT_SOCKET_PATH = $oldClientSocket
+        $env:KARVEX_CLIENT_SOCKET_PATH = $oldClientSocket
     }
 
     $json = $report | ConvertTo-Json -Depth 8

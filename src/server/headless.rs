@@ -1,9 +1,9 @@
-//! Headless server mode — runs the herdr event loop without a real terminal.
+//! Headless server mode — runs the karvex event loop without a real terminal.
 //!
 //! The server:
 //! - Does not enter raw mode or read stdin
-//! - Creates and listens on both `herdr.sock` (existing JSON API) and
-//!   `herdr-client.sock` (new binary protocol)
+//! - Creates and listens on both `karvex.sock` (existing JSON API) and
+//!   `karvex-client.sock` (new binary protocol)
 //! - Initializes AppState and all PTYs from session restore or fresh state
 //! - Runs the main event loop (drain events, drain API requests, scheduled tasks)
 //! - Renders to a virtual ratatui Buffer in memory
@@ -288,7 +288,7 @@ enum AltScreenReadConflict {
     Defer,
 }
 
-/// The headless server — runs the herdr event loop without a real terminal.
+/// The headless server — runs the karvex event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
     #[cfg(unix)]
@@ -1173,7 +1173,7 @@ impl HeadlessServer {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "live handoff supports at most {} panes in one update; close panes or restart herdr normally",
+                    "live handoff supports at most {} panes in one update; close panes or restart karvex normally",
                     crate::server::handoff::MAX_FDS_PER_HANDOFF
                 ),
             ));
@@ -1993,7 +1993,7 @@ impl HeadlessServer {
                 })
                 .unwrap_or_else(|_| "{}".to_string());
             }
-            config::ToastDelivery::Herdr => {
+            config::ToastDelivery::Karvex => {
                 let sound = params.sound;
                 let response = self.app.handle_api_request_after_internal_events_drained(
                     api::schema::Request {
@@ -2927,7 +2927,7 @@ impl HeadlessServer {
                         kind: protocol::NotifyKind::Toast,
                         message: "Paste rejected".to_owned(),
                         body: Some(format!(
-                            "Input message is {size} bytes; Herdr's limit is {max} bytes"
+                            "Input message is {size} bytes; Karvex's limit is {max} bytes"
                         )),
                     },
                 );
@@ -3518,7 +3518,7 @@ impl HeadlessServer {
         }
 
         // Forward new toast state only when a client-local delivery mode is selected.
-        // Herdr delivery renders the toast in-frame and must not ask clients to
+        // Karvex delivery renders the toast in-frame and must not ask clients to
         // show a terminal or system notification.
         let toast_after = self.app.state.toast.clone();
         let forwarded_toast_from_state = if should_forward_toast_to_clients(
@@ -4518,7 +4518,7 @@ impl HeadlessServer {
     }
 }
 
-// Pane applications render their own motion responses through PTY output. Only Herdr modes with
+// Pane applications render their own motion responses through PTY output. Only Karvex modes with
 // hover selection mutate the current frame directly from a plain mouse-move event.
 fn events_are_render_neutral_mouse_motion(
     events: &[crate::raw_input::RawInputEvent],
@@ -4690,7 +4690,7 @@ pub fn run_server() -> io::Result<()> {
     let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: herdr server is already running");
+            eprintln!("error: karvex server is already running");
             eprintln!("api socket: {}", api::socket_path().display());
             std::process::exit(1);
         }
@@ -4733,7 +4733,7 @@ pub fn run_server() -> io::Result<()> {
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: herdr server is already running");
+                eprintln!("error: karvex server is already running");
                 eprintln!("client socket: {}", client_socket_path().display());
                 std::process::exit(1);
             }
@@ -4743,7 +4743,7 @@ pub fn run_server() -> io::Result<()> {
         info!(
             api_socket = %api::socket_path().display(),
             client_socket = %client_socket_path().display(),
-            "herdr server started"
+            "karvex server started"
         );
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.app.run_plugin_startup_hooks();
@@ -4825,7 +4825,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         app.local_terminal_notifications = false;
         app.local_input_source_switch = false;
         crate::server::handoff::report_restored(&mut received.stream)?;
-        if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
+        if std::env::var("KARVEX_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
             return Err(io::Error::other(
                 "test handoff import failure after restored",
             ));
@@ -4884,21 +4884,21 @@ fn run_handoff_import_server(_socket_path: &Path, _token: &str) -> io::Result<()
 }
 
 fn print_ready_message(api_socket: &Path, client_socket: &Path) {
-    eprintln!("herdr server running; you can use any herdr CLI command in another terminal.");
+    eprintln!("karvex server running; you can use any karvex CLI command in another terminal.");
     eprintln!("api socket: {}", api_socket.display());
     eprintln!("client socket: {}", client_socket.display());
     eprintln!(
         "logs: {}",
         crate::session::data_dir()
-            .join("herdr-server.log")
+            .join("karvex-server.log")
             .display()
     );
-    eprintln!("did you mean to open the Herdr TUI? run `herdr`; you do not need `herdr server`.");
+    eprintln!("did you mean to open the Karvex TUI? run `kvx`; you do not need `kvx server`.");
 }
 
 /// Initialize logging for the server process.
 fn init_logging() {
-    crate::logging::init_file_logging("herdr-server.log");
+    crate::logging::init_file_logging("karvex-server.log");
 }
 
 // ---------------------------------------------------------------------------
@@ -5156,7 +5156,7 @@ mod tests {
                 .event_tx
                 .try_send(AppEvent::UpdateReady {
                     version: format!("4.0.{i}"),
-                    install_command: "herdr install".into(),
+                    install_command: "karvex install".into(),
                 })
                 .unwrap();
         }
@@ -5542,7 +5542,7 @@ new_tab = "prefix+t"
     #[test]
     fn local_keybinding_client_keeps_local_keybindings_after_settings_save() {
         let path = std::env::temp_dir().join(format!(
-            "herdr-headless-settings-{}-{}.toml",
+            "karvex-headless-settings-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5599,7 +5599,7 @@ next_tab = ""
             .any(|binding| binding.label == "prefix+n"));
         assert!(server.app.state.toast.is_none());
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("delivery = \"herdr\""));
+        assert!(content.contains("delivery = \"karvex\""));
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_file(path);
@@ -5609,7 +5609,7 @@ next_tab = ""
     fn invalid_server_keybindings_apply_valid_subset_after_settings_save_without_caching_local_keybindings(
     ) {
         let path = std::env::temp_dir().join(format!(
-            "herdr-headless-invalid-settings-{}-{}.toml",
+            "karvex-headless-invalid-settings-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -6731,7 +6731,7 @@ next_tab = ""
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
-            dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            dedupe_key: "karvex:codex\0codex\0Id\0codex-session".into(),
         });
         server.app.pending_agent_resume_deadline = Some(Instant::now() - Duration::from_millis(1));
 
@@ -6767,7 +6767,7 @@ next_tab = ""
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
-            dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            dedupe_key: "karvex:codex\0codex\0Id\0codex-session".into(),
         });
 
         server.render_and_stream();
@@ -6842,7 +6842,7 @@ next_tab = ""
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
-            dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            dedupe_key: "karvex:codex\0codex\0Id\0codex-session".into(),
         });
         server.app.pending_agent_resume_deadline = Some(Instant::now() - Duration::from_millis(1));
 
@@ -9917,7 +9917,7 @@ next_tab = ""
                 assert_eq!(message, "Paste rejected");
                 assert_eq!(
                     body.as_deref(),
-                    Some("Input message is 5000012 bytes; Herdr's limit is 1048576 bytes")
+                    Some("Input message is 5000012 bytes; Karvex's limit is 1048576 bytes")
                 );
             }
             other => panic!("expected paste rejection notification, got {other:?}"),
@@ -9934,7 +9934,7 @@ next_tab = ""
     }
 
     #[test]
-    fn herdr_toast_delivery_keeps_toast_in_frame_without_client_notify() {
+    fn karvex_toast_delivery_keeps_toast_in_frame_without_client_notify() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
 
@@ -9951,11 +9951,11 @@ next_tab = ""
             ),
         );
         server.foreground_client_id = Some(1);
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::UpdateReady {
             version: "9.9.9".to_string(),
-            install_command: "herdr update".into(),
+            install_command: "kvx update".into(),
         });
 
         assert!(changed);
@@ -9964,7 +9964,7 @@ next_tab = ""
             client_control_rx
                 .recv_timeout(Duration::from_millis(50))
                 .is_err(),
-            "herdr delivery should render in-frame instead of forwarding a client-local notification"
+            "karvex delivery should render in-frame instead of forwarding a client-local notification"
         );
     }
 
@@ -9990,7 +9990,7 @@ next_tab = ""
 
         let changed = server.handle_internal_event_with_forwarding(AppEvent::UpdateReady {
             version: "9.9.9".to_string(),
-            install_command: "herdr update".into(),
+            install_command: "kvx update".into(),
         });
 
         assert!(changed);
@@ -10008,7 +10008,7 @@ next_tab = ""
                 assert_eq!(message, "v9.9.9 available");
                 assert_eq!(
                     body.as_deref(),
-                    Some("detach, run `herdr update`, then follow its restart guidance")
+                    Some("detach, run `kvx update`, then follow its restart guidance")
                 );
             }
             other => panic!("expected system toast notify, got {other:?}"),
@@ -10043,7 +10043,7 @@ next_tab = ""
                     api::schema::NotificationShowParams {
                         title: "build failed".into(),
                         body: Some("api workspace".into()),
-                        position: Some(crate::config::ToastHerdrPosition::TopLeft),
+                        position: Some(crate::config::ToastKarvexPosition::TopLeft),
                         sound: api::schema::NotificationShowSound::Request,
                     },
                 ),
@@ -10237,9 +10237,9 @@ next_tab = ""
     }
 
     #[test]
-    fn notification_show_api_herdr_toast_expires_headless() {
+    fn notification_show_api_karvex_toast_expires_headless() {
         let mut server = test_headless_server();
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
@@ -10278,7 +10278,7 @@ next_tab = ""
     }
 
     #[test]
-    fn notification_show_api_forwards_sound_for_herdr_delivery() {
+    fn notification_show_api_forwards_sound_for_karvex_delivery() {
         let mut server = test_headless_server();
         let (client_tx, client_control_rx, _client_rx) = test_client_writer();
 
@@ -10295,7 +10295,7 @@ next_tab = ""
             ),
         );
         server.foreground_client_id = Some(1);
-        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        server.app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
@@ -10552,7 +10552,7 @@ next_tab = ""
             .get_mut(&terminal_id)
             .unwrap()
             .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
-                source: "herdr:pi".into(),
+                source: "karvex:pi".into(),
                 agent: "pi".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::path(
                     std::env::current_dir()
@@ -10570,7 +10570,7 @@ next_tab = ""
             .get_mut(&terminal_id)
             .unwrap()
             .set_hook_authority(
-                "herdr:pi".into(),
+                "karvex:pi".into(),
                 "pi".into(),
                 crate::detect::AgentState::Working,
                 None,
@@ -10602,7 +10602,7 @@ next_tab = ""
                 id: "stale".into(),
                 method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
                     pane_id: public_pane_id,
-                    source: "herdr:pi".into(),
+                    source: "karvex:pi".into(),
                     agent: "pi".into(),
                     state: api::schema::PaneAgentState::Idle,
                     message: None,

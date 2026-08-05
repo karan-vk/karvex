@@ -10,7 +10,7 @@ use super::text::display_width_u16;
 use super::widgets::panel_contrast_fg;
 use crate::{
     app::state::{CopyFeedback, Palette, ToastKind, ToastNotification},
-    config::{StatusIndicatorStyle, ToastClipboardPosition, ToastHerdrPosition},
+    config::{StatusIndicatorStyle, ToastClipboardPosition, ToastKarvexPosition},
     detect::AgentState,
 };
 
@@ -53,7 +53,7 @@ pub(crate) fn toast_notification_rect(
     area: Rect,
     toast: &ToastNotification,
     offset_for_warning: bool,
-    position: ToastHerdrPosition,
+    position: ToastKarvexPosition,
 ) -> Rect {
     let content_width = display_width_u16(&toast.title)
         .max(display_width_u16(&toast.context))
@@ -62,17 +62,17 @@ pub(crate) fn toast_notification_rect(
     let content_height = if toast.context.is_empty() { 1 } else { 2 };
     let height = (content_height + 2).min(area.height);
     let x = match position {
-        ToastHerdrPosition::TopLeft | ToastHerdrPosition::BottomLeft => area.x,
-        ToastHerdrPosition::TopRight | ToastHerdrPosition::BottomRight => {
+        ToastKarvexPosition::TopLeft | ToastKarvexPosition::BottomLeft => area.x,
+        ToastKarvexPosition::TopRight | ToastKarvexPosition::BottomRight => {
             area.x + area.width.saturating_sub(width)
         }
     };
     let warning_offset = u16::from(offset_for_warning);
     let y = match position {
-        ToastHerdrPosition::TopLeft | ToastHerdrPosition::TopRight => {
+        ToastKarvexPosition::TopLeft | ToastKarvexPosition::TopRight => {
             area.y + warning_offset.min(area.height)
         }
-        ToastHerdrPosition::BottomLeft | ToastHerdrPosition::BottomRight => {
+        ToastKarvexPosition::BottomLeft | ToastKarvexPosition::BottomRight => {
             area.y + area.height.saturating_sub(height + warning_offset)
         }
     };
@@ -84,7 +84,7 @@ pub(super) fn render_toast_notification(
     area: Rect,
     toast: &ToastNotification,
     offset_for_warning: bool,
-    position: ToastHerdrPosition,
+    position: ToastKarvexPosition,
     p: &Palette,
 ) {
     let dot_color = match toast.kind {
@@ -247,7 +247,7 @@ pub(super) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ToastClipboardPosition, ToastHerdrPosition};
+    use crate::config::{ToastClipboardPosition, ToastKarvexPosition};
 
     fn toast() -> ToastNotification {
         ToastNotification {
@@ -295,21 +295,21 @@ mod tests {
         let area = Rect::new(10, 20, 100, 40);
         let toast = toast();
 
-        let top_left = toast_notification_rect(area, &toast, false, ToastHerdrPosition::TopLeft);
+        let top_left = toast_notification_rect(area, &toast, false, ToastKarvexPosition::TopLeft);
         assert_eq!(top_left.x, area.x);
         assert_eq!(top_left.y, area.y);
 
-        let top_right = toast_notification_rect(area, &toast, false, ToastHerdrPosition::TopRight);
+        let top_right = toast_notification_rect(area, &toast, false, ToastKarvexPosition::TopRight);
         assert_eq!(top_right.x + top_right.width, area.x + area.width);
         assert_eq!(top_right.y, area.y);
 
         let bottom_left =
-            toast_notification_rect(area, &toast, false, ToastHerdrPosition::BottomLeft);
+            toast_notification_rect(area, &toast, false, ToastKarvexPosition::BottomLeft);
         assert_eq!(bottom_left.x, area.x);
         assert_eq!(bottom_left.y + bottom_left.height, area.y + area.height);
 
         let bottom_right =
-            toast_notification_rect(area, &toast, false, ToastHerdrPosition::BottomRight);
+            toast_notification_rect(area, &toast, false, ToastKarvexPosition::BottomRight);
         assert_eq!(bottom_right.x + bottom_right.width, area.x + area.width);
         assert_eq!(bottom_right.y + bottom_right.height, area.y + area.height);
     }
@@ -320,12 +320,12 @@ mod tests {
         let toast = ToastNotification {
             kind: ToastKind::NeedsAttention,
             title: "重构用户认证模块".to_string(),
-            context: "提交 herdr 的反馈".to_string(),
+            context: "提交 karvex 的反馈".to_string(),
             position: None,
             target: None,
         };
 
-        let rect = toast_notification_rect(area, &toast, false, ToastHerdrPosition::TopRight);
+        let rect = toast_notification_rect(area, &toast, false, ToastKarvexPosition::TopRight);
 
         let expected_content_width =
             display_width_u16(&toast.title).max(display_width_u16(&toast.context)) + 6;

@@ -1652,7 +1652,7 @@ impl App {
     ///
     /// The input bytes are parsed into `RawInputEvent`s and then processed.
     /// In terminal mode, keys are routed through the same semantic
-    /// key-handling path as monolithic herdr so they are re-encoded for the
+    /// key-handling path as monolithic karvex so they are re-encoded for the
     /// focused pane's negotiated keyboard protocol instead of passing host
     /// terminal escape sequences through unchanged.
     #[cfg(test)]
@@ -2008,7 +2008,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{stamp}", std::process::id()))
+        std::env::temp_dir().join(format!("karvex-{name}-{}-{stamp}", std::process::id()))
     }
 
     #[cfg(windows)]
@@ -2251,7 +2251,7 @@ mod tests {
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
         let unique = format!(
-            "herdr-{name}-{}-{}",
+            "karvex-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2387,9 +2387,9 @@ mod tests {
     }
 
     #[test]
-    fn notification_show_api_creates_herdr_toast_with_position() {
+    fn notification_show_api_creates_karvex_toast_with_position() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -2398,7 +2398,7 @@ mod tests {
                     crate::api::schema::NotificationShowParams {
                         title: "build failed".into(),
                         body: Some("api workspace".into()),
-                        position: Some(crate::config::ToastHerdrPosition::TopLeft),
+                        position: Some(crate::config::ToastKarvexPosition::TopLeft),
                         sound: crate::api::schema::NotificationShowSound::None,
                     },
                 ),
@@ -2417,15 +2417,15 @@ mod tests {
         assert_eq!(toast.context, "api workspace");
         assert_eq!(
             toast.position,
-            Some(crate::config::ToastHerdrPosition::TopLeft)
+            Some(crate::config::ToastKarvexPosition::TopLeft)
         );
         assert!(app.toast_deadline.is_some());
     }
 
     #[test]
-    fn notification_show_api_herdr_toast_expires() {
+    fn notification_show_api_karvex_toast_expires() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
 
         let response =
             app.handle_api_request_after_internal_events_drained(crate::api::schema::Request {
@@ -2486,7 +2486,7 @@ mod tests {
     #[test]
     fn notification_show_api_does_not_replace_existing_toast() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: crate::app::state::ToastKind::NeedsAttention,
             title: "pi needs attention".to_string(),
@@ -2525,7 +2525,7 @@ mod tests {
     #[test]
     fn notification_show_api_is_rate_limited() {
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
         app.mark_api_notification_shown(Instant::now());
 
         let response =
@@ -2574,7 +2574,7 @@ mod tests {
             app.event_tx
                 .try_send(AppEvent::UpdateReady {
                     version: format!("2.0.{i}"),
-                    install_command: "herdr install".into(),
+                    install_command: "karvex install".into(),
                 })
                 .unwrap();
         }
@@ -2596,7 +2596,7 @@ mod tests {
             app.event_tx
                 .try_send(AppEvent::UpdateReady {
                     version: format!("3.0.{i}"),
-                    install_command: "herdr install".into(),
+                    install_command: "karvex install".into(),
                 })
                 .unwrap();
         }
@@ -2865,7 +2865,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\ncopy_on_select = false\nright_click_passthrough_modifier = \"ctrl\"\nprompt_new_workspace_name = true\n[ui.toast]\ndelivery = \"herdr\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[ui]\nagent_panel_sort = \"priority\"\nredraw_on_focus_gained = false\ncopy_on_select = false\nright_click_passthrough_modifier = \"ctrl\"\nprompt_new_workspace_name = true\n[ui.toast]\ndelivery = \"karvex\"\n[experimental]\nswitch_ascii_input_source_in_prefix = true\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -2908,7 +2908,7 @@ mod tests {
             .matches_prefix(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())));
         assert_eq!(
             app.state.toast_config.delivery,
-            crate::config::ToastDelivery::Herdr
+            crate::config::ToastDelivery::Karvex
         );
         assert_eq!(app.state.agent_panel_sort, state::AgentPanelSort::Priority);
         assert!(!app.state.redraw_on_focus_gained);
@@ -3251,7 +3251,7 @@ mod tests {
         );
         assert_eq!(
             app.state.config_diagnostic.as_deref(),
-            Some("config.toml; herdr config check")
+            Some("config.toml; kvx config check")
         );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -3316,7 +3316,7 @@ mod tests {
         assert_eq!(app.state.mouse_capture, target_mouse_capture);
         assert_eq!(
             app.state.config_diagnostic.as_deref(),
-            Some("config.toml has unknown keys; herdr config check")
+            Some("config.toml has unknown keys; kvx config check")
         );
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -3366,7 +3366,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
         let report = app.reload_config();
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
@@ -3381,7 +3381,7 @@ mod tests {
             .matches_prefix(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty())));
         assert_eq!(
             app.state.toast_config.delivery,
-            crate::config::ToastDelivery::Herdr
+            crate::config::ToastDelivery::Karvex
         );
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -3525,7 +3525,7 @@ mod tests {
             .config_diagnostic
             .as_deref()
             .is_some_and(|message| {
-                message == "config.toml invalid; keeping current config; herdr config check"
+                message == "config.toml invalid; keeping current config; kvx config check"
             }));
         assert!(app.state.toast.is_none());
 
@@ -4031,8 +4031,8 @@ mod tests {
     #[test]
     fn workspace_creation_in_navigate_mode_uses_selected_workspace_seed_cwd() {
         let mut app = test_app();
-        let mut first = Workspace::test_new("herdr");
-        first.identity_cwd = std::path::PathBuf::from("/tmp/herdr");
+        let mut first = Workspace::test_new("karvex");
+        first.identity_cwd = std::path::PathBuf::from("/tmp/karvex");
         let mut second = Workspace::test_new("pion");
         second.identity_cwd = std::path::PathBuf::from("/tmp/pion");
 
@@ -4052,10 +4052,10 @@ mod tests {
     fn new_terminal_cwd_follow_uses_source_cwd() {
         let cwd = creation::resolve_new_terminal_cwd(
             &crate::config::NewTerminalCwdConfig::Follow,
-            Some(std::path::PathBuf::from("/tmp/herdr-source")),
+            Some(std::path::PathBuf::from("/tmp/karvex-source")),
         );
 
-        assert_eq!(cwd, std::path::PathBuf::from("/tmp/herdr-source"));
+        assert_eq!(cwd, std::path::PathBuf::from("/tmp/karvex-source"));
     }
 
     #[test]
@@ -4073,11 +4073,11 @@ mod tests {
     #[test]
     fn new_terminal_cwd_path_uses_configured_path() {
         let cwd = creation::resolve_new_terminal_cwd(
-            &crate::config::NewTerminalCwdConfig::Path("/tmp/herdr-fixed".into()),
-            Some(std::path::PathBuf::from("/tmp/herdr-source")),
+            &crate::config::NewTerminalCwdConfig::Path("/tmp/karvex-fixed".into()),
+            Some(std::path::PathBuf::from("/tmp/karvex-source")),
         );
 
-        assert_eq!(cwd, std::path::PathBuf::from("/tmp/herdr-fixed"));
+        assert_eq!(cwd, std::path::PathBuf::from("/tmp/karvex-fixed"));
     }
 
     #[test]
@@ -4733,17 +4733,17 @@ mod tests {
         let mut parent = Workspace::test_new("api-pane-close-parent");
         parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
+            checkout_path: "/repo/karvex".into(),
             is_linked_worktree: false,
         });
         let mut child = Workspace::test_new("api-pane-close-child");
         child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
-            checkout_path: "/repo/herdr-child".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
+            checkout_path: "/repo/karvex-child".into(),
             is_linked_worktree: true,
         });
         app.state.workspaces = vec![parent, child];
@@ -4980,7 +4980,7 @@ mod tests {
             app.event_tx
                 .try_send(AppEvent::UpdateReady {
                     version: format!("9.9.{i}"),
-                    install_command: "herdr update".into(),
+                    install_command: "kvx update".into(),
                 })
                 .unwrap();
         }
@@ -6021,13 +6021,13 @@ last_pane = "prefix+tab"
         app.state.name_input_replace_on_type = true;
         app.state.worktree_create = Some(state::WorktreeCreateState {
             source_workspace_id: "source".into(),
-            source_checkout_path: "/repo/herdr".into(),
+            source_checkout_path: "/repo/karvex".into(),
             source_existing_membership: None,
-            source_repo_root: "/repo/herdr".into(),
+            source_repo_root: "/repo/karvex".into(),
             repo_key: "repo-key".into(),
-            repo_name: "herdr".into(),
+            repo_name: "karvex".into(),
             branch: "generated-branch".into(),
-            checkout_path: "/repo/herdr-generated-branch".into(),
+            checkout_path: "/repo/karvex-generated-branch".into(),
             error: None,
             creating: false,
         });

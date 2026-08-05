@@ -125,7 +125,7 @@ pub enum AppEvent {
         status: crate::detect::manifest_update::ManifestUpdateStatus,
     },
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
-    /// re-emits it through herdr's own clipboard writer.
+    /// re-emits it through karvex's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
     /// Prefix-mode ASCII input-source request, emitted on entering/leaving the ASCII input
     /// realm. The foreground process applies the host-local TIS switch (`active = true`) /

@@ -1,12 +1,12 @@
-# installed by herdr
-# managed by herdr; reinstalling or updating the integration overwrites this file.
+# installed by karvex
+# managed by karvex; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
-# HERDR_INTEGRATION_ID=copilot
-# HERDR_INTEGRATION_VERSION=2
+# KARVEX_INTEGRATION_ID=copilot
+# KARVEX_INTEGRATION_VERSION=2
 
-if ($env:HERDR_ENV -ne "1") { exit 0 }
-if ([string]::IsNullOrWhiteSpace($env:HERDR_PANE_ID)) { exit 0 }
-if ([string]::IsNullOrWhiteSpace($env:HERDR_SOCKET_PATH)) { exit 0 }
+if ($env:KARVEX_ENV -ne "1") { exit 0 }
+if ([string]::IsNullOrWhiteSpace($env:KARVEX_PANE_ID)) { exit 0 }
+if ([string]::IsNullOrWhiteSpace($env:KARVEX_SOCKET_PATH)) { exit 0 }
 
 $inputText = [Console]::In.ReadToEnd()
 try {
@@ -49,4 +49,4 @@ if ([string]::IsNullOrWhiteSpace($sessionId)) {
 if ([string]::IsNullOrWhiteSpace($sessionId)) { exit 0 }
 
 $seq = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-& herdr pane report-agent-session $env:HERDR_PANE_ID --source herdr:copilot --agent copilot --agent-session-id $sessionId --seq $seq 2>$null | Out-Null
+& kvx pane report-agent-session $env:KARVEX_PANE_ID --source karvex:copilot --agent copilot --agent-session-id $sessionId --seq $seq 2>$null | Out-Null

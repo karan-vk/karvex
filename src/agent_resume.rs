@@ -81,14 +81,14 @@ pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
 pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
-        ("herdr:claude", "claude")
-            | ("herdr:codex", "codex")
-            | ("herdr:copilot", "copilot")
-            | ("herdr:devin", "devin")
-            | ("herdr:droid", "droid")
-            | ("herdr:qodercli", "qodercli")
-            | ("herdr:cursor", "cursor")
-            | ("herdr:grok", "grok")
+        ("karvex:claude", "claude")
+            | ("karvex:codex", "codex")
+            | ("karvex:copilot", "copilot")
+            | ("karvex:devin", "devin")
+            | ("karvex:droid", "droid")
+            | ("karvex:qodercli", "qodercli")
+            | ("karvex:cursor", "cursor")
+            | ("karvex:grok", "grok")
     )
 }
 
@@ -119,82 +119,82 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
     }
 
     let argv = match (source, agent, session_ref.kind) {
-        ("herdr:claude", "claude", AgentSessionRefKind::Id) => {
+        ("karvex:claude", "claude", AgentSessionRefKind::Id) => {
             vec![
                 "claude".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
+        ("karvex:codex", "codex", AgentSessionRefKind::Id) => {
             vec!["codex".into(), "resume".into(), session_ref.value.clone()]
         }
-        ("herdr:copilot", "copilot", AgentSessionRefKind::Id) => {
+        ("karvex:copilot", "copilot", AgentSessionRefKind::Id) => {
             vec!["copilot".into(), format!("--resume={}", session_ref.value)]
         }
-        ("herdr:devin", "devin", AgentSessionRefKind::Id) => {
+        ("karvex:devin", "devin", AgentSessionRefKind::Id) => {
             vec!["devin".into(), "--resume".into(), session_ref.value.clone()]
         }
-        ("herdr:droid", "droid", AgentSessionRefKind::Id) => {
+        ("karvex:droid", "droid", AgentSessionRefKind::Id) => {
             vec!["droid".into(), "--resume".into(), session_ref.value.clone()]
         }
-        ("herdr:kimi", "kimi", AgentSessionRefKind::Id) => {
+        ("karvex:kimi", "kimi", AgentSessionRefKind::Id) => {
             vec!["kimi".into(), "--session".into(), session_ref.value.clone()]
         }
-        ("herdr:mastracode", "mastracode", AgentSessionRefKind::Id) => {
+        ("karvex:mastracode", "mastracode", AgentSessionRefKind::Id) => {
             vec![
                 "mastracode".into(),
                 "--thread".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
+        ("karvex:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
             vec!["pi".into(), "--session".into(), session_ref.value.clone()]
         }
-        ("herdr:omp", "omp", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
+        ("karvex:omp", "omp", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
             // omp resume is `-r, --resume=<value>` (ID prefix or path); it has no
             // `--session` flag, unlike pi.
             vec!["omp".into(), format!("--resume={}", session_ref.value)]
         }
-        ("herdr:hermes", "hermes", AgentSessionRefKind::Id) => {
+        ("karvex:hermes", "hermes", AgentSessionRefKind::Id) => {
             vec![
                 "hermes".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:opencode", "opencode", AgentSessionRefKind::Id) => {
+        ("karvex:opencode", "opencode", AgentSessionRefKind::Id) => {
             vec![
                 "opencode".into(),
                 "--session".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:qodercli", "qodercli", AgentSessionRefKind::Id) => {
+        ("karvex:qodercli", "qodercli", AgentSessionRefKind::Id) => {
             vec![
                 "qodercli".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:kilo", "kilo", AgentSessionRefKind::Id) => {
+        ("karvex:kilo", "kilo", AgentSessionRefKind::Id) => {
             vec!["kilo".into(), "--session".into(), session_ref.value.clone()]
         }
-        ("herdr:cursor", "cursor", AgentSessionRefKind::Id) => {
+        ("karvex:cursor", "cursor", AgentSessionRefKind::Id) => {
             vec![
                 "cursor-agent".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:antigravity_cli", "agy", AgentSessionRefKind::Id) => {
+        ("karvex:antigravity_cli", "agy", AgentSessionRefKind::Id) => {
             vec![
                 "agy".into(),
                 "--conversation".into(),
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:grok", "grok", AgentSessionRefKind::Id) => {
+        ("karvex:grok", "grok", AgentSessionRefKind::Id) => {
             vec!["grok".into(), "--resume".into(), session_ref.value.clone()]
         }
         _ => return None,
@@ -217,22 +217,22 @@ pub fn dedupe_key(source: &str, agent: &str, session_ref: &AgentSessionRef) -> S
 pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
-        ("herdr:claude", "claude")
-            | ("herdr:codex", "codex")
-            | ("herdr:copilot", "copilot")
-            | ("herdr:devin", "devin")
-            | ("herdr:droid", "droid")
-            | ("herdr:kimi", "kimi")
-            | ("herdr:omp", "omp")
-            | ("herdr:mastracode", "mastracode")
-            | ("herdr:pi", "pi")
-            | ("herdr:hermes", "hermes")
-            | ("herdr:opencode", "opencode")
-            | ("herdr:qodercli", "qodercli")
-            | ("herdr:kilo", "kilo")
-            | ("herdr:cursor", "cursor")
-            | ("herdr:antigravity_cli", "agy")
-            | ("herdr:grok", "grok")
+        ("karvex:claude", "claude")
+            | ("karvex:codex", "codex")
+            | ("karvex:copilot", "copilot")
+            | ("karvex:devin", "devin")
+            | ("karvex:droid", "droid")
+            | ("karvex:kimi", "kimi")
+            | ("karvex:omp", "omp")
+            | ("karvex:mastracode", "mastracode")
+            | ("karvex:pi", "pi")
+            | ("karvex:hermes", "hermes")
+            | ("karvex:opencode", "opencode")
+            | ("karvex:qodercli", "qodercli")
+            | ("karvex:kilo", "kilo")
+            | ("karvex:cursor", "cursor")
+            | ("karvex:antigravity_cli", "agy")
+            | ("karvex:grok", "grok")
     )
 }
 
@@ -261,12 +261,12 @@ mod tests {
 
     #[test]
     fn native_state_reservation_excludes_full_lifecycle_sources() {
-        assert!(is_reserved_native_state_source("herdr:claude", "claude"));
-        assert!(is_reserved_native_state_source("herdr:codex", "codex"));
-        assert!(is_reserved_native_state_source("herdr:devin", "devin"));
-        assert!(!is_reserved_native_state_source("herdr:kimi", "kimi"));
+        assert!(is_reserved_native_state_source("karvex:claude", "claude"));
+        assert!(is_reserved_native_state_source("karvex:codex", "codex"));
+        assert!(is_reserved_native_state_source("karvex:devin", "devin"));
+        assert!(!is_reserved_native_state_source("karvex:kimi", "kimi"));
         assert!(!is_reserved_native_state_source(
-            "herdr:opencode",
+            "karvex:opencode",
             "opencode"
         ));
     }
@@ -277,7 +277,7 @@ mod tests {
         let omp_session = absolute_test_path("omp-session.jsonl");
         assert_eq!(
             plan(
-                "herdr:claude",
+                "karvex:claude",
                 "claude",
                 &AgentSessionRef::id("claude-session").unwrap()
             )
@@ -287,7 +287,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:codex",
+                "karvex:codex",
                 "codex",
                 &AgentSessionRef::id("codex-session").unwrap()
             )
@@ -297,7 +297,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:copilot",
+                "karvex:copilot",
                 "copilot",
                 &AgentSessionRef::id("copilot-session").unwrap()
             )
@@ -307,7 +307,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:devin",
+                "karvex:devin",
                 "devin",
                 &AgentSessionRef::id("devin-session").unwrap()
             )
@@ -317,7 +317,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:droid",
+                "karvex:droid",
                 "droid",
                 &AgentSessionRef::id("droid-session").unwrap()
             )
@@ -327,7 +327,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:kimi",
+                "karvex:kimi",
                 "kimi",
                 &AgentSessionRef::id("kimi-session").unwrap()
             )
@@ -337,7 +337,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:mastracode",
+                "karvex:mastracode",
                 "mastracode",
                 &AgentSessionRef::id("mastracode-session").unwrap()
             )
@@ -347,7 +347,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:pi",
+                "karvex:pi",
                 "pi",
                 &AgentSessionRef::path(&pi_session).unwrap()
             )
@@ -357,7 +357,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:omp",
+                "karvex:omp",
                 "omp",
                 &AgentSessionRef::path(&omp_session).unwrap()
             )
@@ -367,7 +367,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:hermes",
+                "karvex:hermes",
                 "hermes",
                 &AgentSessionRef::id("hermes-session").unwrap()
             )
@@ -377,7 +377,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:opencode",
+                "karvex:opencode",
                 "opencode",
                 &AgentSessionRef::id("opencode-session").unwrap()
             )
@@ -387,7 +387,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:qodercli",
+                "karvex:qodercli",
                 "qodercli",
                 &AgentSessionRef::id("qoder-session").unwrap()
             )
@@ -397,7 +397,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:kilo",
+                "karvex:kilo",
                 "kilo",
                 &AgentSessionRef::id("kilo-session").unwrap()
             )
@@ -407,7 +407,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:cursor",
+                "karvex:cursor",
                 "cursor",
                 &AgentSessionRef::id("cursor-session").unwrap()
             )
@@ -417,7 +417,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:antigravity_cli",
+                "karvex:antigravity_cli",
                 "agy",
                 &AgentSessionRef::id("agy-session").unwrap()
             )
@@ -427,7 +427,7 @@ mod tests {
         );
         assert_eq!(
             plan(
-                "herdr:grok",
+                "karvex:grok",
                 "grok",
                 &AgentSessionRef::id("grok-session").unwrap()
             )
@@ -447,7 +447,7 @@ mod tests {
         )
         .is_none());
         assert!(plan(
-            "herdr:claude",
+            "karvex:claude",
             "claude",
             &AgentSessionRef::path(&claude_session).unwrap()
         )
@@ -461,7 +461,7 @@ mod tests {
         let claude_session = absolute_test_path("claude-session");
         let copilot_session = absolute_test_path("copilot-session");
         let session_ref = session_ref_from_report(
-            "herdr:pi",
+            "karvex:pi",
             "pi",
             Some("pi-id".into()),
             Some(pi_session.clone()),
@@ -470,15 +470,15 @@ mod tests {
         assert_eq!(session_ref.kind, AgentSessionRefKind::Path);
         assert_eq!(session_ref.value, pi_session);
 
-        assert!(session_ref_from_report("herdr:pi", "pi", Some("bad\nid".into()), None).is_none());
+        assert!(session_ref_from_report("karvex:pi", "pi", Some("bad\nid".into()), None).is_none());
         assert!(
-            session_ref_from_report("herdr:pi", "pi", None, Some("relative.jsonl".into()))
+            session_ref_from_report("karvex:pi", "pi", None, Some("relative.jsonl".into()))
                 .is_none()
         );
         assert!(session_ref_from_report("custom:pi", "pi", Some("pi-id".into()), None).is_none());
 
         let session_ref = session_ref_from_report(
-            "herdr:omp",
+            "karvex:omp",
             "omp",
             Some("omp-id".into()),
             Some(omp_session.clone()),
@@ -488,11 +488,11 @@ mod tests {
         assert_eq!(session_ref.value, omp_session);
 
         let session_ref =
-            session_ref_from_report("herdr:omp", "omp", Some("omp-id".into()), None).unwrap();
+            session_ref_from_report("karvex:omp", "omp", Some("omp-id".into()), None).unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "omp-id");
         let session_ref = session_ref_from_report(
-            "herdr:omp",
+            "karvex:omp",
             "omp",
             Some("omp-id".into()),
             Some("relative.jsonl".into()),
@@ -501,35 +501,38 @@ mod tests {
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "omp-id");
         assert!(
-            session_ref_from_report("herdr:omp", "omp", None, Some("relative.jsonl".into()))
+            session_ref_from_report("karvex:omp", "omp", None, Some("relative.jsonl".into()))
                 .is_none()
         );
 
         assert!(
-            session_ref_from_report("herdr:claude", "claude", None, Some(claude_session)).is_none()
+            session_ref_from_report("karvex:claude", "claude", None, Some(claude_session))
+                .is_none()
         );
 
         let session_ref =
-            session_ref_from_report("herdr:copilot", "copilot", Some("copilot-id".into()), None)
+            session_ref_from_report("karvex:copilot", "copilot", Some("copilot-id".into()), None)
                 .unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "copilot-id");
         assert!(
-            session_ref_from_report("herdr:copilot", "copilot", None, Some(copilot_session))
+            session_ref_from_report("karvex:copilot", "copilot", None, Some(copilot_session))
                 .is_none()
         );
 
         let session_ref =
-            session_ref_from_report("herdr:devin", "devin", Some("devin-id".into()), None).unwrap();
+            session_ref_from_report("karvex:devin", "devin", Some("devin-id".into()), None)
+                .unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "devin-id");
 
         let session_ref =
-            session_ref_from_report("herdr:droid", "droid", Some("droid-id".into()), None).unwrap();
+            session_ref_from_report("karvex:droid", "droid", Some("droid-id".into()), None)
+                .unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "droid-id");
         assert!(session_ref_from_report(
-            "herdr:droid",
+            "karvex:droid",
             "droid",
             None,
             Some("/tmp/droid-session".into())
@@ -537,12 +540,12 @@ mod tests {
         .is_none());
 
         let session_ref =
-            session_ref_from_report("herdr:kimi", "kimi", Some("kimi-id".into()), None).unwrap();
+            session_ref_from_report("karvex:kimi", "kimi", Some("kimi-id".into()), None).unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "kimi-id");
 
         let session_ref = session_ref_from_report(
-            "herdr:mastracode",
+            "karvex:mastracode",
             "mastracode",
             Some("mastracode-id".into()),
             None,
@@ -552,18 +555,18 @@ mod tests {
         assert_eq!(session_ref.value, "mastracode-id");
 
         let session_ref =
-            session_ref_from_report("herdr:kilo", "kilo", Some("kilo-id".into()), None).unwrap();
+            session_ref_from_report("karvex:kilo", "kilo", Some("kilo-id".into()), None).unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "kilo-id");
 
         let session_ref =
-            session_ref_from_report("herdr:qodercli", "qodercli", Some("qoder-id".into()), None)
+            session_ref_from_report("karvex:qodercli", "qodercli", Some("qoder-id".into()), None)
                 .unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "qoder-id");
 
         let session_ref =
-            session_ref_from_report("herdr:antigravity_cli", "agy", Some("agy-id".into()), None)
+            session_ref_from_report("karvex:antigravity_cli", "agy", Some("agy-id".into()), None)
                 .unwrap();
         assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
         assert_eq!(session_ref.value, "agy-id");
@@ -606,18 +609,18 @@ mod tests {
     #[test]
     fn ids_are_data_not_shell_text() {
         let id = "abc; rm -rf /";
-        let codex_plan = plan("herdr:codex", "codex", &AgentSessionRef::id(id).unwrap()).unwrap();
+        let codex_plan = plan("karvex:codex", "codex", &AgentSessionRef::id(id).unwrap()).unwrap();
         assert_eq!(codex_plan.argv, vec!["codex", "resume", id]);
 
         let copilot_plan = plan(
-            "herdr:copilot",
+            "karvex:copilot",
             "copilot",
             &AgentSessionRef::id(id).unwrap(),
         )
         .unwrap();
         assert_eq!(copilot_plan.argv, vec!["copilot", "--resume=abc; rm -rf /"]);
 
-        let devin_plan = plan("herdr:devin", "devin", &AgentSessionRef::id(id).unwrap()).unwrap();
+        let devin_plan = plan("karvex:devin", "devin", &AgentSessionRef::id(id).unwrap()).unwrap();
         assert_eq!(devin_plan.argv, vec!["devin", "--resume", id]);
     }
 
@@ -629,79 +632,79 @@ mod tests {
         let copilot_session = absolute_test_path("copilot-session");
         let devin_session = absolute_test_path("devin-session");
         assert!(plan(
-            "herdr:hermes",
+            "karvex:hermes",
             "hermes",
             &AgentSessionRef::path(&hermes_session).unwrap()
         )
         .is_none());
         assert!(plan(
-            "herdr:opencode",
+            "karvex:opencode",
             "opencode",
             &AgentSessionRef::path(&opencode_session).unwrap()
         )
         .is_none());
         assert!(plan(
-            "herdr:kilo",
+            "karvex:kilo",
             "kilo",
             &AgentSessionRef::path(&kilo_session).unwrap()
         )
         .is_none());
         assert!(plan(
-            "herdr:copilot",
+            "karvex:copilot",
             "copilot",
             &AgentSessionRef::path(&copilot_session).unwrap()
         )
         .is_none());
         assert!(plan(
-            "herdr:devin",
+            "karvex:devin",
             "devin",
             &AgentSessionRef::path(&devin_session).unwrap()
         )
         .is_none());
         assert!(session_ref_from_snapshot(
-            "herdr:mastracode",
+            "karvex:mastracode",
             "mastracode",
             AgentSessionRefKind::Id,
             "mastracode-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(
-            "herdr:hermes",
+            "karvex:hermes",
             "hermes",
             AgentSessionRefKind::Id,
             "hermes-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(
-            "herdr:opencode",
+            "karvex:opencode",
             "opencode",
             AgentSessionRefKind::Id,
             "opencode-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(
-            "herdr:kilo",
+            "karvex:kilo",
             "kilo",
             AgentSessionRefKind::Id,
             "kilo-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(
-            "herdr:copilot",
+            "karvex:copilot",
             "copilot",
             AgentSessionRefKind::Id,
             "copilot-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(
-            "herdr:devin",
+            "karvex:devin",
             "devin",
             AgentSessionRefKind::Id,
             "devin-session"
         )
         .is_some());
         assert!(session_ref_from_snapshot(
-            "herdr:antigravity_cli",
+            "karvex:antigravity_cli",
             "agy",
             AgentSessionRefKind::Id,
             "agy-session"
@@ -709,7 +712,7 @@ mod tests {
         .is_some());
         let agy_session = absolute_test_path("agy-session");
         assert!(plan(
-            "herdr:antigravity_cli",
+            "karvex:antigravity_cli",
             "agy",
             &AgentSessionRef::path(&agy_session).unwrap()
         )

@@ -23,7 +23,7 @@ use super::{
     input::{
         ghostty_key_event_from_terminal_key, ghostty_mouse_encoder_for_terminal,
         ghostty_mouse_event_from_button_kind, ghostty_mouse_event_from_motion_kind,
-        ghostty_mouse_event_from_wheel_kind, ghostty_prefers_herdr_text_encoding,
+        ghostty_mouse_event_from_wheel_kind, ghostty_prefers_karvex_text_encoding,
     },
     kitty_keyboard::KittyKeyboardTracker,
     osc::{
@@ -1711,7 +1711,7 @@ impl GhosttyPaneTerminal {
         key: crate::input::TerminalKey,
         protocol: crate::input::KeyboardProtocol,
     ) -> Vec<u8> {
-        if ghostty_prefers_herdr_text_encoding(&key) {
+        if ghostty_prefers_karvex_text_encoding(&key) {
             return crate::input::encode_terminal_key(key, protocol);
         }
 
@@ -3417,19 +3417,19 @@ mod tests {
         let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
         let pane_id = PaneId::from_raw(1);
 
-        let partial = pane.process_pty_bytes(pane_id, 0, b"\x1b]7;file:///tmp/herdr%20", &tx);
+        let partial = pane.process_pty_bytes(pane_id, 0, b"\x1b]7;file:///tmp/karvex%20", &tx);
         assert_eq!(partial.reported_cwd, None);
 
         let completed = pane.process_pty_bytes(pane_id, 0, b"repo\x07", &tx);
         #[cfg(not(windows))]
         assert_eq!(
             completed.reported_cwd,
-            Some(std::path::PathBuf::from("/tmp/herdr repo"))
+            Some(std::path::PathBuf::from("/tmp/karvex repo"))
         );
         #[cfg(windows)]
         assert_eq!(
             completed.reported_cwd,
-            Some(std::path::PathBuf::from("\\tmp\\herdr repo"))
+            Some(std::path::PathBuf::from("\\tmp\\karvex repo"))
         );
 
         let latest = pane.process_pty_bytes(
@@ -3970,7 +3970,7 @@ mod tests {
     }
 
     #[test]
-    fn ghostty_char_keys_still_use_herdr_encoding() {
+    fn ghostty_char_keys_still_use_karvex_encoding() {
         let (tx, _rx) = mpsc::channel(4);
         let mut terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
         terminal.write(b"\x1b[>1u");

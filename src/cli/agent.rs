@@ -85,10 +85,8 @@ fn agent_explain(args: &[String]) -> std::io::Result<i32> {
                 index += 1;
             }
             "help" | "--help" | "-h" => {
-                eprintln!("usage: herdr agent explain <target> [--json|--verbose]");
-                eprintln!(
-                    "usage: herdr agent explain --file PATH --agent LABEL [--json|--verbose]"
-                );
+                eprintln!("usage: kvx agent explain <target> [--json|--verbose]");
+                eprintln!("usage: kvx agent explain --file PATH --agent LABEL [--json|--verbose]");
                 return Ok(0);
             }
             value if value.starts_with('-') => {
@@ -97,7 +95,7 @@ fn agent_explain(args: &[String]) -> std::io::Result<i32> {
             }
             value => {
                 if target.is_some() {
-                    eprintln!("usage: herdr agent explain <target> [--json]");
+                    eprintln!("usage: kvx agent explain <target> [--json]");
                     return Ok(2);
                 }
                 target = Some(value.to_string());
@@ -108,11 +106,11 @@ fn agent_explain(args: &[String]) -> std::io::Result<i32> {
 
     let explain = if let Some(path) = file {
         if target.is_some() {
-            eprintln!("usage: herdr agent explain --file PATH --agent LABEL [--json]");
+            eprintln!("usage: kvx agent explain --file PATH --agent LABEL [--json]");
             return Ok(2);
         }
         let Some(agent_label) = agent else {
-            eprintln!("herdr agent explain --file requires --agent LABEL");
+            eprintln!("kvx agent explain --file requires --agent LABEL");
             return Ok(2);
         };
         let content = std::fs::read_to_string(path)?;
@@ -122,8 +120,8 @@ fn agent_explain(args: &[String]) -> std::io::Result<i32> {
         ))
     } else {
         let Some(target) = target else {
-            eprintln!("usage: herdr agent explain <target> [--json]");
-            eprintln!("usage: herdr agent explain --file PATH --agent LABEL [--json]");
+            eprintln!("usage: kvx agent explain <target> [--json]");
+            eprintln!("usage: kvx agent explain --file PATH --agent LABEL [--json]");
             return Ok(2);
         };
         if agent.is_some() {
@@ -271,7 +269,7 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+        eprintln!("usage: kvx agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
         return Ok(2);
     };
     let separator = args
@@ -376,7 +374,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
     if !args.is_empty() {
-        eprintln!("usage: herdr agent list");
+        eprintln!("usage: kvx agent list");
         return Ok(2);
     }
 
@@ -388,11 +386,11 @@ fn agent_list(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_get(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent get <target>");
+        eprintln!("usage: kvx agent get <target>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: herdr agent get <target>");
+        eprintln!("usage: kvx agent get <target>");
         return Ok(2);
     }
 
@@ -406,11 +404,11 @@ fn agent_get(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_focus(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent focus <target>");
+        eprintln!("usage: kvx agent focus <target>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: herdr agent focus <target>");
+        eprintln!("usage: kvx agent focus <target>");
         return Ok(2);
     }
 
@@ -424,7 +422,7 @@ fn agent_focus(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_attach(args: &[String]) -> std::io::Result<i32> {
     let (target, takeover) =
-        match super::parse_attach_target(args, "usage: herdr agent attach <target> [--takeover]") {
+        match super::parse_attach_target(args, "usage: kvx agent attach <target> [--takeover]") {
             Ok(parsed) => parsed,
             Err(code) => return Ok(code),
         };
@@ -444,7 +442,7 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent wait <target> [--until STATUS]... [--timeout MS]");
+        eprintln!("usage: kvx agent wait <target> [--until STATUS]... [--timeout MS]");
         return Ok(2);
     };
     let mut until = Vec::new();
@@ -479,7 +477,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
                 index += 2;
             }
             "help" | "--help" | "-h" => {
-                eprintln!("usage: herdr agent wait <target> [--until STATUS]... [--timeout MS]");
+                eprintln!("usage: kvx agent wait <target> [--until STATUS]... [--timeout MS]");
                 return Ok(0);
             }
             other => {
@@ -624,7 +622,7 @@ fn agent_get_request(target: &str, request_id: &str) -> Request {
 
 fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     let [target, value] = args else {
-        eprintln!("usage: herdr agent rename <target> <name>|--clear");
+        eprintln!("usage: kvx agent rename <target> <name>|--clear");
         return Ok(2);
     };
     let name = if value == "--clear" {
@@ -645,7 +643,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+            "usage: kvx agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
         );
         return Ok(2);
     };
@@ -716,7 +714,7 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: herdr agent send-keys <target> <key> [key ...]");
+        eprintln!("usage: kvx agent send-keys <target> <key> [key ...]");
         return Ok(2);
     }
 
@@ -731,7 +729,7 @@ fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!("usage: kvx agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
         return Ok(2);
     };
 
@@ -794,22 +792,20 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn print_agent_help() {
-    eprintln!("herdr agent commands:");
-    eprintln!("  herdr agent list");
-    eprintln!("  herdr agent get <target>");
-    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  herdr agent send-keys <target> <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
-    eprintln!("  herdr agent rename <target> <name>|--clear");
-    eprintln!("  herdr agent focus <target>");
-    eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
-    eprintln!("  herdr agent attach <target> [--takeover]");
+    eprintln!("kvx agent commands:");
+    eprintln!("  kvx agent list");
+    eprintln!("  kvx agent get <target>");
+    eprintln!("  kvx agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  kvx agent send-keys <target> <key> [key ...]");
+    eprintln!("  kvx agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  kvx agent rename <target> <name>|--clear");
+    eprintln!("  kvx agent focus <target>");
+    eprintln!("  kvx agent wait <target> [--until STATUS]... [--timeout MS]");
+    eprintln!("  kvx agent attach <target> [--takeover]");
+    eprintln!("  kvx agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+    eprintln!("  kvx agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
-        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
-    );
-    eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
-    eprintln!(
-        "  herdr agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
+        "  kvx agent explain --file PATH --agent LABEL [--json|--format text|json] [--verbose]"
     );
     eprintln!("  targets accept unique agent names and pane ids that currently host agents");
     eprintln!("  kinds: {}", super::spec::agent_kind_values().join("|"));

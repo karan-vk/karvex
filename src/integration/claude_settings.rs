@@ -589,7 +589,7 @@ mod tests {
     fn paths() -> (&'static Path, &'static Path) {
         (
             Path::new("/home/test/.claude/settings.json"),
-            Path::new("/home/test/.claude/hooks/herdr-agent-state.sh"),
+            Path::new("/home/test/.claude/hooks/karvex-agent-state.sh"),
         )
     }
 

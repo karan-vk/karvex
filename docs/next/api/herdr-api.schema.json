@@ -2305,7 +2305,7 @@
             "position": {
               "anyOf": [
                 {
-                  "$ref": "#/schemas/request/$defs/ToastHerdrPosition"
+                  "$ref": "#/schemas/request/$defs/ToastKarvexPosition"
                 },
                 {
                   "type": "null"
@@ -4091,7 +4091,7 @@
           ],
           "type": "object"
         },
-        "ToastHerdrPosition": {
+        "ToastKarvexPosition": {
           "enum": [
             "top-left",
             "top-right",
@@ -7023,7 +7023,7 @@
             "manifest_path": {
               "type": "string"
             },
-            "min_herdr_version": {
+            "min_karvex_version": {
               "default": "",
               "type": "string"
             },
@@ -9969,5 +9969,5 @@
       "type": "object"
     }
   },
-  "title": "Herdr API"
+  "title": "Karvex API"
 }

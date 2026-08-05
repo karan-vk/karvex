@@ -1,7 +1,7 @@
 //! Thin client mode — connects to the server's client socket.
 //!
 //! The client:
-//! - Connects to `herdr-client.sock`, sends Hello with terminal size and protocol version
+//! - Connects to `karvex-client.sock`, sends Hello with terminal size and protocol version
 //! - Sets up the real terminal (raw mode, mouse capture, keyboard enhancements)
 //! - Receives Frame messages and blits them to the terminal (diff against last frame)
 //! - Reads stdin events (keystrokes, mouse, paste) and sends them as ClientMessage::Input
@@ -82,7 +82,7 @@ struct ClientState {
     /// Rows scrolled for one direct-attach wheel notch.
     #[cfg(unix)]
     mouse_scroll_lines: usize,
-    /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
+    /// Local-client shortcut that sends a clipboard image to a remote Karvex session.
     #[cfg(unix)]
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     /// Whether outer focus gain should force a full host-terminal redraw.
@@ -252,10 +252,7 @@ impl std::fmt::Display for ClientError {
             ClientError::ConnectionFailed(err) => {
                 write!(f, "failed to connect to server: {err}")?;
                 let path = client_socket_path();
-                write!(
-                    f,
-                    "\nIs herdr server running? Start it with `herdr server`."
-                )?;
+                write!(f, "\nIs karvex server running? Start it with `kvx server`.")?;
                 write!(f, "\nSocket path: {}", path.display())
             }
             ClientError::HandshakeRejected { version, error } => {
@@ -290,7 +287,7 @@ impl std::fmt::Display for ClientError {
             ClientError::ConnectionLost(err) => {
                 if let Ok(reattach_command) = std::env::var(crate::remote::REATTACH_COMMAND_ENV_VAR)
                 {
-                    write!(f, "lost connection to remote Herdr: {err}")?;
+                    write!(f, "lost connection to remote Karvex: {err}")?;
                     write!(f, "\nIf the remote server survived the SSH or network drop, its panes may still be running.")?;
                     write!(f, "\nRun `{reattach_command}` to reattach")
                 } else {
@@ -528,7 +525,7 @@ fn enable_windows_virtual_terminal_input() -> WindowsVirtualTerminalInputSetup {
 
 #[cfg(windows)]
 fn windows_vti_input_backend_enabled() -> bool {
-    std::env::var("HERDR_WINDOWS_INPUT_BACKEND")
+    std::env::var("KARVEX_WINDOWS_INPUT_BACKEND")
         .map(|backend| !backend.eq_ignore_ascii_case("crossterm"))
         .unwrap_or(true)
 }
@@ -628,7 +625,7 @@ fn pop_keyboard_enhancement_flags() -> io::Result<()> {
 
 #[cfg(windows)]
 fn windows_win32_input_mode_enabled() -> bool {
-    std::env::var("HERDR_WINDOWS_INPUT_PROBE")
+    std::env::var("KARVEX_WINDOWS_INPUT_PROBE")
         .map(|probe| probe.eq_ignore_ascii_case("win32"))
         .unwrap_or(true)
 }
@@ -661,7 +658,7 @@ impl Drop for TerminalGuard {
 // ---------------------------------------------------------------------------
 
 fn requested_render_encoding() -> RenderEncoding {
-    match std::env::var("HERDR_RENDER_ENCODING").ok().as_deref() {
+    match std::env::var("KARVEX_RENDER_ENCODING").ok().as_deref() {
         Some("terminal-ansi" | "terminal_ansi" | "ansi") => RenderEncoding::TerminalAnsi,
         _ => RenderEncoding::SemanticFrame,
     }
@@ -675,7 +672,7 @@ fn is_remote_client_process() -> bool {
 /// Time to wait for the server's Welcome reply during the handshake.
 ///
 /// A local client talks to an already-connected server, so 5s is plenty. The
-/// remote bridge client (`herdr --remote`) sits behind a fresh per-attach ssh
+/// remote bridge client (`kvx --remote`) sits behind a fresh per-attach ssh
 /// connection whose cold-connect (TCP + key exchange + auth) happens inside this
 /// window; on a high-latency link that easily exceeds 5s, so it gets a far
 /// larger budget. See issue #753.
@@ -900,7 +897,7 @@ pub fn run_terminal_session_control(
                         return;
                     }
                 }
-                Err(err) => eprintln!("herdr: terminal session control input ignored: {err}"),
+                Err(err) => eprintln!("kvx: terminal session control input ignored: {err}"),
             }
         }
         let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
@@ -924,7 +921,7 @@ fn connect_terminal_session_stream(
     let mut stream = match crate::ipc::connect_local_stream(&socket_path) {
         Ok(stream) => stream,
         Err(err) => {
-            eprintln!("herdr: {}", ClientError::ConnectionFailed(err));
+            eprintln!("kvx: {}", ClientError::ConnectionFailed(err));
             std::process::exit(1);
         }
     };
@@ -940,13 +937,11 @@ fn connect_terminal_session_stream(
     ) {
         Ok(RenderEncoding::TerminalAnsi) => {}
         Ok(encoding) => {
-            eprintln!(
-                "herdr: terminal session observe negotiated unsupported encoding {encoding:?}"
-            );
+            eprintln!("kvx: terminal session observe negotiated unsupported encoding {encoding:?}");
             std::process::exit(1);
         }
         Err(err) => {
-            eprintln!("herdr: {err}");
+            eprintln!("kvx: {err}");
             std::process::exit(1);
         }
     }
@@ -1151,7 +1146,7 @@ fn run_client_with_mode(
         Err(err) => {
             // Server unreachable — show clear error and exit.
             let client_err = ClientError::ConnectionFailed(err);
-            eprintln!("herdr: {client_err}");
+            eprintln!("kvx: {client_err}");
             std::process::exit(1);
         }
     };
@@ -1172,7 +1167,7 @@ fn run_client_with_mode(
     ) {
         Ok(encoding) => encoding,
         Err(err) => {
-            eprintln!("herdr: {err}");
+            eprintln!("kvx: {err}");
             std::process::exit(1);
         }
     };
@@ -1183,7 +1178,7 @@ fn run_client_with_mode(
             takeover,
         };
         if let Err(err) = write_to_server(&mut stream, &attach) {
-            eprintln!("herdr: failed to request terminal attach: {err}");
+            eprintln!("kvx: failed to request terminal attach: {err}");
             std::process::exit(1);
         }
     }
@@ -1197,7 +1192,7 @@ fn run_client_with_mode(
         setup_terminal(mouse_capture)
     }
     .map_err(|err| {
-        eprintln!("herdr: failed to set up terminal: {err}");
+        eprintln!("kvx: failed to set up terminal: {err}");
         err
     })?;
 
@@ -1253,7 +1248,7 @@ fn run_client_with_mode(
     drop(terminal_guard);
 
     if let Err(err) = result {
-        eprintln!("herdr: {err}");
+        eprintln!("kvx: {err}");
         rt.shutdown_timeout(Duration::from_millis(100));
         crate::logging::shutdown("client");
 
@@ -2004,7 +1999,7 @@ fn forward_clipboard(data: &str) {
 }
 
 fn window_title_osc(title: Option<&str>) -> Vec<u8> {
-    let title = title.unwrap_or("herdr");
+    let title = title.unwrap_or("karvex");
     let safe_title = title
         .chars()
         .filter(|ch| !matches!(*ch, '\u{1b}' | '\u{7}' | '\u{9c}'))
@@ -2278,7 +2273,7 @@ fn reported_cell_size_from_events(
 }
 
 fn init_logging() {
-    crate::logging::init_file_logging("herdr-client.log");
+    crate::logging::init_file_logging("karvex-client.log");
 }
 
 // ---------------------------------------------------------------------------
@@ -2438,7 +2433,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "herdr-client-drop-{name_fragment}-{}-{nanos}.{extension}",
+                "karvex-client-drop-{name_fragment}-{}-{nanos}.{extension}",
                 std::process::id()
             ));
             std::fs::write(&path, bytes).unwrap();
@@ -2536,7 +2531,7 @@ mod tests {
     }
 
     #[test]
-    fn kitty_graphics_image_id_parser_tracks_herdr_ids_only() {
+    fn kitty_graphics_image_id_parser_tracks_karvex_ids_only() {
         let ids = kitty_graphics_image_ids(
             b"text\x1b_Ga=t,t=d,f=32,s=1,v=1,i=10023,q=2;AAAA\x1b\\\x1b_Ga=p,i=10023,p=7;\x1b\\",
         );
@@ -2792,7 +2787,7 @@ mod tests {
             "should mention connection failure: {msg}"
         );
         assert!(
-            msg.contains("herdr server"),
+            msg.contains("karvex server"),
             "should suggest starting server: {msg}"
         );
     }
@@ -2846,7 +2841,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `herdr` to reattach"),
+            msg.contains("Run `kvx` to reattach"),
             "should suggest default reattach command: {msg}"
         );
     }
@@ -2861,7 +2856,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `herdr session attach work` to reattach"),
+            msg.contains("Run `kvx session attach work` to reattach"),
             "should suggest named session reattach command: {msg}"
         );
     }
@@ -2871,7 +2866,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let _remote_env = EnvVarGuard::set(
             crate::remote::REATTACH_COMMAND_ENV_VAR,
-            "herdr --remote host --session work",
+            "kvx --remote host --session work",
         );
         let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
         let err = ClientError::ServerShutdown {
@@ -2879,7 +2874,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("Run `herdr --remote host --session work` to reattach"),
+            msg.contains("Run `kvx --remote host --session work` to reattach"),
             "should prefer remote reattach command: {msg}"
         );
     }
@@ -2902,13 +2897,13 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let _remote_env = EnvVarGuard::set(
             crate::remote::REATTACH_COMMAND_ENV_VAR,
-            "herdr --remote host --session work",
+            "kvx --remote host --session work",
         );
         let err =
             ClientError::ConnectionLost(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"));
         let msg = err.to_string();
         assert!(
-            msg.contains("lost connection to remote Herdr"),
+            msg.contains("lost connection to remote Karvex"),
             "should mention remote connection loss: {msg}"
         );
         assert!(
@@ -2916,7 +2911,7 @@ mod tests {
             "should explain possible persistence: {msg}"
         );
         assert!(
-            msg.contains("Run `herdr --remote host --session work` to reattach"),
+            msg.contains("Run `kvx --remote host --session work` to reattach"),
             "should show remote reattach command: {msg}"
         );
     }
@@ -2946,7 +2941,7 @@ mod tests {
     fn reload_local_client_config_refreshes_local_client_presentation_state() {
         let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let path = std::env::temp_dir().join(format!(
-            "herdr-client-config-reload-{}-{}.toml",
+            "karvex-client-config-reload-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3136,11 +3131,11 @@ mod tests {
     }
 
     #[test]
-    fn window_title_osc_strips_terminators_and_defaults_to_herdr() {
+    fn window_title_osc_strips_terminators_and_defaults_to_karvex() {
         assert_eq!(
-            window_title_osc(Some("herdr\x1b api\u{7}\u{9c}")),
-            b"\x1b]0;herdr api\x07"
+            window_title_osc(Some("karvex\x1b api\u{7}\u{9c}")),
+            b"\x1b]0;karvex api\x07"
         );
-        assert_eq!(window_title_osc(None), b"\x1b]0;herdr\x07");
+        assert_eq!(window_title_osc(None), b"\x1b]0;karvex\x07");
     }
 }

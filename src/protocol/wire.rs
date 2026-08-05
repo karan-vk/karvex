@@ -1,4 +1,4 @@
-//! Wire protocol for herdr server/client communication.
+//! Wire protocol for karvex server/client communication.
 //!
 //! Defines the message types, framing, version negotiation, and safety
 //! constraints for the binary protocol over Unix domain sockets.
@@ -459,7 +459,7 @@ pub struct CellData {
     pub fg: u32,
     /// Background color as a packed u32.
     pub bg: u32,
-    /// Bitmask of style modifiers (bold, italic, etc.) plus Herdr extension bits.
+    /// Bitmask of style modifiers (bold, italic, etc.) plus Karvex extension bits.
     pub modifier: u16,
     /// Whether this cell should be skipped during diff-based rendering.
     pub skip: bool,
@@ -685,7 +685,7 @@ pub enum ServerMessage {
 
     /// Set the foreground client's outer terminal window title.
     WindowTitle {
-        /// Sanitized title to write with OSC 0. `None` restores Herdr's default title.
+        /// Sanitized title to write with OSC 0. `None` restores Karvex's default title.
         title: Option<String>,
     },
 
@@ -694,7 +694,7 @@ pub enum ServerMessage {
 
     /// Whether the client should currently capture host mouse input.
     MouseCapture {
-        /// True when Herdr mouse UI is enabled or the focused pane app requests mouse reporting.
+        /// True when Karvex mouse UI is enabled or the focused pane app requests mouse reporting.
         enabled: bool,
     },
 
@@ -969,11 +969,11 @@ pub fn check_client_version(client_version: u32) -> VersionCheck {
         VersionCheck::Compatible
     } else if client_version < PROTOCOL_VERSION {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is older than server version {PROTOCOL_VERSION}; please upgrade your herdr client"
+            "client version {client_version} is older than server version {PROTOCOL_VERSION}; please upgrade your karvex client"
         ))
     } else {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is newer than server version {PROTOCOL_VERSION}; please upgrade the herdr server"
+            "client version {client_version} is newer than server version {PROTOCOL_VERSION}; please upgrade the karvex server"
         ))
     }
 }
@@ -1482,7 +1482,7 @@ mod tests {
 
     #[test]
     fn server_window_title_roundtrip() {
-        for title in [Some("herdr api".to_owned()), None] {
+        for title in [Some("karvex api".to_owned()), None] {
             let msg = ServerMessage::WindowTitle { title };
             let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
             let (decoded, _): (ServerMessage, _) =

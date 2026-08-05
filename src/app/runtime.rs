@@ -425,7 +425,7 @@ impl App {
     pub(crate) fn expire_metadata_at(&mut self, deadline: Instant, now: Instant) {
         let previous_toast = self.state.toast.clone();
         for update in self.state.expire_agent_metadata_at(deadline, now) {
-            self.refresh_new_herdr_toast_context_for_update(&update, &previous_toast);
+            self.refresh_new_karvex_toast_context_for_update(&update, &previous_toast);
             self.emit_pane_state_update(&update);
         }
         let (panes, workspaces) = self.state.expire_metadata_tokens(now);
@@ -864,7 +864,7 @@ mod tests {
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
-            dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            dedupe_key: "karvex:codex\0codex\0Id\0codex-session".into(),
         });
 
         assert!(
@@ -919,7 +919,7 @@ mod tests {
             .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "codex".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
-            dedupe_key: "herdr:codex\0codex\0Id\0codex-session".into(),
+            dedupe_key: "karvex:codex\0codex\0Id\0codex-session".into(),
         });
         app.pending_agent_resume_deadline = Some(Instant::now() - Duration::from_millis(1));
 

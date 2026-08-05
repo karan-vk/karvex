@@ -76,10 +76,10 @@ class ChangelogScriptTests(unittest.TestCase):
         self.assertEqual(
             manifest["assets"],
             {
-                "linux-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.1.1/herdr-linux-x86_64",
-                "linux-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.1.1/herdr-linux-aarch64",
-                "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.1.1/herdr-macos-x86_64",
-                "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.1.1/herdr-macos-aarch64",
+                "linux-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.1.1/kvx-linux-x86_64",
+                "linux-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.1.1/kvx-linux-aarch64",
+                "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.1.1/kvx-macos-x86_64",
+                "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.1.1/kvx-macos-aarch64",
             },
         )
         self.assertEqual(manifest["releases"]["0.1.1"]["assets"], manifest["assets"])
@@ -251,7 +251,7 @@ class ChangelogScriptTests(unittest.TestCase):
             path.unlink(missing_ok=True)
 
     def test_load_product_announcement_rejects_missing_file(self) -> None:
-        path = Path(tempfile.gettempdir()) / "herdr-missing-product-announcement.json"
+        path = Path(tempfile.gettempdir()) / "karvex-missing-product-announcement.json"
         path.unlink(missing_ok=True)
         with self.assertRaisesRegex(ChangelogError, "file not found"):
             load_product_announcement(path)
@@ -288,10 +288,10 @@ class ChangelogScriptTests(unittest.TestCase):
                 "isPrerelease": False,
                 "body": "### Fixed\n- One\n",
                 "assets": [
-                    {"name": "herdr-linux-x86_64", "url": "https://example.com/linux-x86_64"},
-                    {"name": "herdr-linux-aarch64", "url": "https://example.com/linux-aarch64"},
-                    {"name": "herdr-macos-x86_64", "url": "https://example.com/macos-x86_64"},
-                    {"name": "herdr-macos-aarch64", "url": "https://example.com/macos-aarch64"},
+                    {"name": "kvx-linux-x86_64", "url": "https://example.com/linux-x86_64"},
+                    {"name": "kvx-linux-aarch64", "url": "https://example.com/linux-aarch64"},
+                    {"name": "kvx-macos-x86_64", "url": "https://example.com/macos-x86_64"},
+                    {"name": "kvx-macos-aarch64", "url": "https://example.com/macos-aarch64"},
                 ],
             },
             "0.1.1",
@@ -320,10 +320,10 @@ class ChangelogScriptTests(unittest.TestCase):
                 "isPrerelease": False,
                 "body": "### Fixed\n- One\n",
                 "assets": [
-                    {"name": "herdr-linux-x86_64", "url": "https://example.com/linux-x86_64"},
-                    {"name": "herdr-linux-aarch64", "url": "https://example.com/linux-aarch64"},
-                    {"name": "herdr-macos-x86_64", "url": "https://example.com/macos-x86_64"},
-                    {"name": "herdr-macos-aarch64", "url": "https://example.com/macos-aarch64"},
+                    {"name": "kvx-linux-x86_64", "url": "https://example.com/linux-x86_64"},
+                    {"name": "kvx-linux-aarch64", "url": "https://example.com/linux-aarch64"},
+                    {"name": "kvx-macos-x86_64", "url": "https://example.com/macos-x86_64"},
+                    {"name": "kvx-macos-aarch64", "url": "https://example.com/macos-aarch64"},
                 ],
             },
             "0.1.1",
@@ -333,7 +333,7 @@ class ChangelogScriptTests(unittest.TestCase):
         self.assertEqual(manifest["protocol"], 42)
 
     def test_manifest_from_release_payload_rejects_missing_asset(self) -> None:
-        with self.assertRaisesRegex(ChangelogError, "missing asset herdr-macos-aarch64"):
+        with self.assertRaisesRegex(ChangelogError, "missing asset kvx-macos-aarch64"):
             manifest_from_release_payload(
                 {
                     "tagName": "v0.1.1",
@@ -341,9 +341,9 @@ class ChangelogScriptTests(unittest.TestCase):
                     "isPrerelease": False,
                     "body": "### Fixed\n- One\n",
                     "assets": [
-                        {"name": "herdr-linux-x86_64", "url": "https://example.com/linux-x86_64"},
-                        {"name": "herdr-linux-aarch64", "url": "https://example.com/linux-aarch64"},
-                        {"name": "herdr-macos-x86_64", "url": "https://example.com/macos-x86_64"},
+                        {"name": "kvx-linux-x86_64", "url": "https://example.com/linux-x86_64"},
+                        {"name": "kvx-linux-aarch64", "url": "https://example.com/linux-aarch64"},
+                        {"name": "kvx-macos-x86_64", "url": "https://example.com/macos-x86_64"},
                     ],
                 },
                 "0.1.1",

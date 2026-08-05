@@ -14,8 +14,8 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::Deserialize;
 use serde_json::{json, Value};
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
+    cleanup_test_base, register_runtime_dir, register_spawned_karvex_pid,
+    unregister_spawned_karvex_pid, CURRENT_PROTOCOL,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -24,23 +24,23 @@ fn unique_test_dir() -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     PathBuf::from(format!(
-        "/tmp/herdr-cross-area-test-{}-{nanos}",
+        "/tmp/karvex-cross-area-test-{}-{nanos}",
         std::process::id()
     ))
 }
 
-struct SpawnedHerdr {
+struct SpawnedKarvex {
     _master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
 }
 
-impl SpawnedHerdr {
+impl SpawnedKarvex {
     fn close_master(&mut self) {
         drop(self._master.take());
     }
 }
 
-impl Drop for SpawnedHerdr {
+impl Drop for SpawnedKarvex {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
@@ -58,12 +58,12 @@ impl Drop for SpawnedHerdr {
                 thread::sleep(Duration::from_millis(20));
             }
 
-            unregister_spawned_herdr_pid(Some(pid));
+            unregister_spawned_karvex_pid(Some(pid));
         }
     }
 }
 
-fn cleanup_spawned_herdr(spawned: SpawnedHerdr, base: PathBuf) {
+fn cleanup_spawned_karvex(spawned: SpawnedKarvex, base: PathBuf) {
     drop(spawned);
     cleanup_test_base(&base);
 }
@@ -86,7 +86,7 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
     panic!("socket did not appear at {}", path.display());
 }
 
-fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) -> SpawnedHerdr {
+fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) -> SpawnedKarvex {
     spawn_server_with_path(config_home, runtime_dir, api_socket_path, None)
 }
 
@@ -95,12 +95,12 @@ fn spawn_server_with_path(
     runtime_dir: &Path,
     api_socket_path: &Path,
     path_override: Option<&Path>,
-) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+) -> SpawnedKarvex {
+    fs::create_dir_all(config_home.join("karvex")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join("karvex/config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -114,23 +114,23 @@ fn spawn_server_with_path(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_kvx"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", api_socket_path);
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("KARVEX_SOCKET_PATH", api_socket_path);
+    cmd.env_remove("KARVEX_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("KARVEX_ENV");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
+    register_spawned_karvex_pid(child.process_id());
     drop(pair.slave);
 
-    SpawnedHerdr {
+    SpawnedKarvex {
         _master: Some(pair.master),
         child,
     }
@@ -140,7 +140,7 @@ fn spawn_client_process(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
-) -> SpawnedHerdr {
+) -> SpawnedKarvex {
     register_runtime_dir(runtime_dir);
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -151,21 +151,21 @@ fn spawn_client_process(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_kvx"));
     cmd.arg("client");
-    cmd.env("HERDR_DISABLE_SOUND", "1");
+    cmd.env("KARVEX_DISABLE_SOUND", "1");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", api_socket_path);
-    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("KARVEX_SOCKET_PATH", api_socket_path);
+    cmd.env_remove("KARVEX_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("KARVEX_ENV");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
-    register_spawned_herdr_pid(child.process_id());
+    register_spawned_karvex_pid(child.process_id());
     drop(pair.slave);
 
-    SpawnedHerdr {
+    SpawnedKarvex {
         _master: Some(pair.master),
         child,
     }
@@ -687,8 +687,8 @@ fn cross_area_detach_and_reattach_preserves_state() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("karvex.sock");
+    let client_socket = runtime_dir.join("karvex-client.sock");
 
     let server = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -699,7 +699,7 @@ fn cross_area_detach_and_reattach_preserves_state() {
     client_handshake(&mut client_a, CURRENT_PROTOCOL, 100, 30);
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
 
-    // Use herdr: create a workspace and write output into its pane.
+    // Use karvex: create a workspace and write output into its pane.
     let create = workspace_create(&api_socket, "cross-ssh-state");
     let workspace_id = create["result"]["workspace"]["workspace_id"]
         .as_str()
@@ -752,7 +752,7 @@ fn cross_area_detach_and_reattach_preserves_state() {
         "pane output should include detached-period output: {readback}"
     );
 
-    cleanup_spawned_herdr(server, base);
+    cleanup_spawned_karvex(server, base);
 }
 
 #[test]
@@ -761,8 +761,8 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("karvex.sock");
+    let client_socket = runtime_dir.join("karvex-client.sock");
 
     let bin_dir = base.join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
@@ -872,7 +872,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
         "reattached client frame should show blocked status after transition"
     );
 
-    cleanup_spawned_herdr(server, base);
+    cleanup_spawned_karvex(server, base);
 }
 
 #[test]
@@ -881,8 +881,8 @@ fn cross_area_client_and_api_workspace_views_are_consistent() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("karvex.sock");
+    let client_socket = runtime_dir.join("karvex-client.sock");
 
     let server = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -935,7 +935,7 @@ fn cross_area_client_and_api_workspace_views_are_consistent() {
         "API and client-side state should reference the same created workspace"
     );
 
-    cleanup_spawned_herdr(server, base);
+    cleanup_spawned_karvex(server, base);
 }
 
 #[test]
@@ -944,8 +944,8 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("karvex.sock");
+    let client_socket = runtime_dir.join("karvex-client.sock");
 
     let server = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -1002,7 +1002,7 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
         "server and remaining client flow should stay healthy: {ping}"
     );
 
-    cleanup_spawned_herdr(server, base);
+    cleanup_spawned_karvex(server, base);
 }
 
 #[test]
@@ -1011,8 +1011,8 @@ fn cross_area_server_kill_then_restart_and_reconnect() {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let client_socket = runtime_dir.join("herdr-client.sock");
+    let api_socket = runtime_dir.join("karvex.sock");
+    let client_socket = runtime_dir.join("karvex-client.sock");
 
     let mut server = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -1135,5 +1135,5 @@ fn cross_area_server_kill_then_restart_and_reconnect() {
         "restarted server should respond over API: {ping}"
     );
 
-    cleanup_spawned_herdr(server2, base);
+    cleanup_spawned_karvex(server2, base);
 }

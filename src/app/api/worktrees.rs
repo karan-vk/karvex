@@ -198,7 +198,7 @@ impl App {
             let space = crate::workspace::git_space_metadata(&path).ok_or_else(|| {
                 ApiFailure::new(
                     "not_git_worktree",
-                    "Herdr worktree actions require a path inside a Git work tree",
+                    "Karvex worktree actions require a path inside a Git work tree",
                 )
             })?;
             if space.is_linked_worktree {
@@ -258,7 +258,7 @@ impl App {
             let space = crate::workspace::git_space_metadata(&path).ok_or_else(|| {
                 ApiFailure::new(
                     "not_git_worktree",
-                    "Herdr worktree actions require a path inside a Git work tree",
+                    "Karvex worktree actions require a path inside a Git work tree",
                 )
             })?;
             let workspace_idx = self.list_source_workspace_idx_for_space(&space);
@@ -310,7 +310,7 @@ impl App {
         let Some(space) = git_space else {
             return Err(ApiFailure::new(
                 "not_git_worktree",
-                "Herdr worktree actions require a workspace inside a Git work tree",
+                "Karvex worktree actions require a workspace inside a Git work tree",
             ));
         };
         if space.is_linked_worktree {
@@ -366,7 +366,7 @@ impl App {
         let Some(space) = git_space else {
             return Err(ApiFailure::new(
                 "not_git_worktree",
-                "Herdr worktree actions require a workspace inside a Git work tree",
+                "Karvex worktree actions require a workspace inside a Git work tree",
             ));
         };
         let workspace_idx = if space.is_linked_worktree {
@@ -735,7 +735,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("karvex-{name}-{}-{nanos}", std::process::id()))
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
@@ -757,8 +757,8 @@ mod tests {
         let repo = unique_temp_path(name);
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "--quiet"]);
-        run_git(&repo, &["config", "user.email", "herdr@example.invalid"]);
-        run_git(&repo, &["config", "user.name", "Herdr Test"]);
+        run_git(&repo, &["config", "user.email", "karvex@example.invalid"]);
+        run_git(&repo, &["config", "user.name", "Karvex Test"]);
         std::fs::write(repo.join("README.md"), "test\n").unwrap();
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);
@@ -813,7 +813,7 @@ mod tests {
     fn install_event_plugin(app: &mut App, name: &str, event: &str) -> PathBuf {
         let plugin_root = unique_temp_path(name);
         std::fs::create_dir_all(&plugin_root).unwrap();
-        let manifest_path = plugin_root.join("herdr-plugin.toml");
+        let manifest_path = plugin_root.join("karvex-plugin.toml");
         std::fs::write(&manifest_path, format!("id = 'example.{name}'\n")).unwrap();
         app.state.installed_plugins.insert(
             format!("example.{name}"),
@@ -821,7 +821,7 @@ mod tests {
                 plugin_id: format!("example.{name}"),
                 name: name.into(),
                 version: "0.1.0".into(),
-                min_herdr_version: "0.7.0".into(),
+                min_karvex_version: "0.7.0".into(),
                 description: None,
                 manifest_path: manifest_path.display().to_string(),
                 plugin_root: plugin_root.display().to_string(),
@@ -1190,7 +1190,7 @@ mod tests {
                 source_checkout_path: repo.clone(),
                 source_repo_root: repo.clone(),
                 repo_key: "repo-key".into(),
-                repo_name: "herdr".into(),
+                repo_name: "karvex".into(),
                 label: None,
                 focus: false,
                 respond_to,
@@ -2184,12 +2184,12 @@ mod tests {
     fn deferred_api_worktree_remove_emits_removed_after_workspace_changes() {
         let event_hub = crate::api::EventHub::default();
         let mut app = test_app_with_event_hub(event_hub.clone());
-        let checkout = PathBuf::from("/repo/herdr-issue");
+        let checkout = PathBuf::from("/repo/karvex-issue");
         let mut child = Workspace::test_new("child");
         child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
             checkout_path: checkout.clone(),
             is_linked_worktree: true,
         });
@@ -2203,8 +2203,8 @@ mod tests {
             .insert(crate::worktree::canonical_or_original(&checkout), 7);
         app.state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: "repo-key".into(),
-            label: "herdr".into(),
-            repo_root: "/repo/herdr".into(),
+            label: "karvex".into(),
+            repo_root: "/repo/karvex".into(),
             checkout_path: "/repo/other".into(),
             is_linked_worktree: true,
         });

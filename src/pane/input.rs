@@ -37,7 +37,7 @@ pub(super) fn ghostty_key_event_from_terminal_key(
     Some(event)
 }
 
-pub(super) fn ghostty_prefers_herdr_text_encoding(key: &crate::input::TerminalKey) -> bool {
+pub(super) fn ghostty_prefers_karvex_text_encoding(key: &crate::input::TerminalKey) -> bool {
     matches!(key.code, crossterm::event::KeyCode::Char(_))
 }
 
@@ -67,7 +67,7 @@ pub(super) fn ghostty_mouse_encoder_for_terminal(
         .mode_get(crate::ghostty::MODE_MOUSE_SGR_PIXELS)
         .ok()?
     {
-        // Herdr receives host mouse positions in terminal cells. Downgrade
+        // Karvex receives host mouse positions in terminal cells. Downgrade
         // SGR-pixels to normal SGR so forwarded coordinates stay cell-local.
         encoder.set_format(crate::ghostty::MOUSE_FORMAT_SGR);
     }

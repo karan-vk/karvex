@@ -523,7 +523,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
 
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     let path = std::env::temp_dir().join(format!(
-        "herdr-clipboard-image-{}-{}.png",
+        "karvex-clipboard-image-{}-{}.png",
         std::process::id(),
         unique_timestamp_nanos()
     ));
@@ -783,7 +783,7 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
     procargs2_argv(&buf)
 }
 
-/// Read a Herdr agent identity hint from a process environment.
+/// Read a Karvex agent identity hint from a process environment.
 pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     if pid == 0 {
         return None;
@@ -1046,8 +1046,12 @@ mod tests {
     fn procargs2_env_reads_agent_hint_after_argv() {
         let buf = build_procargs2(
             "/opt/homebrew/bin/nono",
-            &["nono", "run", "HERDR_AGENT=codex", "--", "claude"],
-            &["PATH=/usr/bin", "HERDR_AGENT=claude", "TERM=xterm-256color"],
+            &["nono", "run", "KARVEX_AGENT=codex", "--", "claude"],
+            &[
+                "PATH=/usr/bin",
+                "KARVEX_AGENT=claude",
+                "TERM=xterm-256color",
+            ],
         );
 
         let env = procargs2_env(&buf).expect("expected env block");
@@ -1061,7 +1065,7 @@ mod tests {
     fn procargs2_env_does_not_treat_argv_as_environment() {
         let buf = build_procargs2(
             "/opt/homebrew/bin/nono",
-            &["nono", "run", "HERDR_AGENT=claude"],
+            &["nono", "run", "KARVEX_AGENT=claude"],
             &["PATH=/usr/bin"],
         );
 
@@ -1134,16 +1138,16 @@ mod tests {
     #[test]
     fn terminal_notifier_success_skips_osascript() {
         let path = std::env::temp_dir().join(format!(
-            "herdr-terminal-notifier-args-{}",
+            "karvex-terminal-notifier-args-{}",
             std::process::id()
         ));
-        let script = "printf '%s:%s\\n' \"$0\" \"$*\" >> \"$HERDR_NOTIFY_ARGS\"";
+        let script = "printf '%s:%s\\n' \"$0\" \"$*\" >> \"$KARVEX_NOTIFY_ARGS\"";
         let mut command = |program: &str| {
             let mut cmd = Command::new("sh");
             cmd.arg("-c")
                 .arg(script)
                 .arg(program)
-                .env("HERDR_NOTIFY_ARGS", &path);
+                .env("KARVEX_NOTIFY_ARGS", &path);
             cmd
         };
 
@@ -1166,19 +1170,19 @@ mod tests {
     #[test]
     fn desktop_notification_falls_back_to_osascript_when_terminal_notifier_fails() {
         let path =
-            std::env::temp_dir().join(format!("herdr-osascript-args-{}", std::process::id()));
+            std::env::temp_dir().join(format!("karvex-osascript-args-{}", std::process::id()));
         let script = r#"
 if [ "$0" = "terminal-notifier" ]; then
   exit 1
 fi
-printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
+printf '%s\n' "$@" > "$KARVEX_NOTIFY_ARGS"
 "#;
         let mut command = |program: &str| {
             let mut cmd = Command::new("sh");
             cmd.arg("-c")
                 .arg(script)
                 .arg(program)
-                .env("HERDR_NOTIFY_ARGS", &path);
+                .env("KARVEX_NOTIFY_ARGS", &path);
             cmd
         };
         let shown = show_desktop_notification_with_command("title", Some("body"), &mut command)
@@ -1195,12 +1199,12 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
 
     #[test]
     fn scrollback_editor_argv_preserves_unix_editor_shell_semantics() {
-        let path = std::path::Path::new("/tmp/herdr scrollback.txt");
+        let path = std::path::Path::new("/tmp/karvex scrollback.txt");
         let argv = scrollback_editor_argv(path).unwrap();
 
         assert_eq!(argv[0], "/bin/sh");
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
-        assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+        assert!(argv[2].contains("/tmp/karvex scrollback.txt"));
     }
 }

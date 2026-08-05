@@ -55,11 +55,12 @@ mod tests {
 
     #[test]
     fn verifies_matching_sha256() {
-        let path = std::env::temp_dir().join(format!("herdr-checksum-test-{}", std::process::id()));
-        fs::write(&path, b"herdr").unwrap();
+        let path =
+            std::env::temp_dir().join(format!("karvex-checksum-test-{}", std::process::id()));
+        fs::write(&path, b"karvex").unwrap();
         let result = super::verify_sha256(
             &path,
-            "78193ef266c1e3c2ce4ea2a86d7fc87e8c52799653faaac8536533a1c9300f82",
+            "1f1ab6d79024aae717b66ca5c09305883d14585a187022314eef7692b5d807b9",
         );
         let _ = fs::remove_file(&path);
         assert!(result.is_ok());

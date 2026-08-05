@@ -522,9 +522,9 @@ mod tests {
                 plugin_id: "example.links".into(),
                 name: "Links".into(),
                 version: "0.1.0".into(),
-                min_herdr_version: "0.6.10".into(),
+                min_karvex_version: "0.6.10".into(),
                 description: None,
-                manifest_path: plugin_root.join("herdr-plugin.toml").display().to_string(),
+                manifest_path: plugin_root.join("karvex-plugin.toml").display().to_string(),
                 plugin_root: plugin_root.display().to_string(),
                 enabled: true,
                 platforms: None,
@@ -1522,7 +1522,7 @@ mod tests {
 
         let output_path = unique_temp_path("custom-popup-command");
         let command = format!(
-            "printf '%s|%s' \"${{HERDR_PANE_ID-unset}}\" \"$HERDR_ACTIVE_PANE_ID\" > '{}'",
+            "printf '%s|%s' \"${{KARVEX_PANE_ID-unset}}\" \"$KARVEX_ACTIVE_PANE_ID\" > '{}'",
             output_path.display()
         );
         app.state.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {

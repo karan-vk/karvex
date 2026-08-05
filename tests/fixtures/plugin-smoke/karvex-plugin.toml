@@ -1,7 +1,7 @@
 id = "example.smoke"
 name = "Smoke Plugin"
 version = "0.1.0"
-min_herdr_version = "0.6.10"
+min_karvex_version = "0.6.10"
 description = "Portable plugin smoke fixture"
 platforms = ["linux", "macos", "windows"]
 
@@ -9,14 +9,14 @@ platforms = ["linux", "macos", "windows"]
 id = "workspace-list"
 title = "List workspaces"
 contexts = ["workspace"]
-command = ["herdr", "workspace", "list"]
+command = ["karvex", "workspace", "list"]
 
 [[events]]
 on = "worktree.created"
-command = ["herdr", "plugin", "log", "list", "--plugin", "example.smoke"]
+command = ["karvex", "plugin", "log", "list", "--plugin", "example.smoke"]
 
 [[panes]]
 id = "board"
 title = "Board"
 placement = "overlay"
-command = ["herdr", "workspace", "list"]
+command = ["karvex", "workspace", "list"]

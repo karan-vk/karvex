@@ -587,7 +587,7 @@ impl Default for OscDebugTracker {
 }
 
 fn osc_debug_enabled_from_env() -> bool {
-    std::env::var("HERDR_DEBUG_OSC_EVIDENCE")
+    std::env::var("KARVEX_DEBUG_OSC_EVIDENCE")
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -741,7 +741,7 @@ pub(super) fn maybe_filter_primary_screen_scrollback_clear<'a>(
     foreground_job: Option<&crate::platform::ForegroundJob>,
 ) -> Cow<'a, [u8]> {
     // Droid redraws its primary-screen TUI with CSI 3 J, which erases pane
-    // scrollback inside herdr. Keep the hack scoped to Droid on the primary
+    // scrollback inside karvex. Keep the hack scoped to Droid on the primary
     // screen so normal terminal clear-history behavior still works elsewhere.
     if alternate_screen
         || !contains_scrollback_clear_sequence(bytes)
@@ -955,12 +955,12 @@ mod tests {
     #[test]
     fn reported_cwd_parses_file_uri_and_bare_paths() {
         assert_eq!(
-            parse_reported_cwd(b"file:///tmp/herdr%20repo"),
-            Some(std::path::PathBuf::from("/tmp/herdr repo"))
+            parse_reported_cwd(b"file:///tmp/karvex%20repo"),
+            Some(std::path::PathBuf::from("/tmp/karvex repo"))
         );
         assert_eq!(
-            parse_reported_cwd(b"C:\\Users\\herdr\\src\\herdr"),
-            Some(std::path::PathBuf::from("C:\\Users\\herdr\\src\\herdr"))
+            parse_reported_cwd(b"C:\\Users\\karvex\\src\\karvex"),
+            Some(std::path::PathBuf::from("C:\\Users\\karvex\\src\\karvex"))
         );
         assert_eq!(
             parse_reported_cwd(b"\"C:\\my proj\""),

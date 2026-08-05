@@ -1213,7 +1213,7 @@ mod tests {
             ws_idx: 0,
             tab_idx: 0,
             pane_id: PaneId::from_raw(1),
-            primary_label: "herdr".into(),
+            primary_label: "karvex".into(),
             primary_tab_label: primary_tab_label.map(str::to_string),
             pane_label: None,
             terminal_title: None,
@@ -1432,8 +1432,8 @@ mod tests {
         let mut ws = crate::workspace::Workspace::test_new(name);
         ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
             key: key.into(),
-            label: "herdr".into(),
-            repo_root: std::path::PathBuf::from("/repo/herdr"),
+            label: "karvex".into(),
+            repo_root: std::path::PathBuf::from("/repo/karvex"),
             checkout_path: std::path::PathBuf::from(format!("/repo/{name}")),
             is_linked_worktree: linked,
         });
@@ -1548,7 +1548,7 @@ mod tests {
     #[tokio::test]
     async fn mobile_header_uses_live_root_runtime_cwd_for_workspace_label() {
         let unique = format!(
-            "herdr-mobile-header-runtime-cwd-{}-{}",
+            "karvex-mobile-header-runtime-cwd-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1557,7 +1557,7 @@ mod tests {
         );
         let root = std::env::temp_dir().join(unique);
         let stale_cwd = root.join("issue-264-nix-support");
-        let live_cwd = root.join("herdr");
+        let live_cwd = root.join("karvex");
         std::fs::create_dir_all(stale_cwd.join(".git")).unwrap();
         std::fs::create_dir_all(live_cwd.join(".git")).unwrap();
 
@@ -1617,7 +1617,7 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(root);
 
-        assert!(row.contains("herdr"), "header row: {row:?}");
+        assert!(row.contains("karvex"), "header row: {row:?}");
         assert!(
             !row.contains("issue-264-nix-support"),
             "header row: {row:?}"

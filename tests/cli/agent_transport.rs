@@ -4,7 +4,7 @@ use super::harness::*;
 fn agent_start_accepts_durable_readiness_during_detection_gap() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
-    let socket_path = base.join("herdr.sock");
+    let socket_path = base.join("karvex.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
 
     let server = thread::spawn(move || {
@@ -83,7 +83,7 @@ fn agent_start_accepts_durable_readiness_during_detection_gap() {
 fn prompt_wait_is_sent_as_one_agent_request() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
-    let socket_path = base.join("herdr.sock");
+    let socket_path = base.join("karvex.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
 
     let server = thread::spawn(move || {

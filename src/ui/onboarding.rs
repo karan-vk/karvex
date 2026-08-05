@@ -48,7 +48,7 @@ fn render_onboarding_welcome(app: &AppState, frame: &mut Frame, area: Rect) {
     .areas::<4>(stack.content);
 
     frame.render_widget(
-        Paragraph::new("  herdr").style(
+        Paragraph::new("  kvx").style(
             Style::default()
                 .fg(app.palette.text)
                 .add_modifier(Modifier::BOLD),

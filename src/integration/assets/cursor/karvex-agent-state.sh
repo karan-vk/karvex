@@ -1,12 +1,12 @@
 #!/bin/sh
-# managed by herdr; reinstalling the integration replaces this file.
-# HERDR_INTEGRATION_ID=cursor
-# HERDR_INTEGRATION_VERSION=1
+# managed by karvex; reinstalling the integration replaces this file.
+# KARVEX_INTEGRATION_ID=cursor
+# KARVEX_INTEGRATION_VERSION=1
 
 [ "${1:-}" = "session" ] || exit 0
-[ "${HERDR_ENV:-}" = "1" ] || exit 0
-[ -n "${HERDR_SOCKET_PATH:-}" ] || exit 0
-[ -n "${HERDR_PANE_ID:-}" ] || exit 0
+[ "${KARVEX_ENV:-}" = "1" ] || exit 0
+[ -n "${KARVEX_SOCKET_PATH:-}" ] || exit 0
+[ -n "${KARVEX_PANE_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
 python3 -c '
@@ -38,11 +38,11 @@ if session_id is None:
 
 seq = time.time_ns()
 request = json.dumps({
-    "id": f"herdr:cursor:{seq}",
+    "id": f"karvex:cursor:{seq}",
     "method": "pane.report_agent_session",
     "params": {
-        "pane_id": os.environ["HERDR_PANE_ID"],
-        "source": "herdr:cursor",
+        "pane_id": os.environ["KARVEX_PANE_ID"],
+        "source": "karvex:cursor",
         "agent": "cursor",
         "seq": seq,
         "agent_session_id": session_id,
@@ -51,7 +51,7 @@ request = json.dumps({
 try:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(0.5)
-        client.connect(os.environ["HERDR_SOCKET_PATH"])
+        client.connect(os.environ["KARVEX_SOCKET_PATH"])
         client.sendall((request + "\n").encode())
         client.recv(4096)
 except Exception:

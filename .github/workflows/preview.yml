@@ -127,26 +127,26 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            name: herdr-linux-x86_64
+            name: kvx-linux-x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            name: herdr-linux-aarch64
+            name: kvx-linux-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: herdr-macos-x86_64
+            name: kvx-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: herdr-macos-aarch64
+            name: kvx-macos-aarch64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            name: herdr-windows-x86_64.zip
+            name: kvx-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
       LIBGHOSTTY_VT_SIMD: 'true'
-      HERDR_BUILD_CHANNEL: preview
-      HERDR_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
-      HERDR_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
+      KARVEX_BUILD_CHANNEL: preview
+      KARVEX_BUILD_ID: ${{ needs.preflight.outputs.build_id }}
+      KARVEX_BUILD_COMMIT: ${{ needs.preflight.outputs.commit }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -229,7 +229,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/kvx ${{ matrix.name }}
           if [ "${{ runner.os }}" = "Linux" ]; then
             file ${{ matrix.name }} > BUILD_INFO.txt
             ldd ${{ matrix.name }} > LDD_INFO.txt 2>&1 || true
@@ -260,9 +260,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
-          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          $stage = Join-Path $env:RUNNER_TEMP "kvx-windows-x86_64"
           .\scripts\package_windows_conpty.ps1 `
-            -HerdrExe target\${{ matrix.target }}\release\herdr.exe `
+            -KvxExe target\${{ matrix.target }}\release\kvx.exe `
             -PackagePath $package `
             -StageDir $stage `
             -OutputPath ${{ matrix.name }}
@@ -337,9 +337,9 @@ jobs:
           python3 - <<'PY'
           import json, pathlib
           result = {}
-          for path in pathlib.Path('artifacts').glob('herdr-*/*.sha256'):
+          for path in pathlib.Path('artifacts').glob('kvx-*/*.sha256'):
               digest, name = path.read_text().split()[:2]
-              target = name.removeprefix('herdr-').removesuffix('.exe').removesuffix('.zip')
+              target = name.removeprefix('kvx-').removesuffix('.exe').removesuffix('.zip')
               result[target] = digest
           pathlib.Path('preview-sha256.json').write_text(json.dumps(result, indent=2) + '\n')
           PY
@@ -355,11 +355,11 @@ jobs:
           overwrite_files: true
           target_commitish: ${{ needs.preflight.outputs.commit }}
           files: |
-            artifacts/herdr-linux-x86_64/herdr-linux-x86_64
-            artifacts/herdr-linux-aarch64/herdr-linux-aarch64
-            artifacts/herdr-macos-x86_64/herdr-macos-x86_64
-            artifacts/herdr-macos-aarch64/herdr-macos-aarch64
-            artifacts/herdr-windows-x86_64.zip/herdr-windows-x86_64.zip
+            artifacts/kvx-linux-x86_64/kvx-linux-x86_64
+            artifacts/kvx-linux-aarch64/kvx-linux-aarch64
+            artifacts/kvx-macos-x86_64/kvx-macos-x86_64
+            artifacts/kvx-macos-aarch64/kvx-macos-aarch64
+            artifacts/kvx-windows-x86_64.zip/kvx-windows-x86_64.zip
 
       - name: Update preview documentation and manifest
         run: |
@@ -453,8 +453,8 @@ jobs:
           fi
 
           PREVIEW_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${PREVIEW_TAG}"
-          PREVIEW_COMMENT_MARKER="<!-- herdr:preview-released:${PREVIEW_TAG} -->"
-          PREVIEW_COMMENT="${PREVIEW_COMMENT_MARKER}"$'\n'"Released on the preview channel in [${PREVIEW_BUILD_ID}](${PREVIEW_URL}). This is available to preview users, but is not in a stable Herdr release yet."
+          PREVIEW_COMMENT_MARKER="<!-- karvex:preview-released:${PREVIEW_TAG} -->"
+          PREVIEW_COMMENT="${PREVIEW_COMMENT_MARKER}"$'\n'"Released on the preview channel in [${PREVIEW_BUILD_ID}](${PREVIEW_URL}). This is available to preview users, but is not in a stable Karvex release yet."
 
           issue_has_comment_marker() {
             local issue="$1"

@@ -615,7 +615,7 @@ mod tests {
     fn user_agent_metadata_overrides_presentation_fields_only() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -625,7 +625,7 @@ mod tests {
         let mutation = terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:presentation".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Refactor auth".into()),
             display_agent: Some("Claude: auth".into()),
             state_labels: HashMap::from([("working".into(), "deep in the mines".into())]),
@@ -678,7 +678,7 @@ mod tests {
     fn metadata_without_sequence_can_update_same_source() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -689,7 +689,7 @@ mod tests {
             terminal.set_agent_metadata(AgentMetadataReport {
                 source: "user:claude-title".into(),
                 agent_label: Some("claude".into()),
-                applies_to_source: Some("herdr:claude".into()),
+                applies_to_source: Some("karvex:claude".into()),
                 title: Some(title.into()),
                 display_agent: None,
                 state_labels: HashMap::new(),
@@ -708,7 +708,7 @@ mod tests {
     fn metadata_resolves_newest_value_per_presentation_field() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -717,7 +717,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:title".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Prompt title".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -730,7 +730,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: None,
             display_agent: Some("Claude activity".into()),
             state_labels: HashMap::new(),
@@ -753,7 +753,7 @@ mod tests {
     fn partial_update_does_not_refresh_unchanged_field_precedence() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -762,7 +762,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:first".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: None,
             display_agent: Some("First display".into()),
             state_labels: HashMap::new(),
@@ -775,7 +775,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:first".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Fresh title".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -795,7 +795,7 @@ mod tests {
     fn metadata_clear_plus_set_without_ttl_does_not_keep_old_ttl() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -804,7 +804,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Old title".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -819,7 +819,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Fresh title".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -845,7 +845,7 @@ mod tests {
     fn metadata_clear_only_without_ttl_does_not_extend_old_ttl() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -854,7 +854,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Prompt title".into()),
             display_agent: Some("Old display".into()),
             state_labels: HashMap::new(),
@@ -898,7 +898,7 @@ mod tests {
     fn metadata_ttl_expiry_reports_presentation_change() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -907,7 +907,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Activity".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -938,7 +938,7 @@ mod tests {
     fn stale_guarded_metadata_expiry_does_not_report_visible_change() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:codex".into(),
+            "karvex:codex".into(),
             "codex".into(),
             AgentState::Working,
             None,
@@ -947,7 +947,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Stale".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -966,7 +966,7 @@ mod tests {
         assert_eq!(terminal.effective_title(), None);
 
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -986,7 +986,7 @@ mod tests {
     fn late_metadata_expiry_reports_all_due_visible_changes() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -995,7 +995,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:first".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("First".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -1009,7 +1009,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:second".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: None,
             display_agent: Some("Second".into()),
             state_labels: HashMap::new(),
@@ -1043,7 +1043,7 @@ mod tests {
     fn immediately_expired_visible_metadata_still_schedules_expiry_event() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -1052,7 +1052,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Instant".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -1083,7 +1083,7 @@ mod tests {
     fn pending_metadata_expiry_clears_when_lifecycle_guard_hides_metadata() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -1092,7 +1092,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Instant".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -1105,14 +1105,14 @@ mod tests {
         assert!(terminal.next_agent_metadata_expiry().is_some());
 
         terminal.set_hook_authority(
-            "herdr:codex".into(),
+            "karvex:codex".into(),
             "codex".into(),
             AgentState::Working,
             None,
             None,
         );
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
@@ -1127,7 +1127,7 @@ mod tests {
     fn partial_update_does_not_resurrect_expired_hidden_metadata_fields() {
         let mut terminal = test_terminal();
         terminal.set_hook_authority(
-            "herdr:codex".into(),
+            "karvex:codex".into(),
             "codex".into(),
             AgentState::Working,
             None,
@@ -1136,7 +1136,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: Some("Expired title".into()),
             display_agent: None,
             state_labels: HashMap::new(),
@@ -1151,7 +1151,7 @@ mod tests {
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
-            applies_to_source: Some("herdr:claude".into()),
+            applies_to_source: Some("karvex:claude".into()),
             title: None,
             display_agent: Some("Fresh display".into()),
             state_labels: HashMap::new(),
@@ -1162,7 +1162,7 @@ mod tests {
             seq: None,
         });
         terminal.set_hook_authority(
-            "herdr:claude".into(),
+            "karvex:claude".into(),
             "claude".into(),
             AgentState::Working,
             None,
