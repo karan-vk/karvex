@@ -13,6 +13,8 @@
 #                   turns a schema-invalid result from a corrective re-prompt
 #                   into NeedsAttention (§4.3)
 #   idle            never write result.json and never report; just sit there
+#   die   [code]    exit immediately without a result, which §4.3 defines as a
+#                   node failure once the retry policy is exhausted
 #
 # After the mode's work is done the process stays alive so the pane binding
 # stays observable and so `pane.read` can see anything steered into the pane
@@ -46,6 +48,10 @@ case "$mode" in
     ;;
   idle)
     printf 'node-stub idle\n'
+    ;;
+  die)
+    printf 'node-stub exiting without a result\n'
+    exit "${payload:-3}"
     ;;
   *)
     printf 'node_stub: unknown mode %s\n' "$mode" >&2

@@ -119,18 +119,27 @@ pub fn resolve_edge(graph: &RunGraph, edge_index: usize) -> EdgeResolution {
     }
 }
 
-/// Settles every edge, then moves every `Pending` node whose inbound edges have
-/// all settled to `Ready` or `Skipped`. Returns the nodes whose status changed,
-/// in index order.
+/// Settles every edge against its source's *current* state, then moves every
+/// node between `Pending` and `Ready`/`Skipped` accordingly. Returns the nodes
+/// whose status changed, in index order.
 ///
 /// `Skipped` propagates: a `Sequence`/`Data`/`Conditional` edge out of a
 /// `Skipped` source is dead, so a whole conditional branch collapses in one
 /// call.
+///
+/// Resolution is not one-way. Restarting a node clears its validated result, so
+/// its outbound edges go back to `Unresolved` and any target admitted on their
+/// strength waits again — §3.1 resolves a `Data` edge only while its source is
+/// `Succeeded`/`Restored` *with* a validated result, and a stale `fired` would
+/// run a fan-in node with the restarted branch's port missing.
 pub fn propagate(graph: &mut RunGraph) -> Vec<RunNodeIdx> {
     let mut changed: Vec<RunNodeIdx> = Vec::new();
-    // Statuses only move Pending → Ready/Skipped here and edges only settle
-    // once, so the fixpoint is reached in at most one pass per node plus one;
-    // the bound is belt-and-braces against a graph whose nodes are not in
+    // An edge resolves purely from its source's status, and the only status
+    // moves this function makes are Pending → Ready/Skipped and Ready →
+    // Pending — neither of which turns a settled edge back into an unresolved
+    // one. So within a single call every edge only settles further, no node can
+    // oscillate, and the fixpoint is reached in at most one pass per node plus
+    // one; the bound is belt-and-braces against a graph whose nodes are not in
     // topological order.
     let rounds = graph.nodes.len() + graph.edges.len() + 1;
 
@@ -139,7 +148,7 @@ pub fn propagate(graph: &mut RunGraph) -> Vec<RunNodeIdx> {
 
         for index in 0..graph.edges.len() {
             let (fired, condition_result) = match resolve_edge(graph, index) {
-                EdgeResolution::Unresolved => continue,
+                EdgeResolution::Unresolved => (false, None),
                 EdgeResolution::Fired => (true, Some(true)),
                 EdgeResolution::Dead => (false, Some(false)),
             };
@@ -155,7 +164,11 @@ pub fn propagate(graph: &mut RunGraph) -> Vec<RunNodeIdx> {
 
         for index in 0..graph.nodes.len() {
             let idx = RunNodeIdx(index);
-            if graph.node(idx).map(|node| node.status) != Some(NodeStatus::Pending) {
+            let status = graph.node(idx).map(|node| node.status);
+            // Only the two admission statuses move here. A node that already
+            // holds a pane, or that has closed, is the run's business, not the
+            // scheduler's.
+            if !matches!(status, Some(NodeStatus::Pending | NodeStatus::Ready)) {
                 continue;
             }
             let inbound: Vec<usize> = graph.inbound(idx).collect();
@@ -165,18 +178,22 @@ pub fn propagate(graph: &mut RunGraph) -> Vec<RunNodeIdx> {
                     .get(*edge_index)
                     .is_some_and(|edge| edge.condition_result.is_some())
             });
-            if !settled {
-                continue;
-            }
             let all_dead = !inbound.is_empty()
                 && inbound
                     .iter()
                     .all(|edge_index| graph.edges.get(*edge_index).is_some_and(|edge| !edge.fired));
-            let next = if all_dead {
+            let next = if !settled {
+                // An admitted node whose upstream went back to `Unresolved`
+                // waits again rather than starting without that branch's data.
+                NodeStatus::Pending
+            } else if all_dead {
                 NodeStatus::Skipped
             } else {
                 NodeStatus::Ready
             };
+            if status == Some(next) {
+                continue;
+            }
             let Some(node) = graph.node_mut(idx) else {
                 continue;
             };
@@ -191,6 +208,7 @@ pub fn propagate(graph: &mut RunGraph) -> Vec<RunNodeIdx> {
     }
 
     changed.sort_unstable();
+    changed.dedup();
     changed
 }
 

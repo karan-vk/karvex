@@ -224,6 +224,12 @@ impl WorkflowRuntimeState {
         self.claimed_spawns.clear();
         self.spawn_failures.clear();
         self.node_tokens.clear();
+        // Persistence health is a property of the run, not of the process: a
+        // previous run's lost write must not leave the next one reporting
+        // itself degraded.
+        self.pending_writes.clear();
+        self.dropped_writes = 0;
+        self.persistence_degraded = false;
         self.run = Some(run);
         self.engine.install_definition(definition);
         let effects = self.engine.apply(EngineInput::Start {
@@ -237,6 +243,12 @@ impl WorkflowRuntimeState {
         if self.run.is_none() {
             debug!("workflow engine input with no active run");
             return Vec::new();
+        }
+        // A restart is the user asking for a fresh attempt, so the node's spawn
+        // attempts start over too — otherwise a node that had already burnt the
+        // spawn budget would be given up on again the moment it is admitted.
+        if let EngineInput::RestartNode { path } = &input {
+            self.spawn_failures.remove(path);
         }
         let effects = self.engine.apply(input);
         self.settle(now);
@@ -305,8 +317,12 @@ impl WorkflowRuntimeState {
         self.pending_writes.push_back(write);
     }
 
-    pub(crate) fn take_pending_writes(&mut self) -> Vec<StoreWrite> {
-        self.pending_writes.drain(..).collect()
+    /// Takes at most `limit` buffered writes, oldest first. The cap is what
+    /// lets the caller stop handing work to a store thread that is behind, so
+    /// the surplus stays here under [`PENDING_WRITE_BUDGET`].
+    pub(crate) fn take_pending_writes(&mut self, limit: usize) -> Vec<StoreWrite> {
+        let take = limit.min(self.pending_writes.len());
+        self.pending_writes.drain(..take).collect()
     }
 
     pub(crate) fn pending_write_count(&self) -> usize {
@@ -322,9 +338,13 @@ impl WorkflowRuntimeState {
     }
 
     /// Marks persistence degraded after a store write failed. Surfaced on the
-    /// run rather than killing it (`04` §9).
-    pub(crate) fn mark_persistence_degraded(&mut self) {
+    /// run rather than killing it (`04` §9). Returns whether this was the
+    /// transition, so the surfacing happens once per run rather than once per
+    /// lost write.
+    pub(crate) fn mark_persistence_degraded(&mut self) -> bool {
+        let newly = !self.persistence_degraded;
         self.persistence_degraded = true;
+        newly
     }
 
     pub(crate) fn pending_spawns(&self) -> &[InstancePath] {
@@ -756,10 +776,12 @@ impl App {
         changed
     }
 
-    /// A spawn failure has no `EngineInput`, so the node stays `Ready` and is
-    /// retried on a later admission until the attempt budget runs out. Both the
-    /// retry and the give-up are surfaced: a node that silently never starts is
-    /// the failure this design exists to prevent.
+    /// A failed spawn keeps the node `Ready` and retries it on a later
+    /// admission until the attempt budget runs out; the give-up then goes back
+    /// to the engine as [`EngineInput::SpawnFailed`], which takes the node out
+    /// of the ready set so §3.2 can pause the run. Both the retry and the
+    /// give-up are surfaced: a node that silently never starts is the failure
+    /// this design exists to prevent.
     fn fail_workflow_spawn(&mut self, path: &InstancePath, reason: &str) -> bool {
         let attempts = self.workflow.record_spawn_failure(path);
         let retrying = attempts < SPAWN_ATTEMPT_BUDGET;
@@ -782,6 +804,19 @@ impl App {
                 format!("node spawn failed: {reason}")
             },
         });
+        if !retrying {
+            // Deliberately not `apply_workflow_engine_input`: this already runs
+            // inside `drive_workflow_spawns`, and re-driving spawns from here
+            // would recurse once per node whose spawn is failing.
+            let effects = self.workflow.apply(
+                EngineInput::SpawnFailed {
+                    path: path.clone(),
+                    reason: reason.to_string(),
+                },
+                Instant::now(),
+            );
+            self.dispatch_workflow_effects(effects);
+        }
         true
     }
 
@@ -1004,6 +1039,25 @@ impl App {
             inputs,
             transcript_path,
         })
+    }
+
+    /// `04` §9: a store write failure degrades the run to
+    /// `persistence_degraded` and that degradation is surfaced. The run itself
+    /// is unaffected — the in-memory graph is authoritative while it executes —
+    /// so this is a warning, not a failure, and it is shown once per run.
+    pub(crate) fn mark_workflow_persistence_degraded(&mut self) {
+        if !self.workflow.mark_persistence_degraded() {
+            return;
+        }
+        let run = self.workflow.active_run().map(|run| run.run_id.clone());
+        warn!("workflow run persistence degraded: part of the journal was not written");
+        self.show_workflow_notice(UserNotice {
+            level: NoticeLevel::Warning,
+            run,
+            path: None,
+            message: "the run's journal is incomplete: a durable write could not be stored"
+                .to_string(),
+        });
     }
 
     fn show_workflow_notice(&mut self, notice: UserNotice) {
@@ -1616,7 +1670,16 @@ mod tests {
         assert_eq!(state.dropped_write_count(), 1);
         assert!(state.persistence_degraded());
 
-        assert_eq!(state.take_pending_writes().len(), PENDING_WRITE_BUDGET);
+        assert_eq!(
+            state.take_pending_writes(8).len(),
+            8,
+            "the drain is capped by what the store thread has room for"
+        );
+        assert_eq!(state.pending_write_count(), PENDING_WRITE_BUDGET - 8);
+        assert_eq!(
+            state.take_pending_writes(usize::MAX).len(),
+            PENDING_WRITE_BUDGET - 8
+        );
         assert_eq!(state.pending_write_count(), 0);
     }
 
@@ -1784,7 +1847,7 @@ mod tests {
             "run and node writes are journalled off the critical path"
         );
         assert!(!app.workflow.persistence_degraded());
-        let writes = app.workflow.take_pending_writes();
+        let writes = app.workflow.take_pending_writes(usize::MAX);
         assert!(writes
             .iter()
             .any(|write| matches!(write, StoreWrite::RunStatus { .. })));
@@ -1922,7 +1985,11 @@ mod tests {
                 .is_some_and(|next| next > deadline),
             "a fired tick rearms the clock"
         );
-        assert_eq!(app.workflow.run_status(), Some(RunStatus::Running));
+        // `App::new(no_session)` has no workspace, so the tick's spawn retry
+        // exhausts the node's attempt budget and the run stalls. A paused run
+        // is still live, which is exactly why the clock stays armed.
+        assert_eq!(app.workflow.run_status(), Some(RunStatus::Paused));
+        assert!(app.workflow.is_live());
     }
 
     #[test]
@@ -2025,7 +2092,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_failure_is_retried_then_left_on_the_node() {
+    fn a_spawn_failure_is_retried_then_stalls_the_run_on_the_node() {
         let mut app = test_app_with_hub(EventHub::default());
         app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
         let definition = definition();
@@ -2061,15 +2128,44 @@ mod tests {
             .as_ref()
             .is_some_and(|toast| !toast.context.contains("retrying")));
 
+        // A node nothing will ever start must not sit `Ready` forever: it takes
+        // the failure as a status, which lets §3.2's conjunction stall the run
+        // with a surfaced reason instead of leaving it `Running` — and, because
+        // a live run blocks every later `workflow.run`, wedging the subsystem.
+        assert_eq!(
+            app.workflow.node(&path).map(|node| node.status),
+            Some(NodeStatus::NeedsAttention)
+        );
+        assert_eq!(app.workflow.run_status(), Some(RunStatus::Paused));
+        assert!(
+            app.workflow.pending_spawns().is_empty(),
+            "the node is no longer admitted"
+        );
+
         app.tick_workflow_engine(
             app.workflow_tick_deadline()
-                .expect("a live run arms the tick"),
+                .expect("a paused run is still live, so the clock stays armed"),
         );
         assert_eq!(
             app.workflow.spawn_failure_count(&path),
             SPAWN_ATTEMPT_BUDGET,
             "the attempt budget stops the retry loop"
         );
+
+        // A restart is the way out: the node is admitted again with a fresh
+        // spawn budget and the run leaves the pause.
+        app.apply_workflow_engine_input(EngineInput::RestartNode { path: path.clone() });
+        assert_eq!(
+            app.workflow.spawn_failure_count(&path),
+            1,
+            "the restart cleared the budget, and the immediate retry spent one"
+        );
+        assert_eq!(
+            app.workflow.pending_spawns(),
+            std::slice::from_ref(&path),
+            "the node is admitted again"
+        );
+        assert_eq!(app.workflow.run_status(), Some(RunStatus::Running));
     }
 
     #[test]

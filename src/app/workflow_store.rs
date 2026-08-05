@@ -19,12 +19,37 @@
 //! every runtime flavour: the headless server builds a multi-thread runtime,
 //! but in-crate tests drive `App` with no runtime at all.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tracing::{debug, warn};
 
 use crate::workflow::store::{StoreError, StoreLocation, WorkflowStore};
+
+/// How long a request/response store call may hold the event loop before it is
+/// reported as unavailable. The store is an embedded database on local disk, so
+/// anything near this is pathological — but "deliberate and bounded" has to have
+/// something enforcing the bound, or a wedged query freezes input and rendering
+/// for as long as it takes.
+const CALL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How many durable writes may be in the store thread's queue at once. Past
+/// this, writes stay in `WorkflowRuntimeState`'s own bounded queue, which is
+/// what makes its budget real backpressure instead of a limit the unbounded
+/// channel downstream can never let it reach.
+const STORE_QUEUE_BUDGET: usize = 512;
+
+/// What the store thread reports back to the event loop without a reply
+/// channel: the depth of its own queue, and how many durable writes failed
+/// (`04` §9 degrades the run's persistence rather than failing it).
+#[derive(Debug, Default)]
+struct QueueStats {
+    in_flight: AtomicUsize,
+    failures: AtomicU64,
+}
 
 /// A store failure that has taken the whole subsystem out of service, reduced
 /// to the pair a `workflow.*` response needs. [`StoreError`] is not `Clone`, and
@@ -66,6 +91,7 @@ type StoreJob = Box<dyn FnOnce(&StoreContext<'_>) + Send + 'static>;
 
 struct StoreWorker {
     jobs: Sender<StoreJob>,
+    stats: Arc<QueueStats>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -127,18 +153,61 @@ impl WorkflowStoreHandle {
         if submitted.is_err() {
             return Err(Self::thread_lost());
         }
-        wait.recv().map_err(|_| Self::thread_lost())
+        match wait.recv_timeout(CALL_DEADLINE) {
+            Ok(answer) => Ok(answer),
+            Err(RecvTimeoutError::Timeout) => Err(Self::call_timed_out()),
+            Err(RecvTimeoutError::Disconnected) => Err(Self::thread_lost()),
+        }
     }
 
-    /// Queues `job` without waiting. Used for the engine's durable writes, whose
-    /// failure degrades persistence instead of stalling the run (`04` §9).
+    /// Queues `job` without waiting. Used for the engine's durable writes,
+    /// whose failure degrades persistence instead of stalling the run
+    /// (`04` §9): a job that reports an error is counted here, on the store
+    /// thread, and collected by [`Self::take_write_failures`], because the
+    /// store thread has no way to reach `WorkflowRuntimeState` itself.
+    ///
+    /// The returned bool says only whether the job was *queued*.
     pub(crate) fn submit<F>(&mut self, job: F) -> bool
     where
-        F: FnOnce(&StoreContext<'_>) + Send + 'static,
+        F: FnOnce(&StoreContext<'_>) -> Result<(), StoreError> + Send + 'static,
     {
-        match self.open() {
-            Ok(worker) => worker.jobs.send(Box::new(job)).is_ok(),
-            Err(_) => false,
+        let Ok(worker) = self.open() else {
+            return false;
+        };
+        let stats = Arc::clone(&worker.stats);
+        stats.in_flight.fetch_add(1, Ordering::Relaxed);
+        let queued = worker
+            .jobs
+            .send(Box::new(move |cx| {
+                if let Err(error) = job(cx) {
+                    warn!(error = %error, "workflow store write failed");
+                    stats.failures.fetch_add(1, Ordering::Relaxed);
+                }
+                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+            }))
+            .is_ok();
+        if !queued {
+            worker.stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
+        queued
+    }
+
+    /// How many submitted jobs the store thread has not finished yet.
+    pub(crate) fn in_flight(&self) -> usize {
+        match &self.state {
+            HandleState::Open(worker) => worker.stats.in_flight.load(Ordering::Relaxed),
+            _ => 0,
+        }
+    }
+
+    /// Durable-write failures observed on the store thread since the last call,
+    /// and clears the counter. The store thread cannot reach
+    /// `WorkflowRuntimeState`, so this is how a failed write becomes a
+    /// surfaced `persistence_degraded` rather than only a log line.
+    pub(crate) fn take_write_failures(&self) -> u64 {
+        match &self.state {
+            HandleState::Open(worker) => worker.stats.failures.swap(0, Ordering::Relaxed),
+            _ => 0,
         }
     }
 
@@ -170,6 +239,16 @@ impl WorkflowStoreHandle {
         StoreUnavailable {
             code: crate::workflow::store::error::WORKFLOW_STORE_ERROR_CODE,
             message: "the workflow store thread is no longer running".to_string(),
+        }
+    }
+
+    fn call_timed_out() -> StoreUnavailable {
+        StoreUnavailable {
+            code: crate::workflow::store::error::WORKFLOW_STORE_ERROR_CODE,
+            message: format!(
+                "the workflow store did not answer within {}s",
+                CALL_DEADLINE.as_secs()
+            ),
         }
     }
 
@@ -207,9 +286,13 @@ impl WorkflowStoreHandle {
                 message: format!("the workflow store thread could not be started: {error}"),
             })?;
 
+        // Deliberately not deadlined, unlike `call`: a slow first open (the
+        // migrations run here) that timed out would leave the whole subsystem
+        // stuck in `Unavailable`, which `03` §2 makes sticky.
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(StoreWorker {
                 jobs: jobs_tx,
+                stats: Arc::new(QueueStats::default()),
                 thread: Some(thread),
             }),
             Ok(Err(unavailable)) => {
@@ -273,18 +356,32 @@ impl crate::app::App {
         // `03` §2 and would make an `AppState`-only unit test take the on-disk
         // lock. A run always begins with a `workflow.*` call that opened the
         // store, so the gate never costs a real run its journal.
-        if !self.workflow_store.is_open() || self.workflow.pending_write_count() == 0 {
+        if !self.workflow_store.is_open() {
             return;
         }
-        let writes = self.workflow.take_pending_writes();
-        for write in writes {
-            let queued = self.workflow_store.submit(move |cx| {
-                if let Err(error) = cx.block_on(cx.store().write(write)) {
-                    warn!(error = %error, "workflow store write failed");
-                }
-            });
+        // A write that failed on the store thread degrades the run's
+        // persistence, which is surfaced — the journal is incomplete, but the
+        // in-memory graph is authoritative during a run, so nothing is failed
+        // over it (`04` §9).
+        if self.workflow_store.take_write_failures() > 0 {
+            self.mark_workflow_persistence_degraded();
+        }
+        if self.workflow.pending_write_count() == 0 {
+            return;
+        }
+        // Only as many as the store thread's queue has room for. The rest stay
+        // in the engine's own bounded queue, so a store thread that falls
+        // behind applies backpressure there instead of growing without limit.
+        let room = STORE_QUEUE_BUDGET.saturating_sub(self.workflow_store.in_flight());
+        if room == 0 {
+            return;
+        }
+        for write in self.workflow.take_pending_writes(room) {
+            let queued = self
+                .workflow_store
+                .submit(move |cx| cx.block_on(cx.store().write(write)));
             if !queued {
-                self.workflow.mark_persistence_degraded();
+                self.mark_workflow_persistence_degraded();
             }
         }
     }
@@ -320,6 +417,7 @@ mod tests {
                 crate::workflow::tier::Tier::High,
             ));
             let _ = done_tx.send(created.is_ok());
+            created.map(|_| ())
         }));
         assert!(done_rx
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -331,6 +429,37 @@ mod tests {
             .expect("the query succeeds");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "queued");
+        assert_eq!(
+            handle.take_write_failures(),
+            0,
+            "a job that succeeded is not counted as a lost write"
+        );
+    }
+
+    #[test]
+    fn a_submitted_job_that_fails_is_counted_for_the_event_loop() {
+        let mut handle = memory_handle();
+        let (done_tx, done_rx) = channel();
+        assert!(handle.submit(move |_| {
+            let _ = done_tx.send(());
+            Err(StoreError::Query("deliberate failure".to_string()))
+        }));
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the submitted job runs");
+        // The counter is written after the job body returns, so wait for the
+        // store thread to come back for more work before reading it.
+        handle
+            .call(|_| ())
+            .expect("the store thread answers after the failing job");
+
+        assert_eq!(handle.take_write_failures(), 1);
+        assert_eq!(
+            handle.take_write_failures(),
+            0,
+            "taking the failures clears them"
+        );
+        assert_eq!(handle.in_flight(), 0);
     }
 
     #[test]

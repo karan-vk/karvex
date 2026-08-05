@@ -150,11 +150,13 @@ kvx workflow node restart <run_id> <path>
 kvx workflow node complete [--result-file <path>]
 ```
 
-`<path>` is the node's instance path, such as `plan` or `research/2/verify` — shown by `run show` and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` is the one command a node runs on itself; see The node contract, above.
+`<path>` is the node's instance path, such as `plan` or `research/2/verify` — shown by `run show` and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` is the one command a node runs on itself; see The node contract, above.
 
 ## The DAG view
 
 Open a run's DAG view from the Karvex TUI to watch it execute live: node boxes laid out by graph layer, edges drawn between them, and a detail strip for whichever node is selected showing its status, model, usage, last checkpoint summary, and any blocker.
+
+Open it from the global menu — the launcher at the bottom of the sidebar — and pick **workflow dag**. The entry appears only while this server is executing a run, since there is otherwise no graph to draw.
 
 | Input | Action |
 | --- | --- |

@@ -139,6 +139,7 @@ impl Engine {
             EngineInput::AgentStatus { pane, state, at } => self.agent_status(&pane, state, at),
             EngineInput::ProgressObserved { path, delta } => self.progress(&path, &delta),
             EngineInput::PaneExited { pane, code } => self.pane_exited(&pane, code),
+            EngineInput::SpawnFailed { path, reason } => self.spawn_failed(&path, &reason),
             EngineInput::Steer { path, text } => self.steer(&path, &text),
             EngineInput::Interrupt { path } => self.interrupt(&path),
             EngineInput::RestartNode { path } => self.restart(&path),
@@ -247,8 +248,22 @@ impl Engine {
                     Some(path.clone()),
                     payload,
                 ));
-                if let Some(pane) = pane_of(graph, idx) {
-                    effects.push(RunEffect::PromptNode { pane, text });
+                let delivered = match pane_of(graph, idx) {
+                    Some(pane) => {
+                        effects.push(RunEffect::PromptNode { pane, text });
+                        true
+                    }
+                    None => false,
+                };
+                if !delivered {
+                    // A node with no pane — restarted, or waiting on a respawn
+                    // after its pane died — has nowhere to receive the
+                    // correction. Spending its single re-prompt on a message
+                    // that was never sent would send the next result straight
+                    // to `NeedsAttention` with the agent never told what was
+                    // wrong, so the strike is given back.
+                    self.reports
+                        .insert(path.clone(), report_ordinal.saturating_sub(1));
                 }
                 effects
             }
@@ -362,7 +377,12 @@ impl Engine {
         }
 
         let max_attempts = self.max_attempts_of(idx);
+        // The retry below is a fresh attempt in a fresh pane, so it starts with
+        // a fresh evidence ledger *and* a fresh corrective-re-prompt budget:
+        // §4.3 gives every reported-result cycle one automatic re-prompt, and
+        // an attempt that inherited the dead pane's strike would never get one.
         self.signals.remove(&path);
+        self.reports.remove(&path);
         let mut effects = Vec::new();
         let exit = code.map_or_else(|| "no exit code".to_string(), |code| format!("code {code}"));
         let Some(graph) = self.graph.as_mut() else {
@@ -403,6 +423,29 @@ impl Engine {
         }
         self.settle(&mut effects);
         effects
+    }
+
+    /// The runtime exhausted its spawn attempts for an admitted node. The node
+    /// leaves the ready set with the reason on it, which is what lets §3.2's
+    /// conjunction pause the run instead of leaving it `Running` behind a node
+    /// nothing will ever start.
+    fn spawn_failed(&mut self, path: &InstancePath, reason: &str) -> Vec<RunEffect> {
+        let Some(idx) = self.graph.as_ref().and_then(|graph| graph.index_of(path)) else {
+            debug!(path = %path, "workflow spawn failure for an unknown node");
+            return Vec::new();
+        };
+        let done = self
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.node(idx))
+            .is_some_and(|node| node.status.is_terminal());
+        if done {
+            return Vec::new();
+        }
+        self.needs_attention(
+            idx,
+            &format!("the node's pane could not be started: {reason}"),
+        )
     }
 
     fn steer(&mut self, path: &InstancePath, text: &str) -> Vec<RunEffect> {
@@ -485,19 +528,8 @@ impl Engine {
             payload,
         ));
         record_status(graph, idx, &mut effects);
-        // A restart is the explicit user action that clears a pause: the
-        // conjunct that stalled the run now has a runnable node again.
-        if graph.status == RunStatus::Paused {
-            graph.status = RunStatus::Running;
-            effects.push(RunEffect::Persist(Box::new(StoreWrite::RunStatus {
-                run: graph.run_id.clone(),
-                status: RunStatus::Running,
-            })));
-            effects.push(RunEffect::Emit(WorkflowEvent::RunUpdated {
-                run: graph.run_id.clone(),
-                status: RunStatus::Running,
-            }));
-        }
+        // A restart is one of the explicit actions that clears a pause; the
+        // node is `Ready` again, so `settle` is what notices and resumes.
         self.settle(&mut effects);
         effects
     }
@@ -549,7 +581,13 @@ impl Engine {
         let Some(graph) = self.graph.as_mut() else {
             return;
         };
-        if graph.status != RunStatus::Running {
+        // A `Paused` run is still live: §3.2 pauses a run that stalled, it does
+        // not close it. A steer, a late report, a retry, or a restart can hand
+        // the graph a runnable node again, so a paused run has to keep settling
+        // — otherwise no completion path could ever finish it, `RunFinished`
+        // would never be emitted, and every later run would be refused as
+        // in-flight.
+        if !matches!(graph.status, RunStatus::Running | RunStatus::Paused) {
             return;
         }
         for idx in schedule::propagate(graph) {
@@ -579,8 +617,12 @@ impl Engine {
                     .nodes
                     .iter()
                     .any(|node| matches!(node.status, NodeStatus::Ready | NodeStatus::Running));
-                if !live {
-                    pause(graph, &blocker, effects);
+                match (live, graph.status) {
+                    // The conjunct that stalled the run has a runnable node
+                    // again, so the pause is over.
+                    (true, RunStatus::Paused) => resume(graph, effects),
+                    (false, RunStatus::Running) => pause(graph, &blocker, effects),
+                    _ => {}
                 }
             }
         }
@@ -800,6 +842,21 @@ fn finish(graph: &mut RunGraph, status: RunStatus, effects: &mut Vec<RunEffect>)
     effects.push(RunEffect::Emit(WorkflowEvent::RunFinished {
         run: graph.run_id.clone(),
         status,
+    }));
+}
+
+/// Lifts a pause once the graph has a runnable node again. The counterpart of
+/// [`pause`]: the run never left the live set, so this only restores the status
+/// and tells the readers about it.
+fn resume(graph: &mut RunGraph, effects: &mut Vec<RunEffect>) {
+    graph.status = RunStatus::Running;
+    effects.push(RunEffect::Persist(Box::new(StoreWrite::RunStatus {
+        run: graph.run_id.clone(),
+        status: RunStatus::Running,
+    })));
+    effects.push(RunEffect::Emit(WorkflowEvent::RunUpdated {
+        run: graph.run_id.clone(),
+        status: RunStatus::Running,
     }));
 }
 
@@ -1159,6 +1216,237 @@ mod tests {
             Some(RunStatus::Running)
         );
         assert_eq!(status_of(&engine, "plan"), NodeStatus::Ready);
+    }
+
+    /// A pause is a stall, not a close: `Paused` stays in the live set, so the
+    /// run has to be able to leave it *and* finish. Without this the run never
+    /// emits `RunFinished`, never sets `ended_at`, and blocks every later
+    /// `workflow.run` with `run_in_flight` until the server restarts.
+    #[test]
+    fn a_paused_run_that_gets_a_valid_result_resumes_and_finishes() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        for _ in 0..2 {
+            engine.apply(EngineInput::NodeSelfReport {
+                path: InstancePath::new("plan"),
+                token: NodeToken::new("token"),
+                result: report(r#"{"notes":"oops"}"#),
+            });
+        }
+        assert_eq!(
+            engine.graph().map(|graph| graph.status),
+            Some(RunStatus::Paused)
+        );
+
+        // The user steers the node and it finally reports something valid.
+        let resumed = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"plan":"do it"}"#),
+        });
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Succeeded);
+        assert_eq!(status_of(&engine, "implement"), NodeStatus::Ready);
+        assert_eq!(
+            engine.graph().map(|graph| graph.status),
+            Some(RunStatus::Running),
+            "a runnable node lifts the pause"
+        );
+        assert!(resumed.iter().any(|effect| matches!(
+            effect,
+            RunEffect::Emit(WorkflowEvent::RunUpdated {
+                status: RunStatus::Running,
+                ..
+            })
+        )));
+        assert_eq!(
+            engine.admissions(),
+            vec![RunNodeIdx(1)],
+            "the resumed run schedules again"
+        );
+
+        engine.bind_node(&InstancePath::new("implement"), binding("pane-2"));
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("implement"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"report":"shipped"}"#),
+        });
+        assert_eq!(
+            engine.graph().map(|graph| graph.status),
+            Some(RunStatus::Succeeded)
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::Emit(WorkflowEvent::RunFinished { .. }))),
+            "a run that recovered from a pause still finishes"
+        );
+    }
+
+    /// §3.1 resolves a `Data` edge only while its source is `Succeeded` *with* a
+    /// validated result. Restarting a succeeded node clears that result, so its
+    /// outbound edges must stop counting — otherwise a fan-in node runs with the
+    /// restarted branch's port missing.
+    #[test]
+    fn restarting_a_succeeded_node_unfires_its_edges_and_holds_the_fan_in() {
+        let definition = kvdag_of(
+            vec![
+                spec_node(&TestNode::requiring("plan", &["plan"])),
+                spec_node(&TestNode::requiring("left", &["report"])),
+                spec_node(&TestNode::requiring("right", &["report"])),
+                spec_node(&TestNode::requiring("join", &["report"])),
+            ],
+            vec![
+                spec_edge("plan", "left", EdgeKind::Data),
+                spec_edge("plan", "right", EdgeKind::Data),
+                spec_edge("left", "join", EdgeKind::Data),
+                spec_edge("right", "join", EdgeKind::Data),
+            ],
+        );
+        let graph = RunGraph::materialise(&definition, RunId::new("workflow_run:1"), Tier::High);
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.install_definition(definition);
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+
+        let succeed = |engine: &mut Engine, path: &str, pane: &str, body: &str| {
+            engine.bind_node(&InstancePath::new(path), binding(pane));
+            engine.apply(EngineInput::NodeSelfReport {
+                path: InstancePath::new(path),
+                token: NodeToken::new("token"),
+                result: report(body),
+            });
+        };
+        succeed(&mut engine, "plan", "pane-plan", r#"{"plan":"do it"}"#);
+        succeed(&mut engine, "left", "pane-left", r#"{"report":"left"}"#);
+        assert_eq!(status_of(&engine, "join"), NodeStatus::Pending);
+
+        engine.apply(EngineInput::RestartNode {
+            path: InstancePath::new("left"),
+        });
+        assert_eq!(status_of(&engine, "left"), NodeStatus::Ready);
+        let left_to_join = engine
+            .graph()
+            .and_then(|graph| graph.edges.iter().find(|edge| edge.to == RunNodeIdx(3)))
+            .expect("the fan-in edge exists");
+        assert!(
+            !left_to_join.fired && left_to_join.condition_result.is_none(),
+            "a restarted source leaves its outbound edge unresolved"
+        );
+
+        succeed(&mut engine, "right", "pane-right", r#"{"report":"right"}"#);
+        assert_eq!(
+            status_of(&engine, "join"),
+            NodeStatus::Pending,
+            "the fan-in waits for the branch that is running again"
+        );
+        assert!(!engine.admissions().contains(&RunNodeIdx(3)));
+
+        succeed(&mut engine, "left", "pane-left-2", r#"{"report":"left"}"#);
+        assert_eq!(status_of(&engine, "join"), NodeStatus::Ready);
+    }
+
+    /// The re-prompt budget is per reported-result cycle (§4.3). A node whose
+    /// pane died is retried in a fresh pane, so it starts that attempt with its
+    /// one corrective re-prompt intact.
+    #[test]
+    fn a_retry_after_a_pane_exit_gets_its_corrective_reprompt_back() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"notes":"oops"}"#),
+        });
+
+        engine.apply(EngineInput::PaneExited {
+            pane: PublicPaneId::new("pane-1"),
+            code: Some(1),
+        });
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Ready);
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1b"));
+
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"notes":"oops again"}"#),
+        });
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, RunEffect::PromptNode { .. }))
+                .count(),
+            1,
+            "the fresh attempt still gets its one corrective re-prompt"
+        );
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Running);
+    }
+
+    /// A correction that had nowhere to go was never delivered, so it must not
+    /// count against the node's single re-prompt.
+    #[test]
+    fn a_reprompt_with_no_pane_does_not_spend_the_correction() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        // No `bind_node`: the node is admitted but holds no pane.
+        let dropped = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"notes":"oops"}"#),
+        });
+        assert!(
+            !dropped
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "there is no pane to prompt"
+        );
+
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"notes":"still oops"}"#),
+        });
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, RunEffect::PromptNode { .. }))
+                .count(),
+            1,
+            "the undeliverable correction did not burn the budget"
+        );
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Running);
+    }
+
+    /// A node the runtime could not put in a pane has no `PaneExited` to report.
+    /// Without a status of its own it would sit `Ready` forever, leaving the run
+    /// `Running` behind a node nothing will ever start.
+    #[test]
+    fn a_spawn_that_never_happened_takes_the_node_out_of_the_ready_set() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+
+        engine.apply(EngineInput::SpawnFailed {
+            path: InstancePath::new("plan"),
+            reason: "no workspace to host the node's pane".to_string(),
+        });
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+        assert!(engine.admissions().is_empty());
+        assert_eq!(
+            engine.graph().map(|graph| graph.status),
+            Some(RunStatus::Paused),
+            "the run stalls with a surfaced reason instead of running forever"
+        );
     }
 
     #[test]

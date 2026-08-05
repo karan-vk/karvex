@@ -731,13 +731,16 @@ fn print_workflow_node_response(response: &serde_json::Value, json: bool) -> std
 }
 
 fn print_workflow_cli_error(code: &str, message: &str) {
-    eprintln!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "error": { "code": code, "message": message }
-        }))
-        .unwrap()
-    );
+    let envelope = serde_json::json!({
+        "error": { "code": code, "message": message }
+    });
+    // Serialising an object of string leaves cannot fail, but an error path
+    // that panics instead of reporting the error is the worst place to find
+    // out otherwise.
+    match serde_json::to_string(&envelope) {
+        Ok(json) => eprintln!("{json}"),
+        Err(_) => eprintln!("{{\"error\":{{\"code\":\"{code}\",\"message\":\"{code}\"}}}}"),
+    }
 }
 
 fn print_workflow_help() {

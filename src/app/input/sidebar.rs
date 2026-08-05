@@ -196,8 +196,14 @@ impl AppState {
         Rect::new(x, footer.y, width, footer.height)
     }
 
+    /// Must stay in the same order as `input::modal::global_menu_actions`: the
+    /// menu is rendered from these labels and dispatched from that list by
+    /// index, by both the sidebar menu and the mobile switcher.
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
         let mut labels = vec!["settings", "keybinds", "reload config"];
+        if self.workflow_run_graph().is_some() {
+            labels.push("workflow dag");
+        }
         if self.update_available.is_some() {
             labels.push("update ready");
         } else if self.latest_release_notes_available {

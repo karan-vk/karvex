@@ -79,14 +79,20 @@ pub(crate) enum GlobalMenuAction {
     Keybinds,
     ReloadConfig,
     Settings,
+    WorkflowDag,
 }
 
+/// Must stay in the same order as [`AppState::global_menu_labels`]: the menu is
+/// rendered from the labels and dispatched from this list by index.
 pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
     let mut actions = vec![
         GlobalMenuAction::Settings,
         GlobalMenuAction::Keybinds,
         GlobalMenuAction::ReloadConfig,
     ];
+    if state.workflow_run_graph().is_some() {
+        actions.push(GlobalMenuAction::WorkflowDag);
+    }
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
     }
@@ -141,7 +147,19 @@ pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuA
             leave_modal(state);
         }
         GlobalMenuAction::Settings => super::settings::open_settings(state),
+        GlobalMenuAction::WorkflowDag => open_workflow_dag(state),
     }
+}
+
+/// Opens the live workflow DAG overlay (`05-phase-plan.md` W6). The entry only
+/// exists while a run graph is mirrored into `AppState`, so the overlay is
+/// never opened onto nothing; `Esc` closes it through `leave_modal` like every
+/// other overlay.
+pub(super) fn open_workflow_dag(state: &mut AppState) {
+    if state.workflow_run_graph().is_none() {
+        return;
+    }
+    state.mode = Mode::WorkflowDag;
 }
 
 pub(crate) fn handle_global_menu_key(state: &mut AppState, key: KeyEvent) {
@@ -1524,6 +1542,45 @@ mod tests {
 
         assert!(state.should_quit);
         assert!(!state.detach_requested);
+    }
+
+    /// The DAG overlay's only production entry point. Without it `05-phase-plan.md`
+    /// W6's "live in-TUI DAG view" is unreachable from a running karvex.
+    #[test]
+    fn global_menu_opens_the_workflow_dag_only_while_a_run_graph_exists() {
+        let mut state = state_with_workspaces(&["test"]);
+        assert!(!global_menu_actions(&state).contains(&GlobalMenuAction::WorkflowDag));
+        assert!(!state.global_menu_labels().contains(&"workflow dag"));
+        apply_global_menu_action(&mut state, GlobalMenuAction::WorkflowDag);
+        assert_ne!(state.mode, Mode::WorkflowDag, "there is nothing to show");
+
+        state.set_workflow_run_graph(Some(crate::workflow::model::RunGraph {
+            run_id: crate::workflow::model::RunId::new("workflow_run:1"),
+            version_id: crate::workflow::model::KvdagVersionId::new("kvdag_version:1"),
+            tier: crate::workflow::tier::Tier::High,
+            growth: crate::workflow::model::GrowthLimits::default(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            status: crate::workflow::model::RunStatus::Running,
+            seq: 0,
+        }));
+
+        let actions = global_menu_actions(&state);
+        let labels = state.global_menu_labels();
+        assert_eq!(
+            labels.len(),
+            actions.len(),
+            "the label list and the action list are dispatched by the same index"
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .position(|action| *action == GlobalMenuAction::WorkflowDag),
+            labels.iter().position(|label| *label == "workflow dag"),
+        );
+
+        apply_global_menu_action(&mut state, GlobalMenuAction::WorkflowDag);
+        assert_eq!(state.mode, Mode::WorkflowDag);
     }
 
     #[test]

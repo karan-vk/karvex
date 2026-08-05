@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 #[cfg(feature = "workflow")]
 use crate::api::schema::{
     ErrorBody, KvdagEdgeInfo, KvdagNodeInfo, KvdagVersionDetail, KvdagVersionSummary,
-    ResponseResult, WorkflowArgSpec, WorkflowDefinitionFormat, WorkflowDemand, WorkflowEdgePayload,
+    ResponseResult, WorkflowArgSpec, WorkflowDefinitionFormat, WorkflowEdgePayload,
     WorkflowIsolation, WorkflowNodeKind, WorkflowRunGraph, WorkflowRunInfo, WorkflowRunNodeInfo,
     WorkflowRunner, WorkflowSummary, WorkflowTier, WorkflowVersionOrigin,
 };
@@ -78,6 +78,12 @@ const NO_ACTIVE_RUN_CODE: &str = "workflow_run_not_active";
 /// A required run argument was not supplied and has no default.
 #[cfg(feature = "workflow")]
 const MISSING_ARG_CODE: &str = "workflow_missing_arg";
+/// A node method that delivers into the node's pane addressed a node that has
+/// none. `05-phase-plan.md` W5 scopes steering and interrupting to a running
+/// node; answering with a success the node never received would be worse than
+/// refusing.
+#[cfg(feature = "workflow")]
+const NODE_NOT_RUNNING_CODE: &str = "workflow_node_not_running";
 
 /// Default page size for `workflow.run.list`.
 #[cfg(feature = "workflow")]
@@ -769,6 +775,26 @@ impl App {
                 },
             );
         }
+        // Steer and interrupt are deliveries into the node's pane; the engine
+        // emits nothing at all for a node that has no binding. Reporting that
+        // as a success would tell the caller their text landed when it was
+        // silently dropped.
+        let delivers_to_pane = matches!(
+            input,
+            EngineInput::Steer { .. } | EngineInput::Interrupt { .. }
+        );
+        if delivers_to_pane
+            && self
+                .workflow
+                .node(path)
+                .is_none_or(|node| node.binding.is_none())
+        {
+            return encode_error(
+                id,
+                NODE_NOT_RUNNING_CODE,
+                format!("node {path_text} has no pane to deliver to"),
+            );
+        }
         self.apply_workflow_engine_input(input);
         match self.workflow_node_info(path) {
             Some(node) => encode_success(id, result(node)),
@@ -1076,7 +1102,7 @@ fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> Workfl
         parent_path: None,
         depth: u32::from(record.depth),
         status: wire_node_status(record.status),
-        demand: WorkflowDemand::Standard,
+        demand: wire_demand(record.demand),
         model: record.model,
         effort: record.effort,
         attempt: u32::from(record.attempt),
