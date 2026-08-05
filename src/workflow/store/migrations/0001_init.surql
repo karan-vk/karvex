@@ -220,6 +220,8 @@ DEFINE FIELD digest         ON node_checkpoint TYPE string;
 DEFINE FIELD created_at     ON node_checkpoint TYPE datetime DEFAULT time::now();
 DEFINE INDEX checkpoint_seq ON node_checkpoint FIELDS run_node, seq UNIQUE;
 DEFINE INDEX checkpoint_lookup ON node_checkpoint FIELDS kvdag_version, node_key, kind;
+-- one node instance's checkpoints in order: what `list_checkpoints` filters on
+DEFINE INDEX checkpoint_by_instance ON node_checkpoint FIELDS run, instance_path, seq;
 
 -- ─── run_summary: the token-efficient end-of-run record ─────────────────────
 DEFINE TABLE run_summary SCHEMAFULL;

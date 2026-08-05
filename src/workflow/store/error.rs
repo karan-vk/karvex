@@ -41,10 +41,6 @@ pub enum StoreError {
     /// engine never sees a graph that hasn't already passed this gate.
     InvalidGraph(KvdagError),
     Io(io::Error),
-    /// The skeleton landed before step 2a wired the query bodies.
-    NotImplemented {
-        operation: &'static str,
-    },
 }
 
 impl StoreError {
@@ -86,12 +82,6 @@ impl fmt::Display for StoreError {
             Self::NotFound { table, id } => write!(f, "no {table} with id {id}"),
             Self::InvalidGraph(error) => write!(f, "invalid kvdag: {error}"),
             Self::Io(error) => write!(f, "{error}"),
-            Self::NotImplemented { operation } => {
-                write!(
-                    f,
-                    "workflow store operation \"{operation}\" is not implemented yet"
-                )
-            }
         }
     }
 }

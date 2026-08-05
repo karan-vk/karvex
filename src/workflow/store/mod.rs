@@ -255,8 +255,10 @@ impl WorkflowStore {
         // the caller supplies content (contract/growth/args/nodes/edges) and,
         // optionally, an explicit parent override for a non-linear origin
         // (e.g. a future `restore_rewrite`).
-        let next_version = self.next_version_number(&workflow_id).await?;
-        let parent = spec.parent.clone().or_else(|| {
+        let latest = self.latest_version(&workflow_id).await?;
+        let next_version = latest.as_ref().map_or(1, |(_, version)| version + 1);
+        let explicit_parent = spec.parent.clone();
+        let parent = explicit_parent.clone().or_else(|| {
             workflow_row
                 .head_version
                 .as_ref()
@@ -272,11 +274,28 @@ impl WorkflowStore {
         };
         let validated = Kvdag::try_new(probe_spec)?;
 
-        if let Some(existing) = self
-            .find_version_by_digest(&workflow_id, validated.spec_digest.as_str())
-            .await?
-        {
-            return self.load_version(&existing).await;
+        // A no-op revision is compared against the tip of the chain, and on
+        // everything a version stores — `spec_digest` covers only nodes and
+        // edges (`03` §5), while the row also carries the contract, the run
+        // arguments, and the growth limits.
+        //
+        // Both halves matter. Matching any historical digest anywhere in the
+        // workflow's history would return an *older* version, and the caller
+        // advances `head_version` to whatever comes back, so a graph that
+        // reproduced a past shape would walk the head backwards. Matching on
+        // the digest alone would silently discard a caller's new
+        // contract/args/limits and report success for a revision that was never
+        // written. An explicit parent is a deliberate non-linear origin and is
+        // never a no-op, so it skips the check entirely.
+        if let Some((latest_id, _)) = latest.as_ref().filter(|_| explicit_parent.is_none()) {
+            let existing = self.load_version(latest_id).await?;
+            if existing.spec_digest == validated.spec_digest
+                && existing.contract == validated.contract
+                && existing.args == validated.args
+                && existing.growth == validated.growth
+            {
+                return Ok(existing);
+            }
         }
 
         let args_json = serde_json::to_value(&validated.args)
@@ -763,7 +782,7 @@ fn demand_str(demand: Demand) -> &'static str {
     }
 }
 
-fn parse_demand(value: &str) -> Result<Demand, StoreError> {
+pub(super) fn parse_demand(value: &str) -> Result<Demand, StoreError> {
     match value {
         "peak" => Ok(Demand::Peak),
         "critical" => Ok(Demand::Critical),
@@ -1070,10 +1089,11 @@ impl WorkflowStore {
         response.take(0).map_err(query_error)
     }
 
-    async fn next_version_number(
+    /// The workflow's highest-numbered version, which is the tip of its chain.
+    async fn latest_version(
         &self,
         workflow_id: &surrealdb_types::RecordId,
-    ) -> Result<u32, StoreError> {
+    ) -> Result<Option<(KvdagVersionId, u32)>, StoreError> {
         let mut response = self
             .db
             .query(
@@ -1084,32 +1104,12 @@ impl WorkflowStore {
             .await
             .map_err(query_error)?;
         let rows: Vec<KvdagVersionRow> = response.take(0).map_err(query_error)?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .map_or(1, |row| row.version as u32 + 1))
-    }
-
-    async fn find_version_by_digest(
-        &self,
-        workflow_id: &surrealdb_types::RecordId,
-        digest: &str,
-    ) -> Result<Option<KvdagVersionId>, StoreError> {
-        let mut response = self
-            .db
-            .query(
-                "SELECT * FROM kvdag_version WHERE workflow = $workflow \
-                 AND spec_digest = $digest LIMIT 1",
+        Ok(rows.into_iter().next().map(|row| {
+            (
+                KvdagVersionId::new(record_id_to_string(&row.id)),
+                row.version as u32,
             )
-            .bind(("workflow", workflow_id.clone()))
-            .bind(("digest", digest.to_string()))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<KvdagVersionRow> = response.take(0).map_err(query_error)?;
-        Ok(rows
-            .into_iter()
-            .next()
-            .map(|row| KvdagVersionId::new(record_id_to_string(&row.id))))
+        }))
     }
 
     /// Materialises the static run-node/run-edge set for a freshly created run:
@@ -1222,11 +1222,20 @@ impl WorkflowStore {
         ) else {
             return Ok(None);
         };
+        // The node pair alone does not identify an edge: nothing forbids two
+        // edges between the same ordered pair (only a target's inbound *port*
+        // names have to be unique), so `kind` and `port` are part of the match
+        // or a run edge's provenance link can point at the wrong `kvdag_edge`.
         let mut response = self
             .db
-            .query("SELECT * FROM kvdag_edge WHERE in = $from AND out = $to LIMIT 1")
+            .query(
+                "SELECT * FROM kvdag_edge WHERE in = $from AND out = $to \
+                 AND kind = $kind AND port = $port LIMIT 1",
+            )
             .bind(("from", from.clone()))
             .bind(("to", to.clone()))
+            .bind(("kind", edge_kind_str(edge.kind).to_string()))
+            .bind(("port", edge.port.clone()))
             .await
             .map_err(query_error)?;
         let rows: Vec<KvdagEdgeRow> = response.take(0).map_err(query_error)?;
@@ -1312,6 +1321,9 @@ impl WorkflowStore {
         Ok(())
     }
 
+    // The parameters are the destructured fields of `StoreWrite::RunNode`, so
+    // grouping them into a struct would only re-wrap the variant this method
+    // exists to unwrap.
     #[allow(clippy::too_many_arguments)]
     async fn write_run_node(
         &self,
@@ -1390,6 +1402,8 @@ impl WorkflowStore {
         Ok(())
     }
 
+    // Same as `write_run_node`: these are the destructured fields of
+    // `StoreWrite::Checkpoint`, not an argument list that grew by accident.
     #[allow(clippy::too_many_arguments)]
     async fn write_checkpoint(
         &self,

@@ -6,15 +6,15 @@
 use std::collections::BTreeMap;
 
 use crate::workflow::model::{
-    CheckpointKind, Evidence, InstancePath, KvdagVersionId, NodeKey, NodeStatus, RunEventKind,
-    RunId, RunStatus, Succession, WorkflowId,
+    CheckpointKind, Demand, Evidence, InstancePath, KvdagVersionId, NodeKey, NodeStatus,
+    RunEventKind, RunId, RunStatus, Succession, WorkflowId,
 };
 use crate::workflow::tier::Tier;
 
 use super::records::{self, parse_record_id, record_id_to_string};
 use super::{
-    parse_evidence, parse_node_status, parse_run_status, parse_succession, query_error, StoreError,
-    WorkflowStore, TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
+    parse_demand, parse_evidence, parse_node_status, parse_run_status, parse_succession,
+    query_error, StoreError, WorkflowStore, TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
 };
 
 /// One `workflow` row, projected for listing.
@@ -63,6 +63,10 @@ pub struct RunNodeRecord {
     pub status: NodeStatus,
     pub model: String,
     pub effort: String,
+    /// The node's declared demand, stored on the row rather than re-derived
+    /// from the kvdag: a run answered from the journal has no live definition
+    /// to consult, and reporting every node as `Standard` would misreport it.
+    pub demand: Demand,
     pub attempt: u8,
     pub pane_id: Option<String>,
     pub terminal_id: Option<String>,
@@ -367,6 +371,7 @@ fn run_node_record(row: records::RunNodeRow) -> Result<RunNodeRecord, StoreError
         status: parse_node_status(&row.status)?,
         model: row.model,
         effort: row.effort,
+        demand: parse_demand(&row.demand)?,
         attempt: row.attempt as u8,
         pane_id: row.pane_id,
         terminal_id: row.terminal_id,

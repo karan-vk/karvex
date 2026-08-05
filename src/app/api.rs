@@ -174,6 +174,11 @@ impl App {
         }
 
         if let AppEvent::PaneDied { pane_id } = &ev {
+            // §4.3: a node's pane exiting before a valid result fails the node,
+            // subject to its retry policy. This has to run before
+            // `handle_pane_died` removes the pane, because that is what the
+            // node's public pane id is resolved from.
+            self.observe_workflow_pane_exit(*pane_id);
             if self
                 .state
                 .popup_pane
@@ -623,6 +628,12 @@ impl App {
                 },
             });
         }
+
+        // §4.3 signal 3: detector evidence reaches the workflow engine on every
+        // published pane-state change, not only on the 20 s engine tick, which
+        // is also the only way `agent_released` is ever observed. The call
+        // no-ops for any pane that is not a running node's.
+        self.observe_workflow_pane_update(update);
     }
 
     fn emit_terminal_or_system_agent_notifications(

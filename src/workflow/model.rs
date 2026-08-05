@@ -743,9 +743,26 @@ fn assert_reachable(
     edges: &[KvdagEdge],
     roots: &[&KvdagNode],
 ) -> Result<(), KvdagError> {
+    let templates: HashSet<&str> = nodes
+        .iter()
+        .filter(|node| node.is_template)
+        .map(|node| node.key.as_str())
+        .collect();
     let mut seen: HashSet<&str> = roots.iter().map(|node| node.key.as_str()).collect();
     let mut queue: VecDeque<&str> = seen.iter().copied().collect();
     while let Some(key) = queue.pop_front() {
+        // The walk stops at a template. A template is never scheduled directly
+        // (§3.1) and its edges are dropped when the run graph is materialised,
+        // so a node whose only path from a root runs through one would start
+        // the run with no inbound edge at all — that is, `Ready` at t=0,
+        // executing before the work it is meant to consume. Reporting it as
+        // unreachable is what keeps §3.1's root rule ("nodes with no inbound
+        // edges start Ready") true of the materialised graph. §3.4's fan-in
+        // point is the *proposing parent's* outbound edge, which is exactly the
+        // edge this asks the author to draw.
+        if templates.contains(key) {
+            continue;
+        }
         for edge in edges.iter().filter(|edge| edge.from.as_str() == key) {
             if seen.insert(edge.to.as_str()) {
                 queue.push_back(edge.to.as_str());
@@ -1380,6 +1397,14 @@ pub enum EngineInput {
         pane: PublicPaneId,
         code: Option<i32>,
     },
+    /// The runtime gave up putting an admitted node into a pane. The node never
+    /// acquired one, so there is no `PaneExited` to report; without this the
+    /// node would sit `Ready` forever and the run would never pause or finish
+    /// (`04` §9: every failure path has a node status).
+    SpawnFailed {
+        path: InstancePath,
+        reason: String,
+    },
     Steer {
         path: InstancePath,
         text: String,
@@ -1773,6 +1798,37 @@ mod tests {
             Kvdag::try_new(spec),
             Err(KvdagError::UnreachableNode(NodeKey::new("report")))
         );
+    }
+
+    /// A template is not materialised at run start and neither are its edges,
+    /// so a node whose only path from a root runs through one would be a root
+    /// of the *materialised* graph and execute at t=0 with nothing to consume.
+    /// §3.4's fan-in point is the proposing parent's own outbound edge.
+    #[test]
+    fn a_node_reachable_only_through_a_template_is_rejected() {
+        let mut template = node("worker", "Work on {{plan}}");
+        template.is_template = true;
+        let mut spec = spec(
+            vec![
+                node("fanout", "Plan for: {{goal}}"),
+                template,
+                node("collect", "Collect {{worker_out}}"),
+            ],
+            vec![
+                edge("fanout", "worker", Some("plan")),
+                edge("worker", "collect", Some("worker_out")),
+            ],
+        );
+        spec.nodes[0].expand_allow = vec![NodeKey::new("worker")];
+        spec.nodes[0].expand_max = 4;
+        assert_eq!(
+            Kvdag::try_new(spec.clone()),
+            Err(KvdagError::UnreachableNode(NodeKey::new("collect")))
+        );
+
+        // Drawing the fan-in from the expanding parent makes it valid again.
+        spec.edges.push(edge("fanout", "collect", None));
+        assert!(Kvdag::try_new(spec).is_ok());
     }
 
     #[test]

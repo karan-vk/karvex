@@ -1,6 +1,6 @@
 //! Headless end-to-end tests for the workflow (kvdag) runtime.
 //!
-//! `docs/design/workflow-builder/05-phase-plan.md` W7. Three scenarios against
+//! `docs/design/workflow-builder/05-phase-plan.md` W7. Four scenarios against
 //! a real `kvx server`, over the real JSON API socket:
 //!
 //! 1. a two-node kvdag runs to `succeeded`, each node visibly executing in its
@@ -9,8 +9,16 @@
 //!    `NeedsAttention` and the run does **not** report success — the single
 //!    most important behavioural guarantee in the design
 //!    (`00-overview.md` D7, `04-kvdag-and-execution.md` §4.3);
-//! 3. `workflow.node.steer` delivers text into the node's pane, asserted
+//! 3. a node whose pane exits before a valid result ends `failed` and the run
+//!    reaches a terminal status instead of staying live forever (`04` §4.3);
+//! 4. `workflow.node.steer` delivers text into the node's pane, asserted
 //!    through `pane.read`.
+//!
+//! **On event ordering.** `events.subscribe` gives each requested `type` its own
+//! cursor and the stream loop yields at most one event per subscription per
+//! poll pass, so only events of the *same* kind arrive in a guaranteed order.
+//! Cross-kind causality is asserted from event payloads, never from stream
+//! position.
 //!
 //! **Why the fixtures use `runner = "command"`.** W7 is explicit: the
 //! managed-agent path is closed to a stub by construction —
@@ -476,16 +484,27 @@ fn two_node_command_kvdag_runs_to_succeeded_with_a_pane_per_node() {
         "both nodes must be announced; saw {:?}",
         event_kinds(&seen)
     );
-    assert!(
-        position_of_kind(&seen, "workflow_run_started")
-            < position_of_kind(&seen, "workflow_node_created"),
-        "run.started must precede node.created; saw {:?}",
-        event_kinds(&seen)
+    // Causal order is asserted from the payloads, not from stream position.
+    // `events.subscribe` gives every requested `type` its own cursor and
+    // `stream_subscriptions` yields at most one event per subscription per poll
+    // pass, so two events of *different* kinds have no guaranteed relative
+    // position on the wire — only events of the same kind do.
+    assert_eq!(
+        started["data"]["run"]["nodes_done"], 0,
+        "run.started is published before any node has closed: {started}"
+    );
+    assert_eq!(
+        started["data"]["run"]["nodes_total"], 2,
+        "the graph is materialised before run.started: {started}"
+    );
+    assert_eq!(
+        finished["data"]["run"]["nodes_done"], 2,
+        "run.finished reports every node closed: {finished}"
     );
     assert!(
         position_of_kind(&seen, "workflow_node_created")
-            < position_of_kind(&seen, "workflow_run_finished"),
-        "node.created must precede run.finished; saw {:?}",
+            < position_of_kind(&seen, "workflow_node_updated"),
+        "within one subscription the stream is ordered; saw {:?}",
         event_kinds(&seen)
     );
     assert!(
@@ -676,7 +695,102 @@ fn node_without_a_valid_result_ends_needs_attention_and_the_run_does_not_succeed
 }
 
 // ---------------------------------------------------------------------------
-// 3. Steering reaches the node's pane
+// 3. A node's pane exiting before a valid result fails the node
+// ---------------------------------------------------------------------------
+
+/// `04` §4.3: `PaneExited` before a valid result is a node failure once the
+/// retry policy is exhausted. The engine only learns this from the runtime, so
+/// this scenario is really about the wiring — an unwired pane exit leaves the
+/// node `Running` forever, which never pauses, never finishes, and refuses
+/// every later `workflow.run` with `workflow_run_in_flight`.
+#[test]
+fn a_node_whose_pane_exits_without_a_result_fails_and_closes_the_run() {
+    let server = spawn_workflow_server("pane-exit");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe(&socket);
+
+    let workflow_id = create_workflow(&socket, "pane_exit.toml");
+    let run_id = start_run(&socket, &workflow_id, "add dark mode");
+
+    wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_started",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+
+    let node = poll_until(
+        "the node to record its pane's exit",
+        SETTLE,
+        Duration::from_millis(200),
+        || {
+            let node = node_get(&socket, &run_id, "doomed");
+            (node["status"] == "failed").then_some(node)
+        },
+    );
+    assert!(
+        node["evidence"].is_null(),
+        "a node that never produced a result records no completion evidence: {node}"
+    );
+    assert!(
+        node["blocker"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("pane exited")),
+        "the failure is recorded as the node's succession: {node}"
+    );
+
+    // The run has to *close*. A run left live blocks the whole subsystem.
+    let status = poll_until(
+        "the run to reach a terminal status",
+        SETTLE,
+        Duration::from_millis(200),
+        || {
+            let status = run_status(&socket, &run_id);
+            matches!(status.as_str(), "failed" | "succeeded" | "cancelled").then_some(status)
+        },
+    );
+    assert_eq!(
+        status, "failed",
+        "a run with a failed node is not a success"
+    );
+
+    let run = run_get(&socket, &run_id);
+    assert!(
+        run["run"]["ended_at_unix_ms"].is_u64(),
+        "a closed run records when it ended: {run}"
+    );
+
+    // The proof that the subsystem is not wedged: another run starts.
+    let second = request_ok(
+        &socket,
+        &request(
+            "req_run_again",
+            "workflow.run",
+            json!({ "workflow_id": workflow_id, "args": { "goal": "again" } }),
+        ),
+    );
+    assert_eq!(second["type"], "workflow_run_started", "{second}");
+
+    drain_events(&mut reader, &mut seen, Duration::from_millis(500));
+    for finished in events_of_kind(&seen, "workflow_run_finished") {
+        assert_ne!(
+            finished["data"]["run"]["status"], "succeeded",
+            "a run.finished event claimed success: {finished}"
+        );
+    }
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 4. Steering reaches the node's pane
 // ---------------------------------------------------------------------------
 
 #[test]

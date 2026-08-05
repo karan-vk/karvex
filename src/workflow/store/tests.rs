@@ -314,6 +314,72 @@ async fn create_version_digest_is_deterministic_and_identical_graphs_dedupe() {
     assert_eq!(first.version, 1);
 }
 
+/// `spec_digest` covers only nodes and edges, so a revision that changes only
+/// the contract, the args, or the growth limits must still write a version —
+/// and a graph that reproduces an older shape must never hand the caller back
+/// that older version, because the caller advances `head_version` to it.
+#[tokio::test]
+async fn create_version_dedupes_only_a_whole_no_op_against_the_chain_tip() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("demo", "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+
+    let v1 = store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", diamond_spec())
+        .await
+        .expect("v1");
+    store
+        .set_head_version(&workflow, &v1.version_id)
+        .await
+        .expect("head -> v1");
+
+    let mut contract_only = diamond_spec();
+    contract_only.contract = "reply only through result.json, and cite sources".to_string();
+    let v2 = store
+        .create_version(&workflow, VersionOrigin::Authored, "v2", contract_only)
+        .await
+        .expect("v2");
+    assert_eq!(v2.spec_digest, v1.spec_digest, "the graph itself is equal");
+    assert_ne!(
+        v2.version_id, v1.version_id,
+        "a contract-only revision is still a revision"
+    );
+    assert_eq!(v2.version, 2);
+    assert_eq!(
+        v2.contract,
+        "reply only through result.json, and cite sources"
+    );
+    store
+        .set_head_version(&workflow, &v2.version_id)
+        .await
+        .expect("head -> v2");
+
+    // Reverting the graph shape back to v1's while the head is at v2 must not
+    // resurrect v1: v1 carries the old contract, and returning it would walk
+    // `head_version` backwards.
+    let mut reverted = diamond_spec();
+    reverted.contract = "reply only through result.json, and cite sources".to_string();
+    reverted.args[0].description = "what to build, precisely".to_string();
+    let v3 = store
+        .create_version(&workflow, VersionOrigin::Authored, "v3", reverted)
+        .await
+        .expect("v3");
+    assert_eq!(v3.version, 3);
+    assert_eq!(v3.args[0].description, "what to build, precisely");
+
+    // A byte-identical resubmission of the tip is the one real no-op.
+    let mut same = diamond_spec();
+    same.contract = "reply only through result.json, and cite sources".to_string();
+    same.args[0].description = "what to build, precisely".to_string();
+    let again = store
+        .create_version(&workflow, VersionOrigin::Authored, "v3 again", same)
+        .await
+        .expect("no-op");
+    assert_eq!(again.version_id, v3.version_id);
+}
+
 // ── 3: version chain + immutability ─────────────────────────────────────
 
 #[tokio::test]

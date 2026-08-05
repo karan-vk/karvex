@@ -172,6 +172,11 @@ mod tests {
         fanout.expand_allow = vec![NodeKey::new("worker")];
         fanout.expand_max = 4;
 
+        // `fanout -> collect` is not redundant with `worker -> collect`: it is
+        // the §3.4 fan-in point, drawn from the node that expands the template
+        // because an instantiated child inherits *its parent's* outbound edges.
+        // Without it `collect` would be reachable only through the template and
+        // `Kvdag::try_new` would reject the graph.
         let definition = kvdag_of(
             vec![fanout, template, spec_node(&TestNode::new("collect"))],
             vec![
@@ -191,6 +196,11 @@ mod tests {
             graph.edges.len(),
             1,
             "only the fanout → collect edge has two materialised endpoints"
+        );
+        assert_eq!(
+            node(&graph, "collect").status,
+            NodeStatus::Pending,
+            "a node that depends on the expanding parent is not a root"
         );
     }
 
