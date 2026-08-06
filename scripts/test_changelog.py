@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.changelog import (
     ChangelogError,
@@ -11,7 +13,11 @@ from scripts.changelog import (
     build_latest_json,
     canonicalize_manifest,
     DEFAULT_PRODUCT_ANNOUNCEMENT_PATH,
+    FALLBACK_LIVE_MANIFEST_URL,
+    FALLBACK_RELEASE_REPO,
+    default_live_manifest_url,
     default_release_assets,
+    default_release_repo,
     ensure_current_release_assets_are_mirrored,
     ensure_manifest_is_outdated,
     ensure_manifest_matches_expected,
@@ -66,7 +72,7 @@ class ChangelogScriptTests(unittest.TestCase):
             build_latest_json(
                 "v0.1.1",
                 "### Fixed\n- Smoothed Claude flapping.\n",
-                default_release_assets("0.1.1"),
+                default_release_assets("0.1.1", repo="herdrdev/herdr"),
             )
         )
 
@@ -83,6 +89,35 @@ class ChangelogScriptTests(unittest.TestCase):
             },
         )
         self.assertEqual(manifest["releases"]["0.1.1"]["assets"], manifest["assets"])
+
+    def test_default_release_repo_follows_the_actions_environment(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "karan-vk/karvex"}):
+            self.assertEqual(default_release_repo(), "karan-vk/karvex")
+            self.assertEqual(
+                default_release_assets("0.9.0"),
+                {
+                    "linux-x86_64": "https://github.com/karan-vk/karvex/releases/download/v0.9.0/kvx-linux-x86_64",
+                    "linux-aarch64": "https://github.com/karan-vk/karvex/releases/download/v0.9.0/kvx-linux-aarch64",
+                    "macos-x86_64": "https://github.com/karan-vk/karvex/releases/download/v0.9.0/kvx-macos-x86_64",
+                    "macos-aarch64": "https://github.com/karan-vk/karvex/releases/download/v0.9.0/kvx-macos-aarch64",
+                },
+            )
+
+    def test_default_release_repo_falls_back_outside_actions(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(default_release_repo(), FALLBACK_RELEASE_REPO)
+            self.assertEqual(
+                default_release_assets("0.1.1")["linux-x86_64"],
+                f"https://github.com/{FALLBACK_RELEASE_REPO}/releases/download/v0.1.1/kvx-linux-x86_64",
+            )
+
+    def test_default_live_manifest_url_is_overridable(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(default_live_manifest_url(), FALLBACK_LIVE_MANIFEST_URL)
+        with mock.patch.dict(
+            os.environ, {"KARVEX_LIVE_MANIFEST_URL": "https://example.com/latest.json"}
+        ):
+            self.assertEqual(default_live_manifest_url(), "https://example.com/latest.json")
 
     def test_build_latest_json_embeds_product_announcement(self) -> None:
         manifest = json.loads(

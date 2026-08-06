@@ -80,6 +80,18 @@ class PreviewNotesTests(unittest.TestCase):
                     retain=1,
                 )
 
+    def test_default_release_repo_follows_the_actions_environment(self):
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "karan-vk/karvex"}):
+            self.assertEqual(preview.default_release_repo(), "karan-vk/karvex")
+            self.assertEqual(
+                preview.default_asset_urls(preview.default_release_repo(), "preview-test")[
+                    "linux-x86_64"
+                ],
+                "https://github.com/karan-vk/karvex/releases/download/preview-test/kvx-linux-x86_64",
+            )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(preview.default_release_repo(), preview.FALLBACK_RELEASE_REPO)
+
     def test_hidden_subjects_include_preview_manifest_commits(self):
         self.assertTrue(preview.hidden_subject("docs: update preview manifest"))
         self.assertTrue(preview.hidden_subject("docs: update website manifest"))

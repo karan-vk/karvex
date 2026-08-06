@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
 from typing import Any
 
+# Used only when the environment does not identify the publishing repository.
+FALLBACK_RELEASE_REPO = "herdrdev/herdr"
 ASSET_TARGETS = (
     "linux-x86_64",
     "linux-aarch64",
@@ -37,6 +40,17 @@ TYPE_HEADINGS = {
 }
 TYPE_ORDER = ("Added", "Fixed", "Performance", "Maintenance", "Other")
 COMMIT_RE = re.compile(r"^(?P<kind>[a-z]+)(?:\([^)]+\))?!?:\s+(?P<body>.+)$")
+
+
+def default_release_repo() -> str:
+    """Repository that publishes the preview assets this manifest points at.
+
+    GitHub Actions always sets GITHUB_REPOSITORY to the repository the workflow
+    runs in, so preview automation generates asset and compare URLs for its own
+    repository instead of the upstream one. Local runs without that variable
+    keep the historical default.
+    """
+    return os.environ.get("GITHUB_REPOSITORY", "").strip() or FALLBACK_RELEASE_REPO
 
 
 def run_git(args: list[str]) -> str:
@@ -299,13 +313,13 @@ def main() -> int:
     notes.add_argument("--commit", required=True)
     notes.add_argument("--build-id", required=True)
     notes.add_argument("--base-version", required=True)
-    notes.add_argument("--repo", default="herdrdev/herdr")
+    notes.add_argument("--repo", default=default_release_repo())
     notes.add_argument("--output", required=True)
     notes.set_defaults(func=cmd_notes)
 
     manifest = sub.add_parser("manifest")
     manifest.add_argument("--output", default="website/preview.json")
-    manifest.add_argument("--repo", default="herdrdev/herdr")
+    manifest.add_argument("--repo", default=default_release_repo())
     manifest.add_argument("--tag", required=True)
     manifest.add_argument("--build-id", required=True)
     manifest.add_argument("--commit", required=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -11,11 +12,12 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-DEFAULT_LIVE_MANIFEST_URL = "https://herdr.dev/latest.json"
+# Used only when the environment does not identify the publishing repository.
+FALLBACK_LIVE_MANIFEST_URL = "https://herdr.dev/latest.json"
 
 SECTION_RE = re.compile(r"^##\s+(?:\[(?P<bracketed>[^\]]+)\]|(?P<plain>.+?))\s*$", re.MULTILINE)
 VERSION_WITH_DATE_RE = re.compile(r"^(?P<version>.+?)\s+-\s+\d{4}-\d{2}-\d{2}$")
-DEFAULT_RELEASE_REPO = "herdrdev/herdr"
+FALLBACK_RELEASE_REPO = "herdrdev/herdr"
 DEFAULT_LATEST_JSON_PATH = Path("website/latest.json")
 DEFAULT_PRODUCT_ANNOUNCEMENT_PATH = Path("docs/next/product-announcement.json")
 PROTOCOL_SOURCE_PATH = Path("src/protocol/wire.rs")
@@ -38,6 +40,26 @@ class Section:
 
 class ChangelogError(ValueError):
     pass
+
+
+def default_release_repo() -> str:
+    """Repository that publishes the release assets this manifest points at.
+
+    GitHub Actions always sets GITHUB_REPOSITORY to the repository the workflow
+    runs in, so release automation generates asset URLs for its own repository
+    instead of the upstream one. Local runs without that variable keep the
+    historical default.
+    """
+    return os.environ.get("GITHUB_REPOSITORY", "").strip() or FALLBACK_RELEASE_REPO
+
+
+def default_live_manifest_url() -> str:
+    """URL of the deployed manifest to cross-check against a release.
+
+    Only the upstream deployment serves this manifest, so a fork must point the
+    check at its own site with KARVEX_LIVE_MANIFEST_URL (or --live-url).
+    """
+    return os.environ.get("KARVEX_LIVE_MANIFEST_URL", "").strip() or FALLBACK_LIVE_MANIFEST_URL
 
 
 def normalize_title(raw_title: str) -> str:
@@ -284,7 +306,8 @@ def build_latest_json(
     return json.dumps(manifest, indent=2) + "\n"
 
 
-def default_release_assets(version: str, repo: str = DEFAULT_RELEASE_REPO) -> dict[str, str]:
+def default_release_assets(version: str, repo: str | None = None) -> dict[str, str]:
+    repo = repo or default_release_repo()
     normalized_version = normalize_version(version)
     tag = f"v{normalized_version}"
     return {
@@ -685,7 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Update website/latest.json from a published GitHub release",
     )
     sync_latest_json.add_argument("--version", required=True)
-    sync_latest_json.add_argument("--repo", default=DEFAULT_RELEASE_REPO)
+    sync_latest_json.add_argument("--repo", default=default_release_repo())
     sync_latest_json.add_argument("--output", default=str(DEFAULT_LATEST_JSON_PATH))
     sync_latest_json.add_argument("--announcement", default=str(DEFAULT_PRODUCT_ANNOUNCEMENT_PATH))
     sync_latest_json.add_argument("--protocol", type=int)
@@ -705,9 +728,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify GitHub release, local manifest, live manifest, and asset URLs all match",
     )
     verify_release_state.add_argument("--version", required=True)
-    verify_release_state.add_argument("--repo", default=DEFAULT_RELEASE_REPO)
+    verify_release_state.add_argument("--repo", default=default_release_repo())
     verify_release_state.add_argument("--output", default=str(DEFAULT_LATEST_JSON_PATH))
-    verify_release_state.add_argument("--live-url", default=DEFAULT_LIVE_MANIFEST_URL)
+    verify_release_state.add_argument("--live-url", default=default_live_manifest_url())
     verify_release_state.add_argument("--protocol", type=int)
     verify_release_state.set_defaults(func=cmd_verify_release_state)
 
