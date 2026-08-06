@@ -204,6 +204,13 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
+      # Dependencies that build C through cc-rs (aws-lc-sys, lz4-sys) otherwise
+      # compile against the runner's glibc headers and fail to link against
+      # musl. The script is a no-op for non-musl targets.
+      - name: Set up musl C toolchain
+        if: runner.os == 'Linux'
+        run: scripts/setup_musl_cc.sh "${{ matrix.target }}" "$RUNNER_TEMP/musl-cc" >> "$GITHUB_ENV"
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
