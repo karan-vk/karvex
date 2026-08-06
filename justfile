@@ -26,15 +26,17 @@ lint:
 [unix]
 ci filter='all()': lint
     cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
-    just check-no-workflow
+    just check-no-workflow "{{filter}}"
     just integration-assets-test
     just plugin-marketplace-test
 
-# Lint and test with the workflow feature off, so the feature-off build stays working
+# Lint and test with the workflow feature off, so the feature-off build stays working.
+# Takes the same nextest filter as `ci` so per-platform exclusions (macOS skips
+# `binary(live_handoff)`) apply to this leg too.
 [unix]
-check-no-workflow:
+check-no-workflow filter='all()':
     cargo clippy --locked --no-default-features --all-targets -- -D warnings
-    cargo nextest run --locked --no-default-features --status-level fail --final-status-level fail --failure-output final --success-output never
+    cargo nextest run --locked --no-default-features -E "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
 # --no-default-features on purpose: this lint exists to catch cfg(windows) errors in karvex's own
 # code, not to cross-build SurrealDB and aws-lc-sys for MSVC from Linux.
