@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.9.0] - 2026-08-07
+
 ### Added
 - Workflows: `kvx workflow create` and `kvx workflow update` save a multi-agent kvdag as an immutable, versioned definition, and `kvx workflow run start` executes it. Every node runs as a real Karvex-managed pane, `sequence`, `data`, and `conditional` edges pass results between nodes, each node's result is validated against its declared `output_schema`, independent nodes run in parallel up to the run's concurrency limit, and a live DAG view shows the run as it executes.
 - `kvx workflow run show`, `kvx workflow run cancel`, and the `kvx workflow node` verbs (`show`, `steer`, `interrupt`, `restart`, `complete`) inspect and steer an in-flight run without restarting it.
