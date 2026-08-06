@@ -3,15 +3,30 @@
 ## Unreleased
 
 ### Added
+- Workflows: `kvx workflow create` and `kvx workflow update` save a multi-agent kvdag as an immutable, versioned definition, and `kvx workflow run start` executes it. Every node runs as a real Karvex-managed pane, `sequence`, `data`, and `conditional` edges pass results between nodes, each node's result is validated against its declared `output_schema`, independent nodes run in parallel up to the run's concurrency limit, and a live DAG view shows the run as it executes.
+- `kvx workflow run show`, `kvx workflow run cancel`, and the `kvx workflow node` verbs (`show`, `steer`, `interrupt`, `restart`, `complete`) inspect and steer an in-flight run without restarting it.
+- Workflow definitions, versions, and runs persist in an embedded SurrealDB store. The subsystem sits behind the default-on `workflow` cargo feature, so `--no-default-features` still builds Karvex without it.
 - `theme.custom.sidebar_bg` can now give the desktop sidebar its own background without changing built-in theme defaults.
 - Settings and `ui.status_indicators = "symbols"` can now use distinct static shapes for blocked, working, done, idle, and unknown agent states. (#2260)
 - The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
+
+### Changed
+- Renamed the project from Herdr to Karvex. The CLI, server, and TUI now ship as a single `kvx` binary, the crate is `karvex`, and config, state, socket, and log paths move from the `herdr` directories to `karvex` ones (for example `~/.config/herdr` to `~/.config/karvex`) — copy an existing directory across to keep settings and saved sessions. Bundled agent integration assets are now named `karvex-agent-state.*`.
+- The Windows installer installs `kvx.exe` and still recognizes a pre-rename `herdr.exe` install so it can be replaced in place.
 
 ### Fixed
 - Configs containing the retired Herdr-written `ui.agent_panel_scope` setting no longer report it as an unknown key after upgrades. (#2292)
 - Claude Code confirmation prompts using `Enter to confirm · Esc to cancel` now report `blocked` instead of `idle`. (#2268)
 - Sidebar agent lists keep scrolling when differently sized clients are attached to the same session. (#2255, thanks @aiworkflowpro)
 - `pane send-keys` and `agent send-keys` now preserve Shift when sending `shift+tab`, allowing agent permission modes to be cycled programmatically. (#1561, thanks @keinstn and @tomohisa)
+- Pane applications that enable `modifyOtherKeys` with event-type reporting keep receiving key release events. (#2302)
+- Host terminals that report mouse input in the default `ESC [ M` encoding instead of SGR are understood again, including reports split across reads. (#2309)
+- Closing a focused pane returns focus to the pane the split was opened from instead of the next pane in tree order. (#2266)
+- Halfwidth katakana combined with a voiced or semi-voiced mark now renders instead of being blanked. (#2257)
+- Navigator search matches named tabs in single-tab workspaces. (#2320)
+- `pane query --current` resolves the calling pane from the caller's environment instead of the focused pane. (#2297)
+- Pending URL clicks survive host terminal focus loss, so opening a link no longer opens it a second time. (#2290)
+- Collapsed workspaces keep their agent status visible, including at two-digit positions. (#2216)
 
 ## [0.8.0] - 2026-08-03
 
