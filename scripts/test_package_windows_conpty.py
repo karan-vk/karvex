@@ -41,6 +41,55 @@ class WindowsConptyPackageTests(unittest.TestCase):
             source = package.PROJECT_ROOT / notice["source"]
             self.assertEqual(package.sha256_file(source), notice["sha256"])
 
+    def test_installer_activates_the_packaged_executable_name(self) -> None:
+        metadata = package.load_metadata(package.DEFAULT_METADATA)
+        staged = package.expected_stage_files(metadata, "x86_64")
+        executables = sorted(
+            name for name in staged if "/" not in name and name.endswith(".exe")
+        )
+        self.assertEqual(executables, ["kvx.exe"])
+        executable = executables[0]
+
+        installer = (package.PROJECT_ROOT / "website/install.ps1").read_text(
+            encoding="utf-8"
+        )
+        # install.ps1 is the only consumer of the archive layout, so every path
+        # it builds for the product binary must use the name the packager
+        # stages. A partial rename here silently fails the completeness gate.
+        for expression in (
+            f'Join-Path $ReleaseDir "{executable}"',
+            f'Join-Path $stagingDir "{executable}"',
+            f'Join-Path $releaseDir "{executable}"',
+        ):
+            self.assertIn(expression, installer)
+
+        # The one surviving herdr.exe reference is the pre-rename bin directory
+        # migration, which must keep accepting both names.
+        legacy = [line.strip() for line in installer.splitlines() if "herdr.exe" in line]
+        self.assertEqual(len(legacy), 1, legacy)
+        self.assertIn(executable, legacy[0])
+
+        installer_test = (
+            package.PROJECT_ROOT / "scripts/windows_install_conpty_package_test.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn(f'"{executable}"', installer_test)
+        self.assertNotIn("herdr.exe", installer_test)
+
+    def test_conpty_interop_names_stay_frozen(self) -> None:
+        # vendor/portable-pty loads the bundle by these exact names, so the
+        # herdr -> karvex product rename must not propagate into them.
+        self.assertEqual(package.MARKER_PATH.as_posix(), "conpty/herdr-conpty.json")
+        loader = (
+            package.PROJECT_ROOT / "vendor/portable-pty/src/win/psuedocon.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"herdr-conpty.json"', loader)
+        self.assertIn('"HERDR_WINDOWS_CONPTY"', loader)
+
+        installer = (package.PROJECT_ROOT / "website/install.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('Join-Path $conptyRoot "herdr-conpty.json"', installer)
+
     def test_powershell_wrapper_verifies_package_and_signatures(self) -> None:
         wrapper = (package.PROJECT_ROOT / "scripts/package_windows_conpty.ps1").read_text(
             encoding="utf-8"

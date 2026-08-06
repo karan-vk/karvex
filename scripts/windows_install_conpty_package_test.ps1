@@ -119,7 +119,7 @@ try {
         -ExpectedBuildId "installer-test"
 
     $required = @(
-        "herdr.exe",
+        "kvx.exe",
         "conpty\herdr-conpty.json",
         "conpty\conpty.dll",
         "conpty\x64\OpenConsole.exe",
@@ -159,7 +159,7 @@ try {
     if (-not $downloadFailed) {
         throw "installer repair unexpectedly accepted a missing archive"
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $releaseDir.FullName "herdr.exe") -PathType Leaf)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $releaseDir.FullName "kvx.exe") -PathType Leaf)) {
         throw "failed repair removed the existing release"
     }
 
