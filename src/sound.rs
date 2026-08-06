@@ -18,6 +18,14 @@ use tracing::warn;
 const DISABLE_SOUND_ENV: &str = "KARVEX_DISABLE_SOUND";
 #[cfg(any(windows, test))]
 const WINDOWS_SOUND_PATH_ENV: &str = "KARVEX_SOUND_PATH";
+/// Watchdog handed to the Windows player script through the process
+/// environment, like the sound path. Always set by `windows_player_command`, so
+/// it is not a user-facing knob; the script keeps its own default for the case
+/// where someone runs it by hand.
+#[cfg(any(windows, test))]
+const WINDOWS_SOUND_TIMEOUT_ENV: &str = "KARVEX_SOUND_TIMEOUT_SECS";
+#[cfg(any(windows, test))]
+const WINDOWS_SOUND_TIMEOUT_SECS: u64 = 15;
 #[cfg(not(any(windows, target_os = "macos")))]
 const AUDIO_PLAYER_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -134,13 +142,15 @@ fn windows_media_player_script() -> &'static str {
 $ErrorActionPreference = 'Stop'
 $Path = [Environment]::GetEnvironmentVariable('KARVEX_SOUND_PATH', 'Process')
 if ([string]::IsNullOrWhiteSpace($Path)) { throw 'KARVEX_SOUND_PATH is not set' }
+$TimeoutSecs = [Environment]::GetEnvironmentVariable('KARVEX_SOUND_TIMEOUT_SECS', 'Process')
+if ([string]::IsNullOrWhiteSpace($TimeoutSecs)) { $TimeoutSecs = '15' }
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 $resolved = (Resolve-Path -LiteralPath $Path).ProviderPath
 $script:player = [System.Windows.Media.MediaPlayer]::new()
 $script:frame = [System.Windows.Threading.DispatcherFrame]::new()
 $script:timer = [System.Windows.Threading.DispatcherTimer]::new()
-$script:timer.Interval = [TimeSpan]::FromSeconds(15)
+$script:timer.Interval = [TimeSpan]::FromSeconds([int]$TimeoutSecs)
 $script:failed = $null
 $script:timedOut = $false
 $script:player.add_MediaOpened({ $script:player.Play() })
@@ -169,6 +179,15 @@ if ($script:timedOut) { throw 'sound playback timed out' }
 
 #[cfg(any(windows, test))]
 fn windows_player_command(path: &Path) -> Command {
+    windows_player_command_with_timeout(path, WINDOWS_SOUND_TIMEOUT_SECS)
+}
+
+/// The playback watchdog is a parameter so tests can raise it far above the
+/// production value: on a cold CI runner the WPF media stack can take longer
+/// than the default 15s to report `MediaFailed`, and the dispatcher timer would
+/// otherwise win that race and mask the error the test is asserting on.
+#[cfg(any(windows, test))]
+fn windows_player_command_with_timeout(path: &Path, timeout_secs: u64) -> Command {
     let mut command = crate::noninteractive_process::command("powershell.exe");
     command
         .args([
@@ -180,7 +199,8 @@ fn windows_player_command(path: &Path) -> Command {
             "-Command",
             windows_media_player_script(),
         ])
-        .env(WINDOWS_SOUND_PATH_ENV, path);
+        .env(WINDOWS_SOUND_PATH_ENV, path)
+        .env(WINDOWS_SOUND_TIMEOUT_ENV, timeout_secs.to_string());
     command
 }
 
@@ -436,14 +456,31 @@ mod tests {
                 .then_some(value)
                 .flatten()
         });
+        let env_timeout = command.get_envs().find_map(|(key, value)| {
+            (key == std::ffi::OsStr::new(WINDOWS_SOUND_TIMEOUT_ENV))
+                .then_some(value)
+                .flatten()
+        });
 
         assert!(script.contains("GetEnvironmentVariable('KARVEX_SOUND_PATH', 'Process')"));
+        assert!(script.contains("GetEnvironmentVariable('KARVEX_SOUND_TIMEOUT_SECS', 'Process')"));
+        assert!(script.contains("FromSeconds([int]$TimeoutSecs)"));
+        assert!(
+            script.contains(&format!("$TimeoutSecs = '{WINDOWS_SOUND_TIMEOUT_SECS}'")),
+            "the script fallback must match the Rust default watchdog"
+        );
         assert!(!script.contains("param([string]$Path)"));
         assert!(script.contains("Resolve-Path -LiteralPath $Path"));
         assert!(script.contains("Dispatcher]::PushFrame"));
         assert!(script.contains("add_MediaEnded"));
         assert!(script.contains("add_MediaFailed"));
         assert_eq!(env_path, Some(path.as_os_str()));
+        let expected_timeout = WINDOWS_SOUND_TIMEOUT_SECS.to_string();
+        assert_eq!(
+            env_timeout,
+            Some(std::ffi::OsStr::new(&expected_timeout)),
+            "production playback keeps the default watchdog"
+        );
         assert!(!command.get_args().any(|arg| arg == path.as_os_str()));
     }
 
@@ -452,13 +489,23 @@ mod tests {
     fn windows_media_player_reports_invalid_media_without_waiting_for_timeout() {
         let path = temp_sound_path();
         std::fs::write(&path, b"not an mp3").unwrap();
-        let output = run_windows_player(&path).unwrap();
+        // Raise the dispatcher watchdog well above the 15s production value:
+        // a cold, loaded CI runner can spend longer than that inside the WPF
+        // media stack, and a watchdog tick would report "sound playback timed
+        // out" instead of the MediaFailed error this test exists to cover.
+        let output = windows_player_command_with_timeout(&path, 120)
+            .output()
+            .expect("windows media player script should run");
         let _ = std::fs::remove_file(path);
 
-        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("sound media failed"),
-            "stderr should identify a MediaFailed error"
+            !output.status.success(),
+            "invalid media should fail playback, stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("sound media failed"),
+            "stderr should identify a MediaFailed error, got: {stderr}"
         );
     }
 }

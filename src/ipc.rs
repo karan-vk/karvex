@@ -45,6 +45,13 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     }
 }
 
+/// Capacity of `sockaddr_un.sun_path` on macOS, the tightest limit across the
+/// Unix targets we support (Linux allows 108). Test helpers that build socket
+/// paths assert against this so a path that is fine on Linux cannot silently
+/// break the macOS CI leg.
+#[cfg(all(test, unix))]
+pub(crate) const MACOS_SUN_PATH_LIMIT: usize = 104;
+
 pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(unix)]
     {

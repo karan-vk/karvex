@@ -476,13 +476,25 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Unique path for a test socket.
+    ///
+    /// Rooted at `/tmp` rather than `std::env::temp_dir()` because macOS caps
+    /// `sockaddr_un.sun_path` at 104 bytes while its `$TMPDIR` alone is a ~49
+    /// byte `/var/folders/<xx>/<hash>/T/` path. Same convention as the helpers
+    /// in `api::server` and `server::client_transport`.
     #[cfg(unix)]
     fn unique_test_path(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("karvex-{name}-{}-{nanos}", std::process::id()))
+        let path = std::path::PathBuf::from("/tmp")
+            .join(format!("karvex-{name}-{}-{nanos}", std::process::id()));
+        debug_assert!(
+            path.as_os_str().len() <= crate::ipc::MACOS_SUN_PATH_LIMIT,
+            "test socket path is longer than the macOS sun_path limit: {path:?}"
+        );
+        path
     }
 
     #[cfg(unix)]

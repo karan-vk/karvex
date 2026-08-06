@@ -56,8 +56,10 @@ jobs:
             kind: windows
     runs-on: ${{ matrix.os }}
     # The workflow feature adds SurrealDB (~257 crates) to both the default and
-    # the --no-default-features leg of `just ci`.
-    timeout-minutes: 30
+    # the --no-default-features leg of `just ci`. On macOS the two legs together
+    # needed ~19 min just to reach the first test run on a cold cache, so 30 was
+    # not enough headroom for the full recipe.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -125,8 +127,11 @@ jobs:
           restore-keys: |
             zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-
 
-      # cmake and a C toolchain are mandatory on every leg: surrealdb-core pulls
-      # aws-lc-sys unconditionally via jsonwebtoken.
+      # surrealdb-core pulls aws-lc-sys unconditionally via jsonwebtoken, so the
+      # default workflow feature needs a native build toolchain on every leg.
+      # x86_64 Windows additionally needs NASM, which not every runner image
+      # ships; .cargo/config.toml opts into aws-lc-sys' prebuilt objects so the
+      # build does not depend on that image detail.
       - name: Install macOS build tools
         if: runner.os == 'macOS'
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja
@@ -167,7 +172,10 @@ jobs:
   windows-conpty-package:
     name: Windows ConPTY package
     runs-on: windows-2022
-    timeout-minutes: 25
+    # Builds default features so the packaged binary matches what ships. The
+    # workflow feature adds SurrealDB (~257 crates), which a cold cache on this
+    # older image does not reliably compile inside the previous 25 minutes.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
