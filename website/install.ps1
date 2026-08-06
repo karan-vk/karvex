@@ -31,7 +31,7 @@ function Write-WarningStep {
 }
 
 function Get-HerdrCommandSource {
-    $existing = Get-Command herdr -ErrorAction SilentlyContinue
+    $existing = Get-Command kvx -ErrorAction SilentlyContinue
     if ($null -eq $existing) {
         return $null
     }
@@ -263,8 +263,8 @@ function Test-HerdrReleaseComplete {
     if (-not (Test-RegularDirectory -Path $ReleaseDir)) {
         return $false
     }
-    $herdrExe = Join-Path $ReleaseDir "herdr.exe"
-    if (-not (Test-RegularFile -Path $herdrExe)) {
+    $kvxExe = Join-Path $ReleaseDir "kvx.exe"
+    if (-not (Test-RegularFile -Path $kvxExe)) {
         return $false
     }
     if ($Format -eq "exe") {
@@ -439,7 +439,7 @@ function Move-LegacyHerdrBinDirectory {
         return $false
     }
 
-    if (($entries | Where-Object { $_.Name -ieq "herdr.exe" } | Select-Object -First 1) -eq $null) {
+    if (($entries | Where-Object { $_.Name -ieq "kvx.exe" -or $_.Name -ieq "herdr.exe" } | Select-Object -First 1) -eq $null) {
         return $false
     }
 
@@ -585,7 +585,7 @@ if (-not [string]::IsNullOrWhiteSpace($existingHerdr) -and -not (Test-PathStarts
 Write-Step "Fetching Herdr $Channel manifest"
 $manifest = ConvertTo-ManifestObject -Manifest (Invoke-RestMethod -Uri $ManifestUrl)
 if (-not [string]::IsNullOrWhiteSpace($ExpectedBuildId) -and [string]$manifest.build_id -ne $ExpectedBuildId) {
-    throw "Preview manifest changed while updating. Expected build $ExpectedBuildId but found $($manifest.build_id). Run herdr update again."
+    throw "Preview manifest changed while updating. Expected build $ExpectedBuildId but found $($manifest.build_id). Run kvx update again."
 }
 $versionIdentity = Resolve-HerdrVersion -Manifest $manifest -SelectedChannel $Channel
 $asset = Get-ManifestAsset -Manifest $manifest -Target $target
@@ -612,15 +612,15 @@ try {
                 Expand-Archive -LiteralPath $downloadPath -DestinationPath $stagingDir
             } else {
                 New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
-                Copy-Item -LiteralPath $downloadPath -Destination (Join-Path $stagingDir "herdr.exe")
+                Copy-Item -LiteralPath $downloadPath -Destination (Join-Path $stagingDir "kvx.exe")
             }
             if (-not (Test-HerdrReleaseComplete -ReleaseDir $stagingDir -Format $asset.Format)) {
                 throw "Downloaded Herdr package is incomplete or failed ConPTY verification."
             }
-            $stagedHerdr = Join-Path $stagingDir "herdr.exe"
-            & $stagedHerdr --version *> $null
+            $stagedKvx = Join-Path $stagingDir "kvx.exe"
+            & $stagedKvx --version *> $null
             if ($LASTEXITCODE -ne 0) {
-                throw "Downloaded Herdr command failed verification: $stagedHerdr --version"
+                throw "Downloaded Herdr command failed verification: $stagedKvx --version"
             }
             $backupDir = $null
             if (Test-Path -LiteralPath $releaseDir) {
@@ -640,10 +640,10 @@ try {
             }
         }
 
-        $releaseHerdr = Join-Path $releaseDir "herdr.exe"
-        & $releaseHerdr --version *> $null
+        $releaseKvx = Join-Path $releaseDir "kvx.exe"
+        & $releaseKvx --version *> $null
         if ($LASTEXITCODE -ne 0) {
-            throw "Installed Herdr command failed verification: $releaseHerdr --version"
+            throw "Installed Herdr command failed verification: $releaseKvx --version"
         }
         Get-ChildItem -LiteralPath $releasesDir -Force -Directory -Filter ".backup.$releaseName.*" -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -680,9 +680,9 @@ if ($newProcessPath -cne $env:Path) {
 
 $resolvedHerdr = Get-HerdrCommandSource
 if (-not (Test-PathStartsWith -Path $resolvedHerdr -Prefix $visibleBinDir)) {
-    Write-WarningStep "PowerShell still resolves herdr to $resolvedHerdr. Open a new PowerShell window or inspect PATH order manually."
+    Write-WarningStep "PowerShell still resolves kvx to $resolvedHerdr. Open a new PowerShell window or inspect PATH order manually."
 }
 
-Write-Step "Current PowerShell session: herdr"
-Write-Step "Future PowerShell windows: open a new PowerShell window and run: herdr"
+Write-Step "Current PowerShell session: kvx"
+Write-Step "Future PowerShell windows: open a new PowerShell window and run: kvx"
 Write-Host "Herdr $versionIdentity installed successfully."
