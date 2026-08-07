@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.9.1] - 2026-08-07
+
 ### Added
 - Releases now publish a `kvx-workflow-<target>` asset alongside each platform's canonical `kvx-<target>` binary, built with `--features workflow`. `kvx update` and `kvx channel set` keep a binary on its own variant's release track, so switching channels or updating never swaps a workflow install for a canonical one or back.
 
