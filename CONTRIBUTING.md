@@ -89,7 +89,10 @@ Run the PR checks and make sure they pass.
 just ci
 ```
 
-`just ci` runs `cargo fmt --check`, then clippy and `cargo nextest run`.
+`just ci` runs `cargo fmt --check`, then clippy and `cargo nextest run` in both
+cargo feature configurations: the default feature set (`workflow` on, the
+build that ships as the single `kvx-<target>` binary) and
+`--no-default-features` (the slim, workflow-off build).
 
 Do not open a PR that bypasses failing tests, formatting, or build errors.
 

@@ -1,41 +1,66 @@
 # karvex task runner
+#
+# Karvex builds in two cargo feature configurations and both stay covered:
+#   * default features (`workflow` is on by default) — the full build that
+#     ships as the single `kvx-<target>` asset. Most tests live here,
+#     including the workflow store tests gated behind the feature, so this is
+#     the primary leg. `--features workflow` is passed explicitly below even
+#     though it is already the default, so these commands keep exercising it
+#     if the default feature set ever changes.
+#   * `--no-default-features` — the slim, workflow-off build. It ships as
+#     nothing on its own; it exists as a CI escape hatch for the MSVC
+#     cross-lint (surrealdb/aws-lc-sys don't cross-compile cleanly to MSVC
+#     from Linux) and as a slim source-build option.
 
-# Run tests
+# Run tests (primary, workflow-on configuration)
 test:
-    cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
+    cargo nextest run --locked --features workflow --status-level fail --final-status-level fail --failure-output final --success-output never
     python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     just integration-assets-test
     just plugin-marketplace-test
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
-    cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
+    cargo nextest run --locked --features workflow "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
-# Run fast local lint checks
+# Run fast local lint checks (primary, workflow-on configuration)
 [unix]
 lint:
     cargo fmt --check
-    cargo clippy --all-targets --locked -- -D warnings
+    cargo clippy --all-targets --locked --features workflow -- -D warnings
 
 [script("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File")]
 [windows]
 lint:
     & .\scripts\windows_check.ps1 -Mode lint
 
-# Run PR CI checks
+# Run PR CI checks over both cargo feature configurations
 [unix]
 ci filter='all()': lint
-    cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    cargo nextest run --locked --features workflow -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    just check-slim "{{filter}}"
     just integration-assets-test
     just plugin-marketplace-test
 
+# `--no-default-features` is the slim, workflow-off leg. Takes the same
+# nextest filter as `ci` so per-platform exclusions (macOS skips
+# `binary(live_handoff)`) apply to this leg too.
+# Lint and test the slim (workflow-off) build
+[unix]
+check-slim filter='all()':
+    cargo clippy --locked --all-targets --no-default-features -- -D warnings
+    cargo nextest run --locked --no-default-features -E "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
+
+# --no-default-features on purpose: this lint exists to catch cfg(windows) errors in karvex's own
+# code, not to cross-build surrealdb and aws-lc-sys for MSVC from Linux. `workflow` is a default
+# feature, so this flag is required to keep the lint feature-off.
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
 [unix]
 windows-lint:
     rustup target add x86_64-pc-windows-msvc
-    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin kvx --locked --target x86_64-pc-windows-msvc -- -D warnings
+    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin kvx --locked --no-default-features --target x86_64-pc-windows-msvc -- -D warnings
 
-# Check formatting + run unit tests + Windows target lint + maintenance script tests
+# Check formatting + unit tests in both feature configs + Windows target lint + maintenance script tests
 [unix]
 check: ci windows-lint
     python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty

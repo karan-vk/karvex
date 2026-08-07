@@ -234,10 +234,11 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
 enum Readiness {
     /// The server can serve `workflow.*`.
     Ready,
-    /// The store itself refused to open — the workflow subsystem is always
-    /// compiled in, so this is a genuine runtime failure (a lock held by
-    /// another process, or a corrupt/unwritable database file), never an
-    /// expected build configuration.
+    /// The store itself refused to open — this binary only exists with the
+    /// `workflow` feature on (`[[test]] required-features` in `Cargo.toml`),
+    /// so this is a genuine runtime failure (a lock held by another process,
+    /// or a corrupt/unwritable database directory), never an expected build
+    /// configuration.
     StoreUnavailable,
     /// The store is reachable but the handlers still resolve to the
     /// placeholder engine handle.
@@ -258,19 +259,20 @@ fn workflow_readiness(socket: &Path) -> Readiness {
 /// answering `not ready` is a state the phase has to leave behind, and a test
 /// that skipped over it would reproduce precisely the silent-pass failure mode
 /// `05-phase-plan.md` §6 exists to prevent. A store that will not open is
-/// failed the same way rather than skipped: workflows ship in every build, so
-/// there is no configuration in which having nothing to assert is correct.
+/// failed the same way rather than skipped: this suite only compiles with the
+/// `workflow` feature on, so there is no configuration in which having nothing
+/// to assert is correct.
 fn require_workflow_api(socket: &Path) -> bool {
     match workflow_readiness(socket) {
         Readiness::Ready => true,
         Readiness::StoreUnavailable => panic!(
             "the server answers workflow.* with `workflow_unavailable`.\n\
-             The workflow subsystem is compiled into every build, so this is a \
-             real store failure, not a feature-off build: `WorkflowStore` could \
-             not open its redb database. Check for another karvex server \
-             holding the exclusive file lock on `$KARVEX_WORKFLOW_DB_PATH` \
-             (default `<state_dir>/workflow.redb`), and for a corrupt or \
-             read-only database file."
+             This binary is only built with the `workflow` feature on, so this \
+             is a real store failure, not a feature-off build: `WorkflowStore` \
+             could not open its SurrealKV database. Check for another karvex \
+             server holding the lock on `$KARVEX_WORKFLOW_DB_PATH` (default \
+             `<state_dir>/workflow`), and for a corrupt or read-only database \
+             directory."
         ),
         Readiness::EngineUnwired => panic!(
             "the server answers workflow.* with `workflow_engine_not_ready`.\n\

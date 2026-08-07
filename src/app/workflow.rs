@@ -683,8 +683,10 @@ impl App {
 
     /// Hands whatever `RunEffect::Persist` queued to the store. Every effect
     /// batch ends here, so the journal never lags the in-memory graph by more
-    /// than one batch.
+    /// than one batch. With the `workflow` feature off there is no store, and
+    /// the queue is simply left to its own budget.
     fn flush_workflow_writes(&mut self) {
+        #[cfg(feature = "workflow")]
         self.drain_workflow_store_writes();
     }
 

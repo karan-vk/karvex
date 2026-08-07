@@ -2,8 +2,7 @@
 //! vocabulary.
 //!
 //! This module is pure data plus construction-time validation. It must not
-//! reference `App`, `TerminalRuntime`, the workflow store backend, or
-//! ratatui — see
+//! reference `App`, `TerminalRuntime`, SurrealDB, or ratatui — see
 //! `docs/design/workflow-builder/04-kvdag-and-execution.md` §1 and §2.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};

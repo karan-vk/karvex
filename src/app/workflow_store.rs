@@ -2,19 +2,18 @@
 //!
 //! `03-storage-schema.md` §2: the store is opened **lazily on first
 //! `workflow.*` use**, so a karvex that never touches workflows never pays the
-//! open cost, and a database file another server holds puts the whole subsystem
-//! in `Unavailable { reason: "store_locked", holder }` rather than failing one
+//! open cost, and a directory another server holds puts the whole subsystem in
+//! `Unavailable { reason: "store_locked", holder }` rather than failing one
 //! call at a time.
 //!
 //! The API handlers are synchronous (`handle_api_request` returns a `String`)
-//! while the store's surface is async, so the store lives on its own thread
-//! with its own current-thread runtime and is reached over a channel. Blocking
-//! the event loop for the reply is deliberate and bounded: the engine's
-//! *durable* writes (`04` §9) are queued by `WorkflowRuntimeState` and
-//! submitted here without a reply, so nothing on a node's critical path waits
-//! on the disk. Only the handful of request/response methods — create,
-//! version.create, run, list — wait, and only because their answer is the
-//! response.
+//! while SurrealDB is async, so the store lives on its own thread with its own
+//! current-thread runtime and is reached over a channel. Blocking the event
+//! loop for the reply is deliberate and bounded: the engine's *durable* writes
+//! (`04` §9) are queued by `WorkflowRuntimeState` and submitted here without a
+//! reply, so nothing on a node's critical path waits on the disk. Only the
+//! handful of request/response methods — create, version.create, run, list —
+//! wait, and only because their answer is the response.
 //!
 //! Going through a thread rather than `block_in_place` keeps this correct on
 //! every runtime flavour: the headless server builds a multi-thread runtime,
@@ -221,9 +220,9 @@ impl WorkflowStoreHandle {
         matches!(self.state, HandleState::Open(_))
     }
 
-    /// An already-open handle backed by an in-memory database. Unit tests drive
-    /// `App`'s `workflow.*` handlers through this so they never touch — or lock
-    /// — the developer's real database.
+    /// An already-open handle backed by `kv-mem`. Unit tests drive `App`'s
+    /// `workflow.*` handlers through this so they never touch — or lock — the
+    /// developer's real database.
     #[cfg(test)]
     pub(crate) fn in_memory() -> Self {
         match Self::spawn(StoreLocation::Memory) {

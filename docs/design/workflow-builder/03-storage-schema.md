@@ -4,6 +4,13 @@ Covers workflow definitions, immutable kvdag versioning, runs, per-node
 checkpoints, run summaries, interrogation-restore records, and the
 self-improvement review cycle.
 
+> **Addendum — 2026-08-07 (later same day):** owner direction supersedes the
+> redb addendum immediately below. SurrealDB is reinstated as the workflow
+> store described in this document, to support planned SurrealQL, graph,
+> vector, and live-query feature extensions. The redb interlude documented
+> below shipped only in v0.9.1; both addenda are kept in place for history.
+> See `00-overview.md` D4 for the equivalent note on the decision list.
+
 > **Addendum — 2026-08-07:** owner directive supersedes the SurrealDB mandate
 > below. Karvex ships one slim binary per platform with the workflow
 > subsystem always included; the store is reimplemented on `redb` (pure

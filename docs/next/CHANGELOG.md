@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+- The workflow subsystem's embedded store moves back to SurrealDB, reinstating the `SurrealValue`-based records and `.surql` migrations behind the unchanged `WorkflowStore` API, in line with the project's plans to build SurrealQL, graph, vector, and live-query features on top of it. Workflow run history written by v0.9.1's `redb` store is not migrated to the reinstated SurrealDB store.
+- Release binaries grow to roughly 53 MB accordingly, still about 40% smaller than v0.9.0's binaries; the `[profile.release]` thin-LTO, single-codegen-unit, stripped-symbol build introduced in v0.9.1 is unchanged.
+
 ## [0.9.1] - 2026-08-07
 
 ### Changed

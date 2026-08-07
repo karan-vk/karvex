@@ -6,7 +6,7 @@ use std::io;
 use crate::workflow::model::KvdagError;
 
 /// `StoreError::Unavailable::reason` when another karvex server holds the
-/// exclusive lock on the database file.
+/// SurrealKv lock on the database directory.
 pub const STORE_LOCKED: &str = "store_locked";
 
 /// The API error code every `workflow.*` method returns while the subsystem is

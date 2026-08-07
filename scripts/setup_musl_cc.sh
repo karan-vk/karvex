@@ -5,9 +5,8 @@
 # Why this exists
 # ---------------
 # Rust's musl targets ship their own libc, but any dependency that compiles C
-# through cc-rs needs a C compiler that actually targets musl. Karvex has no
-# such dependency today, but this keeps the release legs working the moment one
-# is added. The GitHub Linux runners have no
+# through cc-rs (aws-lc-sys via the `workflow` feature, lz4-sys, ...) needs a C
+# compiler that actually targets musl. The GitHub Linux runners have no
 # aarch64 musl compiler at all, and on the aarch64 leg the situation is worse:
 # the workflow sets CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER, cargo
 # exports it to build scripts as RUSTC_LINKER, and cc-rs derives its tool

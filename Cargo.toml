@@ -23,6 +23,23 @@ include = [
 name = "kvx"
 path = "src/main.rs"
 
+# `tests/workflow_headless.rs` drives `workflow.*` end to end against a real
+# server, so it has nothing to assert without the store. Requiring the feature
+# here means a `--no-default-features` build does not compile the binary at
+# all, instead of building a suite that skips itself at runtime.
+[[test]]
+name = "workflow_headless"
+path = "tests/workflow_headless.rs"
+required-features = ["workflow"]
+
+[features]
+# On by default: there is one `kvx-<target>` asset per platform and the
+# workflow subsystem ships in it. The feature exists only so the subsystem —
+# and with it surrealdb — can be dropped from a build that cannot have it: the
+# MSVC cross-lint leg, and slim source builds.
+default = ["workflow"]
+workflow = ["dep:surrealdb", "dep:surrealdb-types"]
+
 [dependencies]
 base64 = "0.22.1"
 bincode = { version = "2", features = ["serde"] }
@@ -37,16 +54,19 @@ libc = "0.2"
 portable-pty = "=0.9.0"
 png = "0.17"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
-# The workflow store. Pure Rust, no C toolchain, no TLS/JWT stack, and no
-# optional features enabled: it contributes a handful of crates and ~1-2 MiB to
-# the binary, which is what lets the workflow subsystem ship in the one
-# canonical `kvx-<target>` asset instead of a separate variant.
-redb = "4.1.0"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
 sha2 = "0.10"
+# Embedded only: the crate default features pull a WebSocket + TLS client stack
+# for talking to a remote SurrealDB server, which karvex never does. kv-mem is
+# kept so store and engine tests run with no disk I/O.
+surrealdb = { version = "3", default-features = false, features = [
+    "kv-surrealkv",
+    "kv-mem",
+], optional = true }
+surrealdb-types = { version = "3", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 toml = "0.8"
 tracing = "0.1.44"
@@ -59,6 +79,7 @@ portable-pty = { path = "vendor/portable-pty" }
 
 # Release binaries ship over the wire on every `kvx update`, so size matters.
 # There is one build configuration, so this applies to every shipped binary.
+# Measured on the default (workflow on) build: 86.13 MiB -> 53.46 MiB.
 [profile.release]
 lto = "thin"
 codegen-units = 1

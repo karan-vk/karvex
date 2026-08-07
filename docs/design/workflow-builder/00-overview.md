@@ -179,6 +179,17 @@ Neutral naming is enforced in the API surface: `workflow`, `kvdag_version`,
 Each decision states the call and why. Alternatives that were rejected are named
 so the rationale survives.
 
+> **Addendum — 2026-08-07 (later same day):** owner direction supersedes the
+> redb addendum immediately below. The workflow store is reinstated on
+> embedded SurrealDB — D4's original call — to support planned SurrealQL,
+> graph, vector, and live-query feature extensions that `redb` cannot offer.
+> The redb interlude documented below shipped only in v0.9.1; both addenda are
+> kept in place for history. Karvex still ships a single binary per platform
+> with the workflow subsystem always included: the `workflow` cargo feature
+> returns with `default = ["workflow"]`, existing only as a CI escape hatch for
+> the MSVC cross-lint and as a slim source-build option, never as a shipped
+> variant. See `03-storage-schema.md` for the matching note on the schema doc.
+
 > **Addendum — 2026-08-07:** owner directive supersedes D4 below. Karvex ships
 > one slim binary per platform with the workflow subsystem always included,
 > rather than a SurrealDB-bearing variant next to a lean default. The store is

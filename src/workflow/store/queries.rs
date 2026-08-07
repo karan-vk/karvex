@@ -1,11 +1,7 @@
 //! Read methods that project stored rows into domain-typed records.
 //!
-//! Every method here is additive: it only ever reads, never mutates. The
-//! mutating surface lives in `mod.rs`.
-//!
-//! Most of these are a single range scan, because the key layout in `db.rs`
-//! already stores rows in the order the caller wants them. The two that sort in
-//! memory say so, and why.
+//! Every method here is additive: it only ever runs `SELECT`, never mutates.
+//! The mutating surface lives in `mod.rs`.
 
 use std::collections::BTreeMap;
 
@@ -15,12 +11,10 @@ use crate::workflow::model::{
 };
 use crate::workflow::tier::Tier;
 
-use super::db::{self, RowReader as _};
 use super::records::{self, parse_record_id, record_id_to_string};
 use super::{
     parse_demand, parse_evidence, parse_node_status, parse_run_status, parse_succession,
-    StoreError, WorkflowStore, TABLE_KVDAG_VERSION, TABLE_RUN_NODE, TABLE_WORKFLOW,
-    TABLE_WORKFLOW_RUN,
+    query_error, StoreError, WorkflowStore, TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
 };
 
 /// One `workflow` row, projected for listing.
@@ -92,7 +86,7 @@ pub struct RunEventRecord {
     pub kind: RunEventKind,
     /// The full `run_node:...` id, not resolved to an `InstancePath`: some
     /// events (e.g. `run_started`) have none, and resolving the rest would
-    /// cost a lookup per row for a value most callers already know.
+    /// cost a join per row for a value most callers already know.
     pub run_node: Option<String>,
     pub payload: serde_json::Value,
 }
@@ -127,96 +121,115 @@ impl WorkflowStore {
         &self,
         workflow: &WorkflowId,
     ) -> Result<Option<WorkflowSummary>, StoreError> {
-        let key = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow id: {workflow}")))?;
-        let read = self.read()?;
-        let table = read.open_table(db::WORKFLOW).map_err(db::storage_error)?;
-        let row: Option<records::WorkflowRow> = db::get_row(&table, &key)?;
-        row.map(workflow_summary).transpose()
+        let mut response = self
+            .db
+            .query("SELECT * FROM $id")
+            .bind(("id", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::WorkflowRow> = response.take(0).map_err(query_error)?;
+        rows.into_iter().next().map(workflow_summary).transpose()
     }
 
-    /// Every workflow, by name. Workflow keys are creation-ordered rather than
-    /// name-ordered, so this is the one listing that sorts in memory.
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowSummary>, StoreError> {
-        let read = self.read()?;
-        let table = read.open_table(db::WORKFLOW).map_err(db::storage_error)?;
-        let mut rows: Vec<records::WorkflowRow> = db::scan_prefix(&table, "")?;
-        rows.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut response = self
+            .db
+            .query("SELECT * FROM workflow ORDER BY name")
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::WorkflowRow> = response.take(0).map_err(query_error)?;
         rows.into_iter().map(workflow_summary).collect()
     }
 
     /// Resolves a workflow-relative version *number* — which is what the wire
-    /// carries — to the version's record id. The number is part of the version
-    /// key, so this is a point lookup rather than a scan.
+    /// carries — to the version's record id.
     pub async fn find_version_id(
         &self,
         workflow: &WorkflowId,
         version: u32,
     ) -> Result<Option<KvdagVersionId>, StoreError> {
-        let workflow_key = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow id: {workflow}")))?;
-        let key = db::version_key(&workflow_key, version);
-        let read = self.read()?;
-        let table = read
-            .open_table(db::KVDAG_VERSION)
-            .map_err(db::storage_error)?;
-        if !table.row_exists(&key)? {
-            return Ok(None);
-        }
-        Ok(Some(KvdagVersionId::new(record_id_to_string(
-            TABLE_KVDAG_VERSION,
-            &key,
-        ))))
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM kvdag_version WHERE workflow = $workflow \
+                 AND version = $version LIMIT 1",
+            )
+            .bind(("workflow", id))
+            .bind(("version", i64::from(version)))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::KvdagVersionRow> = response.take(0).map_err(query_error)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|row| KvdagVersionId::new(record_id_to_string(&row.id))))
     }
 
     pub async fn get_run(&self, run: &RunId) -> Result<Option<RunRecord>, StoreError> {
-        let key = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        self.select_run(&key)?.map(run_record).transpose()
+        let mut response = self
+            .db
+            .query("SELECT * FROM $id")
+            .bind(("id", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
+        rows.into_iter().next().map(run_record).transpose()
     }
 
-    /// Runs for a workflow, newest first (`03-storage-schema.md` §6). Run keys
-    /// are creation-ordered, so "newest first" is the key range read backwards.
+    /// Runs for a workflow, newest first (`03-storage-schema.md` §6).
     pub async fn list_runs(
         &self,
         workflow: &WorkflowId,
         limit: u32,
     ) -> Result<Vec<RunRecord>, StoreError> {
-        let workflow_key = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow id: {workflow}")))?;
-        let read = self.read()?;
-        let table = read
-            .open_table(db::WORKFLOW_RUN)
-            .map_err(db::storage_error)?;
-        let mut rows: Vec<records::RunRow> =
-            db::scan_prefix(&table, &db::run_prefix(&workflow_key))?;
-        rows.reverse();
-        rows.truncate(limit as usize);
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM workflow_run WHERE workflow = $workflow \
+                 ORDER BY started_at DESC LIMIT $limit",
+            )
+            .bind(("workflow", id))
+            .bind(("limit", i64::from(limit)))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
         rows.into_iter().map(run_record).collect()
     }
 
     /// Every `run_node` for a run, in scheduling order (`04` §3.1: depth, then
-    /// instance path). Keys order by instance path alone, so depth is applied
-    /// on top of that here.
+    /// instance path).
     pub async fn list_run_nodes(&self, run: &RunId) -> Result<Vec<RunNodeRecord>, StoreError> {
-        let key = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let read = self.read()?;
-        let table = read.open_table(db::RUN_NODE).map_err(db::storage_error)?;
-        let mut rows: Vec<records::RunNodeRow> = db::scan_prefix(&table, &db::child_prefix(&key))?;
-        rows.sort_by(|left, right| {
-            (left.depth, &left.instance_path).cmp(&(right.depth, &right.instance_path))
-        });
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_node WHERE run = $run ORDER BY depth, instance_path")
+            .bind(("run", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
         rows.into_iter().map(run_node_record).collect()
     }
 
     /// Replays a run's journal in order (`03-storage-schema.md` §6).
     pub async fn list_run_events(&self, run: &RunId) -> Result<Vec<RunEventRecord>, StoreError> {
-        let key = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let read = self.read()?;
-        let table = read.open_table(db::RUN_EVENT).map_err(db::storage_error)?;
-        let rows: Vec<records::RunEventRow> = db::scan_prefix(&table, &db::child_prefix(&key))?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_event WHERE run = $run ORDER BY seq")
+            .bind(("run", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunEventRow> = response.take(0).map_err(query_error)?;
         rows.into_iter().map(run_event_record).collect()
     }
 
@@ -226,14 +239,19 @@ impl WorkflowStore {
         run: &RunId,
         path: &InstancePath,
     ) -> Result<Vec<CheckpointRecord>, StoreError> {
-        let key = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let read = self.read()?;
-        let table = read
-            .open_table(db::NODE_CHECKPOINT)
-            .map_err(db::storage_error)?;
-        let rows: Vec<records::CheckpointRow> =
-            db::scan_prefix(&table, &db::checkpoint_prefix(&key, path.as_str()))?;
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM node_checkpoint WHERE run = $run AND instance_path = $path \
+                 ORDER BY seq",
+            )
+            .bind(("run", id))
+            .bind(("path", path.to_string()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::CheckpointRow> = response.take(0).map_err(query_error)?;
         rows.into_iter().map(checkpoint_record).collect()
     }
 
@@ -244,22 +262,20 @@ impl WorkflowStore {
         run: &RunId,
         node_keys: &[NodeKey],
     ) -> Result<Vec<CheckpointRecord>, StoreError> {
-        let key = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let read = self.read()?;
-        let table = read
-            .open_table(db::NODE_CHECKPOINT)
-            .map_err(db::storage_error)?;
-        let mut rows: Vec<records::CheckpointRow> =
-            db::scan_prefix(&table, &db::child_prefix(&key))?;
-        rows.retain(|row| {
-            row.kind == "result"
-                && row.schema_valid
-                && node_keys.iter().any(|key| key.as_str() == row.node_key)
-        });
-        // Checkpoints are keyed by instance path, and one node key can have
-        // several instances, so node-key order is not the key order.
-        rows.sort_by(|left, right| (&left.node_key, left.seq).cmp(&(&right.node_key, right.seq)));
+        let selectors: Vec<String> = node_keys.iter().map(NodeKey::to_string).collect();
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM node_checkpoint WHERE run = $run AND kind = \"result\" \
+                 AND schema_valid = true AND node_key IN $selectors ORDER BY node_key, seq",
+            )
+            .bind(("run", id))
+            .bind(("selectors", selectors))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::CheckpointRow> = response.take(0).map_err(query_error)?;
         rows.into_iter().map(checkpoint_record).collect()
     }
 
@@ -267,39 +283,42 @@ impl WorkflowStore {
         &self,
         run: &RunId,
     ) -> Result<Option<RunSummaryRecord>, StoreError> {
-        let key = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let read = self.read()?;
-        let table = read
-            .open_table(db::RUN_SUMMARY)
-            .map_err(db::storage_error)?;
-        let row: Option<records::RunSummaryRow> = db::get_row(&table, &key)?;
-        row.map(run_summary_record).transpose()
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_summary WHERE run = $run LIMIT 1")
+            .bind(("run", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunSummaryRow> = response.take(0).map_err(query_error)?;
+        rows.into_iter().next().map(run_summary_record).transpose()
     }
 }
 
 fn workflow_summary(row: records::WorkflowRow) -> Result<WorkflowSummary, StoreError> {
     Ok(WorkflowSummary {
-        id: WorkflowId::new(record_id_to_string(TABLE_WORKFLOW, &row.id)),
+        id: WorkflowId::new(record_id_to_string(&row.id)),
         name: row.name,
         description: row.description,
         head_version: row
             .head_version
-            .as_deref()
-            .map(|key| KvdagVersionId::new(record_id_to_string(TABLE_KVDAG_VERSION, key))),
+            .as_ref()
+            .map(record_id_to_string)
+            .map(KvdagVersionId::new),
         default_tier: Tier::parse(&row.default_tier)
             .ok_or_else(|| StoreError::Decode(format!("unknown tier {:?}", row.default_tier)))?,
         archived: row.archived,
-        created_at_unix_ms: unix_ms(row.created_at),
-        updated_at_unix_ms: unix_ms(row.updated_at),
+        created_at_unix_ms: unix_ms(&row.created_at),
+        updated_at_unix_ms: unix_ms(&row.updated_at),
     })
 }
 
-/// Rows carry signed unix milliseconds; the wire carries unsigned, so a
-/// pre-epoch timestamp (which this store never writes) clamps to 0 rather than
-/// wrapping.
-fn unix_ms(value: i64) -> u64 {
-    u64::try_from(value).unwrap_or(0)
+/// `surrealdb_types::Datetime` derefs to `chrono::DateTime<Utc>`; the wire
+/// carries unsigned epoch milliseconds, so a pre-epoch timestamp (which this
+/// store never writes) clamps to 0 rather than wrapping.
+fn unix_ms(value: &surrealdb_types::Datetime) -> u64 {
+    u64::try_from(value.timestamp_millis()).unwrap_or(0)
 }
 
 fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
@@ -317,9 +336,9 @@ fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
         })
         .unwrap_or_default();
     Ok(RunRecord {
-        id: RunId::new(record_id_to_string(TABLE_WORKFLOW_RUN, &row.id)),
-        workflow: WorkflowId::new(record_id_to_string(TABLE_WORKFLOW, &row.workflow)),
-        version: KvdagVersionId::new(record_id_to_string(TABLE_KVDAG_VERSION, &row.kvdag_version)),
+        id: RunId::new(record_id_to_string(&row.id)),
+        workflow: WorkflowId::new(record_id_to_string(&row.workflow)),
+        version: KvdagVersionId::new(record_id_to_string(&row.kvdag_version)),
         tier: Tier::parse(&row.tier)
             .ok_or_else(|| StoreError::Decode(format!("unknown tier {:?}", row.tier)))?,
         status: parse_run_status(&row.status)?,
@@ -327,7 +346,7 @@ fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
         context_runs: row
             .context_runs
             .iter()
-            .map(|key| RunId::new(record_id_to_string(TABLE_WORKFLOW_RUN, key)))
+            .map(|id| RunId::new(record_id_to_string(id)))
             .collect(),
         max_depth: row.max_depth as u16,
         max_nodes: row.max_nodes as u16,
@@ -337,15 +356,15 @@ fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
         nodes_done: row.nodes_done as u32,
         total_tokens: row.total_tokens as u64,
         total_tool_uses: row.total_tool_uses as u32,
-        started_at_unix_ms: unix_ms(row.started_at),
-        ended_at_unix_ms: row.ended_at.map(unix_ms),
+        started_at_unix_ms: unix_ms(&row.started_at),
+        ended_at_unix_ms: row.ended_at.as_ref().map(unix_ms),
         failure: row.failure,
     })
 }
 
 fn run_node_record(row: records::RunNodeRow) -> Result<RunNodeRecord, StoreError> {
     Ok(RunNodeRecord {
-        run: RunId::new(record_id_to_string(TABLE_WORKFLOW_RUN, &row.run)),
+        run: RunId::new(record_id_to_string(&row.run)),
         node_key: NodeKey::new(row.node_key),
         instance_path: InstancePath::new(row.instance_path),
         depth: row.depth as u16,
@@ -368,12 +387,9 @@ fn run_node_record(row: records::RunNodeRow) -> Result<RunNodeRecord, StoreError
 fn run_event_record(row: records::RunEventRow) -> Result<RunEventRecord, StoreError> {
     Ok(RunEventRecord {
         seq: row.seq as u64,
-        at: db::rfc3339_utc(row.at),
+        at: row.at.to_string(),
         kind: parse_run_event_kind(&row.kind)?,
-        run_node: row
-            .run_node
-            .as_deref()
-            .map(|key| record_id_to_string(TABLE_RUN_NODE, key)),
+        run_node: row.run_node.as_ref().map(record_id_to_string),
         payload: row.payload,
     })
 }
@@ -394,7 +410,7 @@ fn checkpoint_record(row: records::CheckpointRow) -> Result<CheckpointRecord, St
 
 fn run_summary_record(row: records::RunSummaryRow) -> Result<RunSummaryRecord, StoreError> {
     Ok(RunSummaryRecord {
-        run: RunId::new(record_id_to_string(TABLE_WORKFLOW_RUN, &row.run)),
+        run: RunId::new(record_id_to_string(&row.run)),
         text: row.text,
         outcome: row.outcome,
         highlights: row.highlights,

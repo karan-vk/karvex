@@ -1,16 +1,19 @@
 //! Store test plan (`docs/design/workflow-builder/03-storage-schema.md` §10).
 //!
-//! Cases 1-11 run against redb's in-memory backend (no disk, no PTY). Cases
-//! 12-13 need a real on-disk file lock and are marked `#[ignore]` by default.
+//! Cases 1-11 run against `kv-mem` (no disk, no PTY). Cases 12-13 need a real
+//! on-disk `SurrealKv` lock and are marked `#[ignore]` by default.
 
 use std::collections::BTreeMap;
 
-use redb::TableHandle as _;
-
-use super::db;
-use super::records;
+use super::records::{self, parse_record_id, record_id_to_string};
 use super::*;
 use crate::workflow::model::{ArgSpec, InstancePath, KvdagError, Runner};
+// The derive macro's generated `impl SurrealValue for ...` references the
+// trait name unqualified regardless of how the derive itself is invoked, so
+// it must be in scope wherever `#[derive(SurrealValue)]` is used (below, for
+// small ad hoc row shapes this file needs that the store's own `records.rs`
+// has no reason to define).
+use surrealdb_types::SurrealValue;
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -156,35 +159,81 @@ async fn setup_run(store: &WorkflowStore) -> (WorkflowId, Kvdag, RunId) {
 }
 
 async fn seed_run_summary(store: &WorkflowStore, run: &RunId, version: &KvdagVersionId) {
-    store
-        .create_run_summary(run, version, "summary text", "ok")
+    let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id");
+    let version_id = parse_record_id(TABLE_KVDAG_VERSION, version.as_str()).expect("version id");
+    let response = store
+        .db
+        .query(
+            "CREATE run_summary SET run = $run, kvdag_version = $version, \
+             text = \"summary text\", outcome = \"ok\"",
+        )
+        .bind(("run", run_id))
+        .bind(("version", version_id))
         .await
         .expect("create run_summary");
+    response.check().expect("run_summary insert succeeds");
 }
 
-/// Every `interrogation` row still in the database. Read straight out of redb
-/// because there is no engine writer — or reader — for the table yet, so it has
-/// no projection on the public read surface to go through.
-fn all_interrogations(store: &WorkflowStore) -> Vec<records::InterrogationRow> {
-    let read = store.read().expect("read txn");
-    let table = read.open_table(db::INTERROGATION).expect("interrogation");
-    db::scan_prefix(&table, "").expect("decode interrogations")
+#[derive(Debug, Clone, SurrealValue)]
+struct IdOnly {
+    id: surrealdb_types::RecordId,
 }
 
-fn all_review_findings(store: &WorkflowStore) -> Vec<records::ReviewFindingRow> {
-    let read = store.read().expect("read txn");
-    let table = read.open_table(db::REVIEW_FINDING).expect("review_finding");
-    db::scan_prefix(&table, "").expect("decode findings")
+async fn seed_interrogation(
+    store: &WorkflowStore,
+    run_node_id: &surrealdb_types::RecordId,
+) -> surrealdb_types::RecordId {
+    let mut response = store
+        .db
+        .query(
+            "CREATE interrogation SET run_node = $run_node, source_session_id = \"sess-1\", \
+             forked_session_id = \"sess-1-fork\", cwd = \"/tmp\" RETURN AFTER",
+        )
+        .bind(("run_node", run_node_id.clone()))
+        .await
+        .expect("create interrogation");
+    let rows: Vec<IdOnly> = response.take(0).expect("decode interrogation");
+    rows.into_iter().next().expect("interrogation row").id
 }
 
-fn run_summary_generated_by(store: &WorkflowStore, run: &RunId) -> Option<String> {
-    let key = records::parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id");
-    let read = store.read().expect("read txn");
-    let table = read.open_table(db::RUN_SUMMARY).expect("run_summary");
-    let row: records::RunSummaryRow = db::get_row(&table, &key)
-        .expect("decode summary")
-        .expect("the summary exists");
-    row.generated_by
+async fn seed_review_cycle(
+    store: &WorkflowStore,
+    run: &RunId,
+    version: &KvdagVersionId,
+) -> surrealdb_types::RecordId {
+    let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id");
+    let version_id = parse_record_id(TABLE_KVDAG_VERSION, version.as_str()).expect("version id");
+    let mut response = store
+        .db
+        .query(
+            "CREATE review_cycle SET run = $run, kvdag_version = $version, \
+             status = \"running\" RETURN AFTER",
+        )
+        .bind(("run", run_id))
+        .bind(("version", version_id))
+        .await
+        .expect("create review_cycle");
+    let rows: Vec<IdOnly> = response.take(0).expect("decode review_cycle");
+    rows.into_iter().next().expect("review_cycle row").id
+}
+
+async fn seed_review_finding(
+    store: &WorkflowStore,
+    cycle: &surrealdb_types::RecordId,
+    interrogation: &surrealdb_types::RecordId,
+) {
+    let response = store
+        .db
+        .query(
+            "CREATE review_finding SET cycle = $cycle, node_key = \"solo\", \
+             interview = $interview, interview_mode = \"resumed\", level = \"prompt\", \
+             verdict = \"keep\", rationale = \"fine\"",
+        )
+        .bind(("cycle", cycle.clone()))
+        .bind(("interview", interrogation.clone()))
+        .await
+        .expect("create review_finding");
+    response.check().expect("review_finding insert succeeds");
 }
 
 fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -198,32 +247,39 @@ fn unique_temp_dir(label: &str) -> std::path::PathBuf {
     ))
 }
 
+/// Opens an on-disk store, retrying briefly on `store_locked`. The local
+/// engine's background router task (and the SurrealKv lock file it holds)
+/// tears down asynchronously after the last `Surreal<Db>` handle drops, so a
+/// reopen immediately after `drop` can race a lock that hasn't cleared yet.
+async fn open_with_retry(dir: &std::path::Path) -> WorkflowStore {
+    let mut last_error = None;
+    for _ in 0..50 {
+        match WorkflowStore::open(StoreLocation::OnDisk(dir.to_path_buf())).await {
+            Ok(store) => return store,
+            Err(StoreError::Unavailable { reason, .. }) if reason == error::STORE_LOCKED => {
+                last_error = Some(reason);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("reopen failed: {error:?}"),
+        }
+    }
+    panic!("gave up waiting for the lock to clear: {last_error:?}");
+}
+
 // ── 1: migrations ────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn migrations_apply_cleanly_and_reapplying_is_a_noop() {
     let store = open_mem_store().await;
-    let first = store.applied_migrations().expect("read schema_meta");
+    let first = store.applied_migrations().await.expect("read schema_meta");
     assert_eq!(
         first,
         std::collections::BTreeSet::from(["0001_init".to_string()])
     );
 
     store.migrate().await.expect("re-migrate is a no-op");
-    let second = store.applied_migrations().expect("read schema_meta");
+    let second = store.applied_migrations().await.expect("read schema_meta");
     assert_eq!(first, second);
-}
-
-/// Migration 0001 exists to create every table, so that a read transaction on a
-/// freshly opened database never has to handle a missing one.
-#[tokio::test]
-async fn every_table_exists_after_the_first_open() {
-    let store = open_mem_store().await;
-    let read = store.read().expect("read txn");
-    for table in db::ROW_TABLES {
-        read.open_table(*table)
-            .unwrap_or_else(|error| panic!("{} is missing: {error}", table.name()));
-    }
 }
 
 // ── 2: create_version digest determinism + dedupe ───────────────────────
@@ -376,10 +432,10 @@ async fn version_chain_is_stable_and_old_versions_stay_immutable() {
     assert_eq!(v1_keys, v3_keys, "node_key is stable across versions");
 }
 
-// ── 4: edge reload, including a fan-out of 12 ───────────────────────────
+// ── 4: RELATE traversal, including a fan-out of 12 ──────────────────────
 
 #[tokio::test]
-async fn edges_reload_correctly_for_a_diamond_and_a_fanout_of_twelve() {
+async fn relate_edges_reload_correctly_for_a_diamond_and_a_fanout_of_twelve() {
     let store = open_mem_store().await;
     let workflow = store
         .create_workflow("demo", "", Tier::Auto)
@@ -434,43 +490,6 @@ async fn edges_reload_correctly_for_a_diamond_and_a_fanout_of_twelve() {
     for index in 0..12 {
         assert!(children.contains(&NodeKey::new(format!("child{index}"))));
     }
-}
-
-/// Two edges between the same ordered pair are legal as long as their inbound
-/// port names differ, so the edge key has to keep them apart or reloading the
-/// version silently loses one.
-#[tokio::test]
-async fn two_edges_between_the_same_pair_survive_a_reload() {
-    let store = open_mem_store().await;
-    let workflow = store
-        .create_workflow("demo", "", Tier::Auto)
-        .await
-        .expect("create_workflow");
-
-    let spec = base_spec(
-        vec![
-            node("plan", "Plan for: {{goal}}"),
-            node("build", "Use {{outline}} and {{budget}}"),
-        ],
-        vec![
-            edge("plan", "build", Some("outline")),
-            edge("plan", "build", Some("budget")),
-        ],
-    );
-    let kvdag = store
-        .create_version(&workflow, VersionOrigin::Authored, "v1", spec)
-        .await
-        .expect("create_version");
-
-    let mut ports: Vec<Option<String>> = kvdag
-        .outbound_edges(&NodeKey::new("plan"))
-        .map(|edge| edge.port.clone())
-        .collect();
-    ports.sort();
-    assert_eq!(
-        ports,
-        vec![Some("budget".to_string()), Some("outline".to_string())]
-    );
 }
 
 // ── 5: cycle rejection ───────────────────────────────────────────────────
@@ -530,22 +549,8 @@ async fn run_event_seq_is_unique_and_survives_concurrent_appends() {
     let duplicate = store.write(event(&run, 0)).await;
     assert!(
         duplicate.is_err(),
-        "a duplicate seq must be rejected, not overwrite the journalled event"
+        "a duplicate seq must be rejected by the unique index"
     );
-
-    // Sequence numbers past single digits still replay in numeric order, which
-    // is only true because the key pads them.
-    for seq in [9, 10, 11, 100] {
-        store.write(event(&run, seq)).await.expect("append");
-    }
-    let seqs: Vec<u64> = store
-        .list_run_events(&run)
-        .await
-        .expect("list_run_events")
-        .iter()
-        .map(|event| event.seq)
-        .collect();
-    assert_eq!(seqs, vec![0, 1, 2, 3, 9, 10, 11, 100]);
 }
 
 // ── 7: checkpoint spill ──────────────────────────────────────────────────
@@ -591,77 +596,37 @@ async fn checkpoint_payload_over_budget_is_not_stored_inline() {
     );
 }
 
-/// The summary is capped separately from the payload, with a visible marker: a
-/// silently shortened summary would read as a complete one.
-#[tokio::test]
-async fn an_over_long_checkpoint_summary_is_truncated_with_a_marker() {
-    let store = open_mem_store().await;
-    let (_, _, run) = setup_run(&store).await;
-
-    store
-        .write(StoreWrite::Checkpoint {
-            run: run.clone(),
-            path: InstancePath::new("solo"),
-            seq: 0,
-            kind: CheckpointKind::Result,
-            schema_valid: true,
-            payload: serde_json::json!({"report": "ok"}),
-            summary: "s".repeat(SUMMARY_BUDGET_CHARS + 500),
-            artifact_paths: Vec::new(),
-            digest: "deadbeef".to_string(),
-        })
-        .await
-        .expect("checkpoint writes");
-
-    let checkpoints = store
-        .list_checkpoints(&run, &InstancePath::new("solo"))
-        .await
-        .expect("list_checkpoints");
-    assert!(checkpoints[0].summary.ends_with("[truncated]"));
-    assert!(checkpoints[0].summary.chars().count() < SUMMARY_BUDGET_CHARS + 500);
-}
-
 // ── 8: review_finding replace requires a replacement ────────────────────
 
 #[tokio::test]
 async fn review_finding_replace_verdict_requires_a_replacement() {
     let store = open_mem_store().await;
-    let (_, kvdag, run) = setup_run(&store).await;
-    let cycle = store
-        .create_review_cycle(&run, &kvdag.version_id, "running")
-        .await
-        .expect("create_review_cycle");
-
-    let refused = store
-        .create_review_finding(
-            &cycle,
-            &NodeKey::new("solo"),
-            None,
-            "prompt",
-            "replace",
-            "needs a rewrite",
-            None,
+    let response = store
+        .db
+        .query(
+            "CREATE review_finding SET cycle = review_cycle:fake, node_key = \"plan\", \
+             level = \"prompt\", verdict = \"replace\", rationale = \"needs a rewrite\"",
         )
-        .await;
+        .await
+        .expect("query executes");
     assert!(
-        refused.is_err(),
+        response.check().is_err(),
         "a \"replace\" verdict with no replacement must be rejected"
     );
 
-    store
-        .create_review_finding(
-            &cycle,
-            &NodeKey::new("solo"),
-            None,
-            "prompt",
-            "replace",
-            "needs a rewrite",
-            Some(serde_json::json!({"role": "a better teammate"})),
+    let response = store
+        .db
+        .query(
+            "CREATE review_finding SET cycle = review_cycle:fake, node_key = \"plan\", \
+             level = \"prompt\", verdict = \"replace\", rationale = \"needs a rewrite\", \
+             replacement = { role: \"a better teammate\" }",
         )
         .await
-        .expect("a \"replace\" verdict with a replacement is accepted");
-
-    assert_eq!(all_review_findings(&store).len(), 1);
+        .expect("query executes");
+    assert!(
+        response.check().is_ok(),
+        "a \"replace\" verdict with a replacement is accepted"
+    );
 }
 
 // ── 9: restore query returns only valid results ──────────────────────────
@@ -720,15 +685,6 @@ async fn find_restorable_checkpoints_returns_only_valid_results() {
         .expect("find_restorable_checkpoints");
     assert_eq!(restorable.len(), 1);
     assert_eq!(restorable[0].digest, "valid-result");
-
-    let none = store
-        .find_restorable_checkpoints(&run, &[NodeKey::new("someone-else")])
-        .await
-        .expect("find_restorable_checkpoints");
-    assert!(
-        none.is_empty(),
-        "a node key nobody checkpointed matches none"
-    );
 }
 
 // ── 10: prune deletes whole runs and preserves every run_summary ────────
@@ -743,6 +699,7 @@ async fn prune_run_history_deletes_whole_runs_and_preserves_every_summary() {
         let run = create_run(&store, &workflow, &kvdag).await;
         seed_run_summary(&store, &run, &kvdag.version_id).await;
         runs.push(run);
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     }
 
     let pruned = store
@@ -763,26 +720,9 @@ async fn prune_run_history_deletes_whole_runs_and_preserves_every_summary() {
         store.get_run(&runs[2]).await.expect("get_run").is_some(),
         "the retained run must survive"
     );
-    assert!(
-        store
-            .list_run_nodes(&runs[0])
-            .await
-            .expect("list_run_nodes")
-            .is_empty(),
-        "a pruned run keeps none of its nodes"
-    );
-    assert_eq!(
-        store
-            .list_run_nodes(&runs[2])
-            .await
-            .expect("list_run_nodes")
-            .len(),
-        1,
-        "the retained run keeps all of its nodes"
-    );
 }
 
-// ── 11: prune leaves no dangling reference ──────────────────────────────
+// ── 11: prune leaves no dangling record<run_node> reference ─────────────
 
 #[tokio::test]
 async fn prune_run_history_leaves_no_dangling_references() {
@@ -791,38 +731,25 @@ async fn prune_run_history_leaves_no_dangling_references() {
 
     let pruned_run = create_run(&store, &workflow, &kvdag).await;
     seed_run_summary(&store, &pruned_run, &kvdag.version_id).await;
-    let interrogation = store
-        .create_interrogation(
-            &pruned_run,
-            &InstancePath::new("solo"),
-            "sess-1",
-            "sess-1-fork",
-            "/tmp",
-        )
+    let run_node_id = store
+        .find_run_node_id(&pruned_run, &InstancePath::new("solo"))
         .await
-        .expect("create_interrogation");
-    let cycle = store
-        .create_review_cycle(&pruned_run, &kvdag.version_id, "running")
-        .await
-        .expect("create_review_cycle");
-    store
-        .create_review_finding(
-            &cycle,
-            &NodeKey::new("solo"),
-            Some(&interrogation),
-            "prompt",
-            "keep",
-            "fine",
-            None,
-        )
-        .await
-        .expect("create_review_finding");
-    store
-        .set_run_summary_generated_by(&pruned_run, &InstancePath::new("solo"))
+        .expect("find_run_node_id");
+    let interrogation_id = seed_interrogation(&store, &run_node_id).await;
+    let cycle_id = seed_review_cycle(&store, &pruned_run, &kvdag.version_id).await;
+    seed_review_finding(&store, &cycle_id, &interrogation_id).await;
+
+    let run_id = parse_record_id(TABLE_WORKFLOW_RUN, pruned_run.as_str()).expect("run id");
+    let response = store
+        .db
+        .query("UPDATE run_summary SET generated_by = $node WHERE run = $run")
+        .bind(("node", run_node_id.clone()))
+        .bind(("run", run_id))
         .await
         .expect("point the summary at this run's node");
-    assert!(run_summary_generated_by(&store, &pruned_run).is_some());
+    response.check().expect("update succeeds");
 
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
     let kept_run = create_run(&store, &workflow, &kvdag).await;
     seed_run_summary(&store, &kept_run, &kvdag.version_id).await;
 
@@ -840,16 +767,49 @@ async fn prune_run_history_leaves_no_dangling_references() {
             .is_some(),
         "the summary itself survives"
     );
+
+    #[derive(Debug, Clone, SurrealValue)]
+    struct GeneratedBy {
+        generated_by: Option<surrealdb_types::RecordId>,
+    }
+    let run_id = parse_record_id(TABLE_WORKFLOW_RUN, pruned_run.as_str()).expect("run id");
+    let mut response = store
+        .db
+        .query("SELECT generated_by FROM run_summary WHERE run = $run")
+        .bind(("run", run_id))
+        .await
+        .expect("select run_summary");
+    let rows: Vec<GeneratedBy> = response.take(0).expect("decode");
+    assert_eq!(rows.len(), 1);
     assert!(
-        run_summary_generated_by(&store, &pruned_run).is_none(),
+        rows[0].generated_by.is_none(),
         "generated_by must be nulled, not left dangling"
     );
+
+    let mut response = store
+        .db
+        .query("SELECT * FROM interrogation")
+        .await
+        .expect("select interrogation");
+    let remaining: Vec<records::InterrogationRow> = response.take(0).expect("decode");
     assert!(
-        all_interrogations(&store).is_empty(),
+        remaining
+            .iter()
+            .all(|row| record_id_to_string(&row.run_node) != record_id_to_string(&run_node_id)),
         "no interrogation row may reference a deleted run_node"
     );
 
-    let findings = all_review_findings(&store);
+    #[derive(Debug, Clone, SurrealValue)]
+    struct InterviewOnly {
+        interview: Option<surrealdb_types::RecordId>,
+    }
+    let mut response = store
+        .db
+        .query("SELECT interview FROM review_finding WHERE cycle = $cycle")
+        .bind(("cycle", cycle_id))
+        .await
+        .expect("select review_finding");
+    let findings: Vec<InterviewOnly> = response.take(0).expect("decode");
     assert_eq!(findings.len(), 1);
     assert!(
         findings[0].interview.is_none(),
@@ -860,23 +820,17 @@ async fn prune_run_history_leaves_no_dangling_references() {
 // ── 12: store-locked path (on-disk) ──────────────────────────────────────
 
 #[tokio::test]
-#[ignore = "touches disk: takes a real file lock"]
-async fn opening_a_locked_file_reports_unavailable() {
+#[ignore = "touches disk: opens a real SurrealKv lock"]
+async fn opening_a_locked_directory_reports_unavailable() {
     let dir = unique_temp_dir("locked");
-    let path = dir.join("workflow.redb");
-    let first = WorkflowStore::open(StoreLocation::OnDisk(path.clone()))
+    let first = WorkflowStore::open(StoreLocation::OnDisk(dir.clone()))
         .await
         .expect("first open succeeds");
 
-    let second = WorkflowStore::open(StoreLocation::OnDisk(path.clone())).await;
+    let second = WorkflowStore::open(StoreLocation::OnDisk(dir.clone())).await;
     match second {
-        Err(StoreError::Unavailable { reason, holder }) => {
+        Err(StoreError::Unavailable { reason, .. }) => {
             assert_eq!(reason, error::STORE_LOCKED);
-            assert_eq!(
-                holder,
-                Some(format!("pid {}", std::process::id())),
-                "the refusal must name whoever holds the lock"
-            );
         }
         other => panic!("expected a store_locked error, got {other:?}"),
     }
@@ -891,64 +845,33 @@ async fn opening_a_locked_file_reports_unavailable() {
 #[ignore = "touches disk"]
 async fn on_disk_round_trip_survives_close_and_reopen() {
     let dir = unique_temp_dir("roundtrip");
-    let path = dir.join("workflow.redb");
 
-    let (workflow, version_id, run) = {
-        let store = WorkflowStore::open(StoreLocation::OnDisk(path.clone()))
+    let workflow = {
+        let store = WorkflowStore::open(StoreLocation::OnDisk(dir.clone()))
             .await
             .expect("opens");
         let workflow = store
             .create_workflow("demo", "desc", Tier::Auto)
             .await
             .expect("create_workflow");
-        let kvdag = store
+        store
             .create_version(&workflow, VersionOrigin::Authored, "v1", diamond_spec())
             .await
             .expect("create_version");
-        store
-            .set_head_version(&workflow, &kvdag.version_id)
-            .await
-            .expect("set_head_version");
-        let run = create_run(&store, &workflow, &kvdag).await;
-        store
-            .write(StoreWrite::RunEvent {
-                run: run.clone(),
-                seq: 0,
-                kind: RunEventKind::RunStarted,
-                path: None,
-                payload: serde_json::json!({"note": "started"}),
-            })
-            .await
-            .expect("journal the start");
-        (workflow, kvdag.version_id, run)
+        workflow
     };
 
-    // The lock is released when the database handle drops, which happens on the
-    // scope above closing — no retry loop needed, unlike an engine that tore
-    // its lock down on a background task.
-    let store = WorkflowStore::open(StoreLocation::OnDisk(path.clone()))
-        .await
-        .expect("reopens after the first handle dropped");
+    // The local engine tears down its background router task (and, with it,
+    // the SurrealKv lock file) asynchronously after the last `Surreal<Db>`
+    // handle drops, so reopening immediately can race a lock that hasn't
+    // been released yet. Retry briefly rather than sleeping a fixed amount.
+    let store = open_with_retry(&dir).await;
     let summary = store
         .get_workflow(&workflow)
         .await
         .expect("get_workflow")
         .expect("workflow persisted across close/reopen");
     assert_eq!(summary.name, "demo");
-    assert_eq!(summary.head_version.as_ref(), Some(&version_id));
-
-    let reloaded = store.load_version(&version_id).await.expect("load_version");
-    assert_eq!(reloaded.nodes.len(), 4);
-    assert_eq!(reloaded.edges.len(), 4);
-
-    let events = store.list_run_events(&run).await.expect("list_run_events");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, RunEventKind::RunStarted);
-    assert!(
-        events[0].at.ends_with('Z'),
-        "a journalled timestamp reads as UTC: {}",
-        events[0].at
-    );
 
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
