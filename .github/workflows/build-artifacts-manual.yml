@@ -48,26 +48,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Canonical slim assets: default features (no `workflow`), matches
-          # today's kvx-<target> names/args exactly.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: kvx-linux-x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             name: kvx-linux-aarch64
-          # kvx-workflow-<target>: opt-in `workflow` feature (surrealdb +
-          # aws-lc-sys). The slim rows above no longer build that dependency
-          # graph at all now that `workflow` defaults off, so only these two
-          # rows pay for it.
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            name: kvx-workflow-linux-x86_64
-            features: workflow
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            name: kvx-workflow-linux-aarch64
-            features: workflow
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
       LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
@@ -100,18 +86,15 @@ jobs:
         run: |
           sudo find /etc/apt/sources.list.d -type f \( -iname '*microsoft*' -o -iname '*azure-cli*' \) -print -delete
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu crossbuild-essential-arm64
 
       - name: Set Linux aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
-      # Dependencies that build C through cc-rs (aws-lc-sys, lz4-sys) otherwise
-      # compile against the runner's glibc headers and fail to link against
-      # musl. The script is a no-op for non-musl targets. aws-lc-sys/lz4-sys
-      # only enter the dependency graph via the `workflow` feature, so slim
-      # rows never invoke the generated wrappers; this is a CI-time win since
-      # those rows now skip that native compilation entirely.
+      # Any dependency that builds C through cc-rs would otherwise compile
+      # against the runner's glibc headers and fail to link against musl. The
+      # script is a no-op for non-musl targets.
       - name: Set up musl C toolchain
         run: scripts/setup_musl_cc.sh "${{ matrix.target }}" "$RUNNER_TEMP/musl-cc" >> "$GITHUB_ENV"
 
@@ -119,7 +102,7 @@ jobs:
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package artifact
         run: |
@@ -155,26 +138,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Canonical slim assets: default features (no `workflow`), matches
-          # today's kvx-<target> names/args exactly.
           - target: x86_64-apple-darwin
             os: macos-latest
             name: kvx-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
             name: kvx-macos-aarch64
-          # kvx-workflow-<target>: opt-in `workflow` feature (surrealdb +
-          # aws-lc-sys). The slim rows above no longer build that dependency
-          # graph at all now that `workflow` defaults off, so only these two
-          # rows pay for it.
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: kvx-workflow-macos-x86_64
-            features: workflow
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: kvx-workflow-macos-aarch64
-            features: workflow
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ${{ inputs.libghostty_optimize }}
       LIBGHOSTTY_VT_SIMD: ${{ inputs.libghostty_simd }}
@@ -195,14 +164,11 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Install macOS build tools
-        run: brew install cmake ninja
-
       - name: Remove Zig caches
         run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package artifact
         run: |
@@ -282,42 +248,5 @@ jobs:
           name: kvx-windows-x86_64-${{ inputs.libghostty_optimize }}-simd-${{ inputs.libghostty_simd }}
           path: |
             kvx-windows-x86_64.zip
-            BUILD_INFO.txt
-          retention-days: 7
-
-      # kvx-workflow-windows-x86_64.zip: opt-in `workflow` feature (surrealdb
-      # + aws-lc-sys). This is a single fixed target (no matrix here), so the
-      # variant is a second build+package+upload pass reusing the same
-      # toolchain setup rather than a duplicated job. The re-staged nupkg
-      # download is skipped (package_windows_conpty.py only fetches it if
-      # missing), so this pass only pays for the extra `cargo build`.
-      - name: Build (workflow feature)
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc --features workflow
-
-      - name: Package artifact (workflow feature)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
-          $stage = Join-Path $env:RUNNER_TEMP "kvx-workflow-windows-x86_64"
-          .\scripts\package_windows_conpty.ps1 `
-            -KvxExe target\x86_64-pc-windows-msvc\release\kvx.exe `
-            -PackagePath $package `
-            -StageDir $stage `
-            -OutputPath kvx-workflow-windows-x86_64.zip
-          "commit=$env:GITHUB_SHA" | Out-File -Encoding utf8 BUILD_INFO.txt
-          "target=x86_64-pc-windows-msvc" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "features=workflow" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "libghostty_vt_optimize=$env:LIBGHOSTTY_VT_OPTIMIZE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "libghostty_vt_simd=$env:LIBGHOSTTY_VT_SIMD" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          $hash = (Get-FileHash -Algorithm SHA256 kvx-workflow-windows-x86_64.zip).Hash.ToLowerInvariant()
-          "sha256=$hash  kvx-workflow-windows-x86_64.zip" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-
-      - name: Upload artifact (workflow feature)
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: kvx-workflow-windows-x86_64-${{ inputs.libghostty_optimize }}-simd-${{ inputs.libghostty_simd }}
-          path: |
-            kvx-workflow-windows-x86_64.zip
             BUILD_INFO.txt
           retention-days: 7

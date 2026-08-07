@@ -277,20 +277,8 @@ impl RemotePlatform {
         Self { os, arch }
     }
 
-    /// Plain `<os>-<arch>` key describing the remote machine.
     fn asset_key(&self) -> String {
         format!("{}-{}", self.os, self.arch)
-    }
-
-    /// Manifest asset key for provisioning this platform from the release
-    /// manifest.
-    ///
-    /// Releases ship a slim and a `workflow` build per platform. The remote
-    /// server must match the local client's variant, so this applies the same
-    /// compile-time variant the updater uses instead of always taking the slim
-    /// asset.
-    fn manifest_asset_key(&self) -> String {
-        crate::update::asset_key_for_variant(crate::update::ASSET_VARIANT, self.os, self.arch)
     }
 }
 
@@ -990,7 +978,7 @@ fn install_source_description_for(
             "the {} {} asset for {}",
             current_version(),
             current_channel(),
-            platform.manifest_asset_key()
+            platform.asset_key()
         )
     }
 }
@@ -1474,7 +1462,7 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
 }
 
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
-    let asset_key = platform.manifest_asset_key();
+    let asset_key = platform.asset_key();
     let asset = remote_release_asset(&asset_key)?;
 
     let dir = private_download_dir(&asset_key)?;
@@ -3009,26 +2997,9 @@ mod tests {
                 "the {} {} asset for {}",
                 current_version(),
                 current_channel(),
-                platform.manifest_asset_key()
+                platform.asset_key()
             )
         );
-    }
-
-    #[test]
-    fn remote_provisioning_asset_key_follows_the_compiled_variant() {
-        let platform = RemotePlatform {
-            os: "linux",
-            arch: "aarch64",
-        };
-
-        // The plain platform key never carries a variant.
-        assert_eq!(platform.asset_key(), "linux-aarch64");
-
-        if cfg!(feature = "workflow") {
-            assert_eq!(platform.manifest_asset_key(), "workflow-linux-aarch64");
-        } else {
-            assert_eq!(platform.manifest_asset_key(), "linux-aarch64");
-        }
     }
 
     #[test]

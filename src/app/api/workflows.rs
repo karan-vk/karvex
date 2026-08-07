@@ -6,9 +6,9 @@
 //!
 //! Wire params/results are declared in `src/api/schema/workflows.rs` and are
 //! deliberately self-contained (no `crate::workflow::*`), so the schema
-//! artifact has one canonical value with the feature on or off. Every
-//! conversion between the wire vocabulary and the engine's own lives here,
-//! behind `#[cfg(feature = "workflow")]`.
+//! artifact has one canonical value regardless of internal engine changes.
+//! Every conversion between the wire vocabulary and the engine's own lives
+//! here.
 //!
 //! **Where each method's answer comes from.** Definitions, versions, and the
 //! run index are the store's (`03`); the *live* run is the engine's, and the
@@ -17,10 +17,8 @@
 //! back to the store for any other, and the mutating node methods only ever
 //! address the active run.
 
-#[cfg(feature = "workflow")]
 use std::collections::BTreeMap;
 
-#[cfg(feature = "workflow")]
 use crate::api::schema::{
     ErrorBody, KvdagEdgeInfo, KvdagNodeInfo, KvdagVersionDetail, KvdagVersionSummary,
     ResponseResult, WorkflowArgSpec, WorkflowDefinitionFormat, WorkflowEdgePayload,
@@ -32,220 +30,42 @@ use crate::api::schema::{
     WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget, WorkflowTarget,
     WorkflowVersionCreateParams, WorkflowVersionTarget,
 };
-#[cfg(feature = "workflow")]
 use crate::app::workflow::{
     wire_blocker, wire_demand, wire_edge_kind, wire_evidence, wire_node_status, wire_run_status,
     wire_succession, wire_tier, ActiveRun,
 };
-#[cfg(feature = "workflow")]
 use crate::app::workflow_store::StoreUnavailable;
 use crate::app::App;
-#[cfg(feature = "workflow")]
 use crate::workflow::definition::{Definition, DefinitionError};
-#[cfg(feature = "workflow")]
 use crate::workflow::model::{
     EdgePayload, EngineInput, InstancePath, Isolation, Kvdag, KvdagEdge, KvdagNode, KvdagVersionId,
     NodeKind, RunGraph, RunId, Runner, WorkflowId,
 };
-#[cfg(feature = "workflow")]
 use crate::workflow::store::{NewRun, StoreError, VersionOrigin};
-#[cfg(feature = "workflow")]
 use crate::workflow::tier::Tier;
 
 use super::responses::encode_error;
-#[cfg(feature = "workflow")]
 use super::responses::{encode_error_body, encode_success};
-
-/// Error code returned for every `workflow.*` call when the crate is built
-/// without the opt-in `workflow` cargo feature — which is what the canonical
-/// `kvx-<target>` release binary is.
-#[cfg(not(feature = "workflow"))]
-const WORKFLOW_UNAVAILABLE_CODE: &str = "workflow_unavailable";
-/// The message names the two ways out, because the common case is a user on the
-/// canonical release rather than someone who deliberately turned a feature off.
-#[cfg(not(feature = "workflow"))]
-const WORKFLOW_UNAVAILABLE_MESSAGE: &str =
-    "the workflow feature is not compiled into this server; install the kvx-workflow-<target> \
-     release asset or build with --features workflow";
 
 /// The definition document could not be parsed, or the graph it describes
 /// fails `Kvdag::try_new`'s construction invariants.
-#[cfg(feature = "workflow")]
 const INVALID_DEFINITION_CODE: &str = "workflow_invalid_definition";
 /// No workflow, version, run, or node with that id.
-#[cfg(feature = "workflow")]
 const NOT_FOUND_CODE: &str = "workflow_not_found";
 /// A node method addressed a run this server is not currently executing.
 /// Phase 1 executes one run at a time and only the live run is steerable.
-#[cfg(feature = "workflow")]
 const NO_ACTIVE_RUN_CODE: &str = "workflow_run_not_active";
 /// A required run argument was not supplied and has no default.
-#[cfg(feature = "workflow")]
 const MISSING_ARG_CODE: &str = "workflow_missing_arg";
 /// A node method that delivers into the node's pane addressed a node that has
 /// none. `05-phase-plan.md` W5 scopes steering and interrupting to a running
 /// node; answering with a success the node never received would be worse than
 /// refusing.
-#[cfg(feature = "workflow")]
 const NODE_NOT_RUNNING_CODE: &str = "workflow_node_not_running";
 
 /// Default page size for `workflow.run.list`.
-#[cfg(feature = "workflow")]
 const DEFAULT_RUN_LIST_LIMIT: u32 = 50;
 
-#[cfg(not(feature = "workflow"))]
-impl App {
-    /// Feature-off path (`05-phase-plan.md` W3 "Feature-off
-    /// behaviour"): the schema types compile unconditionally, but with the
-    /// `workflow` cargo feature off there is no engine to route to at all.
-    fn workflow_unavailable(&mut self, id: String) -> String {
-        encode_error(id, WORKFLOW_UNAVAILABLE_CODE, WORKFLOW_UNAVAILABLE_MESSAGE)
-    }
-
-    pub(super) fn handle_workflow_list(&mut self, id: String) -> String {
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_get(&mut self, id: String, target: WorkflowTarget) -> String {
-        if let Some(error) = require_non_empty(&id, "workflow_id", &target.workflow_id) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_create(
-        &mut self,
-        id: String,
-        params: WorkflowCreateParams,
-    ) -> String {
-        if let Some(error) = require_non_empty(&id, "definition.text", &params.definition.text) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_version_create(
-        &mut self,
-        id: String,
-        params: WorkflowVersionCreateParams,
-    ) -> String {
-        if let Some(error) = require_non_empty(&id, "workflow_id", &params.workflow_id) {
-            return error;
-        }
-        if let Some(error) = require_non_empty(&id, "definition.text", &params.definition.text) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_version_get(
-        &mut self,
-        id: String,
-        target: WorkflowVersionTarget,
-    ) -> String {
-        if let Some(error) = require_non_empty(&id, "version_id", &target.version_id) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_run(&mut self, id: String, params: WorkflowRunParams) -> String {
-        if let Some(error) = require_non_empty(&id, "workflow_id", &params.workflow_id) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_run_get(
-        &mut self,
-        id: String,
-        target: WorkflowRunTarget,
-    ) -> String {
-        if let Some(error) = require_non_empty(&id, "run_id", &target.run_id) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_run_list(
-        &mut self,
-        id: String,
-        params: WorkflowRunListParams,
-    ) -> String {
-        if let Some(error) = require_non_empty(&id, "workflow_id", &params.workflow_id) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_run_cancel(
-        &mut self,
-        id: String,
-        target: WorkflowRunTarget,
-    ) -> String {
-        if let Some(error) = require_non_empty(&id, "run_id", &target.run_id) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_node_get(
-        &mut self,
-        id: String,
-        target: WorkflowNodeTarget,
-    ) -> String {
-        if let Some(error) = require_node_target(&id, &target) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_node_steer(
-        &mut self,
-        id: String,
-        params: WorkflowNodeSteerParams,
-    ) -> String {
-        if let Some(error) = require_steer_params(&id, &params) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_node_interrupt(
-        &mut self,
-        id: String,
-        target: WorkflowNodeTarget,
-    ) -> String {
-        if let Some(error) = require_node_target(&id, &target) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_node_report(
-        &mut self,
-        id: String,
-        params: WorkflowNodeReportParams,
-    ) -> String {
-        if let Some(error) = require_report_params(&id, &params) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-
-    pub(super) fn handle_workflow_node_restart(
-        &mut self,
-        id: String,
-        target: WorkflowNodeTarget,
-    ) -> String {
-        if let Some(error) = require_node_target(&id, &target) {
-            return error;
-        }
-        self.workflow_unavailable(id)
-    }
-}
-
-#[cfg(feature = "workflow")]
 impl App {
     pub(super) fn handle_workflow_list(&mut self, id: String) -> String {
         let listed = match self.workflow_store.call(|cx| {
@@ -862,7 +682,6 @@ impl App {
     }
 }
 
-#[cfg(feature = "workflow")]
 fn unavailable_response(id: String, unavailable: &StoreUnavailable) -> String {
     encode_error_body(
         id,
@@ -873,7 +692,6 @@ fn unavailable_response(id: String, unavailable: &StoreUnavailable) -> String {
     )
 }
 
-#[cfg(feature = "workflow")]
 fn not_the_active_run(id: String, run_id: &str) -> String {
     encode_error(
         id,
@@ -882,7 +700,6 @@ fn not_the_active_run(id: String, run_id: &str) -> String {
     )
 }
 
-#[cfg(feature = "workflow")]
 fn node_not_found(id: String, target: &WorkflowNodeTarget) -> String {
     encode_error(
         id,
@@ -891,7 +708,6 @@ fn node_not_found(id: String, target: &WorkflowNodeTarget) -> String {
     )
 }
 
-#[cfg(feature = "workflow")]
 fn parse_definition(
     document: &crate::api::schema::WorkflowDefinitionDocument,
 ) -> Result<Definition, DefinitionError> {
@@ -904,7 +720,6 @@ fn parse_definition(
 /// `05-phase-plan.md` §4: `workflow.run` rejects a run that omits a required
 /// arg with no default. Declared args with a default are filled in here, so the
 /// prompt renderer never has to distinguish "absent" from "defaulted".
-#[cfg(feature = "workflow")]
 fn resolve_run_args(
     kvdag: &Kvdag,
     supplied: &std::collections::HashMap<String, String>,
@@ -927,7 +742,6 @@ fn resolve_run_args(
     Ok(resolved)
 }
 
-#[cfg(feature = "workflow")]
 fn head_version_summary(
     cx: &crate::app::workflow_store::StoreContext<'_>,
     head: Option<&KvdagVersionId>,
@@ -951,7 +765,6 @@ fn head_version_summary(
 
 // ── wire conversions ────────────────────────────────────────────────────────
 
-#[cfg(feature = "workflow")]
 fn wire_workflow_summary(
     summary: crate::workflow::store::WorkflowSummary,
     head: Option<&KvdagVersionSummary>,
@@ -972,7 +785,6 @@ fn wire_workflow_summary(
     }
 }
 
-#[cfg(feature = "workflow")]
 fn wire_version_summary(
     kvdag: &Kvdag,
     origin: VersionOrigin,
@@ -992,7 +804,6 @@ fn wire_version_summary(
     }
 }
 
-#[cfg(feature = "workflow")]
 fn wire_version_detail(kvdag: &Kvdag) -> KvdagVersionDetail {
     KvdagVersionDetail {
         version_id: kvdag.version_id.to_string(),
@@ -1021,7 +832,6 @@ fn wire_version_detail(kvdag: &Kvdag) -> KvdagVersionDetail {
     }
 }
 
-#[cfg(feature = "workflow")]
 fn wire_node_info(node: &KvdagNode) -> KvdagNodeInfo {
     KvdagNodeInfo {
         node_key: node.key.to_string(),
@@ -1058,7 +868,6 @@ fn wire_node_info(node: &KvdagNode) -> KvdagNodeInfo {
     }
 }
 
-#[cfg(feature = "workflow")]
 fn wire_edge_info(edge: &KvdagEdge) -> KvdagEdgeInfo {
     KvdagEdgeInfo {
         from: edge.from.to_string(),
@@ -1077,7 +886,6 @@ fn wire_edge_info(edge: &KvdagEdge) -> KvdagEdgeInfo {
     }
 }
 
-#[cfg(feature = "workflow")]
 fn wire_run_record(record: crate::workflow::store::RunRecord) -> WorkflowRunInfo {
     WorkflowRunInfo {
         run_id: record.id.to_string(),
@@ -1098,7 +906,6 @@ fn wire_run_record(record: crate::workflow::store::RunRecord) -> WorkflowRunInfo
     }
 }
 
-#[cfg(feature = "workflow")]
 fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> WorkflowRunNodeInfo {
     WorkflowRunNodeInfo {
         path: record.instance_path.to_string(),
@@ -1127,7 +934,6 @@ fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> Workfl
     }
 }
 
-#[cfg(feature = "workflow")]
 fn engine_tier(tier: WorkflowTier) -> Tier {
     match tier {
         WorkflowTier::Auto => Tier::Auto,
@@ -1138,7 +944,6 @@ fn engine_tier(tier: WorkflowTier) -> Tier {
     }
 }
 
-#[cfg(feature = "workflow")]
 fn wire_origin(origin: VersionOrigin) -> WorkflowVersionOrigin {
     match origin {
         VersionOrigin::Authored => WorkflowVersionOrigin::Authored,
@@ -1186,7 +991,6 @@ mod tests {
 
     fn app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        #[cfg_attr(not(feature = "workflow"), allow(unused_mut))]
         let mut app = App::new(
             &Config::default(),
             true,
@@ -1194,12 +998,8 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         );
-        // Never let a unit test open — or lock — the user's real workflow
-        // database. With the feature off there is no store to redirect.
-        #[cfg(feature = "workflow")]
-        {
-            app.workflow_store = crate::app::workflow_store::WorkflowStoreHandle::in_memory();
-        }
+        // Never let a unit test open — or lock — the user's real workflow database.
+        app.workflow_store = crate::app::workflow_store::WorkflowStoreHandle::in_memory();
         app
     }
 
@@ -1332,55 +1132,6 @@ mod tests {
         }
     }
 
-    /// `workflow` is an opt-in cargo feature and the canonical `kvx-<target>`
-    /// release is built without it, so the feature-off answer is what most
-    /// users' servers actually return. The sweep above only rules out
-    /// `not_implemented`; this pins the exact documented code so the
-    /// slim build can never start answering `workflow.*` with something a
-    /// client cannot recognise.
-    #[cfg(not(feature = "workflow"))]
-    #[test]
-    fn every_workflow_method_reports_workflow_unavailable_with_the_feature_off() {
-        let mut app = app();
-
-        // Valid params throughout: an invalid-params rejection happens before
-        // the engine boundary and would hide the code under test.
-        let methods = vec![
-            Method::WorkflowList(crate::api::schema::EmptyParams::default()),
-            Method::WorkflowGet(WorkflowTarget {
-                workflow_id: "workflow:1".into(),
-            }),
-            Method::WorkflowCreate(WorkflowCreateParams {
-                definition: definition(),
-            }),
-            Method::WorkflowRun(WorkflowRunParams {
-                workflow_id: "workflow:1".into(),
-                version: None,
-                tier: None,
-                args: HashMap::new(),
-            }),
-            Method::WorkflowRunList(WorkflowRunListParams {
-                workflow_id: "workflow:1".into(),
-                limit: None,
-            }),
-            Method::WorkflowNodeSteer(WorkflowNodeSteerParams {
-                run_id: "workflow_run:1".into(),
-                path: "plan".into(),
-                text: "keep going".into(),
-            }),
-        ];
-
-        for method in methods {
-            let response = app.dispatch_api_request("req", method.clone());
-            assert_eq!(
-                error_code(&response),
-                "workflow_unavailable",
-                "{method:?} did not report workflow_unavailable"
-            );
-        }
-    }
-
-    #[cfg(feature = "workflow")]
     #[test]
     fn a_created_workflow_is_listed_and_readable() {
         let mut app = app();
@@ -1434,7 +1185,6 @@ output_schema = { type = "object" }
         assert_eq!(fetched["result"]["workflow"]["workflow_id"], workflow_id);
     }
 
-    #[cfg(feature = "workflow")]
     #[test]
     fn a_definition_that_is_not_a_valid_kvdag_is_rejected_as_such() {
         let mut app = app();
@@ -1464,7 +1214,6 @@ output_schema = { type = "object" }
         );
     }
 
-    #[cfg(feature = "workflow")]
     #[test]
     fn a_run_that_omits_a_required_argument_is_refused() {
         let mut app = app();
@@ -1508,7 +1257,6 @@ output_schema = { type = "object" }
         assert_eq!(error_code(&response), MISSING_ARG_CODE);
     }
 
-    #[cfg(feature = "workflow")]
     #[test]
     fn node_methods_refuse_a_run_this_server_is_not_executing() {
         let mut app = app();
@@ -1546,7 +1294,6 @@ output_schema = { type = "object" }
         }
     }
 
-    #[cfg(feature = "workflow")]
     #[test]
     fn an_unknown_run_is_reported_as_not_found_rather_than_empty() {
         let mut app = app();

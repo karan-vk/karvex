@@ -90,12 +90,6 @@ chmod +x herdr-linux-x86_64
 mv herdr-linux-x86_64 ~/.local/bin/herdr
 ```
 
-### Workflow variant
-
-Each release also publishes a `kvx-workflow-<target>` asset alongside the canonical binary above — for example `kvx-workflow-linux-x86_64` for Linux x86_64. It is built with `--features workflow` and embeds the workflow subsystem's SurrealDB store, so `kvx workflow` commands work without a separate build. The canonical binary above does not embed that feature; its `kvx workflow` commands return a `workflow_unavailable` error. See [Workflows](/docs/workflows/) for details.
-
-Install and update it the same way as the canonical binary. `kvx update` and `kvx channel set` always fetch the next release of whichever variant you already run, so a workflow install stays a workflow install across updates and channel switches.
-
 ### Windows beta downloads
 
 Windows binaries are published only on preview releases while native Windows support is in beta. Use the preview installer above for normal testing, or download the Windows asset from a preview GitHub prerelease:

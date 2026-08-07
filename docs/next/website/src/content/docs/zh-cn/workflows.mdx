@@ -7,17 +7,6 @@ description: 定义多智能体 kvdag,将每个节点作为 Karvex 托管的队�
 
 工作流适合那种你想定义一次、反复运行的多步骤、多智能体任务,比如计划 → 实现 → 审查。如果只是想让已经在运行的智能体之间做一次性的脚本化协作,请改用 [智能体自动化](/zh-cn/docs/agent-automation/)。
 
-## 启用工作流
-
-工作流位于可选启用的 `workflow` cargo 特性之后。默认的 `kvx-<target>` 发行版二进制文件不包含工作流子系统的 SurrealDB 存储,其 `kvx workflow` 命令会返回 `workflow_unavailable` 错误。
-
-要使用工作流:
-
-- 安装 `kvx-workflow-<target>` 发行资产,而不是默认版本 ── 参见[安装](/zh-cn/docs/install/)。
-- 或者使用 `--features workflow` 从源码构建。
-
-`kvx update` 和 `kvx channel set` 始终获取你当前所用变体的下一个版本,因此更新或切换通道不会把工作流版本和默认版本互换。
-
 ## 什么是工作流
 
 **工作流** 是一个或多个 **kvdag 版本** ── 不可变的图定义 ── 的命名容器。`kvx workflow create` 创建第一个版本;`kvx workflow update` 在其基础上创建新版本。编辑操作从不就地修改某个版本,总是产生一个新版本,因此过去的运行始终可以对照它实际运行时所用的版本进行复现。

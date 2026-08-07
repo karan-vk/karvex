@@ -4,7 +4,6 @@ param(
     [string]$ManifestUrl = $env:HERDR_MANIFEST_URL,
     [string]$InstallDir = $env:HERDR_INSTALL_DIR,
     [string]$ExpectedBuildId = $env:HERDR_EXPECTED_BUILD_ID,
-    [string]$Variant = $env:HERDR_VARIANT,
     [int]$Retain = 3
 )
 
@@ -19,21 +18,6 @@ if ([string]::IsNullOrWhiteSpace($Channel)) {
 if ($Channel -notin @("stable", "preview")) {
     Write-Error "Invalid Herdr channel '$Channel'. Use 'preview'."
     exit 1
-}
-
-# Releases ship two builds per target: the canonical slim `kvx-<target>` and
-# `kvx-workflow-<target>` (built with the `workflow` cargo feature). `kvx update`
-# passes its own compiled variant through HERDR_VARIANT so a self-update can only
-# ever land on the same variant. Empty means the canonical slim build.
-if ([string]::IsNullOrWhiteSpace($Variant)) {
-    $Variant = ""
-} else {
-    $Variant = $Variant.Trim()
-    # The variant becomes both a manifest key segment and a path segment.
-    if ($Variant -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
-        Write-Error "Invalid Herdr variant '$Variant'."
-        exit 1
-    }
 }
 
 function Write-Step {
@@ -557,16 +541,6 @@ switch ($architecture) {
     }
 }
 
-$releaseSlug = $targetTriple
-if (-not [string]::IsNullOrWhiteSpace($Variant)) {
-    $target = "$Variant-$target"
-    # Keep each variant in its own release directory. Without this a slim
-    # install and a workflow install of the same version share one directory and
-    # Test-HerdrReleaseComplete would report the other variant's binary as
-    # already installed, silently skipping the download.
-    $releaseSlug = "$Variant-$targetTriple"
-}
-
 if ([string]::IsNullOrWhiteSpace($ManifestUrl)) {
     $ManifestUrl = if ($Channel -eq "preview") {
         "https://herdr.dev/preview.json"
@@ -616,10 +590,10 @@ if (-not [string]::IsNullOrWhiteSpace($ExpectedBuildId) -and [string]$manifest.b
 $versionIdentity = Resolve-HerdrVersion -Manifest $manifest -SelectedChannel $Channel
 $asset = Get-ManifestAsset -Manifest $manifest -Target $target
 $safeVersionIdentity = $versionIdentity -replace '[^0-9A-Za-z._-]', '-'
-$releaseName = "$safeVersionIdentity-$releaseSlug"
+$releaseName = "$safeVersionIdentity-$targetTriple"
 $releaseDir = Join-Path $releasesDir $releaseName
 
-Write-Step "Installing Herdr $versionIdentity for $releaseSlug"
+Write-Step "Installing Herdr $versionIdentity for $targetTriple"
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("herdr-install-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 

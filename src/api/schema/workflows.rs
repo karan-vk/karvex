@@ -8,8 +8,7 @@
 //! The wire contract in `docs/next/api/herdr-api.schema.json` is a stable,
 //! versioned artifact; the engine's internal types are free to change shape
 //! without touching it. Every conversion between the two lives in
-//! `src/app/api/workflows.rs` behind `#[cfg(feature = "workflow")]`, so this
-//! file has zero `use crate::workflow::*` and compiles unconditionally.
+//! `src/app/api/workflows.rs`, so this file has zero `use crate::workflow::*`.
 //!
 //! A kvdag definition document (`workflow.create` / `workflow.version.create`
 //! input) is carried as opaque TOML/JSON text
@@ -17,7 +16,7 @@
 //! the node/edge/condition tree: `docs/design/workflow-builder/05-phase-plan.md`
 //! §4 already promises the document is "the same shape as the kvdag types",
 //! and those types derive `Deserialize` directly. Parsing the text happens
-//! server-side, behind the same feature gate.
+//! server-side.
 
 use std::collections::HashMap;
 

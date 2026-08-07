@@ -11,34 +11,16 @@ from typing import Any
 
 # Used only when the environment does not identify the publishing repository.
 FALLBACK_RELEASE_REPO = "herdrdev/herdr"
-SLIM_ASSET_TARGETS = (
+ASSET_TARGETS = (
     "linux-x86_64",
     "linux-aarch64",
     "macos-x86_64",
     "macos-aarch64",
     "windows-x86_64",
 )
-# Every preview ships two builds per platform: the canonical slim default-feature
-# build and the `--features workflow` build. Slim keys keep their historical
-# `<os>-<arch>` spelling so already-published manifests stay valid; workflow
-# builds resolve `workflow-<os>-<arch>` instead. A binary only ever updates onto
-# its own variant, so both sets must be published together.
-WORKFLOW_ASSET_TARGETS = tuple(f"workflow-{target}" for target in SLIM_ASSET_TARGETS)
-ASSET_TARGETS = SLIM_ASSET_TARGETS + WORKFLOW_ASSET_TARGETS
-
-
-def platform_of(target: str) -> str:
-    """Return the `<os>-<arch>` part of a manifest asset key."""
-    return target.removeprefix("workflow-")
-
-
-def is_windows_target(target: str) -> bool:
-    return platform_of(target).startswith("windows-")
-
-
 EXPECTED_ASSET_NAMES = {
-    target: f"kvx-{target}.zip" if is_windows_target(target) else f"kvx-{target}"
-    for target in ASSET_TARGETS
+    **{target: f"kvx-{target}" for target in ASSET_TARGETS},
+    "windows-x86_64": "kvx-windows-x86_64.zip",
 }
 HIDDEN_SUBJECTS = (
     "docs: update website manifest",
@@ -220,7 +202,7 @@ def asset_objects(urls: dict[str, str], shas: dict[str, str]) -> dict[str, dict[
         sha = shas.get(target)
         if sha:
             entry["sha256"] = sha
-        if is_windows_target(target):
+        if target.startswith("windows-"):
             if not sha or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
                 raise ValueError(f"{target} requires a SHA-256 digest")
             entry["format"] = "zip"

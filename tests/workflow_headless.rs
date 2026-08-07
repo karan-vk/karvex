@@ -234,37 +234,44 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
 enum Readiness {
     /// The server can serve `workflow.*`.
     Ready,
-    /// A `--no-default-features` build: the schema types compile
-    /// unconditionally but there is no engine at all (`05` W3 "Feature-off
-    /// behaviour"). `just check-no-workflow` runs the whole suite this way, so
-    /// these scenarios legitimately have nothing to assert.
-    FeatureOff,
-    /// The `workflow` feature is compiled in but the handlers still resolve to
-    /// the placeholder engine handle.
+    /// The store itself refused to open — the workflow subsystem is always
+    /// compiled in, so this is a genuine runtime failure (a lock held by
+    /// another process, or a corrupt/unwritable database file), never an
+    /// expected build configuration.
+    StoreUnavailable,
+    /// The store is reachable but the handlers still resolve to the
+    /// placeholder engine handle.
     EngineUnwired,
 }
 
 fn workflow_readiness(socket: &Path) -> Readiness {
     let response = send_request(socket, &request("probe", "workflow.list", json!({})));
     match error_code(&response).as_str() {
-        "workflow_unavailable" => Readiness::FeatureOff,
+        "workflow_unavailable" => Readiness::StoreUnavailable,
         "workflow_engine_not_ready" => Readiness::EngineUnwired,
         _ => Readiness::Ready,
     }
 }
 
-/// Returns `false` when the scenario cannot run at all (feature-off build).
+/// Always returns `true`; the `bool` is kept so callers read as a guard.
 /// Panics with the exact remaining wiring when the engine is merely unwired —
 /// answering `not ready` is a state the phase has to leave behind, and a test
 /// that skipped over it would reproduce precisely the silent-pass failure mode
-/// `05-phase-plan.md` §6 exists to prevent.
+/// `05-phase-plan.md` §6 exists to prevent. A store that will not open is
+/// failed the same way rather than skipped: workflows ship in every build, so
+/// there is no configuration in which having nothing to assert is correct.
 fn require_workflow_api(socket: &Path) -> bool {
     match workflow_readiness(socket) {
         Readiness::Ready => true,
-        Readiness::FeatureOff => {
-            eprintln!("skipping: server built with --no-default-features");
-            false
-        }
+        Readiness::StoreUnavailable => panic!(
+            "the server answers workflow.* with `workflow_unavailable`.\n\
+             The workflow subsystem is compiled into every build, so this is a \
+             real store failure, not a feature-off build: `WorkflowStore` could \
+             not open its redb database. Check for another karvex server \
+             holding the exclusive file lock on `$KARVEX_WORKFLOW_DB_PATH` \
+             (default `<state_dir>/workflow.redb`), and for a corrupt or \
+             read-only database file."
+        ),
         Readiness::EngineUnwired => panic!(
             "the server answers workflow.* with `workflow_engine_not_ready`.\n\
              `src/app/api/workflows.rs` still resolves every handler to \

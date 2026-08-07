@@ -1,69 +1,89 @@
-//! Embedded SurrealDB persistence for workflows, versions, runs, and the run
-//! journal.
+//! Embedded persistence for workflows, versions, runs, and the run journal.
 //!
-//! Only this module talks to SurrealDB
-//! (`docs/design/workflow-builder/03-storage-schema.md`). It is gated behind
-//! the `workflow` cargo feature; with the feature off the subsystem reports
-//! `workflow_unavailable` and nothing else in the crate changes shape.
+//! Only this module talks to the database
+//! (`docs/design/workflow-builder/03-storage-schema.md`). The engine below it
+//! and the API above it both see typed Rust values and never a key, a row, or a
+//! transaction. The store is compiled unconditionally: there is one karvex
+//! binary and the workflow subsystem is always in it.
 //!
-//! Two properties are structural, not conventional:
+//! The backing store is [redb] — an embedded, pure-Rust, ACID key/value store
+//! with no C toolchain, no network stack, and no TLS or JWT dependencies. The
+//! key layout that stands in for the old SQL schema is documented in `db.rs`.
+//!
+//! Three properties are structural, not conventional:
 //!
 //! - **Append-only by construction.** `kvdag_version`, `kvdag_node`,
 //!   `kvdag_edge`, `node_checkpoint`, and `run_event` have no update and no
 //!   delete method here. There is no API to call.
 //! - **Whole-run retention only.** [`WorkflowStore::prune_run_history`] is the
-//!   single deleting entry point and can only remove whole runs, never
-//!   individual records inside a retained run.
+//!   single deleting entry point, and every row it can address is keyed by the
+//!   run that owns it, so there is no key shape that removes part of a
+//!   retained run.
+//! - **One writer.** The database file is exclusively locked while open, so a
+//!   second karvex server reports [`StoreError::Unavailable`] with reason
+//!   [`error::STORE_LOCKED`] instead of racing the first one.
 //!
-//! Step 2a adds `mod records;` and `mod queries;`, the migration files under
-//! `migrations/`, and the read methods that return typed rows
-//! (`get_workflow`, `list_workflows`, `get_run`, `list_runs`,
-//! `list_run_nodes`, `list_run_events`, `list_checkpoints`,
-//! `find_restorable_checkpoints`, `get_run_summary`). The names, the error
-//! contract, and the write surface below are frozen.
+//! Every method is `async` because the caller is
+//! `src/app/workflow_store.rs`'s store thread, which drives them through
+//! `block_on`; the work inside is synchronous local I/O.
+//!
+//! [redb]: https://www.redb.org
 
+mod db;
 pub mod error;
 mod queries;
 mod records;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub use error::StoreError;
-// Read-surface record types: no in-crate caller yet (the API layer that
-// exposes them, `src/app/api/workflows.rs`, is a later step), but this is a
-// binary crate, so nothing exempts a `pub use` from the unused-import lint on
-// its own the way it would in a published library.
+// Read-surface record types: no in-crate caller for every one of them yet, but
+// this is a binary crate, so nothing exempts a `pub use` from the unused-import
+// lint on its own the way it would in a published library.
 #[allow(unused_imports)]
 pub use queries::{
     CheckpointRecord, RunEventRecord, RunNodeRecord, RunRecord, RunSummaryRecord, WorkflowSummary,
 };
-use surrealdb::engine::local::{Db, Mem, SurrealKv};
-use surrealdb::Surreal;
 
 use crate::workflow::model::{
-    CheckpointKind, Demand, EdgeKind, EdgePayload, Evidence, GrowthLimits, Isolation, Kvdag,
-    KvdagEdge, KvdagNode, KvdagSpec, KvdagVersionId, NodeBinding, NodeKey, NodeKind, NodeStatus,
-    NodeUsage, OutputSchema, RunEventKind, RunId, RunStatus, StoreWrite, Succession, WorkflowId,
+    CheckpointKind, Demand, EdgeKind, EdgePayload, Evidence, GrowthLimits, InstancePath, Isolation,
+    Kvdag, KvdagEdge, KvdagNode, KvdagSpec, KvdagVersionId, NodeBinding, NodeKey, NodeKind,
+    NodeStatus, NodeUsage, OutputSchema, RunEventKind, RunId, RunStatus, StoreWrite, Succession,
+    WorkflowId,
 };
 use crate::workflow::tier::Tier;
+use db::RowReader as _;
 use records::{
-    parse_record_id, record_id_to_string, KvdagEdgeRow, KvdagNodeRow, KvdagVersionRow,
-    SchemaMetaRow, WorkflowRow,
+    parse_record_id, record_id_to_string, CheckpointRow, InterrogationRow, KvdagEdgeRow,
+    KvdagNodeRow, KvdagVersionRow, ReviewCycleRow, ReviewFindingRow, RunEdgeRow, RunEventRow,
+    RunNodeRow, RunRow, RunSummaryRow, WorkflowRow,
 };
+use redb::ReadableTable as _;
 
-/// Overrides the database directory; primarily for tests and for pointing a
-/// debug build at a release build's history.
+/// Overrides the database file; primarily for tests and for pointing a debug
+/// build at a release build's history.
 pub const DB_PATH_ENV: &str = "KARVEX_WORKFLOW_DB_PATH";
 
-pub const NAMESPACE: &str = "karvex";
-pub const DATABASE: &str = "workflow";
+/// The database file name under `state_dir()`. `0.9.0`'s directory-shaped
+/// SurrealKv store is not read and not migrated; a workflow history from that
+/// build is left where it is rather than half-converted.
+const DB_FILE_NAME: &str = "workflow.redb";
 
-const TABLE_WORKFLOW: &str = "workflow";
-const TABLE_KVDAG_VERSION: &str = "kvdag_version";
+/// Written next to the database while it is open, so a server that loses the
+/// race for the lock can name the process holding it. Only ever read after the
+/// lock has already been refused.
+const OWNER_FILE_SUFFIX: &str = ".owner";
+
+pub(super) const TABLE_WORKFLOW: &str = "workflow";
+pub(super) const TABLE_KVDAG_VERSION: &str = "kvdag_version";
 const TABLE_KVDAG_NODE: &str = "kvdag_node";
-const TABLE_WORKFLOW_RUN: &str = "workflow_run";
+pub(super) const TABLE_WORKFLOW_RUN: &str = "workflow_run";
 const TABLE_RUN_NODE: &str = "run_node";
+const TABLE_RUN_SUMMARY: &str = "run_summary";
+const TABLE_INTERROGATION: &str = "interrogation";
+const TABLE_REVIEW_CYCLE: &str = "review_cycle";
+const TABLE_REVIEW_FINDING: &str = "review_finding";
 
 /// Payload budgets (`03-storage-schema.md` §7): token efficiency is a schema
 /// property, enforced here rather than left to caller discipline.
@@ -71,18 +91,32 @@ const CHECKPOINT_PAYLOAD_BUDGET_BYTES: usize = 256 * 1024;
 const RUN_EVENT_PAYLOAD_BUDGET_BYTES: usize = 16 * 1024;
 const SUMMARY_BUDGET_CHARS: usize = 1_200;
 
-/// Every embedded migration, applied in order and recorded in `schema_meta`.
-/// The version string is both the `schema_meta.version` value and this
-/// module's audit trail of what has ever shipped.
-const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("migrations/0001_init.surql"))];
+type Migration = fn(&redb::WriteTransaction) -> Result<(), StoreError>;
+
+/// Every migration, applied in order and recorded in `schema_meta`. The version
+/// string is both the `schema_meta` key and this module's audit trail of what
+/// has ever shipped.
+const MIGRATIONS: &[(&str, Migration)] = &[("0001_init", migrate_0001_init)];
+
+/// Brings every table into existence. redb creates a table the first time a
+/// write transaction opens it, so this is what lets every later *read*
+/// transaction assume its table is there.
+fn migrate_0001_init(txn: &redb::WriteTransaction) -> Result<(), StoreError> {
+    for table in db::ROW_TABLES {
+        txn.open_table(*table).map_err(db::storage_error)?;
+    }
+    txn.open_table(db::SEQUENCE).map_err(db::storage_error)?;
+    Ok(())
+}
 
 /// Where a store's data lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreLocation {
-    /// A `SurrealKv` directory. Holds an exclusive lock while open.
+    /// A redb database file. Exclusively locked while open.
     OnDisk(PathBuf),
-    /// A `kv-mem` database. Store and engine tests use this so they touch no
-    /// disk; it is never a fallback for a locked on-disk store.
+    /// A database on redb's in-memory backend. Store and engine tests use this
+    /// so they touch no disk; it is never a fallback for a locked on-disk
+    /// store.
     Memory,
 }
 
@@ -123,7 +157,7 @@ pub struct NewRun {
 #[derive(Debug)]
 pub struct WorkflowStore {
     location: StoreLocation,
-    db: Surreal<Db>,
+    db: redb::Database,
 }
 
 impl WorkflowStore {
@@ -133,19 +167,15 @@ impl WorkflowStore {
     pub fn default_location() -> StoreLocation {
         match std::env::var_os(DB_PATH_ENV) {
             Some(path) if !path.is_empty() => StoreLocation::OnDisk(PathBuf::from(path)),
-            _ => StoreLocation::OnDisk(crate::config::state_dir().join("workflow")),
+            _ => StoreLocation::OnDisk(crate::config::state_dir().join(DB_FILE_NAME)),
         }
     }
 
-    /// Opens the database and applies pending migrations in a transaction.
-    /// Returns [`StoreError::Unavailable`] with reason
-    /// [`error::STORE_LOCKED`] when another karvex server owns the directory.
+    /// Opens the database and applies pending migrations. Returns
+    /// [`StoreError::Unavailable`] with reason [`error::STORE_LOCKED`] when
+    /// another karvex server owns the file.
     pub async fn open(location: StoreLocation) -> Result<Self, StoreError> {
-        let db = connect(&location).await?;
-        db.use_ns(NAMESPACE)
-            .use_db(DATABASE)
-            .await
-            .map_err(query_error)?;
+        let db = connect(&location)?;
         let store = Self { location, db };
         store.migrate().await?;
         Ok(store)
@@ -155,54 +185,54 @@ impl WorkflowStore {
         &self.location
     }
 
-    /// Applies every unapplied migration in order, inside one transaction, and
-    /// records the applied set in `schema_meta`. Re-applying is a no-op:
+    /// Applies every unapplied migration in order, each in its own transaction,
+    /// and records the applied set in `schema_meta`. Re-applying is a no-op:
     /// already-applied versions are skipped.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        let applied = self.applied_migrations().await?;
-        for (version, sql) in MIGRATIONS {
+        let applied = self.applied_migrations()?;
+        for (version, apply) in MIGRATIONS {
             if applied.contains(*version) {
                 continue;
             }
-            self.apply_migration(version, sql).await?;
+            self.apply_migration(version, *apply)?;
         }
         Ok(())
     }
 
-    async fn applied_migrations(&self) -> Result<std::collections::BTreeSet<String>, StoreError> {
-        let mut response = self
-            .db
-            .query("SELECT * FROM schema_meta")
-            .await
-            .map_err(query_error)?;
-        // On a brand-new database `schema_meta` itself doesn't exist yet — it
-        // is defined BY migration 0001. `.query()` only fails per-statement on
-        // `.take()`, not on the outer `.await`, so that's where this shows up.
-        // Unlike a schemaless key scan, this embedded engine errors rather
-        // than returning an empty set for a `SELECT` against an undefined
-        // table; that specific failure means "no migrations applied yet".
-        let rows: Vec<SchemaMetaRow> = match response.take(0) {
-            Ok(rows) => rows,
-            Err(error) if error.to_string().contains("does not exist") => Vec::new(),
-            Err(error) => return Err(query_error(error)),
+    fn applied_migrations(&self) -> Result<BTreeSet<String>, StoreError> {
+        let read = self.read()?;
+        let table = match read.open_table(db::SCHEMA_META) {
+            Ok(table) => table,
+            // On a brand-new database `schema_meta` itself does not exist yet —
+            // it is created BY migration 0001. That one failure means "no
+            // migrations applied"; anything else is a real error.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeSet::new()),
+            Err(error) => return Err(db::storage_error(error)),
         };
-        Ok(rows.into_iter().map(|row| row.version).collect())
+        let mut applied = BTreeSet::new();
+        for entry in table.iter().map_err(db::storage_error)? {
+            let (version, _) = entry.map_err(db::storage_error)?;
+            applied.insert(version.value().to_string());
+        }
+        Ok(applied)
     }
 
-    /// A single `.query()` call is already one transaction (SurrealDB commits
-    /// or cancels every statement in one request atomically); the DDL and the
-    /// `schema_meta` marker travel together so a failed migration leaves no
-    /// partial schema behind.
-    async fn apply_migration(&self, version: &str, sql: &str) -> Result<(), StoreError> {
-        let statement = format!("{sql}\nCREATE schema_meta SET version = $version;");
-        let response = self
+    /// The schema change and its `schema_meta` marker share one transaction, so
+    /// a failed migration leaves no partial schema behind.
+    fn apply_migration(&self, version: &str, apply: Migration) -> Result<(), StoreError> {
+        let txn = self
             .db
-            .query(statement)
-            .bind(("version", version.to_string()))
-            .await
+            .begin_write()
             .map_err(|error| migration_error(version, error))?;
-        response
-            .check()
+        apply(&txn).map_err(|error| migration_error(version, error))?;
+        {
+            let mut meta = txn
+                .open_table(db::SCHEMA_META)
+                .map_err(|error| migration_error(version, error))?;
+            meta.insert(version, db::now_ms().unsigned_abs())
+                .map_err(|error| migration_error(version, error))?;
+        }
+        txn.commit()
             .map_err(|error| migration_error(version, error))?;
         Ok(())
     }
@@ -213,23 +243,45 @@ impl WorkflowStore {
         description: &str,
         default_tier: Tier,
     ) -> Result<WorkflowId, StoreError> {
-        let mut response = self
-            .db
-            .query(
-                "CREATE workflow SET name = $name, description = $description, \
-                 default_tier = $default_tier RETURN AFTER",
-            )
-            .bind(("name", name.to_string()))
-            .bind(("description", description.to_string()))
-            .bind(("default_tier", default_tier.as_str().to_string()))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<WorkflowRow> = response.take(0).map_err(query_error)?;
-        let row = rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| StoreError::Query("create workflow returned no row".to_string()))?;
-        Ok(WorkflowId::new(record_id_to_string(&row.id)))
+        if name.is_empty() {
+            return Err(StoreError::Query("a workflow needs a name".to_string()));
+        }
+        // The old schema enforced this with a unique index on `name`. Nothing
+        // in the key layout does, so the check is explicit — dropping it would
+        // silently allow two workflows a user cannot tell apart.
+        if self
+            .list_workflows()
+            .await?
+            .iter()
+            .any(|workflow| workflow.name == name)
+        {
+            return Err(StoreError::Query(format!(
+                "a workflow named {name:?} already exists"
+            )));
+        }
+
+        let now = db::now_ms();
+        let txn = self.write_txn()?;
+        let key = {
+            let mut counters = txn.open_table(db::SEQUENCE).map_err(db::storage_error)?;
+            db::workflow_key(db::next_counter(&mut counters, db::SEQ_WORKFLOW)?)
+        };
+        {
+            let mut workflows = txn.open_table(db::WORKFLOW).map_err(db::storage_error)?;
+            let row = WorkflowRow {
+                id: key.clone(),
+                name: name.to_string(),
+                description: description.to_string(),
+                head_version: None,
+                default_tier: default_tier.as_str().to_string(),
+                archived: false,
+                created_at: now,
+                updated_at: now,
+            };
+            db::insert_new(&mut workflows, &key, &row, TABLE_WORKFLOW)?;
+        }
+        commit(txn)?;
+        Ok(WorkflowId::new(record_id_to_string(TABLE_WORKFLOW, &key)))
     }
 
     /// Writes a new immutable version plus its nodes and edges, and returns the
@@ -242,10 +294,9 @@ impl WorkflowStore {
         change_summary: &str,
         spec: KvdagSpec,
     ) -> Result<Kvdag, StoreError> {
-        let workflow_id = workflow_record_id(workflow)?;
+        let workflow_key = workflow_record_id(workflow)?;
         let workflow_row =
-            self.select_workflow(&workflow_id)
-                .await?
+            self.select_workflow(&workflow_key)?
                 .ok_or_else(|| StoreError::NotFound {
                     table: TABLE_WORKFLOW,
                     id: workflow.to_string(),
@@ -255,14 +306,14 @@ impl WorkflowStore {
         // the caller supplies content (contract/growth/args/nodes/edges) and,
         // optionally, an explicit parent override for a non-linear origin
         // (e.g. a future `restore_rewrite`).
-        let latest = self.latest_version(&workflow_id).await?;
+        let latest = self.latest_version(&workflow_key)?;
         let next_version = latest.as_ref().map_or(1, |(_, version)| version + 1);
         let explicit_parent = spec.parent.clone();
         let parent = explicit_parent.clone().or_else(|| {
             workflow_row
                 .head_version
-                .as_ref()
-                .map(|id| KvdagVersionId::new(record_id_to_string(id)))
+                .as_deref()
+                .map(|key| KvdagVersionId::new(record_id_to_string(TABLE_KVDAG_VERSION, key)))
         });
 
         let probe_spec = KvdagSpec {
@@ -300,178 +351,126 @@ impl WorkflowStore {
 
         let args_json = serde_json::to_value(&validated.args)
             .map_err(|error| StoreError::Query(error.to_string()))?;
-        let mut response = self
-            .db
-            .query(
-                "CREATE kvdag_version SET workflow = $workflow, version = $version, \
-                 parent = $parent, origin = $origin, change_summary = $change_summary, \
-                 contract = $contract, args = $args, max_depth = $max_depth, \
-                 max_nodes = $max_nodes, spec_digest = $spec_digest RETURN AFTER",
-            )
-            .bind(("workflow", workflow_id.clone()))
-            .bind((
-                "parent",
-                parent
+        let version_key = db::version_key(&workflow_key, validated.version);
+        let now = db::now_ms();
+
+        let txn = self.write_txn()?;
+        {
+            let mut versions = txn
+                .open_table(db::KVDAG_VERSION)
+                .map_err(db::storage_error)?;
+            let row = KvdagVersionRow {
+                id: version_key.clone(),
+                workflow: workflow_key.clone(),
+                version: i64::from(validated.version),
+                parent: parent
                     .as_ref()
                     .and_then(|id| parse_record_id(TABLE_KVDAG_VERSION, id.as_str())),
-            ))
-            .bind(("version", i64::from(validated.version)))
-            .bind(("origin", origin.as_str().to_string()))
-            .bind(("change_summary", change_summary.to_string()))
-            .bind(("contract", validated.contract.clone()))
-            .bind(("args", args_json))
-            .bind(("max_depth", i64::from(validated.growth.max_depth)))
-            .bind(("max_nodes", i64::from(validated.growth.max_nodes)))
-            .bind(("spec_digest", validated.spec_digest.to_string()))
-            .await
-            .map_err(query_error)?;
-        let version_rows: Vec<KvdagVersionRow> = response.take(0).map_err(query_error)?;
-        let version_row = version_rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| StoreError::Query("create kvdag_version returned no row".to_string()))?;
-
-        let mut node_ids: BTreeMap<NodeKey, surrealdb_types::RecordId> = BTreeMap::new();
-        for node in &validated.nodes {
-            let node_id = self.insert_kvdag_node(&version_row.id, node).await?;
-            node_ids.insert(node.key.clone(), node_id);
+                origin: origin.as_str().to_string(),
+                change_summary: change_summary.to_string(),
+                contract: validated.contract.clone(),
+                args: args_json,
+                max_depth: i64::from(validated.growth.max_depth),
+                max_nodes: i64::from(validated.growth.max_nodes),
+                spec_digest: validated.spec_digest.to_string(),
+                created_at: now,
+            };
+            db::insert_new(&mut versions, &version_key, &row, TABLE_KVDAG_VERSION)?;
         }
-        for edge in &validated.edges {
-            let from_id = node_ids
-                .get(&edge.from)
-                .ok_or_else(|| StoreError::Query(format!("unknown edge source {}", edge.from)))?;
-            let to_id = node_ids
-                .get(&edge.to)
-                .ok_or_else(|| StoreError::Query(format!("unknown edge target {}", edge.to)))?;
-            self.insert_kvdag_edge(from_id, to_id, edge).await?;
+        {
+            let mut nodes = txn.open_table(db::KVDAG_NODE).map_err(db::storage_error)?;
+            for node in &validated.nodes {
+                let key = db::child_key(&version_key, node.key.as_str());
+                let row = node_model_to_row(&key, &version_key, node);
+                db::insert_new(&mut nodes, &key, &row, TABLE_KVDAG_NODE)?;
+            }
         }
+        {
+            let mut edges = txn.open_table(db::KVDAG_EDGE).map_err(db::storage_error)?;
+            for edge in &validated.edges {
+                let key = kvdag_edge_key(&version_key, edge);
+                let condition = edge
+                    .condition
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|error| StoreError::Query(error.to_string()))?;
+                let row = KvdagEdgeRow {
+                    id: key.clone(),
+                    r#in: db::child_key(&version_key, edge.from.as_str()),
+                    out: db::child_key(&version_key, edge.to.as_str()),
+                    kind: edge_kind_str(edge.kind).to_string(),
+                    condition,
+                    payload: edge_payload_str(edge.payload).to_string(),
+                    port: edge.port.clone(),
+                };
+                db::insert_new(&mut edges, &key, &row, "kvdag_edge")?;
+            }
+        }
+        commit(txn)?;
 
-        self.load_version(&KvdagVersionId::new(record_id_to_string(&version_row.id)))
-            .await
-    }
-
-    async fn insert_kvdag_node(
-        &self,
-        version_id: &surrealdb_types::RecordId,
-        node: &KvdagNode,
-    ) -> Result<surrealdb_types::RecordId, StoreError> {
-        let output_schema = node.output_schema.as_value().clone();
-        let mut response = self
-            .db
-            .query(
-                "CREATE kvdag_node SET version = $version, node_key = $node_key, \
-                 label = $label, role = $role, kind = $kind, runner = $runner, \
-                 command = $command, demand = $demand, prompt_template = $prompt_template, \
-                 system_contract = $system_contract, output_schema = $output_schema, \
-                 max_attempts = $max_attempts, timeout_ms = $timeout_ms, \
-                 isolation = $isolation, is_template = $is_template, \
-                 expand_allow = $expand_allow, expand_max = $expand_max RETURN AFTER",
-            )
-            .bind(("version", version_id.clone()))
-            .bind(("node_key", node.key.to_string()))
-            .bind(("label", node.label.clone()))
-            .bind(("role", node.role.clone()))
-            .bind(("kind", node_kind_str(node.kind).to_string()))
-            .bind(("runner", runner_str(node.runner).to_string()))
-            .bind(("command", node.command.clone()))
-            .bind(("demand", demand_str(node.demand).to_string()))
-            .bind(("prompt_template", node.prompt_template.clone()))
-            .bind(("system_contract", node.system_contract.clone()))
-            .bind(("output_schema", output_schema))
-            .bind(("max_attempts", i64::from(node.max_attempts)))
-            .bind(("timeout_ms", node.timeout_ms.map(|ms| ms as i64)))
-            .bind(("isolation", isolation_str(node.isolation).to_string()))
-            .bind(("is_template", node.is_template))
-            .bind((
-                "expand_allow",
-                node.expand_allow
-                    .iter()
-                    .map(NodeKey::to_string)
-                    .collect::<Vec<_>>(),
-            ))
-            .bind(("expand_max", i64::from(node.expand_max)))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<KvdagNodeRow> = response.take(0).map_err(query_error)?;
-        let row = rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| StoreError::Query("create kvdag_node returned no row".to_string()))?;
-        Ok(row.id)
-    }
-
-    async fn insert_kvdag_edge(
-        &self,
-        from: &surrealdb_types::RecordId,
-        to: &surrealdb_types::RecordId,
-        edge: &KvdagEdge,
-    ) -> Result<(), StoreError> {
-        let condition = edge
-            .condition
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|error| StoreError::Query(error.to_string()))?;
-        let response = self
-            .db
-            .query(
-                "RELATE $from -> kvdag_edge -> $to SET kind = $kind, \
-                 condition = $condition, payload = $payload, port = $port",
-            )
-            .bind(("from", from.clone()))
-            .bind(("to", to.clone()))
-            .bind(("kind", edge_kind_str(edge.kind).to_string()))
-            .bind(("condition", condition))
-            .bind(("payload", edge_payload_str(edge.payload).to_string()))
-            .bind(("port", edge.port.clone()))
-            .await
-            .map_err(query_error)?;
-        response.check().map_err(query_error)?;
-        Ok(())
+        self.load_version(&KvdagVersionId::new(record_id_to_string(
+            TABLE_KVDAG_VERSION,
+            &version_key,
+        )))
+        .await
     }
 
     /// Advances the workflow's head pointer. `workflow` is the one mutable
-    /// definition table; the version it points at is immutable.
+    /// definition record; the version it points at is immutable.
     pub async fn set_head_version(
         &self,
         workflow: &WorkflowId,
         version: &KvdagVersionId,
     ) -> Result<(), StoreError> {
-        let workflow_id = workflow_record_id(workflow)?;
-        let version_id = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
+        let workflow_key = workflow_record_id(workflow)?;
+        let version_key = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a kvdag_version id: {version}")))?;
-        let response = self
-            .db
-            .query("UPDATE $workflow SET head_version = $version, updated_at = time::now()")
-            .bind(("workflow", workflow_id))
-            .bind(("version", version_id))
-            .await
-            .map_err(query_error)?;
-        response.check().map_err(query_error)?;
-        Ok(())
+        let mut row = self
+            .select_workflow(&workflow_key)?
+            .ok_or_else(|| StoreError::NotFound {
+                table: TABLE_WORKFLOW,
+                id: workflow.to_string(),
+            })?;
+        row.head_version = Some(version_key);
+        row.updated_at = db::now_ms();
+
+        let txn = self.write_txn()?;
+        {
+            let mut workflows = txn.open_table(db::WORKFLOW).map_err(db::storage_error)?;
+            db::put_row(&mut workflows, &workflow_key, &row)?;
+        }
+        commit(txn)
     }
 
     /// Loads one version's full node and edge set back into a validated graph.
     pub async fn load_version(&self, version: &KvdagVersionId) -> Result<Kvdag, StoreError> {
-        let version_id = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
+        let version_key = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a kvdag_version id: {version}")))?;
-        let version_row = self
-            .select_kvdag_version(&version_id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound {
+        let read = self.read()?;
+        let versions = read
+            .open_table(db::KVDAG_VERSION)
+            .map_err(db::storage_error)?;
+        let version_row: KvdagVersionRow =
+            db::get_row(&versions, &version_key)?.ok_or_else(|| StoreError::NotFound {
                 table: TABLE_KVDAG_VERSION,
                 id: version.to_string(),
             })?;
 
-        let node_rows = self.select_kvdag_nodes(&version_id).await?;
-        let edge_rows = self.select_kvdag_edges(&version_id).await?;
+        // Both scans come back in key order, which is node key order for nodes
+        // and (from, to, kind, port) for edges — deterministic, so a reloaded
+        // version is byte-identical to the one `create_version` returned.
+        let prefix = db::child_prefix(&version_key);
+        let nodes_table = read.open_table(db::KVDAG_NODE).map_err(db::storage_error)?;
+        let node_rows: Vec<KvdagNodeRow> = db::scan_prefix(&nodes_table, &prefix)?;
+        let edges_table = read.open_table(db::KVDAG_EDGE).map_err(db::storage_error)?;
+        let edge_rows: Vec<KvdagEdgeRow> = db::scan_prefix(&edges_table, &prefix)?;
 
         let mut node_key_by_id: BTreeMap<String, NodeKey> = BTreeMap::new();
-        let mut nodes = Vec::with_capacity(node_rows.len());
         for row in &node_rows {
-            let key = NodeKey::new(row.node_key.clone());
-            node_key_by_id.insert(record_id_to_string(&row.id), key.clone());
+            node_key_by_id.insert(row.id.clone(), NodeKey::new(row.node_key.clone()));
         }
+        let mut nodes = Vec::with_capacity(node_rows.len());
         for row in node_rows {
             nodes.push(node_row_to_model(row)?);
         }
@@ -479,11 +478,11 @@ impl WorkflowStore {
         let mut edges = Vec::with_capacity(edge_rows.len());
         for row in edge_rows {
             let from = node_key_by_id
-                .get(&record_id_to_string(&row.r#in))
+                .get(&row.r#in)
                 .cloned()
                 .ok_or_else(|| StoreError::Decode("edge references an unknown node".to_string()))?;
             let to = node_key_by_id
-                .get(&record_id_to_string(&row.out))
+                .get(&row.out)
                 .cloned()
                 .ok_or_else(|| StoreError::Decode("edge references an unknown node".to_string()))?;
             edges.push(edge_row_to_model(row, from, to)?);
@@ -492,16 +491,21 @@ impl WorkflowStore {
         let args: Vec<crate::workflow::model::ArgSpec> =
             serde_json::from_value(version_row.args)
                 .map_err(|error| StoreError::Decode(error.to_string()))?;
-        let parent = version_row
-            .parent
-            .as_ref()
-            .map(|id| KvdagVersionId::new(record_id_to_string(id)));
 
         let spec = KvdagSpec {
-            version_id: KvdagVersionId::new(record_id_to_string(&version_row.id)),
-            workflow_id: WorkflowId::new(record_id_to_string(&version_row.workflow)),
+            version_id: KvdagVersionId::new(record_id_to_string(
+                TABLE_KVDAG_VERSION,
+                &version_row.id,
+            )),
+            workflow_id: WorkflowId::new(record_id_to_string(
+                TABLE_WORKFLOW,
+                &version_row.workflow,
+            )),
             version: version_row.version as u32,
-            parent,
+            parent: version_row
+                .parent
+                .as_deref()
+                .map(|key| KvdagVersionId::new(record_id_to_string(TABLE_KVDAG_VERSION, key))),
             contract: version_row.contract,
             growth: GrowthLimits {
                 max_depth: version_row.max_depth as u16,
@@ -515,8 +519,8 @@ impl WorkflowStore {
     }
 
     pub async fn create_run(&self, run: NewRun) -> Result<RunId, StoreError> {
-        let workflow_id = workflow_record_id(&run.workflow)?;
-        let version_id =
+        let workflow_key = workflow_record_id(&run.workflow)?;
+        let version_key =
             parse_record_id(TABLE_KVDAG_VERSION, run.version.as_str()).ok_or_else(|| {
                 StoreError::Decode(format!("not a kvdag_version id: {}", run.version))
             })?;
@@ -528,44 +532,79 @@ impl WorkflowStore {
                 .map(|(key, value)| (key, serde_json::Value::String(value)))
                 .collect(),
         );
-        let context_runs: Vec<surrealdb_types::RecordId> = run
+        let context_runs: Vec<String> = run
             .context_runs
             .iter()
             .filter_map(|id| parse_record_id(TABLE_WORKFLOW_RUN, id.as_str()))
             .collect();
 
-        let mut response = self
-            .db
-            .query(
-                "CREATE workflow_run SET workflow = $workflow, kvdag_version = $version, \
-                 tier = $tier, status = \"pending\", args = $args, \
-                 context_runs = $context_runs, max_depth = $max_depth, \
-                 max_nodes = $max_nodes, nodes_total = $nodes_total RETURN AFTER",
-            )
-            .bind(("workflow", workflow_id))
-            .bind(("version", version_id.clone()))
-            .bind(("tier", run.tier.as_str().to_string()))
-            .bind(("args", args_json))
-            .bind(("context_runs", context_runs))
-            .bind(("max_depth", i64::from(run.growth.max_depth)))
-            .bind(("max_nodes", i64::from(run.growth.max_nodes)))
-            .bind((
-                "nodes_total",
-                graph.nodes.iter().filter(|n| !n.is_template).count() as i64,
-            ))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
-        let row = rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| StoreError::Query("create workflow_run returned no row".to_string()))?;
-        let run_id = RunId::new(record_id_to_string(&row.id));
+        // Read the version's stored nodes and edges before opening the write
+        // transaction: the run's materialised graph is built from what was
+        // actually persisted, not from the caller's copy of it.
+        let stored_nodes: BTreeMap<NodeKey, String> = {
+            let read = self.read()?;
+            let table = read.open_table(db::KVDAG_NODE).map_err(db::storage_error)?;
+            let rows: Vec<KvdagNodeRow> = db::scan_prefix(&table, &db::child_prefix(&version_key))?;
+            rows.into_iter()
+                .map(|row| (NodeKey::new(row.node_key), row.id))
+                .collect()
+        };
+        let stored_edges: BTreeSet<String> = {
+            let read = self.read()?;
+            let table = read.open_table(db::KVDAG_EDGE).map_err(db::storage_error)?;
+            db::scan_prefix_keys(&table, &db::child_prefix(&version_key))?
+                .into_iter()
+                .collect()
+        };
 
-        self.materialise_run_nodes(&row.id, &version_id, run.tier, &graph)
-            .await?;
+        let now = db::now_ms();
+        let txn = self.write_txn()?;
+        let run_key = {
+            let mut counters = txn.open_table(db::SEQUENCE).map_err(db::storage_error)?;
+            db::run_key(&workflow_key, db::next_counter(&mut counters, db::SEQ_RUN)?)
+        };
+        {
+            let mut runs = txn
+                .open_table(db::WORKFLOW_RUN)
+                .map_err(db::storage_error)?;
+            let row = RunRow {
+                id: run_key.clone(),
+                workflow: workflow_key,
+                kvdag_version: version_key.clone(),
+                tier: run.tier.as_str().to_string(),
+                status: run_status_str(RunStatus::Pending).to_string(),
+                args: args_json,
+                context_runs,
+                restore_from: None,
+                max_depth: i64::from(run.growth.max_depth),
+                max_nodes: i64::from(run.growth.max_nodes),
+                workspace_id: None,
+                tab_id: None,
+                started_at: now,
+                ended_at: None,
+                total_tokens: 0,
+                total_tool_uses: 0,
+                nodes_total: graph.nodes.iter().filter(|node| !node.is_template).count() as i64,
+                nodes_done: 0,
+                failure: None,
+            };
+            db::insert_new(&mut runs, &run_key, &row, TABLE_WORKFLOW_RUN)?;
+        }
+        materialise_run_nodes(
+            &txn,
+            &run_key,
+            &version_key,
+            run.tier,
+            &graph,
+            &stored_nodes,
+            &stored_edges,
+        )?;
+        commit(txn)?;
 
-        Ok(run_id)
+        Ok(RunId::new(record_id_to_string(
+            TABLE_WORKFLOW_RUN,
+            &run_key,
+        )))
     }
 
     /// The engine's durable write path. Never on the critical path of a node
@@ -579,8 +618,8 @@ impl WorkflowStore {
                 kind,
                 path,
                 payload,
-            } => self.write_run_event(run, seq, kind, path, payload).await,
-            StoreWrite::RunStatus { run, status } => self.write_run_status(run, status).await,
+            } => self.write_run_event(run, seq, kind, path, payload),
+            StoreWrite::RunStatus { run, status } => self.write_run_status(run, status),
             StoreWrite::RunNode {
                 run,
                 path,
@@ -590,12 +629,9 @@ impl WorkflowStore {
                 usage,
                 evidence,
                 succession,
-            } => {
-                self.write_run_node(
-                    run, path, status, attempt, binding, usage, evidence, succession,
-                )
-                .await
-            }
+            } => self.write_run_node(
+                run, path, status, attempt, binding, usage, evidence, succession,
+            ),
             StoreWrite::Checkpoint {
                 run,
                 path,
@@ -606,135 +642,392 @@ impl WorkflowStore {
                 summary,
                 artifact_paths,
                 digest,
-            } => {
-                self.write_checkpoint(
-                    run,
-                    path,
-                    seq,
-                    kind,
-                    schema_valid,
-                    payload,
-                    summary,
-                    artifact_paths,
-                    digest,
-                )
-                .await
-            }
+            } => self.write_checkpoint(
+                run,
+                path,
+                seq,
+                kind,
+                schema_valid,
+                payload,
+                summary,
+                artifact_paths,
+                digest,
+            ),
         }
     }
 
     /// Deletes whole runs beyond the retention window and returns how many were
-    /// removed. Every `run_summary` survives, and no dangling `run_node`
-    /// reference is left behind.
+    /// removed. Every `run_summary` survives, and no dangling reference to a
+    /// removed record is left behind.
     pub async fn prune_run_history(
         &self,
         workflow: &WorkflowId,
         keep_runs: usize,
     ) -> Result<u64, StoreError> {
-        let workflow_id = workflow_record_id(workflow)?;
-        let mut response = self
-            .db
-            .query(
-                // ORDER BY requires the sort key in the projection, so this
-                // selects the full row rather than just `id`.
-                "SELECT * FROM workflow_run WHERE workflow = $workflow \
-                 ORDER BY started_at DESC LIMIT 1000000",
-            )
-            .bind(("workflow", workflow_id))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
-        let to_prune: Vec<surrealdb_types::RecordId> =
-            rows.into_iter().skip(keep_runs).map(|row| row.id).collect();
+        let workflow_key = workflow_record_id(workflow)?;
+        let read = self.read()?;
+        let runs = read
+            .open_table(db::WORKFLOW_RUN)
+            .map_err(db::storage_error)?;
+        // Run keys sort in creation order, so reversing is `ORDER BY
+        // started_at DESC` with a deterministic same-millisecond tiebreak.
+        let mut keys = db::scan_prefix_keys(&runs, &db::run_prefix(&workflow_key))?;
+        drop(runs);
+        drop(read);
+        keys.reverse();
 
         let mut pruned = 0u64;
-        for run_id in to_prune {
-            self.prune_one_run(&run_id).await?;
+        for run_key in keys.into_iter().skip(keep_runs) {
+            self.prune_one_run(&run_key)?;
             pruned += 1;
         }
         Ok(pruned)
     }
 
-    async fn prune_one_run(&self, run: &surrealdb_types::RecordId) -> Result<(), StoreError> {
+    fn prune_one_run(&self, run_key: &str) -> Result<(), StoreError> {
+        let child_prefix = db::child_prefix(run_key);
+
         // §9: the summary itself is exempt from pruning, but the identity of
         // the node that generated it is not worth retaining a whole run for.
-        //
-        // Order matters: `review_finding.interview` is nulled *before* the
-        // `interrogation` rows it points at are deleted. Reversing this would
-        // delete the interrogation first, so `interview.run_node.run` could no
-        // longer resolve through the (now-gone) link and the finding would
-        // never get nulled — leaving a dangling reference instead of the NONE
-        // §9 requires.
-        let response = self
-            .db
-            .query(
-                "UPDATE run_summary SET generated_by = NONE WHERE run = $run;\
-                 UPDATE review_finding SET interview = NONE WHERE interview.run_node.run = $run;\
-                 DELETE interrogation WHERE run_node.run = $run;\
-                 DELETE node_checkpoint WHERE run = $run;\
-                 DELETE run_event WHERE run = $run;\
-                 DELETE spawned WHERE run = $run;\
-                 DELETE run_edge WHERE run = $run;\
-                 DELETE run_node WHERE run = $run;\
-                 DELETE $run;",
-            )
-            .bind(("run", run.clone()))
-            .await
-            .map_err(query_error)?;
-        response.check().map_err(query_error)?;
+        // Both back-references are rewritten *before* the records they point at
+        // are removed, so no reader can ever observe one pointing at a deleted
+        // record.
+        let summary: Option<RunSummaryRow> = {
+            let read = self.read()?;
+            let table = read
+                .open_table(db::RUN_SUMMARY)
+                .map_err(db::storage_error)?;
+            db::get_row(&table, run_key)?
+        };
+        let orphaned_findings: Vec<ReviewFindingRow> = {
+            let read = self.read()?;
+            let table = read
+                .open_table(db::REVIEW_FINDING)
+                .map_err(db::storage_error)?;
+            let all: Vec<ReviewFindingRow> = db::scan_prefix(&table, "")?;
+            all.into_iter()
+                .filter(|finding| {
+                    finding
+                        .interview
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with(&child_prefix))
+                })
+                .collect()
+        };
+
+        let txn = self.write_txn()?;
+        if let Some(mut summary) = summary {
+            summary.generated_by = None;
+            let mut table = txn.open_table(db::RUN_SUMMARY).map_err(db::storage_error)?;
+            db::put_row(&mut table, run_key, &summary)?;
+        }
+        if !orphaned_findings.is_empty() {
+            let mut table = txn
+                .open_table(db::REVIEW_FINDING)
+                .map_err(db::storage_error)?;
+            for mut finding in orphaned_findings {
+                let key = finding.id.clone();
+                finding.interview = None;
+                db::put_row(&mut table, &key, &finding)?;
+            }
+        }
+        for table in [
+            db::INTERROGATION,
+            db::NODE_CHECKPOINT,
+            db::RUN_EVENT,
+            db::RUN_EDGE,
+            db::RUN_NODE,
+        ] {
+            let mut table = txn.open_table(table).map_err(db::storage_error)?;
+            db::delete_prefix(&mut table, &child_prefix)?;
+        }
+        {
+            let mut runs = txn
+                .open_table(db::WORKFLOW_RUN)
+                .map_err(db::storage_error)?;
+            runs.remove(run_key).map_err(db::storage_error)?;
+        }
+        commit(txn)
+    }
+}
+
+// ── run summary, interrogation, review (no Phase 1 engine writer) ───────────
+
+impl WorkflowStore {
+    /// Records a run's summary. `03` §9: a summary outlives the run it
+    /// describes, so it is keyed by the run and exempt from pruning.
+    pub(super) async fn create_run_summary(
+        &self,
+        run: &RunId,
+        version: &KvdagVersionId,
+        text: &str,
+        outcome: &str,
+    ) -> Result<(), StoreError> {
+        let run_key = run_record_id(run)?;
+        let version_key = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a kvdag_version id: {version}")))?;
+        let row = RunSummaryRow {
+            id: run_key.clone(),
+            run: run_key.clone(),
+            kvdag_version: version_key,
+            text: text.to_string(),
+            outcome: outcome.to_string(),
+            highlights: Vec::new(),
+            open_gaps: Vec::new(),
+            per_node: Vec::new(),
+            token_estimate: 0,
+            generated_by: None,
+            created_at: db::now_ms(),
+        };
+        let txn = self.write_txn()?;
+        {
+            let mut table = txn.open_table(db::RUN_SUMMARY).map_err(db::storage_error)?;
+            db::insert_new(&mut table, &run_key, &row, TABLE_RUN_SUMMARY)?;
+        }
+        commit(txn)
+    }
+
+    /// Points an existing summary at the node instance that produced it.
+    pub(super) async fn set_run_summary_generated_by(
+        &self,
+        run: &RunId,
+        path: &InstancePath,
+    ) -> Result<(), StoreError> {
+        let run_key = run_record_id(run)?;
+        let mut row: RunSummaryRow = {
+            let read = self.read()?;
+            let table = read
+                .open_table(db::RUN_SUMMARY)
+                .map_err(db::storage_error)?;
+            db::get_row(&table, &run_key)?.ok_or_else(|| StoreError::NotFound {
+                table: TABLE_RUN_SUMMARY,
+                id: run.to_string(),
+            })?
+        };
+        row.generated_by = Some(db::child_key(&run_key, path.as_str()));
+        let txn = self.write_txn()?;
+        {
+            let mut table = txn.open_table(db::RUN_SUMMARY).map_err(db::storage_error)?;
+            db::put_row(&mut table, &run_key, &row)?;
+        }
+        commit(txn)?;
         Ok(())
+    }
+
+    /// Records one forked-session interrogation of a node. Keyed under the node
+    /// it interrogates, so it is pruned with that node's run.
+    pub(super) async fn create_interrogation(
+        &self,
+        run: &RunId,
+        path: &InstancePath,
+        source_session_id: &str,
+        forked_session_id: &str,
+        cwd: &str,
+    ) -> Result<String, StoreError> {
+        let run_node_key = self.find_run_node_key(run, path)?;
+        let txn = self.write_txn()?;
+        let key = {
+            let mut counters = txn.open_table(db::SEQUENCE).map_err(db::storage_error)?;
+            let counter = db::next_counter(&mut counters, db::SEQ_INTERROGATION)?;
+            db::child_key(&run_node_key, &format!("i{counter:012x}"))
+        };
+        {
+            let mut table = txn
+                .open_table(db::INTERROGATION)
+                .map_err(db::storage_error)?;
+            let row = InterrogationRow {
+                id: key.clone(),
+                run_node: run_node_key,
+                source_session_id: source_session_id.to_string(),
+                forked_session_id: forked_session_id.to_string(),
+                transcript_path: None,
+                cwd: cwd.to_string(),
+                pane_id: None,
+                started_at: db::now_ms(),
+                ended_at: None,
+                note: String::new(),
+                reconstructed: false,
+                seeded_from: None,
+            };
+            db::insert_new(&mut table, &key, &row, TABLE_INTERROGATION)?;
+        }
+        commit(txn)?;
+        Ok(key)
+    }
+
+    pub(super) async fn create_review_cycle(
+        &self,
+        run: &RunId,
+        version: &KvdagVersionId,
+        status: &str,
+    ) -> Result<String, StoreError> {
+        let run_key = run_record_id(run)?;
+        let version_key = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a kvdag_version id: {version}")))?;
+        let txn = self.write_txn()?;
+        let key = {
+            let mut counters = txn.open_table(db::SEQUENCE).map_err(db::storage_error)?;
+            let counter = db::next_counter(&mut counters, db::SEQ_REVIEW_CYCLE)?;
+            format!("c{counter:012x}")
+        };
+        {
+            let mut table = txn
+                .open_table(db::REVIEW_CYCLE)
+                .map_err(db::storage_error)?;
+            let row = ReviewCycleRow {
+                id: key.clone(),
+                run: run_key,
+                kvdag_version: version_key,
+                status: status.to_string(),
+                interviews: Vec::new(),
+                started_at: db::now_ms(),
+                ended_at: None,
+            };
+            db::insert_new(&mut table, &key, &row, TABLE_REVIEW_CYCLE)?;
+        }
+        commit(txn)?;
+        Ok(key)
+    }
+
+    /// A `replace` verdict without a replacement is refused. The old schema
+    /// enforced this with a table event; nothing in a key/value layout can, so
+    /// it is a check here — a review that says "replace this node" and does not
+    /// say what with is not a reviewable finding, it is a lost one.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn create_review_finding(
+        &self,
+        cycle: &str,
+        node_key: &NodeKey,
+        interview: Option<&str>,
+        level: &str,
+        verdict: &str,
+        rationale: &str,
+        replacement: Option<serde_json::Value>,
+    ) -> Result<String, StoreError> {
+        if verdict == "replace" && replacement.is_none() {
+            return Err(StoreError::Query(
+                "a \"replace\" verdict needs a replacement".to_string(),
+            ));
+        }
+        let txn = self.write_txn()?;
+        let key = {
+            let mut counters = txn.open_table(db::SEQUENCE).map_err(db::storage_error)?;
+            let counter = db::next_counter(&mut counters, db::SEQ_REVIEW_FINDING)?;
+            db::child_key(cycle, &format!("f{counter:012x}"))
+        };
+        {
+            let mut table = txn
+                .open_table(db::REVIEW_FINDING)
+                .map_err(db::storage_error)?;
+            let row = ReviewFindingRow {
+                id: key.clone(),
+                cycle: cycle.to_string(),
+                node_key: node_key.to_string(),
+                interview: interview.map(str::to_string),
+                interview_mode: if interview.is_some() {
+                    "resumed".to_string()
+                } else {
+                    "evidence_only".to_string()
+                },
+                level: level.to_string(),
+                verdict: verdict.to_string(),
+                rationale: rationale.to_string(),
+                replacement,
+                evidence: serde_json::Value::Object(serde_json::Map::new()),
+                proposed_change: serde_json::Value::Object(serde_json::Map::new()),
+                accepted: false,
+            };
+            db::insert_new(&mut table, &key, &row, TABLE_REVIEW_FINDING)?;
+        }
+        commit(txn)?;
+        Ok(key)
     }
 }
 
 // ── connection + error classification ───────────────────────────────────────
 
-async fn connect(location: &StoreLocation) -> Result<Surreal<Db>, StoreError> {
+fn connect(location: &StoreLocation) -> Result<redb::Database, StoreError> {
     match location {
-        StoreLocation::Memory => Surreal::new::<Mem>(())
-            .await
+        StoreLocation::Memory => redb::Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(|error| StoreError::Query(error.to_string())),
         StoreLocation::OnDisk(path) => {
-            std::fs::create_dir_all(path)?;
-            let path_str = path.to_string_lossy().into_owned();
-            Surreal::new::<SurrealKv>(path_str.as_str())
-                .await
-                .map_err(|error| classify_open_error(path, error))
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            match redb::Database::create(path) {
+                Ok(database) => {
+                    record_lock_owner(path);
+                    Ok(database)
+                }
+                Err(error) => Err(classify_open_error(path, &error)),
+            }
         }
     }
 }
 
-/// SurrealKv's lock file (`LOCK`, inside the database directory) holds the PID
-/// of whichever process currently owns it — written by the process that
-/// acquired the lock, for exactly this kind of diagnostic read. A failed
-/// acquisition never overwrites it, so on a lock conflict the file still names
-/// the current holder.
-fn classify_open_error(path: &Path, error: surrealdb::Error) -> StoreError {
-    let message = error.to_string();
-    if message.contains("already locked") {
-        let holder = std::fs::read_to_string(path.join("LOCK"))
+fn owner_path(path: &Path) -> PathBuf {
+    let mut owner = path.as_os_str().to_os_string();
+    owner.push(OWNER_FILE_SUFFIX);
+    PathBuf::from(owner)
+}
+
+/// redb's own lock is an advisory file lock with no payload, so the holder's
+/// identity is recorded alongside it. Best-effort: failing to write it costs a
+/// diagnostic, never the open.
+fn record_lock_owner(path: &Path) {
+    let _ = std::fs::write(owner_path(path), format!("pid {}", std::process::id()));
+}
+
+/// A refused lock is the one open failure that takes the whole subsystem out of
+/// service with a name attached, so it is classified rather than reported as a
+/// generic query failure. The owner file is only consulted here: a lock that
+/// was refused is a lock somebody still holds, so what it names is current.
+fn classify_open_error(path: &Path, error: &redb::DatabaseError) -> StoreError {
+    if matches!(error, redb::DatabaseError::DatabaseAlreadyOpen) {
+        let holder = std::fs::read_to_string(owner_path(path))
             .ok()
             .map(|contents| contents.trim().to_string())
-            .filter(|pid| !pid.is_empty());
+            .filter(|holder| !holder.is_empty());
         StoreError::store_locked(holder)
     } else {
-        StoreError::Query(message)
+        StoreError::Query(error.to_string())
     }
 }
 
-fn query_error(error: surrealdb::Error) -> StoreError {
-    StoreError::Query(error.to_string())
-}
-
-fn migration_error(version: &str, error: surrealdb::Error) -> StoreError {
+fn migration_error(version: &str, error: impl std::fmt::Display) -> StoreError {
     StoreError::Migration {
         version: version.to_string(),
         message: error.to_string(),
     }
 }
 
-fn workflow_record_id(id: &WorkflowId) -> Result<surrealdb_types::RecordId, StoreError> {
+fn commit(txn: redb::WriteTransaction) -> Result<(), StoreError> {
+    txn.commit().map_err(db::storage_error)
+}
+
+fn workflow_record_id(id: &WorkflowId) -> Result<String, StoreError> {
     parse_record_id(TABLE_WORKFLOW, id.as_str())
         .ok_or_else(|| StoreError::Decode(format!("not a workflow id: {id}")))
+}
+
+fn run_record_id(id: &RunId) -> Result<String, StoreError> {
+    parse_record_id(TABLE_WORKFLOW_RUN, id.as_str())
+        .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {id}")))
+}
+
+fn kvdag_edge_key(version_key: &str, edge: &KvdagEdge) -> String {
+    // The node pair alone does not identify an edge: nothing forbids two edges
+    // between the same ordered pair (only a target's inbound *port* names have
+    // to be unique), so `kind` and `port` are part of the key or two edges
+    // would collide on one record.
+    db::edge_key(
+        version_key,
+        edge.from.as_str(),
+        edge.to.as_str(),
+        edge_kind_str(edge.kind),
+        edge.port.as_deref().unwrap_or_default(),
+    )
 }
 
 // ── domain <-> schema string conversions ────────────────────────────────────
@@ -992,6 +1285,30 @@ fn truncate_chars(text: String, budget_chars: usize) -> String {
 
 // ── row <-> model conversions ───────────────────────────────────────────────
 
+fn node_model_to_row(key: &str, version_key: &str, node: &KvdagNode) -> KvdagNodeRow {
+    KvdagNodeRow {
+        id: key.to_string(),
+        version: version_key.to_string(),
+        node_key: node.key.to_string(),
+        label: node.label.clone(),
+        role: node.role.clone(),
+        kind: node_kind_str(node.kind).to_string(),
+        runner: runner_str(node.runner).to_string(),
+        command: node.command.clone(),
+        demand: demand_str(node.demand).to_string(),
+        prompt_template: node.prompt_template.clone(),
+        system_contract: node.system_contract.clone(),
+        output_schema: node.output_schema.as_value().clone(),
+        max_attempts: i64::from(node.max_attempts),
+        timeout_ms: node.timeout_ms.map(|ms| ms as i64),
+        isolation: isolation_str(node.isolation).to_string(),
+        is_template: node.is_template,
+        expand_allow: node.expand_allow.iter().map(NodeKey::to_string).collect(),
+        expand_max: i64::from(node.expand_max),
+        position: None,
+    }
+}
+
 fn node_row_to_model(row: KvdagNodeRow) -> Result<KvdagNode, StoreError> {
     Ok(KvdagNode {
         key: NodeKey::new(row.node_key),
@@ -1034,301 +1351,134 @@ fn edge_row_to_model(
     })
 }
 
+// ── reads and writes behind the public surface ──────────────────────────────
+
 impl WorkflowStore {
-    async fn select_workflow(
-        &self,
-        id: &surrealdb_types::RecordId,
-    ) -> Result<Option<WorkflowRow>, StoreError> {
-        let mut response = self
-            .db
-            .query("SELECT * FROM $id")
-            .bind(("id", id.clone()))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<WorkflowRow> = response.take(0).map_err(query_error)?;
-        Ok(rows.into_iter().next())
+    pub(super) fn read(&self) -> Result<redb::ReadTransaction, StoreError> {
+        use redb::ReadableDatabase;
+        self.db.begin_read().map_err(db::storage_error)
     }
 
-    async fn select_kvdag_version(
-        &self,
-        id: &surrealdb_types::RecordId,
-    ) -> Result<Option<KvdagVersionRow>, StoreError> {
-        let mut response = self
-            .db
-            .query("SELECT * FROM $id")
-            .bind(("id", id.clone()))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<KvdagVersionRow> = response.take(0).map_err(query_error)?;
-        Ok(rows.into_iter().next())
+    fn write_txn(&self) -> Result<redb::WriteTransaction, StoreError> {
+        self.db.begin_write().map_err(db::storage_error)
     }
 
-    async fn select_kvdag_nodes(
-        &self,
-        version_id: &surrealdb_types::RecordId,
-    ) -> Result<Vec<KvdagNodeRow>, StoreError> {
-        let mut response = self
-            .db
-            .query("SELECT * FROM kvdag_node WHERE version = $version ORDER BY node_key")
-            .bind(("version", version_id.clone()))
-            .await
-            .map_err(query_error)?;
-        response.take(0).map_err(query_error)
-    }
-
-    async fn select_kvdag_edges(
-        &self,
-        version_id: &surrealdb_types::RecordId,
-    ) -> Result<Vec<KvdagEdgeRow>, StoreError> {
-        let mut response = self
-            .db
-            .query("SELECT * FROM kvdag_edge WHERE in.version = $version ORDER BY in, out, port")
-            .bind(("version", version_id.clone()))
-            .await
-            .map_err(query_error)?;
-        response.take(0).map_err(query_error)
+    fn select_workflow(&self, key: &str) -> Result<Option<WorkflowRow>, StoreError> {
+        let read = self.read()?;
+        let table = read.open_table(db::WORKFLOW).map_err(db::storage_error)?;
+        db::get_row(&table, key)
     }
 
     /// The workflow's highest-numbered version, which is the tip of its chain.
-    async fn latest_version(
+    /// Version keys embed a zero-padded version number, so the tip is simply
+    /// the last key in the workflow's range.
+    fn latest_version(
         &self,
-        workflow_id: &surrealdb_types::RecordId,
+        workflow_key: &str,
     ) -> Result<Option<(KvdagVersionId, u32)>, StoreError> {
-        let mut response = self
-            .db
-            .query(
-                "SELECT * FROM kvdag_version WHERE workflow = $workflow \
-                 ORDER BY version DESC LIMIT 1",
-            )
-            .bind(("workflow", workflow_id.clone()))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<KvdagVersionRow> = response.take(0).map_err(query_error)?;
-        Ok(rows.into_iter().next().map(|row| {
-            (
-                KvdagVersionId::new(record_id_to_string(&row.id)),
-                row.version as u32,
-            )
-        }))
-    }
-
-    /// Materialises the static run-node/run-edge set for a freshly created run:
-    /// one `run_node` per non-template `kvdag_node` (templates are only ever
-    /// instantiated by an accepted expand proposal — Phase 2), roots `Ready`
-    /// and everything else `Pending`, and one `run_edge` `RELATE` per
-    /// `kvdag_edge` between two materialised nodes. `depth` is the longest
-    /// path from any root, computed in one forward pass over `graph.nodes`
-    /// because `Kvdag::try_new` already topologically sorted them.
-    async fn materialise_run_nodes(
-        &self,
-        run_id: &surrealdb_types::RecordId,
-        version_id: &surrealdb_types::RecordId,
-        tier: Tier,
-        graph: &Kvdag,
-    ) -> Result<(), StoreError> {
-        let scheduled: Vec<&KvdagNode> = graph.nodes.iter().filter(|n| !n.is_template).collect();
-        let node_record_ids = self.select_kvdag_nodes(version_id).await?;
-        let node_record_id_by_key: BTreeMap<NodeKey, surrealdb_types::RecordId> = node_record_ids
-            .into_iter()
-            .map(|row| (NodeKey::new(row.node_key.clone()), row.id))
-            .collect();
-
-        let mut depth_by_key: BTreeMap<NodeKey, u16> = BTreeMap::new();
-        let mut run_node_id_by_key: BTreeMap<NodeKey, surrealdb_types::RecordId> = BTreeMap::new();
-
-        for node in &scheduled {
-            let inbound: Vec<&KvdagEdge> = graph.inbound_edges(&node.key).collect();
-            let depth = inbound
-                .iter()
-                .filter_map(|edge| depth_by_key.get(&edge.from))
-                .max()
-                .map_or(0, |max| max + 1);
-            depth_by_key.insert(node.key.clone(), depth);
-
-            let status = if inbound.is_empty() {
-                NodeStatus::Ready
-            } else {
-                NodeStatus::Pending
-            };
-            let assignment = crate::workflow::tier::resolve(tier, node.demand, None);
-            let kvdag_node_id = node_record_id_by_key.get(&node.key).ok_or_else(|| {
-                StoreError::Decode(format!("node {} has no stored kvdag_node row", node.key))
-            })?;
-
-            let mut response = self
-                .db
-                .query(
-                    "CREATE run_node SET run = $run, kvdag_node = $kvdag_node, \
-                     node_key = $node_key, instance_path = $instance_path, \
-                     depth = $depth, status = $status, model = $model, \
-                     effort = $effort, demand = $demand RETURN AFTER",
-                )
-                .bind(("run", run_id.clone()))
-                .bind(("kvdag_node", kvdag_node_id.clone()))
-                .bind(("node_key", node.key.to_string()))
-                .bind(("instance_path", node.key.to_string()))
-                .bind(("depth", i64::from(depth)))
-                .bind(("status", node_status_str(status).to_string()))
-                .bind(("model", assignment.model.as_str().to_string()))
-                .bind(("effort", assignment.effort.as_str().to_string()))
-                .bind(("demand", demand_str(node.demand).to_string()))
-                .await
-                .map_err(query_error)?;
-            let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
-            let row = rows
-                .into_iter()
-                .next()
-                .ok_or_else(|| StoreError::Query("create run_node returned no row".to_string()))?;
-            run_node_id_by_key.insert(node.key.clone(), row.id);
-        }
-
-        for edge in &graph.edges {
-            let (Some(from_id), Some(to_id)) = (
-                run_node_id_by_key.get(&edge.from),
-                run_node_id_by_key.get(&edge.to),
-            ) else {
-                // One endpoint is a template node, never materialised in Phase 1.
-                continue;
-            };
-            let kvdag_edge_id = self
-                .find_kvdag_edge_id(&node_record_id_by_key, edge)
-                .await?;
-            let response = self
-                .db
-                .query(
-                    "RELATE $from -> run_edge -> $to SET run = $run, kind = $kind, \
-                     kvdag_edge = $kvdag_edge",
-                )
-                .bind(("from", from_id.clone()))
-                .bind(("to", to_id.clone()))
-                .bind(("run", run_id.clone()))
-                .bind(("kind", edge_kind_str(edge.kind).to_string()))
-                .bind(("kvdag_edge", kvdag_edge_id))
-                .await
-                .map_err(query_error)?;
-            response.check().map_err(query_error)?;
-        }
-        Ok(())
-    }
-
-    async fn find_kvdag_edge_id(
-        &self,
-        node_record_id_by_key: &BTreeMap<NodeKey, surrealdb_types::RecordId>,
-        edge: &KvdagEdge,
-    ) -> Result<Option<surrealdb_types::RecordId>, StoreError> {
-        let (Some(from), Some(to)) = (
-            node_record_id_by_key.get(&edge.from),
-            node_record_id_by_key.get(&edge.to),
-        ) else {
+        let read = self.read()?;
+        let table = read
+            .open_table(db::KVDAG_VERSION)
+            .map_err(db::storage_error)?;
+        let keys = db::scan_prefix_keys(&table, &db::version_prefix(workflow_key))?;
+        let Some(key) = keys.last() else {
             return Ok(None);
         };
-        // The node pair alone does not identify an edge: nothing forbids two
-        // edges between the same ordered pair (only a target's inbound *port*
-        // names have to be unique), so `kind` and `port` are part of the match
-        // or a run edge's provenance link can point at the wrong `kvdag_edge`.
-        let mut response = self
-            .db
-            .query(
-                "SELECT * FROM kvdag_edge WHERE in = $from AND out = $to \
-                 AND kind = $kind AND port = $port LIMIT 1",
-            )
-            .bind(("from", from.clone()))
-            .bind(("to", to.clone()))
-            .bind(("kind", edge_kind_str(edge.kind).to_string()))
-            .bind(("port", edge.port.clone()))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<KvdagEdgeRow> = response.take(0).map_err(query_error)?;
-        Ok(rows.into_iter().next().map(|row| row.id))
+        let row: KvdagVersionRow = db::get_row(&table, key)?
+            .ok_or_else(|| StoreError::Decode(format!("kvdag_version {key} vanished mid-read")))?;
+        Ok(Some((
+            KvdagVersionId::new(record_id_to_string(TABLE_KVDAG_VERSION, &row.id)),
+            row.version as u32,
+        )))
     }
 
-    async fn find_run_node_id(
+    pub(super) fn find_run_node_key(
         &self,
         run: &RunId,
-        path: &crate::workflow::model::InstancePath,
-    ) -> Result<surrealdb_types::RecordId, StoreError> {
-        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
-            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let mut response = self
-            .db
-            .query("SELECT * FROM run_node WHERE run = $run AND instance_path = $path LIMIT 1")
-            .bind(("run", run_id))
-            .bind(("path", path.to_string()))
-            .await
-            .map_err(query_error)?;
-        let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
-        rows.into_iter()
-            .next()
-            .map(|row| row.id)
-            .ok_or_else(|| StoreError::NotFound {
+        path: &InstancePath,
+    ) -> Result<String, StoreError> {
+        let run_key = run_record_id(run)?;
+        let key = db::child_key(&run_key, path.as_str());
+        let read = self.read()?;
+        let table = read.open_table(db::RUN_NODE).map_err(db::storage_error)?;
+        if table.row_exists(&key)? {
+            Ok(key)
+        } else {
+            Err(StoreError::NotFound {
                 table: TABLE_RUN_NODE,
                 id: format!("{run}/{path}"),
             })
+        }
     }
 
-    async fn write_run_event(
+    fn write_run_event(
         &self,
         run: RunId,
         seq: u64,
         kind: RunEventKind,
-        path: Option<crate::workflow::model::InstancePath>,
+        path: Option<InstancePath>,
         payload: serde_json::Value,
     ) -> Result<(), StoreError> {
-        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
-            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let run_node_id = match &path {
-            Some(path) => Some(self.find_run_node_id(&run, path).await?),
+        let run_key = run_record_id(&run)?;
+        let run_node_key = match &path {
+            Some(path) => Some(self.find_run_node_key(&run, path)?),
             None => None,
         };
         let payload = enforce_payload_budget(payload, RUN_EVENT_PAYLOAD_BUDGET_BYTES);
-        let response = self
-            .db
-            .query(
-                "CREATE run_event SET run = $run, seq = $seq, kind = $kind, \
-                 run_node = $run_node, payload = $payload",
-            )
-            .bind(("run", run_id))
-            .bind(("seq", seq as i64))
-            .bind(("kind", run_event_kind_str(kind).to_string()))
-            .bind(("run_node", run_node_id))
-            .bind(("payload", payload))
-            .await
-            .map_err(query_error)?;
-        response.check().map_err(query_error)?;
-        Ok(())
+        let key = db::seq_key(&run_key, seq);
+        let row = RunEventRow {
+            id: key.clone(),
+            run: run_key,
+            seq: seq as i64,
+            at: db::now_ms(),
+            kind: run_event_kind_str(kind).to_string(),
+            run_node: run_node_key,
+            payload,
+        };
+        let txn = self.write_txn()?;
+        {
+            let mut table = txn.open_table(db::RUN_EVENT).map_err(db::storage_error)?;
+            // The old schema's unique `(run, seq)` index, expressed as the key
+            // itself: a repeated sequence number is refused rather than
+            // silently overwriting the event already journalled under it.
+            db::insert_new(&mut table, &key, &row, "run_event")?;
+        }
+        commit(txn)
     }
 
-    async fn write_run_status(&self, run: RunId, status: RunStatus) -> Result<(), StoreError> {
-        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
-            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let terminal = matches!(
+    fn write_run_status(&self, run: RunId, status: RunStatus) -> Result<(), StoreError> {
+        let run_key = run_record_id(&run)?;
+        let mut row = self
+            .select_run(&run_key)?
+            .ok_or_else(|| StoreError::NotFound {
+                table: TABLE_WORKFLOW_RUN,
+                id: run.to_string(),
+            })?;
+        row.status = run_status_str(status).to_string();
+        if matches!(
             status,
             RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
-        );
-        let statement = if terminal {
-            "UPDATE $run SET status = $status, ended_at = time::now()"
-        } else {
-            "UPDATE $run SET status = $status"
-        };
-        let response = self
-            .db
-            .query(statement)
-            .bind(("run", run_id))
-            .bind(("status", run_status_str(status).to_string()))
-            .await
-            .map_err(query_error)?;
-        response.check().map_err(query_error)?;
-        Ok(())
+        ) {
+            row.ended_at = Some(db::now_ms());
+        }
+        let txn = self.write_txn()?;
+        {
+            let mut table = txn
+                .open_table(db::WORKFLOW_RUN)
+                .map_err(db::storage_error)?;
+            db::put_row(&mut table, &run_key, &row)?;
+        }
+        commit(txn)
     }
 
     // The parameters are the destructured fields of `StoreWrite::RunNode`, so
     // grouping them into a struct would only re-wrap the variant this method
     // exists to unwrap.
     #[allow(clippy::too_many_arguments)]
-    async fn write_run_node(
+    fn write_run_node(
         &self,
         run: RunId,
-        path: crate::workflow::model::InstancePath,
+        path: InstancePath,
         status: NodeStatus,
         attempt: u8,
         binding: Option<NodeBinding>,
@@ -1336,7 +1486,14 @@ impl WorkflowStore {
         evidence: Option<Evidence>,
         succession: Option<Succession>,
     ) -> Result<(), StoreError> {
-        let run_node_id = self.find_run_node_id(&run, &path).await?;
+        let key = self.find_run_node_key(&run, &path)?;
+        let mut row = self
+            .select_run_node(&key)?
+            .ok_or_else(|| StoreError::NotFound {
+                table: TABLE_RUN_NODE,
+                id: format!("{run}/{path}"),
+            })?;
+
         let (succession_str, blocker_json) = match &succession {
             None => (None, None),
             Some(Succession::Satisfied) => (Some("satisfied"), None),
@@ -1353,62 +1510,42 @@ impl WorkflowStore {
             ),
         };
 
-        let response = self
-            .db
-            .query(
-                "UPDATE $id SET status = $status, attempt = $attempt, \
-                 total_tokens = $total_tokens, tool_uses = $tool_uses, \
-                 duration_ms = $duration_ms, evidence = $evidence, \
-                 succession = $succession, blocker = $blocker",
-            )
-            .bind(("id", run_node_id.clone()))
-            .bind(("status", node_status_str(status).to_string()))
-            .bind(("attempt", i64::from(attempt)))
-            .bind(("total_tokens", usage.total_tokens as i64))
-            .bind(("tool_uses", i64::from(usage.tool_uses)))
-            .bind(("duration_ms", usage.duration_ms as i64))
-            .bind((
-                "evidence",
-                evidence.map(|value| evidence_str(value).to_string()),
-            ))
-            .bind(("succession", succession_str.map(str::to_string)))
-            .bind(("blocker", blocker_json))
-            .await
-            .map_err(query_error)?;
-        response.check().map_err(query_error)?;
+        row.status = node_status_str(status).to_string();
+        row.attempt = i64::from(attempt);
+        row.total_tokens = usage.total_tokens as i64;
+        row.tool_uses = i64::from(usage.tool_uses);
+        row.duration_ms = usage.duration_ms as i64;
+        row.evidence = evidence.map(|value| evidence_str(value).to_string());
+        row.succession = succession_str.map(str::to_string);
+        row.blocker = blocker_json;
 
         if let Some(binding) = binding {
-            let response = self
-                .db
-                .query(
-                    "UPDATE $id SET pane_id = $pane_id, terminal_id = $terminal_id, \
-                     agent_session_id = $agent_session_id, transcript_path = $transcript_path, \
-                     node_dir = $node_dir, cwd = $cwd, started_at = started_at OR time::now()",
-                )
-                .bind(("id", run_node_id))
-                .bind(("pane_id", binding.pane_id.to_string()))
-                .bind(("terminal_id", binding.terminal_id.to_string()))
-                .bind(("agent_session_id", binding.agent_session_id))
-                .bind((
-                    "transcript_path",
-                    binding.transcript_path.to_string_lossy().into_owned(),
-                ))
-                .bind(("node_dir", binding.node_dir.to_string_lossy().into_owned()))
-                .bind(("cwd", binding.cwd.to_string_lossy().into_owned()))
-                .await
-                .map_err(query_error)?;
-            response.check().map_err(query_error)?;
+            row.pane_id = Some(binding.pane_id.to_string());
+            row.terminal_id = Some(binding.terminal_id.to_string());
+            row.agent_session_id = Some(binding.agent_session_id);
+            row.transcript_path = Some(binding.transcript_path.to_string_lossy().into_owned());
+            row.node_dir = Some(binding.node_dir.to_string_lossy().into_owned());
+            row.cwd = Some(binding.cwd.to_string_lossy().into_owned());
+            // First binding wins: a re-bind after a retry must not move the
+            // node's start time forward and shrink its measured duration.
+            row.started_at = row.started_at.or_else(|| Some(db::now_ms()));
         }
-        Ok(())
+
+        let txn = self.write_txn()?;
+        {
+            let mut table = txn.open_table(db::RUN_NODE).map_err(db::storage_error)?;
+            db::put_row(&mut table, &key, &row)?;
+        }
+        commit(txn)
     }
 
     // Same as `write_run_node`: these are the destructured fields of
     // `StoreWrite::Checkpoint`, not an argument list that grew by accident.
     #[allow(clippy::too_many_arguments)]
-    async fn write_checkpoint(
+    fn write_checkpoint(
         &self,
         run: RunId,
-        path: crate::workflow::model::InstancePath,
+        path: InstancePath,
         seq: u64,
         kind: CheckpointKind,
         schema_valid: bool,
@@ -1417,35 +1554,16 @@ impl WorkflowStore {
         artifact_paths: Vec<String>,
         digest: String,
     ) -> Result<(), StoreError> {
-        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
-            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
-        let run_node_id = self.find_run_node_id(&run, &path).await?;
-
-        let mut response = self
-            .db
-            .query("SELECT * FROM $id")
-            .bind(("id", run_node_id.clone()))
-            .await
-            .map_err(query_error)?;
-        let node_rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
-        let node_row = node_rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| StoreError::NotFound {
-                table: TABLE_RUN_NODE,
-                id: format!("{run}/{path}"),
-            })?;
-
-        let mut response = self
-            .db
-            .query("SELECT * FROM $id")
-            .bind(("id", run_id.clone()))
-            .await
-            .map_err(query_error)?;
-        let run_rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
-        let run_row = run_rows
-            .into_iter()
-            .next()
+        let run_key = run_record_id(&run)?;
+        let run_node_key = self.find_run_node_key(&run, &path)?;
+        let node_row =
+            self.select_run_node(&run_node_key)?
+                .ok_or_else(|| StoreError::NotFound {
+                    table: TABLE_RUN_NODE,
+                    id: format!("{run}/{path}"),
+                })?;
+        let run_row = self
+            .select_run(&run_key)?
             .ok_or_else(|| StoreError::NotFound {
                 table: TABLE_WORKFLOW_RUN,
                 id: run.to_string(),
@@ -1457,32 +1575,164 @@ impl WorkflowStore {
         let payload = enforce_payload_budget(payload, CHECKPOINT_PAYLOAD_BUDGET_BYTES);
         let summary = truncate_chars(summary, SUMMARY_BUDGET_CHARS);
 
-        let response = self
-            .db
-            .query(
-                "CREATE node_checkpoint SET run = $run, run_node = $run_node, \
-                 node_key = $node_key, instance_path = $instance_path, \
-                 kvdag_version = $kvdag_version, seq = $seq, kind = $kind, \
-                 schema_valid = $schema_valid, payload = $payload, summary = $summary, \
-                 artifact_paths = $artifact_paths, digest = $digest",
-            )
-            .bind(("run", run_id))
-            .bind(("run_node", run_node_id))
-            .bind(("node_key", node_row.node_key))
-            .bind(("instance_path", path.to_string()))
-            .bind(("kvdag_version", run_row.kvdag_version))
-            .bind(("seq", seq as i64))
-            .bind(("kind", checkpoint_kind_str(kind).to_string()))
-            .bind(("schema_valid", schema_valid))
-            .bind(("payload", payload))
-            .bind(("summary", summary))
-            .bind(("artifact_paths", artifact_paths))
-            .bind(("digest", digest))
-            .await
-            .map_err(query_error)?;
-        response.check().map_err(query_error)?;
-        Ok(())
+        let key = db::checkpoint_key(&run_key, path.as_str(), seq);
+        let row = CheckpointRow {
+            id: key.clone(),
+            run: run_key,
+            run_node: run_node_key,
+            node_key: node_row.node_key,
+            instance_path: path.to_string(),
+            kvdag_version: run_row.kvdag_version,
+            seq: seq as i64,
+            kind: checkpoint_kind_str(kind).to_string(),
+            schema_valid,
+            payload,
+            summary,
+            artifact_paths,
+            digest,
+            created_at: db::now_ms(),
+        };
+        let txn = self.write_txn()?;
+        {
+            let mut table = txn
+                .open_table(db::NODE_CHECKPOINT)
+                .map_err(db::storage_error)?;
+            db::insert_new(&mut table, &key, &row, "node_checkpoint")?;
+        }
+        commit(txn)
     }
+
+    pub(super) fn select_run(&self, key: &str) -> Result<Option<RunRow>, StoreError> {
+        let read = self.read()?;
+        let table = read
+            .open_table(db::WORKFLOW_RUN)
+            .map_err(db::storage_error)?;
+        db::get_row(&table, key)
+    }
+
+    pub(super) fn select_run_node(&self, key: &str) -> Result<Option<RunNodeRow>, StoreError> {
+        let read = self.read()?;
+        let table = read.open_table(db::RUN_NODE).map_err(db::storage_error)?;
+        db::get_row(&table, key)
+    }
+}
+
+/// Materialises the static run-node/run-edge set for a freshly created run:
+/// one `run_node` per non-template `kvdag_node` (templates are only ever
+/// instantiated by an accepted expand proposal — Phase 2), roots `Ready` and
+/// everything else `Pending`, and one `run_edge` per `kvdag_edge` between two
+/// materialised nodes. `depth` is the longest path from any root, computed in
+/// one forward pass over `graph.nodes` because `Kvdag::try_new` already
+/// topologically sorted them.
+fn materialise_run_nodes(
+    txn: &redb::WriteTransaction,
+    run_key: &str,
+    version_key: &str,
+    tier: Tier,
+    graph: &Kvdag,
+    stored_nodes: &BTreeMap<NodeKey, String>,
+    stored_edges: &BTreeSet<String>,
+) -> Result<(), StoreError> {
+    let scheduled: Vec<&KvdagNode> = graph
+        .nodes
+        .iter()
+        .filter(|node| !node.is_template)
+        .collect();
+    let mut depth_by_key: BTreeMap<NodeKey, u16> = BTreeMap::new();
+    let mut run_node_key_by_key: BTreeMap<NodeKey, String> = BTreeMap::new();
+    let now = db::now_ms();
+
+    {
+        let mut table = txn.open_table(db::RUN_NODE).map_err(db::storage_error)?;
+        for node in &scheduled {
+            let inbound: Vec<&KvdagEdge> = graph.inbound_edges(&node.key).collect();
+            let depth = inbound
+                .iter()
+                .filter_map(|edge| depth_by_key.get(&edge.from))
+                .max()
+                .map_or(0, |max| max + 1);
+            depth_by_key.insert(node.key.clone(), depth);
+
+            let status = if inbound.is_empty() {
+                NodeStatus::Ready
+            } else {
+                NodeStatus::Pending
+            };
+            let assignment = crate::workflow::tier::resolve(tier, node.demand, None);
+            let kvdag_node_key = stored_nodes.get(&node.key).ok_or_else(|| {
+                StoreError::Decode(format!("node {} has no stored kvdag_node row", node.key))
+            })?;
+
+            let key = db::child_key(run_key, node.key.as_str());
+            let row = RunNodeRow {
+                id: key.clone(),
+                run: run_key.to_string(),
+                kvdag_node: kvdag_node_key.clone(),
+                node_key: node.key.to_string(),
+                instance_path: node.key.to_string(),
+                parent: None,
+                depth: i64::from(depth),
+                status: node_status_str(status).to_string(),
+                model: assignment.model.as_str().to_string(),
+                effort: assignment.effort.as_str().to_string(),
+                demand: demand_str(node.demand).to_string(),
+                attempt: 1,
+                pane_id: None,
+                terminal_id: None,
+                agent_session_id: None,
+                transcript_path: None,
+                cwd: None,
+                node_dir: None,
+                started_at: None,
+                ended_at: None,
+                total_tokens: 0,
+                tool_uses: 0,
+                duration_ms: 0,
+                evidence: None,
+                succession: None,
+                blocker: None,
+                restored_from: None,
+                watchdog_interventions: 0,
+            };
+            db::insert_new(&mut table, &key, &row, TABLE_RUN_NODE)?;
+            run_node_key_by_key.insert(node.key.clone(), key);
+        }
+    }
+
+    let mut table = txn.open_table(db::RUN_EDGE).map_err(db::storage_error)?;
+    for edge in &graph.edges {
+        let (Some(from), Some(to)) = (
+            run_node_key_by_key.get(&edge.from),
+            run_node_key_by_key.get(&edge.to),
+        ) else {
+            // One endpoint is a template node, never materialised in Phase 1.
+            continue;
+        };
+        let kvdag_edge_key = kvdag_edge_key(version_key, edge);
+        let key = db::run_edge_key(
+            run_key,
+            edge.from.as_str(),
+            edge.to.as_str(),
+            edge_kind_str(edge.kind),
+        );
+        let row = RunEdgeRow {
+            id: key.clone(),
+            r#in: from.clone(),
+            out: to.clone(),
+            run: run_key.to_string(),
+            kind: edge_kind_str(edge.kind).to_string(),
+            kvdag_edge: stored_edges
+                .contains(&kvdag_edge_key)
+                .then_some(kvdag_edge_key),
+            condition_result: None,
+            fired_at: Some(now),
+        };
+        // Two edges between the same ordered pair with the same kind collapse
+        // to one run edge; they differ only by port, which the run edge does
+        // not carry, so the second is the same fact as the first.
+        db::put_row(&mut table, &key, &row)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1497,7 +1747,7 @@ mod tests {
         if std::env::var_os(DB_PATH_ENV).is_some() {
             return;
         }
-        assert!(path.ends_with("workflow"), "{path:?}");
+        assert!(path.ends_with(DB_FILE_NAME), "{path:?}");
         assert_eq!(
             path.parent(),
             Some(crate::config::state_dir().as_path()),
@@ -1510,6 +1760,15 @@ mod tests {
         assert_eq!(VersionOrigin::Authored.as_str(), "authored");
         assert_eq!(VersionOrigin::SelfImprovement.as_str(), "self_improvement");
         assert_eq!(VersionOrigin::RestoreRewrite.as_str(), "restore_rewrite");
+    }
+
+    #[test]
+    fn the_owner_file_sits_beside_the_database_not_inside_it() {
+        let path = Path::new("/state/workflow.redb");
+        assert_eq!(
+            owner_path(path),
+            PathBuf::from("/state/workflow.redb.owner")
+        );
     }
 }
 

@@ -25,7 +25,6 @@ mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
 pub(crate) mod workflow;
-#[cfg(feature = "workflow")]
 pub(crate) mod workflow_store;
 mod worktrees;
 
@@ -155,7 +154,6 @@ pub struct App {
     pub(crate) workflow: workflow::WorkflowRuntimeState,
     /// The workflow database, opened lazily on first `workflow.*` use
     /// (`03-storage-schema.md` §2).
-    #[cfg(feature = "workflow")]
     pub(crate) workflow_store: workflow_store::WorkflowStoreHandle,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
@@ -787,7 +785,6 @@ impl App {
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
             workflow: workflow::WorkflowRuntimeState::new(workflow::engine_config(config)),
-            #[cfg(feature = "workflow")]
             workflow_store: workflow_store::WorkflowStoreHandle::default(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }

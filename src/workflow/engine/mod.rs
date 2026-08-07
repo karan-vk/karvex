@@ -1609,7 +1609,8 @@ mod tests {
     }
 
     /// `05-phase-plan.md` W2: the engine must not reference `App`,
-    /// `TerminalRuntime`, SurrealDB, or ratatui, and must stay synchronous.
+    /// `TerminalRuntime`, the workflow store backend, or ratatui, and must
+    /// stay synchronous.
     /// Only production code is scanned — the rule is about what the engine
     /// depends on, and fixtures are free to build whatever they need.
     #[test]
@@ -1629,7 +1630,7 @@ mod tests {
             "PaneRuntime",
             "Workspace",
             "ratatui",
-            "surrealdb",
+            "redb",
             "tokio",
         ];
         let fragments = [".await", "async fn", "std::fs", "std::process", "unwrap()"];

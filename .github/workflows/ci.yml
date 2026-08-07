@@ -55,13 +55,6 @@ jobs:
           - os: windows-latest
             kind: windows
     runs-on: ${{ matrix.os }}
-    # `just ci` covers both cargo feature configurations: the primary
-    # `--features workflow` leg (where most tests live, including the gated
-    # workflow store tests) and the `just check-slim` leg for the default
-    # feature-off build that ships as `kvx-<target>`. The workflow leg adds
-    # SurrealDB (~257 crates); on macOS the two legs together needed ~19 min
-    # just to reach the first test run on a cold cache, so 30 was not enough
-    # headroom for the full recipe.
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -130,33 +123,13 @@ jobs:
           restore-keys: |
             zig-build-v1-${{ runner.os }}-${{ runner.arch }}-0.15.2-
 
-      # surrealdb-core pulls aws-lc-sys unconditionally via jsonwebtoken, so the
-      # `--features workflow` leg of `just ci` needs a native build toolchain.
-      # The Windows leg only builds the default (feature-off) configuration, so
-      # it never compiles SurrealDB and needs no extra tooling. x86_64 Windows
-      # workflow builds additionally need NASM, which not every runner image
-      # ships; .cargo/config.toml opts into aws-lc-sys' prebuilt objects so
-      # those builds do not depend on that image detail.
-      - name: Install macOS build tools
-        if: runner.os == 'macOS'
-        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja
-
-      - name: Install Linux build tools
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
-
       - name: Restore cargo cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: false
           key: ${{ matrix.os }}
 
-      # `just ci` threads this filter through both feature legs, so the macOS
-      # `binary(live_handoff)` exclusion applies to the workflow leg and to
-      # `just check-slim` alike.
-      - name: Run checks (workflow + slim feature legs)
+      - name: Run checks
         if: matrix.kind == 'unix'
         run: just ci '${{ matrix.nextest_filter }}'
 
@@ -176,10 +149,6 @@ jobs:
   windows-conpty-package:
     name: Windows ConPTY package
     runs-on: windows-2022
-    # Builds default features, which is the slim configuration that ships as the
-    # canonical binary. The opt-in workflow feature adds SurrealDB (~257 crates),
-    # which a cold cache on this older image does not reliably compile inside the
-    # previous 25 minutes, so this job deliberately stays on the default build.
     timeout-minutes: 40
     steps:
       - name: Checkout

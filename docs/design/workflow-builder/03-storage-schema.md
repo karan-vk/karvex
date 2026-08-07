@@ -4,6 +4,14 @@ Covers workflow definitions, immutable kvdag versioning, runs, per-node
 checkpoints, run summaries, interrogation-restore records, and the
 self-improvement review cycle.
 
+> **Addendum — 2026-08-07:** owner directive supersedes the SurrealDB mandate
+> below. Karvex ships one slim binary per platform with the workflow
+> subsystem always included; the store is reimplemented on `redb` (pure
+> Rust, ~1-2 MiB) behind the same `WorkflowStore` public API described here.
+> The SurrealDB evaluation, schema, and rejected alternatives below are kept
+> as-is for historical record — see `00-overview.md` D4 for the equivalent
+> note on the decision list.
+
 ---
 
 ## 1. Engine and crate configuration

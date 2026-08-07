@@ -37,8 +37,8 @@ pub const NODE_DIR_ENV_VAR: &str = "KARVEX_WORKFLOW_NODE_DIR";
 pub const NODE_TOKEN_ENV_VAR: &str = "KARVEX_WORKFLOW_NODE_TOKEN";
 
 /// Overrides where run directories are created, mirroring the store's
-/// `KARVEX_WORKFLOW_DB_PATH`. Run directories cannot live *inside*
-/// `state_dir()/workflow`: that path is the SurrealKV database directory.
+/// `KARVEX_WORKFLOW_DB_PATH`. Run directories are kept out of the store's own
+/// path so neither can disturb the other.
 pub const RUNS_DIR_ENV_VAR: &str = "KARVEX_WORKFLOW_RUNS_DIR";
 
 // ── node directory (§4.1) ───────────────────────────────────────────────────
@@ -118,9 +118,9 @@ impl SpawnError {
 
 // ── run and node directories ────────────────────────────────────────────────
 
-/// Root of every run directory. Deliberately a sibling of the store directory,
-/// never a child: `state_dir()/workflow` is opened by SurrealKV, which owns
-/// every file under it.
+/// Root of every run directory. Deliberately a sibling of the store, never a
+/// child: the store is the single file `state_dir()/workflow.redb`, and keeping
+/// run directories out of its path leaves the store free to change layout.
 pub fn runs_root() -> PathBuf {
     match std::env::var_os(RUNS_DIR_ENV_VAR) {
         Some(path) if !path.is_empty() => PathBuf::from(path),

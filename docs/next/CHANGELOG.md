@@ -4,13 +4,9 @@
 
 ## [0.9.1] - 2026-08-07
 
-### Added
-- Releases now publish a `kvx-workflow-<target>` asset alongside each platform's canonical `kvx-<target>` binary, built with `--features workflow`. `kvx update` and `kvx channel set` keep a binary on its own variant's release track, so switching channels or updating never swaps a workflow install for a canonical one or back.
-
 ### Changed
-- The `workflow` cargo feature is now opt-in instead of default-on. The canonical `kvx-<target>` release binary no longer embeds the workflow subsystem's SurrealDB store; its `kvx workflow` commands return the existing `workflow_unavailable` error. Install the new `kvx-workflow-<target>` release asset, or build from source with `--features workflow`, to keep using workflows.
-- Release binaries now build with thin LTO, a single codegen unit, and stripped symbols, cutting the canonical binary to roughly a quarter of its previous size.
-- Remote attach now provisions a host with the release asset matching the local binary's variant, so attaching from a workflow install no longer installs a canonical build on the remote.
+- Release binaries now build with thin LTO, a single codegen unit, and stripped symbols, cutting each platform's single `kvx-<target>` binary to roughly a fifth of its 0.9.0 size. Workflows remain fully included in that one binary; there is no separate build or asset to install for them.
+- The workflow subsystem's embedded store is now `redb` (pure Rust) instead of SurrealDB, behind the unchanged `WorkflowStore` API. Workflow run history written by v0.9.0 is not migrated to the new store.
 
 ## [0.9.0] - 2026-08-07
 

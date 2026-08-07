@@ -90,12 +90,6 @@ chmod +x herdr-linux-x86_64
 mv herdr-linux-x86_64 ~/.local/bin/herdr
 ```
 
-### ワークフローバリアント
-
-各リリースでは、上記の既定バイナリに加えて `kvx-workflow-<target>` アセットも公開されます ── 例えば Linux x86_64 向けの `kvx-workflow-linux-x86_64` です。これは `--features workflow` でビルドされ、ワークフローサブシステムの SurrealDB ストアを組み込んでいるため、別ビルドなしで `kvx workflow` コマンドが動作します。上記の既定バイナリはこのフィーチャーを組み込んでおらず、その `kvx workflow` コマンドは `workflow_unavailable` エラーを返します。詳しくは [ワークフロー](/ja/docs/workflows/) を参照してください。
-
-インストールとアップデートは既定バイナリと同じ方法で行います。`kvx update` と `kvx channel set` は、現在使っているバリアントの次のリリースを常に取得するため、アップデートやチャンネルの切り替えでワークフロー版が既定版に入れ替わることはありません。
-
 ### Windows ベータのダウンロード
 
 ネイティブ Windows 対応がベータの間、Windows バイナリはプレビューリリースでのみ公開されます。通常のテストには上記のプレビューインストーラーを使うか、プレビューの GitHub プレリリースから Windows アセットをダウンロードしてください:

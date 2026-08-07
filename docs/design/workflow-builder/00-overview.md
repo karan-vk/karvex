@@ -179,6 +179,14 @@ Neutral naming is enforced in the API surface: `workflow`, `kvdag_version`,
 Each decision states the call and why. Alternatives that were rejected are named
 so the rationale survives.
 
+> **Addendum — 2026-08-07:** owner directive supersedes D4 below. Karvex ships
+> one slim binary per platform with the workflow subsystem always included,
+> rather than a SurrealDB-bearing variant next to a lean default. The store is
+> reimplemented on `redb` (pure Rust, ~1-2 MiB) behind the same `WorkflowStore`
+> public API; the `workflow` cargo feature is removed. D4's SurrealDB
+> evaluation and cost accounting are kept below for historical record — see
+> `03-storage-schema.md` for the matching note on the schema doc.
+
 ### D1 — karvex owns the spawner; Claude Code Agent Teams is not the orchestration engine
 **Call:** every kvdag node is its own kvx pane running its own interactive
 `claude` session, spawned by karvex. Claude's native Agent Teams feature is not

@@ -1,62 +1,41 @@
 # karvex task runner
-#
-# Karvex builds in two cargo feature configurations and both stay covered:
-#   * `--features workflow` — the full build (`kvx-workflow-<target>` asset).
-#     Most tests live here, including the workflow store tests that are gated
-#     behind the feature, so this is the primary leg.
-#   * default features — the slim build that ships as the canonical
-#     `kvx-<target>` asset. `workflow` is opt-in, so plain cargo commands are
-#     already the feature-off configuration.
 
-# Run tests (primary `--features workflow` configuration)
+# Run tests
 test:
-    cargo nextest run --locked --features workflow --status-level fail --final-status-level fail --failure-output final --success-output never
+    cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
     python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     just integration-assets-test
     just plugin-marketplace-test
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
-    cargo nextest run --locked --features workflow "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
+    cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
-# Run fast local lint checks (primary `--features workflow` configuration)
+# Run fast local lint checks
 [unix]
 lint:
     cargo fmt --check
-    cargo clippy --all-targets --locked --features workflow -- -D warnings
+    cargo clippy --all-targets --locked -- -D warnings
 
 [script("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File")]
 [windows]
 lint:
     & .\scripts\windows_check.ps1 -Mode lint
 
-# Run PR CI checks over both cargo feature configurations
+# Run PR CI checks
 [unix]
 ci filter='all()': lint
-    cargo nextest run --locked --features workflow -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
-    just check-slim "{{filter}}"
+    cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
     just integration-assets-test
     just plugin-marketplace-test
 
-# `workflow` is opt-in, so plain cargo already selects the slim configuration.
-# Takes the same nextest filter as `ci` so per-platform exclusions (macOS skips
-# `binary(live_handoff)`) apply to this leg too.
-# Lint and test the default (workflow-off) build that ships as `kvx-<target>`
-[unix]
-check-slim filter='all()':
-    cargo clippy --locked --all-targets -- -D warnings
-    cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
-
-# --no-default-features on purpose: this lint exists to catch cfg(windows) errors in karvex's own
-# code, not to cross-build SurrealDB and aws-lc-sys for MSVC from Linux. The default feature set is
-# already empty; the flag pins the lint feature-off even if a default feature is added later.
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
 [unix]
 windows-lint:
     rustup target add x86_64-pc-windows-msvc
-    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin kvx --locked --no-default-features --target x86_64-pc-windows-msvc -- -D warnings
+    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin kvx --locked --target x86_64-pc-windows-msvc -- -D warnings
 
-# Check formatting + unit tests in both feature configs + Windows target lint + script tests
+# Check formatting + run unit tests + Windows target lint + maintenance script tests
 [unix]
 check: ci windows-lint
     python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
@@ -74,13 +53,9 @@ install-hooks:
     chmod +x .githooks/commit-msg
     @echo "installed git hooks from .githooks"
 
-# Build the slim release binary that ships as `kvx-<target>`
+# Build release binary
 build:
     cargo build --release --locked
-
-# Build the workflow release binary that ships as `kvx-workflow-<target>`
-build-workflow:
-    cargo build --release --locked --features workflow
 
 # Build the website and documentation
 website-build:
