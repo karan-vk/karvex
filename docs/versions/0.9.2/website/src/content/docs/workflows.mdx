@@ -1,0 +1,170 @@
+---
+title: Workflows
+description: Define multi-agent kvdags, run every node as a Karvex-managed teammate, and watch execution live in the DAG view.
+---
+
+A workflow is a saved, versioned **kvdag**: a directed acyclic graph of nodes, each one a task, connected by edges that pass results between them. Running a workflow spawns every node as a real terminal pane — usually a `claude` teammate — and coordinates them until every branch resolves.
+
+Workflows are for multi-step, multi-agent work you want to define once and run repeatedly, like plan → implement → review. For one-off scripted coordination between agents you already have running, see [Agent automation](/docs/agent-automation/) instead.
+
+## What a workflow is
+
+A **workflow** is a named container for one or more **kvdag versions** — immutable graph definitions. `kvx workflow create` makes the first version; `kvx workflow update` authors a new version on top of it. Editing never mutates a version in place; it always produces a new one, so a past run stays reproducible against the version it actually ran.
+
+A **run** takes one kvdag version, fills its declared run arguments, and executes the graph. Each node becomes a **run node** — an instance with its own status, model/effort assignment, pane binding, and result. Nodes start as soon as every inbound edge resolves, and independent nodes run in parallel up to the configured concurrency limit. A conditional edge whose condition evaluates false is dead; a node all of whose inbound edges are dead becomes `skipped` rather than blocking the rest of the graph — this is how a workflow branches without a scripting language.
+
+A run only finishes once every node has resolved and recorded what happens next, not simply once nothing is left to schedule. If a node ends without a successor edge resolved, a blocker recorded, or explicit evidence that nothing follows, the run pauses and names the exact node responsible instead of silently reporting success.
+
+## Definition format
+
+`kvx workflow create` and `kvx workflow update` read a definition document in TOML or JSON — the file extension selects the format. TOML is the easier one to hand-edit:
+
+```toml
+name = "ship-feature"
+description = "plan → implement → review"
+contract = """
+Reply only through result.json. Never edit files outside your node dir unless the task says so.
+"""
+max_depth = 3
+max_nodes = 24
+
+# Declared run-argument namespace. Without this, `{{goal}}` below has no inbound
+# edge port to resolve against and workflow.create rejects the document.
+[[arg]]
+name = "goal"
+required = true
+description = "what to build"
+
+[[node]]
+key = "plan"
+label = "Plan"
+kind = "agent"
+runner = "agent"          # `claude` teammate; "command" runs `command` as a plain process
+demand = "critical"
+prompt_template = "Produce an implementation plan for: {{goal}}"
+output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
+
+[[node]]
+key = "implement"
+label = "Implement"
+kind = "agent"
+demand = "peak"
+prompt_template = "Implement this plan:\n{{plan}}"
+output_schema = { type = "object", required = ["changed_files","report"], properties = { changed_files = { type = "array" }, report = { type = "string" } } }
+
+[[edge]]
+from = "plan"
+to = "implement"
+kind = "data"
+payload = "summary"
+port = "plan"
+```
+
+`contract` is prepended to every node's system prompt — put cross-cutting rules here instead of repeating them per node. `max_depth` and `max_nodes` are the graph's growth ceiling; a Phase 1 run executes exactly the nodes defined above, so these only start to matter once a later release adds node-driven expansion.
+
+Each `[[arg]]` declares one entry in the run-argument namespace, filled at run time with `--arg name=value`. Every `{{name}}` placeholder in a `prompt_template` must resolve to either a declared arg or an inbound edge `port` — `workflow.create` rejects a document with an unresolved placeholder before it is ever run, and starting a run separately rejects a missing required arg that has no default.
+
+Each `[[node]]` needs a unique `key`, a `label`, and a `prompt_template`. `output_schema` is a JSON Schema the node's result must validate against before it can succeed. `kind` defaults to `"agent"`; the other kinds (`internal`, `gate`, `monitor`) are accepted today but their scheduling behavior ships in a later release. `runner` selects how the node's process is bound — see Node runners, below. `demand` (`peak`, `critical`, `standard`, or `light`, default `standard`) feeds the run's tier into a per-node model and effort assignment.
+
+Each `[[edge]]` connects a `from` node to a `to` node. `kind` is `sequence` (source must succeed), `data` (source must succeed *and* its result validate), or `conditional` (evaluates a `condition` against the source's result; false makes the edge dead). `payload` controls how much of the source's checkpoint the target receives: `none`, `summary` (default), or `full`. `port` names the `{{slot}}` in the target's `prompt_template` that the edge's payload fills.
+
+Run it with the declared args:
+
+```bash
+kvx workflow run start ship-feature --arg goal="add dark mode"
+```
+
+To hand-edit a saved workflow, run `kvx workflow update` with a new definition file. That authors a new kvdag version rather than mutating the one you started from, so every past run stays reproducible against the version it actually ran.
+
+## Node runners
+
+`runner` selects how a node's process is bound, independent of `kind`:
+
+| `runner` | Process | Confirmation | Steering | Completion |
+| --- | --- | --- | --- | --- |
+| `agent` (default) | `claude` in a pane, launched with the run's resolved model and effort | must come up as a detected agent inside the launch window, or the spawn fails outright | delivered through the same verified path as `agent.prompt` | any of the three signals in The node contract, below |
+| `command` | the node's own `command` argv, run as a plain process | none — the pane is just a process that started | delivered as raw pane text | self-report only |
+
+A `command` node needs `command = ["...", ...]` — an argv list, never a shell string. It gets the same `KARVEX_WORKFLOW_*` environment as an `agent` node, so it can call `kvx workflow node complete` the same way, but it has no turn-end hook and no screen detection: the only thing that finishes it is the node reporting itself.
+
+## The node contract
+
+Every node runs inside its own directory, `<run dir>/<instance path>/`:
+
+| File | Written by | Contents |
+| --- | --- | --- |
+| `task.md` | Karvex | rendered prompt: workflow contract, node role, task, and the paths of any `inputs/` files |
+| `inputs/<port>.json` | Karvex | upstream checkpoint payloads, one file per inbound edge port |
+| `output_schema.json` | Karvex | the JSON Schema `result.json` must satisfy |
+| `result.json` | the node | its structured result |
+| `artifacts/` | the node | files referenced from `result.json`'s `artifacts` array |
+
+Finish a node by writing `result.json` and running:
+
+```bash
+kvx workflow node complete
+kvx workflow node complete --result-file <path>   # defaults to ./result.json in the node directory
+```
+
+It reads `KARVEX_WORKFLOW_RUN_ID`, `KARVEX_WORKFLOW_NODE_PATH`, `KARVEX_WORKFLOW_NODE_DIR`, and `KARVEX_WORKFLOW_NODE_TOKEN` from the environment already set on the node's pane, so the command takes no positional arguments. Give `result.json` a `summary` string — it is what downstream nodes and run history see — and, for anything too large to inline, an `artifacts` array of paths under `./artifacts/`.
+
+This self-report is the strongest of three completion signals, in precedence order:
+
+| Precedence | Signal | Applies to | Recorded as |
+| --- | --- | --- | --- |
+| 1 | Self-report — the node calls `kvx workflow node complete` | `agent` and `command` nodes | `self_report` |
+| 2 | Turn end — the bundled Claude hook reports the pane's turn ended, then Karvex reads `result.json` | `agent` nodes only | `hook` |
+| 3 | Detection — the pane reads idle for several consecutive checks and a valid `result.json` exists | `agent` nodes only | `detection` |
+
+:::caution[Idle is never enough on its own]
+A node whose pane goes idle without ever producing a `result.json` that validates against `output_schema.json` does not complete. It moves to `needs_attention` instead, and the run does not report success while it sits there. Always finish through `kvx workflow node complete`, or make sure the last thing your agent does is write a valid result.
+:::
+
+An invalid result gets one automatic corrective re-prompt quoting the schema errors; still invalid, and the node moves to `needs_attention` the same way.
+
+## Commands
+
+```bash
+kvx workflow list
+kvx workflow show <name|id>
+kvx workflow create --file <definition.toml|json> [--name <name>]
+kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>]
+```
+
+`create` and `update` read the definition document described above from `--file`; the extension selects TOML or JSON. `update` authors a new kvdag version rather than editing the current one.
+
+```bash
+kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
+kvx workflow run list <name|id> [--limit N]
+kvx workflow run show <run_id> [--json]
+kvx workflow run cancel <run_id>
+```
+
+`run` is a namespace, not a workflow selector: `start`, `list`, `show`, and `cancel` each take their own arguments, so a workflow can be named `list` without colliding with the subcommand. `--tier` defaults to the workflow's own default tier; repeat `--arg` for every declared run argument. `run cancel` cancels the run's remaining nodes and closes their panes.
+
+```bash
+kvx workflow node show <run_id> <path> [--json]
+kvx workflow node steer <run_id> <path> <text>
+kvx workflow node interrupt <run_id> <path>
+kvx workflow node restart <run_id> <path>
+kvx workflow node complete [--result-file <path>]
+```
+
+`<path>` is the node's instance path, such as `plan` or `research/2/verify` — shown by `run show` and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` is the one command a node runs on itself; see The node contract, above.
+
+## The DAG view
+
+Open a run's DAG view from the Karvex TUI to watch it execute live: node boxes laid out by graph layer, edges drawn between them, and a detail strip for whichever node is selected showing its status, model, usage, last checkpoint summary, and any blocker.
+
+Open it from the global menu — the launcher at the bottom of the sidebar — and pick **workflow dag**. The entry appears only while this server is executing a run, since there is otherwise no graph to draw.
+
+| Input | Action |
+| --- | --- |
+| `h` / `j` / `k` / `l` or the arrow keys | move the selection to the adjacent node in that direction |
+| `Enter`, or click a node | focus that node's pane, leaving the DAG view |
+| `s` | open a steer line for the selected node; type, then `Enter` to send it as `kvx workflow node steer` |
+| `Esc` (with the steer line open) | close the steer line without sending |
+| `Esc` (otherwise) | leave the DAG view |
+| Move the mouse | selection follows the pointer |
+
+The view is a read-only projection of the run: node status, position, and edges all come from the same run graph the CLI and JSON API report. Focusing a node's pane goes through the same path as focusing any other pane in Karvex, so leaving the DAG view leaves you looking at the teammate you selected.
