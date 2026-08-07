@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.9.3] - 2026-08-08
+
 ### Fixed
 - Workflow runs read back from the store are now complete. A run reopened after a restart — or inspected with `kvx workflow run show` on a server that did not start it — reports the same progress counts, edge firing state, workspace binding, per-node directories, graph depth, and timestamps/durations as the live run did, instead of a partial projection that lost which branches were taken and where each node's `task.md`, `inputs/`, and `artifacts/` live.
 - `kvx workflow show` now lists a workflow's full version history with real metadata. Every version in the chain is returned with its own origin, change summary, and creation timestamp, rather than a single head entry with a hardcoded `0` timestamp.
