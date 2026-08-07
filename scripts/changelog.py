@@ -28,6 +28,13 @@ ASSET_TARGETS = (
     "macos-aarch64",
 )
 EXPECTED_ASSET_NAMES = {target: f"kvx-{target}" for target in ASSET_TARGETS}
+# Releases also ship a `--features workflow` build per target. These keys are
+# optional in the manifest: releases published before the variant split have
+# none, and a workflow binary that finds no `workflow-<target>` entry reports a
+# missing asset rather than silently updating onto the slim build. The canonical
+# slim keys above stay required and keep their historical spelling.
+WORKFLOW_ASSET_TARGETS = tuple(f"workflow-{target}" for target in ASSET_TARGETS)
+WORKFLOW_ASSET_NAMES = {target: f"kvx-{target}" for target in WORKFLOW_ASSET_TARGETS}
 
 
 @dataclass(frozen=True)
@@ -205,6 +212,13 @@ def normalize_assets(value: Any, label: str) -> dict[str, str]:
         if not isinstance(url, str) or not url.strip():
             raise ChangelogError(f"{label} is missing asset URL for {target}")
         normalized_assets[target] = url.strip()
+    for target in WORKFLOW_ASSET_TARGETS:
+        if target not in value:
+            continue
+        url = value.get(target)
+        if not isinstance(url, str) or not url.strip():
+            raise ChangelogError(f"{label} is missing asset URL for {target}")
+        normalized_assets[target] = url.strip()
     return normalized_assets
 
 
@@ -350,6 +364,22 @@ def manifest_from_release_payload(
         asset = release_assets.get(asset_name)
         if not isinstance(asset, dict):
             raise ChangelogError(f"GitHub release v{normalized_version} is missing asset {asset_name}")
+        url = str(asset.get("url") or "").strip()
+        if not url:
+            raise ChangelogError(f"GitHub release asset {asset_name} is missing a download URL")
+        manifest_assets[target] = url
+
+    # Pass the workflow-variant assets through when the release publishes them.
+    # They are not required, so re-syncing a release from before the variant
+    # split still works, but a published workflow asset must carry a usable URL.
+    for target, asset_name in WORKFLOW_ASSET_NAMES.items():
+        asset = release_assets.get(asset_name)
+        if asset is None:
+            continue
+        if not isinstance(asset, dict):
+            raise ChangelogError(
+                f"GitHub release v{normalized_version} has a malformed asset {asset_name}"
+            )
         url = str(asset.get("url") or "").strip()
         if not url:
             raise ChangelogError(f"GitHub release asset {asset_name} is missing a download URL")
@@ -540,7 +570,14 @@ def fetch_remote_json(url: str, label: str) -> dict[str, Any]:
 
 
 def verify_asset_urls_resolve(assets: dict[str, str], label: str) -> None:
-    for target in ASSET_TARGETS:
+    # The slim keys are always required. Workflow keys are optional (releases
+    # from before the variant split have none), but when a release does publish
+    # one it has to resolve too: a workflow binary that follows a dead
+    # `workflow-<target>` URL fails at download time instead of at release time.
+    targets = list(ASSET_TARGETS) + [
+        target for target in WORKFLOW_ASSET_TARGETS if target in assets
+    ]
+    for target in targets:
         url = assets[target]
         command = [
             "curl",

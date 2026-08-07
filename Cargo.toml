@@ -24,7 +24,10 @@ name = "kvx"
 path = "src/main.rs"
 
 [features]
-default = ["workflow"]
+# Opt-in on purpose: `workflow` pulls surrealdb (~257 crates) and roughly triples
+# the release binary. The default build is the canonical slim `kvx-<target>`
+# asset; `--features workflow` builds the `kvx-workflow-<target>` variant.
+default = []
 workflow = ["dep:surrealdb", "dep:surrealdb-types"]
 
 [dependencies]
@@ -63,6 +66,13 @@ schemars = { version = "1.2.1", features = ["derive"] }
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
+
+# Release binaries ship over the wire on every `kvx update`, so size matters.
+# Measured with the workflow feature on: 86.13 MiB -> 53.46 MiB.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [target.'cfg(windows)'.dependencies]
 wmi = { version = "0.18.4", default-features = false }

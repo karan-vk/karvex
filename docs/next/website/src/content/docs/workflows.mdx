@@ -7,6 +7,17 @@ A workflow is a saved, versioned **kvdag**: a directed acyclic graph of nodes, e
 
 Workflows are for multi-step, multi-agent work you want to define once and run repeatedly, like plan → implement → review. For one-off scripted coordination between agents you already have running, see [Agent automation](/docs/agent-automation/) instead.
 
+## Enabling workflows
+
+Workflows sit behind the `workflow` cargo feature, which is opt-in. The canonical `kvx-<target>` release binary does not embed the workflow subsystem's SurrealDB store, and its `kvx workflow` commands return a `workflow_unavailable` error.
+
+To use workflows:
+
+- Install the `kvx-workflow-<target>` release asset instead of the canonical one — see [Install](/docs/install/).
+- Or build from source with `--features workflow`.
+
+`kvx update` and `kvx channel set` always fetch the next release of whichever variant you already run, so switching channels or updating never swaps a workflow install for a canonical one, or back.
+
 ## What a workflow is
 
 A **workflow** is a named container for one or more **kvdag versions** — immutable graph definitions. `kvx workflow create` makes the first version; `kvx workflow update` authors a new version on top of it. Editing never mutates a version in place; it always produces a new one, so a past run stays reproducible against the version it actually ran.

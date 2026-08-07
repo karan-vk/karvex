@@ -1,7 +1,9 @@
-# The default `workflow` feature pulls surrealdb -> surrealdb-core ->
+# The opt-in `workflow` feature pulls surrealdb -> surrealdb-core ->
 # jsonwebtoken -> aws-lc-rs -> aws-lc-sys. surrealdb-core hard-pins the
 # `aws_lc_rs` jsonwebtoken backend for every non-wasm target, so this is not
-# escapable through Cargo features while `workflow` is on.
+# escapable through Cargo features while `workflow` is on. The default (slim)
+# build never reaches aws-lc-sys at all, so this only applies to the
+# `kvx-workflow-<target>` variant.
 #
 # On x86_64 Windows, aws-lc-sys assembles its crypto with NASM and its build
 # script panics with "NASM command not found! Build cannot continue." when nasm

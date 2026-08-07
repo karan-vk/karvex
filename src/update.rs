@@ -23,6 +23,19 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
+/// Release variant this binary was built as, or `None` for the canonical slim
+/// build.
+///
+/// Releases ship two builds per target: the canonical slim `kvx-<target>`
+/// (default features) and `kvx-workflow-<target>` (`--features workflow`).
+/// A binary must only ever self-update onto its own variant, so the variant is
+/// baked in at compile time from the feature set and is never read from runtime
+/// state or configuration.
+#[cfg(feature = "workflow")]
+pub(crate) const ASSET_VARIANT: Option<&str> = Some("workflow");
+#[cfg(not(feature = "workflow"))]
+pub(crate) const ASSET_VARIANT: Option<&str> = None;
+
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/karvex.json";
@@ -228,10 +241,8 @@ struct HomebrewFormulaVersions {
 
 impl UpdateManifest {
     #[cfg(all(test, unix))]
-    fn download_url_for(&self, os: &str, arch: &str) -> Option<String> {
-        self.assets
-            .get(&format!("{os}-{arch}"))
-            .map(|asset| asset.url.clone())
+    fn download_url_for_key(&self, asset_key: &str) -> Option<String> {
+        self.assets.get(asset_key).map(|asset| asset.url.clone())
     }
 
     fn metadata_for_version(&self, version: &Version) -> Option<ManifestReleaseMetadata> {
@@ -355,8 +366,7 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         return Err("update manifest notes are empty".into());
     }
 
-    let (os, arch) = platform_target();
-    let asset_key = format!("{os}-{arch}");
+    let asset_key = platform_asset_key();
     let asset = manifest
         .assets
         .get(&asset_key)
@@ -422,8 +432,7 @@ fn release_info_from_preview_manifest(
     if notes_body.is_empty() {
         return Err("preview manifest notes are empty".into());
     }
-    let (os, arch) = platform_target();
-    let asset_key = format!("{os}-{arch}");
+    let asset_key = platform_asset_key();
     if let Some(archived) = manifest.builds.get(build_id) {
         if archived.base_version != manifest.base_version
             || archived.commit != manifest.commit
@@ -648,6 +657,12 @@ fn install_windows_update_with_installer(
         // Get-FileHash. Removing it lets 5.1 compute its own default path.
         // See PowerShell/PowerShell#8635.
         .env_remove("PSModulePath");
+    // Keep the installer on this binary's variant. Slim builds set nothing so
+    // their installer invocation is byte-for-byte what it was before variants
+    // existed; workflow builds ask for the `kvx-workflow-windows-*.zip` asset.
+    if let Some(variant) = ASSET_VARIANT {
+        command.env("HERDR_VARIANT", variant);
+    }
     if let Some(build_id) = expected_build_id {
         command.env("HERDR_EXPECTED_BUILD_ID", build_id);
     }
@@ -2215,6 +2230,25 @@ fn homebrew_release_notes_body_from_manifest(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Manifest asset key for a variant/platform pair.
+///
+/// The slim build keeps the historical `<os>-<arch>` key so `latest.json`
+/// entries published before variants existed stay valid; the workflow build
+/// looks up `workflow-<os>-<arch>`. Taking the variant as an argument keeps
+/// both spellings testable from either feature configuration.
+pub(crate) fn asset_key_for_variant(variant: Option<&str>, os: &str, arch: &str) -> String {
+    match variant {
+        Some(variant) => format!("{variant}-{os}-{arch}"),
+        None => format!("{os}-{arch}"),
+    }
+}
+
+/// Manifest asset key for the running binary's variant and platform.
+fn platform_asset_key() -> String {
+    let (os, arch) = platform_target();
+    asset_key_for_variant(ASSET_VARIANT, os, arch)
+}
+
 fn platform_target() -> (&'static str, &'static str) {
     let os = if cfg!(target_os = "linux") {
         "linux"
@@ -3213,8 +3247,174 @@ mod tests {
             Some("keymap-v2")
         );
         assert_eq!(
-            manifest.download_url_for("linux", "x86_64").as_deref(),
+            manifest.download_url_for_key("linux-x86_64").as_deref(),
             Some("https://example.com/kvx-linux-x86_64")
+        );
+    }
+
+    #[test]
+    fn asset_keys_pin_both_release_variants() {
+        assert_eq!(
+            asset_key_for_variant(None, "linux", "x86_64"),
+            "linux-x86_64"
+        );
+        assert_eq!(
+            asset_key_for_variant(Some("workflow"), "linux", "x86_64"),
+            "workflow-linux-x86_64"
+        );
+
+        // The canonical slim asset names must not move: `latest.json` entries
+        // published before variants existed still point at them.
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            assert_eq!(
+                format!("kvx-{}", asset_key_for_variant(None, os, arch)),
+                format!("kvx-{os}-{arch}")
+            );
+            assert_eq!(
+                format!("kvx-{}", asset_key_for_variant(Some("workflow"), os, arch)),
+                format!("kvx-workflow-{os}-{arch}")
+            );
+        }
+    }
+
+    #[test]
+    fn platform_asset_key_follows_the_compiled_variant() {
+        let (os, arch) = platform_target();
+        let expected_variant = if cfg!(feature = "workflow") {
+            Some("workflow")
+        } else {
+            None
+        };
+
+        assert_eq!(ASSET_VARIANT, expected_variant);
+        assert_eq!(
+            platform_asset_key(),
+            asset_key_for_variant(expected_variant, os, arch)
+        );
+
+        if cfg!(feature = "workflow") {
+            assert_eq!(platform_asset_key(), format!("workflow-{os}-{arch}"));
+        } else {
+            assert_eq!(platform_asset_key(), format!("{os}-{arch}"));
+        }
+    }
+
+    #[test]
+    fn stable_update_selects_only_the_running_variants_asset() {
+        let (os, arch) = platform_target();
+        // A manifest carrying both variants for this platform. Whichever
+        // variant this binary is, it must pick its own asset and never the
+        // other one.
+        let json = format!(
+            r####"{{
+                "version": "99.99.99",
+                "protocol": 4,
+                "notes": "### Changed\n- One",
+                "assets": {{
+                    "{os}-{arch}": "https://example.com/kvx-{os}-{arch}",
+                    "workflow-{os}-{arch}": "https://example.com/kvx-workflow-{os}-{arch}"
+                }}
+            }}"####
+        );
+        let manifest: UpdateManifest = serde_json::from_str(&json).unwrap();
+
+        let release = release_info_from_manifest(&manifest)
+            .unwrap()
+            .expect("release info");
+
+        assert_eq!(
+            release.download_url,
+            format!("https://example.com/kvx-{}", platform_asset_key())
+        );
+        if cfg!(feature = "workflow") {
+            assert!(
+                release.download_url.contains("kvx-workflow-"),
+                "workflow build must fetch the workflow asset: {}",
+                release.download_url
+            );
+        } else {
+            assert!(
+                !release.download_url.contains("kvx-workflow-"),
+                "slim build must not fetch the workflow asset: {}",
+                release.download_url
+            );
+        }
+    }
+
+    #[test]
+    fn stable_update_rejects_a_manifest_without_this_variants_asset() {
+        let (os, arch) = platform_target();
+        // Only the *other* variant is published for this platform.
+        let other_key = if cfg!(feature = "workflow") {
+            format!("{os}-{arch}")
+        } else {
+            format!("workflow-{os}-{arch}")
+        };
+        let json = format!(
+            r####"{{
+                "version": "99.99.99",
+                "protocol": 4,
+                "notes": "### Changed\n- One",
+                "assets": {{
+                    "{other_key}": "https://example.com/kvx-other"
+                }}
+            }}"####
+        );
+        let manifest: UpdateManifest = serde_json::from_str(&json).unwrap();
+
+        let error = release_info_from_manifest(&manifest).expect_err("missing variant asset");
+        assert!(
+            error.contains(&platform_asset_key()),
+            "error should name the missing variant asset key: {error}"
+        );
+    }
+
+    #[test]
+    fn preview_update_selects_only_the_running_variants_asset() {
+        let (os, arch) = platform_target();
+        let json = format!(
+            r####"{{
+                "channel": "preview",
+                "base_version": "9.9.9",
+                "build_id": "2026-06-02-abcdef123456",
+                "commit": "abcdef1234567890",
+                "built_at": "2026-06-02T03:00:00Z",
+                "protocol": 77,
+                "notes": "### Fixed\n- One",
+                "assets": {{
+                    "{os}-{arch}": {{
+                        "url": "https://example.com/kvx-{os}-{arch}",
+                        "sha256": "slim"
+                    }},
+                    "workflow-{os}-{arch}": {{
+                        "url": "https://example.com/kvx-workflow-{os}-{arch}",
+                        "sha256": "workflow"
+                    }}
+                }}
+            }}"####
+        );
+        let manifest: PreviewManifest = serde_json::from_str(&json).unwrap();
+
+        let release = release_info_from_preview_manifest(&manifest)
+            .unwrap()
+            .expect("preview update");
+
+        assert_eq!(
+            release.download_url,
+            format!("https://example.com/kvx-{}", platform_asset_key())
+        );
+        assert_eq!(
+            release.sha256.as_deref(),
+            Some(if cfg!(feature = "workflow") {
+                "workflow"
+            } else {
+                "slim"
+            })
         );
     }
 
@@ -3330,8 +3530,7 @@ mod tests {
 
     #[test]
     fn invalid_manifest_announcement_does_not_block_release_info() {
-        let (os, arch) = platform_target();
-        let asset_key = format!("{os}-{arch}");
+        let asset_key = platform_asset_key();
         let json = format!(
             r####"{{
                 "version": "99.99.99",
@@ -3376,8 +3575,7 @@ mod tests {
 
     #[test]
     fn preview_manifest_reports_update_when_build_id_differs() {
-        let (os, arch) = platform_target();
-        let asset_key = format!("{os}-{arch}");
+        let asset_key = platform_asset_key();
         let json = format!(
             r####"{{
                 "channel": "preview",
@@ -3435,28 +3633,70 @@ mod tests {
         // current unreleased checkout. Its protocol is updated by the release
         // flow together with the release assets.
         assert!(manifest.protocol.is_some());
-        assert_eq!(manifest.assets.len(), 4);
         assert!(manifest.releases.contains_key(&manifest.version));
 
-        for target in [
+        // The four canonical slim targets are required in every release.
+        // Workflow-variant entries are optional: releases published before the
+        // variant split have none, and the updater falls back to a clear "no
+        // binary for workflow-<target>" error rather than a slim download.
+        const SLIM_TARGETS: [&str; 4] = [
             "linux-x86_64",
             "linux-aarch64",
             "macos-x86_64",
             "macos-aarch64",
-        ] {
+        ];
+
+        // Assets are named `kvx-<key>` today. Releases published before the
+        // binary was renamed still carry `herdr-<key>` in the archive, so
+        // archived entries accept either spelling while the current release
+        // must use the canonical one.
+        let check_url = |label: &str, version: &str, key: &str, url: &str, allow_legacy: bool| {
+            assert!(
+                url.contains(&format!("/releases/download/v{version}/")),
+                "unexpected release URL for {label}: {url}"
+            );
+            let accepted = if allow_legacy {
+                vec![format!("kvx-{key}"), format!("herdr-{key}")]
+            } else {
+                vec![format!("kvx-{key}")]
+            };
+            assert!(
+                accepted.iter().any(|name| url.ends_with(name)),
+                "unexpected asset name for {label}: {url}"
+            );
+        };
+
+        let mut expected_keys = std::collections::BTreeSet::new();
+        for target in SLIM_TARGETS {
+            expected_keys.insert(target.to_string());
+            expected_keys.insert(format!("workflow-{target}"));
+        }
+
+        for key in manifest.assets.keys() {
+            assert!(
+                expected_keys.contains(key),
+                "unexpected root asset key: {key}"
+            );
+        }
+
+        for target in SLIM_TARGETS {
             let url = &manifest
                 .assets
                 .get(target)
                 .unwrap_or_else(|| panic!("missing asset URL for {target}"))
                 .url;
-            assert!(
-                url.contains(&format!("/releases/download/v{}/", manifest.version)),
-                "unexpected release URL for {target}: {url}"
-            );
-            assert!(
-                url.ends_with(&format!("herdr-{target}")),
-                "unexpected asset name for {target}: {url}"
-            );
+            check_url(target, &manifest.version, target, url, false);
+
+            let workflow_key = format!("workflow-{target}");
+            if let Some(asset) = manifest.assets.get(&workflow_key) {
+                check_url(
+                    &workflow_key,
+                    &manifest.version,
+                    &workflow_key,
+                    &asset.url,
+                    false,
+                );
+            }
         }
 
         for (version, release) in &manifest.releases {
@@ -3464,24 +3704,34 @@ mod tests {
                 .get("assets")
                 .and_then(serde_json::Value::as_object)
                 .unwrap_or_else(|| panic!("missing assets for release {version}"));
-            for target in [
-                "linux-x86_64",
-                "linux-aarch64",
-                "macos-x86_64",
-                "macos-aarch64",
-            ] {
+            for key in assets.keys() {
+                assert!(
+                    expected_keys.contains(key),
+                    "unexpected asset key for release {version}: {key}"
+                );
+            }
+            for target in SLIM_TARGETS {
                 let url = assets
                     .get(target)
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_else(|| panic!("missing asset URL for {version} {target}"));
-                assert!(
-                    url.contains(&format!("/releases/download/v{version}/")),
-                    "unexpected release URL for {version} {target}: {url}"
-                );
-                assert!(
-                    url.ends_with(&format!("herdr-{target}")),
-                    "unexpected asset name for {version} {target}: {url}"
-                );
+                check_url(&format!("{version} {target}"), version, target, url, true);
+
+                let workflow_key = format!("workflow-{target}");
+                if let Some(url) = assets
+                    .get(&workflow_key)
+                    .and_then(serde_json::Value::as_str)
+                {
+                    // The workflow variant postdates the rename, so it is never
+                    // legacy-named.
+                    check_url(
+                        &format!("{version} {workflow_key}"),
+                        version,
+                        &workflow_key,
+                        url,
+                        false,
+                    );
+                }
             }
         }
     }

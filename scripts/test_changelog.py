@@ -8,7 +8,11 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.changelog import (
+    ASSET_TARGETS,
     ChangelogError,
+    EXPECTED_ASSET_NAMES,
+    WORKFLOW_ASSET_NAMES,
+    WORKFLOW_ASSET_TARGETS,
     archived_releases_from_current_manifest,
     build_latest_json,
     canonicalize_manifest,
@@ -366,6 +370,148 @@ class ChangelogScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(manifest["protocol"], 42)
+
+    def test_expected_asset_names_pin_both_release_variants(self) -> None:
+        # The canonical slim asset names are load-bearing: already-published
+        # latest.json entries point at them and must keep resolving.
+        self.assertEqual(
+            EXPECTED_ASSET_NAMES,
+            {
+                "linux-x86_64": "kvx-linux-x86_64",
+                "linux-aarch64": "kvx-linux-aarch64",
+                "macos-x86_64": "kvx-macos-x86_64",
+                "macos-aarch64": "kvx-macos-aarch64",
+            },
+        )
+        self.assertEqual(
+            WORKFLOW_ASSET_NAMES,
+            {
+                "workflow-linux-x86_64": "kvx-workflow-linux-x86_64",
+                "workflow-linux-aarch64": "kvx-workflow-linux-aarch64",
+                "workflow-macos-x86_64": "kvx-workflow-macos-x86_64",
+                "workflow-macos-aarch64": "kvx-workflow-macos-aarch64",
+            },
+        )
+        self.assertEqual(
+            WORKFLOW_ASSET_TARGETS,
+            tuple(f"workflow-{target}" for target in ASSET_TARGETS),
+        )
+
+    def test_default_release_assets_stay_slim_only(self) -> None:
+        # The fallback is used for archived releases, including ones published
+        # before the variant split, so it must never invent workflow URLs.
+        assets = default_release_assets("0.1.1", repo="herdrdev/herdr")
+
+        self.assertEqual(set(assets), set(ASSET_TARGETS))
+        self.assertFalse([key for key in assets if key.startswith("workflow-")])
+
+    def test_manifest_from_release_payload_passes_workflow_assets_through(self) -> None:
+        manifest = manifest_from_release_payload(
+            {
+                "tagName": "v0.1.1",
+                "isDraft": False,
+                "isPrerelease": False,
+                "body": "### Fixed\n- One\n",
+                "assets": [
+                    {"name": "kvx-linux-x86_64", "url": "https://example.com/linux-x86_64"},
+                    {"name": "kvx-linux-aarch64", "url": "https://example.com/linux-aarch64"},
+                    {"name": "kvx-macos-x86_64", "url": "https://example.com/macos-x86_64"},
+                    {"name": "kvx-macos-aarch64", "url": "https://example.com/macos-aarch64"},
+                    {
+                        "name": "kvx-workflow-linux-x86_64",
+                        "url": "https://example.com/workflow-linux-x86_64",
+                    },
+                    {
+                        "name": "kvx-workflow-linux-aarch64",
+                        "url": "https://example.com/workflow-linux-aarch64",
+                    },
+                    {
+                        "name": "kvx-workflow-macos-x86_64",
+                        "url": "https://example.com/workflow-macos-x86_64",
+                    },
+                    {
+                        "name": "kvx-workflow-macos-aarch64",
+                        "url": "https://example.com/workflow-macos-aarch64",
+                    },
+                ],
+            },
+            "0.1.1",
+        )
+
+        self.assertEqual(
+            manifest["assets"],
+            {
+                "linux-x86_64": "https://example.com/linux-x86_64",
+                "linux-aarch64": "https://example.com/linux-aarch64",
+                "macos-x86_64": "https://example.com/macos-x86_64",
+                "macos-aarch64": "https://example.com/macos-aarch64",
+                "workflow-linux-x86_64": "https://example.com/workflow-linux-x86_64",
+                "workflow-linux-aarch64": "https://example.com/workflow-linux-aarch64",
+                "workflow-macos-x86_64": "https://example.com/workflow-macos-x86_64",
+                "workflow-macos-aarch64": "https://example.com/workflow-macos-aarch64",
+            },
+        )
+
+    def test_manifest_from_release_payload_allows_missing_workflow_assets(self) -> None:
+        # Re-syncing a release published before the variant split must still
+        # work; a workflow binary then reports a missing asset instead of
+        # updating onto the slim build.
+        manifest = manifest_from_release_payload(
+            {
+                "tagName": "v0.1.1",
+                "isDraft": False,
+                "isPrerelease": False,
+                "body": "### Fixed\n- One\n",
+                "assets": [
+                    {"name": "kvx-linux-x86_64", "url": "https://example.com/linux-x86_64"},
+                    {"name": "kvx-linux-aarch64", "url": "https://example.com/linux-aarch64"},
+                    {"name": "kvx-macos-x86_64", "url": "https://example.com/macos-x86_64"},
+                    {"name": "kvx-macos-aarch64", "url": "https://example.com/macos-aarch64"},
+                ],
+            },
+            "0.1.1",
+        )
+
+        self.assertEqual(set(manifest["assets"]), set(ASSET_TARGETS))
+
+    def test_manifest_from_release_payload_rejects_workflow_asset_without_url(self) -> None:
+        with self.assertRaisesRegex(
+            ChangelogError, "kvx-workflow-linux-x86_64 is missing a download URL"
+        ):
+            manifest_from_release_payload(
+                {
+                    "tagName": "v0.1.1",
+                    "isDraft": False,
+                    "isPrerelease": False,
+                    "body": "### Fixed\n- One\n",
+                    "assets": [
+                        {"name": "kvx-linux-x86_64", "url": "https://example.com/linux-x86_64"},
+                        {"name": "kvx-linux-aarch64", "url": "https://example.com/linux-aarch64"},
+                        {"name": "kvx-macos-x86_64", "url": "https://example.com/macos-x86_64"},
+                        {"name": "kvx-macos-aarch64", "url": "https://example.com/macos-aarch64"},
+                        {"name": "kvx-workflow-linux-x86_64", "url": ""},
+                    ],
+                },
+                "0.1.1",
+            )
+
+    def test_build_latest_json_keeps_workflow_variant_assets(self) -> None:
+        assets = dict(default_release_assets("0.1.1", repo="herdrdev/herdr"))
+        assets["workflow-linux-x86_64"] = (
+            "https://github.com/herdrdev/herdr/releases/download/v0.1.1/kvx-workflow-linux-x86_64"
+        )
+        manifest = json.loads(build_latest_json("0.1.1", "### Fixed\n- One", assets))
+
+        self.assertEqual(
+            manifest["assets"]["workflow-linux-x86_64"],
+            "https://github.com/herdrdev/herdr/releases/download/v0.1.1/kvx-workflow-linux-x86_64",
+        )
+        # Slim keys keep their historical spelling alongside the variant keys.
+        self.assertEqual(
+            manifest["assets"]["linux-x86_64"],
+            "https://github.com/herdrdev/herdr/releases/download/v0.1.1/kvx-linux-x86_64",
+        )
+        self.assertEqual(manifest["releases"]["0.1.1"]["assets"], manifest["assets"])
 
     def test_manifest_from_release_payload_rejects_missing_asset(self) -> None:
         with self.assertRaisesRegex(ChangelogError, "missing asset kvx-macos-aarch64"):

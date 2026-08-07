@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+- Releases now publish a `kvx-workflow-<target>` asset alongside each platform's canonical `kvx-<target>` binary, built with `--features workflow`. `kvx update` and `kvx channel set` keep a binary on its own variant's release track, so switching channels or updating never swaps a workflow install for a canonical one or back.
+
+### Changed
+- The `workflow` cargo feature is now opt-in instead of default-on. The canonical `kvx-<target>` release binary no longer embeds the workflow subsystem's SurrealDB store; its `kvx workflow` commands return the existing `workflow_unavailable` error. Install the new `kvx-workflow-<target>` release asset, or build from source with `--features workflow`, to keep using workflows.
+- Release binaries now build with thin LTO, a single codegen unit, and stripped symbols, cutting the canonical binary to roughly a quarter of its previous size.
+
 ## [0.9.0] - 2026-08-07
 
 ### Added

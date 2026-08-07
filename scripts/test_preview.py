@@ -25,26 +25,79 @@ class PreviewNotesTests(unittest.TestCase):
             ("Other", "Not conventional"),
         )
 
+    @staticmethod
+    def _preview_shas() -> dict[str, str]:
+        return {
+            "linux-x86_64": "deadbeef",
+            "windows-x86_64": "a" * 64,
+            "workflow-linux-x86_64": "cafebabe",
+            "workflow-windows-x86_64": "b" * 64,
+        }
+
+    def _build_manifest(self, tmp: str, **overrides):
+        kwargs = {
+            "output": Path(tmp) / "preview.json",
+            "repo": "herdrdev/herdr",
+            "tag": "preview-2026-06-02-abcdef123456",
+            "build_id": "2026-06-02-abcdef123456",
+            "commit": "abcdef1234567890",
+            "built_at": "2026-06-02T03:00:00Z",
+            "base_version": "0.6.6",
+            "protocol": 12,
+            "notes": "Preview notes\n",
+            "shas": self._preview_shas(),
+            "retain": 30,
+        }
+        kwargs.update(overrides)
+        return preview.build_manifest(**kwargs)
+
+    def test_asset_targets_cover_both_release_variants(self):
+        self.assertEqual(
+            preview.ASSET_TARGETS,
+            (
+                "linux-x86_64",
+                "linux-aarch64",
+                "macos-x86_64",
+                "macos-aarch64",
+                "windows-x86_64",
+                "workflow-linux-x86_64",
+                "workflow-linux-aarch64",
+                "workflow-macos-x86_64",
+                "workflow-macos-aarch64",
+                "workflow-windows-x86_64",
+            ),
+        )
+        # The canonical slim asset names must not move.
+        self.assertEqual(
+            {
+                target: preview.EXPECTED_ASSET_NAMES[target]
+                for target in preview.SLIM_ASSET_TARGETS
+            },
+            {
+                "linux-x86_64": "kvx-linux-x86_64",
+                "linux-aarch64": "kvx-linux-aarch64",
+                "macos-x86_64": "kvx-macos-x86_64",
+                "macos-aarch64": "kvx-macos-aarch64",
+                "windows-x86_64": "kvx-windows-x86_64.zip",
+            },
+        )
+        self.assertEqual(
+            {
+                target: preview.EXPECTED_ASSET_NAMES[target]
+                for target in preview.WORKFLOW_ASSET_TARGETS
+            },
+            {
+                "workflow-linux-x86_64": "kvx-workflow-linux-x86_64",
+                "workflow-linux-aarch64": "kvx-workflow-linux-aarch64",
+                "workflow-macos-x86_64": "kvx-workflow-macos-x86_64",
+                "workflow-macos-aarch64": "kvx-workflow-macos-aarch64",
+                "workflow-windows-x86_64": "kvx-workflow-windows-x86_64.zip",
+            },
+        )
+
     def test_build_manifest_archives_current_assets(self):
         with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / "preview.json"
-            notes = "Preview notes\n"
-            content = preview.build_manifest(
-                output=output,
-                repo="herdrdev/herdr",
-                tag="preview-2026-06-02-abcdef123456",
-                build_id="2026-06-02-abcdef123456",
-                commit="abcdef1234567890",
-                built_at="2026-06-02T03:00:00Z",
-                base_version="0.6.6",
-                protocol=12,
-                notes=notes,
-                shas={
-                    "linux-x86_64": "deadbeef",
-                    "windows-x86_64": "a" * 64,
-                },
-                retain=30,
-            )
+            content = self._build_manifest(tmp)
             data = json.loads(content)
             self.assertEqual(data["channel"], "preview")
             self.assertEqual(data["build_id"], "2026-06-02-abcdef123456")
@@ -63,31 +116,67 @@ class PreviewNotesTests(unittest.TestCase):
             self.assertEqual(data["assets"]["windows-x86_64"]["format"], "zip")
             self.assertIn("2026-06-02-abcdef123456", data["builds"])
 
+    def test_build_manifest_publishes_workflow_variant_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = json.loads(self._build_manifest(tmp))
+            base = "https://github.com/herdrdev/herdr/releases/download/preview-2026-06-02-abcdef123456"
+
+            self.assertEqual(
+                set(data["assets"]),
+                set(preview.ASSET_TARGETS),
+            )
+            self.assertEqual(
+                data["assets"]["workflow-linux-x86_64"]["url"],
+                f"{base}/kvx-workflow-linux-x86_64",
+            )
+            self.assertEqual(
+                data["assets"]["workflow-linux-x86_64"]["sha256"],
+                "cafebabe",
+            )
+            self.assertEqual(
+                data["assets"]["workflow-macos-aarch64"]["url"],
+                f"{base}/kvx-workflow-macos-aarch64",
+            )
+            self.assertEqual(
+                data["assets"]["workflow-windows-x86_64"]["url"],
+                f"{base}/kvx-workflow-windows-x86_64.zip",
+            )
+            self.assertEqual(
+                data["assets"]["workflow-windows-x86_64"]["sha256"],
+                "b" * 64,
+            )
+            self.assertEqual(data["assets"]["workflow-windows-x86_64"]["format"], "zip")
+            # Slim and workflow assets must never resolve to the same download.
+            self.assertNotEqual(
+                data["assets"]["linux-x86_64"]["url"],
+                data["assets"]["workflow-linux-x86_64"]["url"],
+            )
+            archived = data["builds"]["2026-06-02-abcdef123456"]["assets"]
+            self.assertEqual(set(archived), set(preview.ASSET_TARGETS))
+
     def test_windows_preview_asset_requires_sha256(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaisesRegex(ValueError, "windows-x86_64 requires"):
-                preview.build_manifest(
-                    output=Path(tmp) / "preview.json",
-                    repo="herdrdev/herdr",
-                    tag="preview-test",
-                    build_id="test",
-                    commit="abcdef",
-                    built_at="2026-06-02T03:00:00Z",
-                    base_version="0.6.6",
-                    protocol=12,
-                    notes="test",
-                    shas={},
-                    retain=1,
-                )
+            with self.assertRaisesRegex(ValueError, "^windows-x86_64 requires"):
+                self._build_manifest(tmp, shas={})
+
+    def test_workflow_windows_preview_asset_requires_sha256(self):
+        shas = self._preview_shas()
+        shas.pop("workflow-windows-x86_64")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "^workflow-windows-x86_64 requires"):
+                self._build_manifest(tmp, shas=shas)
 
     def test_default_release_repo_follows_the_actions_environment(self):
         with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "karan-vk/karvex"}):
             self.assertEqual(preview.default_release_repo(), "karan-vk/karvex")
+            urls = preview.default_asset_urls(preview.default_release_repo(), "preview-test")
             self.assertEqual(
-                preview.default_asset_urls(preview.default_release_repo(), "preview-test")[
-                    "linux-x86_64"
-                ],
+                urls["linux-x86_64"],
                 "https://github.com/karan-vk/karvex/releases/download/preview-test/kvx-linux-x86_64",
+            )
+            self.assertEqual(
+                urls["workflow-linux-x86_64"],
+                "https://github.com/karan-vk/karvex/releases/download/preview-test/kvx-workflow-linux-x86_64",
             )
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(preview.default_release_repo(), preview.FALLBACK_RELEASE_REPO)

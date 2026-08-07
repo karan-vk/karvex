@@ -90,6 +90,12 @@ chmod +x herdr-linux-x86_64
 mv herdr-linux-x86_64 ~/.local/bin/herdr
 ```
 
+### 工作流变体
+
+每个发行版除了上面的默认二进制文件外,还会发布一个 `kvx-workflow-<target>` 资产 ── 例如 Linux x86_64 对应 `kvx-workflow-linux-x86_64`。它使用 `--features workflow` 构建,内置了工作流子系统的 SurrealDB 存储,因此无需单独构建即可使用 `kvx workflow` 命令。上面的默认二进制文件不包含该特性;其 `kvx workflow` 命令会返回 `workflow_unavailable` 错误。详见[工作流](/zh-cn/docs/workflows/)。
+
+安装和更新方式与默认二进制文件相同。`kvx update` 和 `kvx channel set` 始终获取你当前所用变体的下一个版本,因此更新或切换通道不会把工作流版本换成默认版本。
+
 ### Windows 测试版下载
 
 在 Windows 原生支持处于测试阶段期间,Windows 二进制文件只在预览版发布中提供。常规测试请使用上面的预览安装器,或从预览的 GitHub 预发布中下载 Windows 产物:

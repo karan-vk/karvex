@@ -125,6 +125,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Canonical slim assets: default features (no `workflow`), matches
+          # today's kvx-<target> names/args exactly.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: kvx-linux-x86_64
@@ -140,6 +142,30 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: kvx-windows-x86_64.zip
+          # kvx-workflow-<target>: opt-in `workflow` feature (surrealdb +
+          # aws-lc-sys). The slim rows above no longer build that dependency
+          # graph at all now that `workflow` defaults off, so only these five
+          # rows pay for it.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: kvx-workflow-linux-x86_64
+            features: workflow
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: kvx-workflow-linux-aarch64
+            features: workflow
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: kvx-workflow-macos-x86_64
+            features: workflow
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: kvx-workflow-macos-aarch64
+            features: workflow
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: kvx-workflow-windows-x86_64.zip
+            features: workflow
     runs-on: ${{ matrix.os }}
     env:
       LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
@@ -206,7 +232,10 @@ jobs:
 
       # Dependencies that build C through cc-rs (aws-lc-sys, lz4-sys) otherwise
       # compile against the runner's glibc headers and fail to link against
-      # musl. The script is a no-op for non-musl targets.
+      # musl. The script is a no-op for non-musl targets. aws-lc-sys/lz4-sys
+      # only enter the dependency graph via the `workflow` feature, so slim
+      # rows never invoke the generated wrappers; this is a CI-time win since
+      # those rows now skip that native compilation entirely.
       - name: Set up musl C toolchain
         if: runner.os == 'Linux'
         run: scripts/setup_musl_cc.sh "${{ matrix.target }}" "$RUNNER_TEMP/musl-cc" >> "$GITHUB_ENV"
@@ -214,7 +243,7 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: preview-${{ matrix.target }}
+          key: preview-${{ matrix.target }}-${{ matrix.features }}
 
       - name: Remove Zig caches
         if: runner.os != 'Windows'
@@ -229,7 +258,7 @@ jobs:
           Remove-Item -Recurse -Force vendor/libghostty-vt/zig-out -ErrorAction SilentlyContinue
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       - name: Package artifact
         if: runner.os != 'Windows'
@@ -367,6 +396,11 @@ jobs:
             artifacts/kvx-macos-x86_64/kvx-macos-x86_64
             artifacts/kvx-macos-aarch64/kvx-macos-aarch64
             artifacts/kvx-windows-x86_64.zip/kvx-windows-x86_64.zip
+            artifacts/kvx-workflow-linux-x86_64/kvx-workflow-linux-x86_64
+            artifacts/kvx-workflow-linux-aarch64/kvx-workflow-linux-aarch64
+            artifacts/kvx-workflow-macos-x86_64/kvx-workflow-macos-x86_64
+            artifacts/kvx-workflow-macos-aarch64/kvx-workflow-macos-aarch64
+            artifacts/kvx-workflow-windows-x86_64.zip/kvx-workflow-windows-x86_64.zip
 
       - name: Update preview documentation and manifest
         run: |

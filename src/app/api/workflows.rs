@@ -57,12 +57,16 @@ use super::responses::encode_error;
 use super::responses::{encode_error_body, encode_success};
 
 /// Error code returned for every `workflow.*` call when the crate is built
-/// with `--no-default-features` (the `workflow` cargo feature off).
+/// without the opt-in `workflow` cargo feature — which is what the canonical
+/// `kvx-<target>` release binary is.
 #[cfg(not(feature = "workflow"))]
 const WORKFLOW_UNAVAILABLE_CODE: &str = "workflow_unavailable";
+/// The message names the two ways out, because the common case is a user on the
+/// canonical release rather than someone who deliberately turned a feature off.
 #[cfg(not(feature = "workflow"))]
 const WORKFLOW_UNAVAILABLE_MESSAGE: &str =
-    "the workflow feature is not compiled into this server (built with --no-default-features)";
+    "the workflow feature is not compiled into this server; install the kvx-workflow-<target> \
+     release asset or build with --features workflow";
 
 /// The definition document could not be parsed, or the graph it describes
 /// fails `Kvdag::try_new`'s construction invariants.
@@ -91,7 +95,7 @@ const DEFAULT_RUN_LIST_LIMIT: u32 = 50;
 
 #[cfg(not(feature = "workflow"))]
 impl App {
-    /// `--no-default-features` path (`05-phase-plan.md` W3 "Feature-off
+    /// Feature-off path (`05-phase-plan.md` W3 "Feature-off
     /// behaviour"): the schema types compile unconditionally, but with the
     /// `workflow` cargo feature off there is no engine to route to at all.
     fn workflow_unavailable(&mut self, id: String) -> String {
@@ -1324,6 +1328,54 @@ mod tests {
             assert_ne!(
                 code, "not_implemented",
                 "{method:?} fell through to the not_implemented catch-all"
+            );
+        }
+    }
+
+    /// `workflow` is an opt-in cargo feature and the canonical `kvx-<target>`
+    /// release is built without it, so the feature-off answer is what most
+    /// users' servers actually return. The sweep above only rules out
+    /// `not_implemented`; this pins the exact documented code so the
+    /// slim build can never start answering `workflow.*` with something a
+    /// client cannot recognise.
+    #[cfg(not(feature = "workflow"))]
+    #[test]
+    fn every_workflow_method_reports_workflow_unavailable_with_the_feature_off() {
+        let mut app = app();
+
+        // Valid params throughout: an invalid-params rejection happens before
+        // the engine boundary and would hide the code under test.
+        let methods = vec![
+            Method::WorkflowList(crate::api::schema::EmptyParams::default()),
+            Method::WorkflowGet(WorkflowTarget {
+                workflow_id: "workflow:1".into(),
+            }),
+            Method::WorkflowCreate(WorkflowCreateParams {
+                definition: definition(),
+            }),
+            Method::WorkflowRun(WorkflowRunParams {
+                workflow_id: "workflow:1".into(),
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+            }),
+            Method::WorkflowRunList(WorkflowRunListParams {
+                workflow_id: "workflow:1".into(),
+                limit: None,
+            }),
+            Method::WorkflowNodeSteer(WorkflowNodeSteerParams {
+                run_id: "workflow_run:1".into(),
+                path: "plan".into(),
+                text: "keep going".into(),
+            }),
+        ];
+
+        for method in methods {
+            let response = app.dispatch_api_request("req", method.clone());
+            assert_eq!(
+                error_code(&response),
+                "workflow_unavailable",
+                "{method:?} did not report workflow_unavailable"
             );
         }
     }
