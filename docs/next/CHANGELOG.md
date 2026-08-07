@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+- Workflow runs read back from the store are now complete. A run reopened after a restart — or inspected with `kvx workflow run show` on a server that did not start it — reports the same progress counts, edge firing state, workspace binding, per-node directories, graph depth, and timestamps/durations as the live run did, instead of a partial projection that lost which branches were taken and where each node's `task.md`, `inputs/`, and `artifacts/` live.
+- `kvx workflow show` now lists a workflow's full version history with real metadata. Every version in the chain is returned with its own origin, change summary, and creation timestamp, rather than a single head entry with a hardcoded `0` timestamp.
+- Every targeted `kvx workflow` command accepts a workflow name as well as a `workflow:<key>` id. `show`, `update`, `run start`, and `run list` all resolve the same `<name|id>` selector, so a workflow created and listed by name can also be updated and run by that name.
+- A node that reports an invalid or missing `result.json` is now flagged `needs_attention` instead of stalling silently. `kvx workflow node complete` always reaches the server, which owns validation and the corrective re-prompt; previously an unreadable result made the CLI exit early and the node stayed `running` forever with nothing on the server ever learning it had tried to finish.
+- `kvx workflow node interrupt` now actually interrupts the node's process. Agent nodes receive `Escape` and command nodes receive `ctrl+c` (SIGINT), and an interrupt or steer the runtime could not deliver reports an error rather than falsely reporting success.
+- Agent nodes are re-sent their kickoff instructions when Claude's first-run trust dialog swallows the initial prompt, so a node no longer sits at an idle agent that never received its task.
+- An agent node's kickoff instructions now reference its `task.md` by absolute path. A node's working directory is the workspace, not its node directory, so the previous relative path named a file the agent could not open.
+- Workflow runs now progress correctly on headless servers. The headless loop advances the workflow engine's clock and reconciles managed agents, so detector-driven signals such as sustained idle can fire and `agent.prompt`/`agent.send_keys` no longer answer `agent_not_ready` indefinitely.
+- Session startup now fails fast with an actionable message when the derived socket path would exceed the platform's `sockaddr_un.sun_path` limit (108 bytes on Linux, 104 on macOS), naming the path, the limit, and the two ways to shorten it. Previously this surfaced only as a 15-second wait followed by "server did not become ready", with an empty server log.
+- `install.sh` installs the binary as `kvx` and honours `KVX_MANIFEST_URL` and `KVX_INSTALL_DIR` overrides (with `HERDR_INSTALL_DIR` still accepted). It previously installed under the old `herdr` name and hardcoded the release manifest URL, so the installed binary did not match the documented `kvx` commands.
+
 ## [0.9.2] - 2026-08-07
 
 ### Changed
