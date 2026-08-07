@@ -8,6 +8,7 @@
 ### Changed
 - The `workflow` cargo feature is now opt-in instead of default-on. The canonical `kvx-<target>` release binary no longer embeds the workflow subsystem's SurrealDB store; its `kvx workflow` commands return the existing `workflow_unavailable` error. Install the new `kvx-workflow-<target>` release asset, or build from source with `--features workflow`, to keep using workflows.
 - Release binaries now build with thin LTO, a single codegen unit, and stripped symbols, cutting the canonical binary to roughly a quarter of its previous size.
+- Remote attach now provisions a host with the release asset matching the local binary's variant, so attaching from a workflow install no longer installs a canonical build on the remote.
 
 ## [0.9.0] - 2026-08-07
 
