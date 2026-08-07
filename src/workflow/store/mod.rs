@@ -36,7 +36,8 @@ pub use error::StoreError;
 // its own the way it would in a published library.
 #[allow(unused_imports)]
 pub use queries::{
-    CheckpointRecord, RunEventRecord, RunNodeRecord, RunRecord, RunSummaryRecord, WorkflowSummary,
+    CheckpointRecord, RunEdgeRecord, RunEventRecord, RunNodeRecord, RunRecord, RunSummaryRecord,
+    VersionRecord, WorkflowSummary,
 };
 use surrealdb::engine::local::{Db, Mem, SurrealKv};
 use surrealdb::Surreal;
@@ -64,6 +65,23 @@ const TABLE_KVDAG_VERSION: &str = "kvdag_version";
 const TABLE_KVDAG_NODE: &str = "kvdag_node";
 const TABLE_WORKFLOW_RUN: &str = "workflow_run";
 const TABLE_RUN_NODE: &str = "run_node";
+
+/// Every statically materialised `run_node` sits at expansion depth 0; see
+/// [`WorkflowStore::materialise_run_nodes`] for why this is not topological
+/// depth.
+const STATIC_NODE_DEPTH: u16 = 0;
+
+/// The `run_node.status` values that close a node, mirroring
+/// [`NodeStatus::is_terminal`] as the string set a query can compare against.
+/// `nodes_done` is recomputed from this set, so the two must not drift;
+/// `terminal_node_statuses_match_the_model` pins that.
+const TERMINAL_NODE_STATUSES: &[NodeStatus] = &[
+    NodeStatus::Succeeded,
+    NodeStatus::Failed,
+    NodeStatus::Skipped,
+    NodeStatus::Restored,
+    NodeStatus::Cancelled,
+];
 
 /// Payload budgets (`03-storage-schema.md` §7): token efficiency is a schema
 /// property, enforced here rather than left to caller discipline.
@@ -104,6 +122,20 @@ impl VersionOrigin {
             Self::RestoreRewrite => "restore_rewrite",
         }
     }
+
+    /// The inverse of [`Self::as_str`], for reading a stored `kvdag_version.origin`
+    /// back into the enum (`queries::version_record`).
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "authored" => Ok(Self::Authored),
+            "imported" => Ok(Self::Imported),
+            "self_improvement" => Ok(Self::SelfImprovement),
+            "restore_rewrite" => Ok(Self::RestoreRewrite),
+            other => Err(StoreError::Decode(format!(
+                "unknown kvdag_version origin {other:?}"
+            ))),
+        }
+    }
 }
 
 /// The inputs of one run, checked against the version's limits on create: a run
@@ -116,6 +148,12 @@ pub struct NewRun {
     pub args: BTreeMap<String, String>,
     pub growth: GrowthLimits,
     pub context_runs: Vec<RunId>,
+    /// Where the run's panes live, as the public API workspace id
+    /// (`03-storage-schema.md` §4.2). Recorded at create time because it is a
+    /// property of the run, not of the server that happens to be executing it:
+    /// without it a run read back from the journal has no workspace binding at
+    /// all.
+    pub workspace_id: Option<String>,
 }
 
 /// The workflow database. Opened lazily on first `workflow.*` use, so a karvex
@@ -540,7 +578,8 @@ impl WorkflowStore {
                 "CREATE workflow_run SET workflow = $workflow, kvdag_version = $version, \
                  tier = $tier, status = \"pending\", args = $args, \
                  context_runs = $context_runs, max_depth = $max_depth, \
-                 max_nodes = $max_nodes, nodes_total = $nodes_total RETURN AFTER",
+                 max_nodes = $max_nodes, workspace_id = $workspace_id, \
+                 nodes_total = $nodes_total RETURN AFTER",
             )
             .bind(("workflow", workflow_id))
             .bind(("version", version_id.clone()))
@@ -549,6 +588,7 @@ impl WorkflowStore {
             .bind(("context_runs", context_runs))
             .bind(("max_depth", i64::from(run.growth.max_depth)))
             .bind(("max_nodes", i64::from(run.growth.max_nodes)))
+            .bind(("workspace_id", run.workspace_id))
             .bind((
                 "nodes_total",
                 graph.nodes.iter().filter(|n| !n.is_template).count() as i64,
@@ -580,7 +620,11 @@ impl WorkflowStore {
                 path,
                 payload,
             } => self.write_run_event(run, seq, kind, path, payload).await,
-            StoreWrite::RunStatus { run, status } => self.write_run_status(run, status).await,
+            StoreWrite::RunStatus {
+                run,
+                status,
+                ended_at_unix_ms,
+            } => self.write_run_status(run, status, ended_at_unix_ms).await,
             StoreWrite::RunNode {
                 run,
                 path,
@@ -590,11 +634,33 @@ impl WorkflowStore {
                 usage,
                 evidence,
                 succession,
+                started_at_unix_ms,
+                ended_at_unix_ms,
             } => {
                 self.write_run_node(
-                    run, path, status, attempt, binding, usage, evidence, succession,
+                    run,
+                    path,
+                    status,
+                    attempt,
+                    binding,
+                    usage,
+                    evidence,
+                    succession,
+                    started_at_unix_ms,
+                    ended_at_unix_ms,
                 )
                 .await
+            }
+            StoreWrite::RunEdge {
+                run,
+                from,
+                to,
+                kind,
+                condition_result,
+                fired,
+            } => {
+                self.write_run_edge(run, from, to, kind, condition_result, fired)
+                    .await
             }
             StoreWrite::Checkpoint {
                 run,
@@ -815,7 +881,7 @@ fn edge_kind_str(kind: EdgeKind) -> &'static str {
     }
 }
 
-fn parse_edge_kind(value: &str) -> Result<EdgeKind, StoreError> {
+pub(super) fn parse_edge_kind(value: &str) -> Result<EdgeKind, StoreError> {
     match value {
         "sequence" => Ok(EdgeKind::Sequence),
         "data" => Ok(EdgeKind::Data),
@@ -1116,9 +1182,18 @@ impl WorkflowStore {
     /// one `run_node` per non-template `kvdag_node` (templates are only ever
     /// instantiated by an accepted expand proposal — Phase 2), roots `Ready`
     /// and everything else `Pending`, and one `run_edge` `RELATE` per
-    /// `kvdag_edge` between two materialised nodes. `depth` is the longest
-    /// path from any root, computed in one forward pass over `graph.nodes`
-    /// because `Kvdag::try_new` already topologically sorted them.
+    /// `kvdag_edge` between two materialised nodes.
+    ///
+    /// `depth` is **expansion** depth, not topological depth: it pairs with
+    /// `run_node.parent` (`03-storage-schema.md` §4.2, both `NONE`/`0` by
+    /// default) and it is what `04-kvdag-and-execution.md` §3.4 guards with
+    /// `parent.depth + 1 <= growth.max_depth` when an accepted expand proposal
+    /// instantiates a template under a proposing node. A statically declared
+    /// graph consumes none of that budget — with `max_depth` defaulting to 3,
+    /// numbering a five-node chain 0..4 would report a legal graph as already
+    /// past its own growth ceiling — so every statically materialised node is
+    /// at depth 0, exactly as [`crate::workflow::model::RunGraph::materialise`]
+    /// records it in memory.
     async fn materialise_run_nodes(
         &self,
         run_id: &surrealdb_types::RecordId,
@@ -1133,18 +1208,10 @@ impl WorkflowStore {
             .map(|row| (NodeKey::new(row.node_key.clone()), row.id))
             .collect();
 
-        let mut depth_by_key: BTreeMap<NodeKey, u16> = BTreeMap::new();
         let mut run_node_id_by_key: BTreeMap<NodeKey, surrealdb_types::RecordId> = BTreeMap::new();
 
         for node in &scheduled {
             let inbound: Vec<&KvdagEdge> = graph.inbound_edges(&node.key).collect();
-            let depth = inbound
-                .iter()
-                .filter_map(|edge| depth_by_key.get(&edge.from))
-                .max()
-                .map_or(0, |max| max + 1);
-            depth_by_key.insert(node.key.clone(), depth);
-
             let status = if inbound.is_empty() {
                 NodeStatus::Ready
             } else {
@@ -1167,7 +1234,7 @@ impl WorkflowStore {
                 .bind(("kvdag_node", kvdag_node_id.clone()))
                 .bind(("node_key", node.key.to_string()))
                 .bind(("instance_path", node.key.to_string()))
-                .bind(("depth", i64::from(depth)))
+                .bind(("depth", i64::from(STATIC_NODE_DEPTH)))
                 .bind(("status", node_status_str(status).to_string()))
                 .bind(("model", assignment.model.as_str().to_string()))
                 .bind(("effort", assignment.effort.as_str().to_string()))
@@ -1298,7 +1365,17 @@ impl WorkflowStore {
         Ok(())
     }
 
-    async fn write_run_status(&self, run: RunId, status: RunStatus) -> Result<(), StoreError> {
+    /// `ended_at_unix_ms` is the engine's own close stamp, which is also what
+    /// the live run reports — the journal and the live projection must not
+    /// describe the same run as ending at two different times. `time::now()`
+    /// stays as the fallback so a terminal status that somehow arrives without
+    /// a stamp still records *an* end time rather than none.
+    async fn write_run_status(
+        &self,
+        run: RunId,
+        status: RunStatus,
+        ended_at_unix_ms: Option<u64>,
+    ) -> Result<(), StoreError> {
         let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
         let terminal = matches!(
@@ -1306,7 +1383,9 @@ impl WorkflowStore {
             RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
         );
         let statement = if terminal {
-            "UPDATE $run SET status = $status, ended_at = time::now()"
+            "UPDATE $run SET status = $status, \
+             ended_at = IF $ended_at_ms = NONE THEN time::now() \
+                        ELSE time::from_millis($ended_at_ms) END"
         } else {
             "UPDATE $run SET status = $status"
         };
@@ -1315,6 +1394,7 @@ impl WorkflowStore {
             .query(statement)
             .bind(("run", run_id))
             .bind(("status", run_status_str(status).to_string()))
+            .bind(("ended_at_ms", ended_at_unix_ms.map(|ms| ms as i64)))
             .await
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
@@ -1335,6 +1415,8 @@ impl WorkflowStore {
         usage: NodeUsage,
         evidence: Option<Evidence>,
         succession: Option<Succession>,
+        started_at_unix_ms: Option<u64>,
+        ended_at_unix_ms: Option<u64>,
     ) -> Result<(), StoreError> {
         let run_node_id = self.find_run_node_id(&run, &path).await?;
         let (succession_str, blocker_json) = match &succession {
@@ -1359,7 +1441,11 @@ impl WorkflowStore {
                 "UPDATE $id SET status = $status, attempt = $attempt, \
                  total_tokens = $total_tokens, tool_uses = $tool_uses, \
                  duration_ms = $duration_ms, evidence = $evidence, \
-                 succession = $succession, blocker = $blocker",
+                 succession = $succession, blocker = $blocker, \
+                 started_at = IF $started_at_ms = NONE THEN started_at \
+                              ELSE time::from_millis($started_at_ms) END, \
+                 ended_at = IF $ended_at_ms = NONE THEN ended_at \
+                            ELSE time::from_millis($ended_at_ms) END",
             )
             .bind(("id", run_node_id.clone()))
             .bind(("status", node_status_str(status).to_string()))
@@ -1373,6 +1459,8 @@ impl WorkflowStore {
             ))
             .bind(("succession", succession_str.map(str::to_string)))
             .bind(("blocker", blocker_json))
+            .bind(("started_at_ms", started_at_unix_ms.map(|ms| ms as i64)))
+            .bind(("ended_at_ms", ended_at_unix_ms.map(|ms| ms as i64)))
             .await
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
@@ -1383,7 +1471,7 @@ impl WorkflowStore {
                 .query(
                     "UPDATE $id SET pane_id = $pane_id, terminal_id = $terminal_id, \
                      agent_session_id = $agent_session_id, transcript_path = $transcript_path, \
-                     node_dir = $node_dir, cwd = $cwd, started_at = started_at OR time::now()",
+                     node_dir = $node_dir, cwd = $cwd",
                 )
                 .bind(("id", run_node_id))
                 .bind(("pane_id", binding.pane_id.to_string()))
@@ -1399,6 +1487,83 @@ impl WorkflowStore {
                 .map_err(query_error)?;
             response.check().map_err(query_error)?;
         }
+
+        self.refresh_nodes_done(&run).await
+    }
+
+    /// Re-derives `workflow_run.nodes_done` from the run's own `run_node`
+    /// statuses.
+    ///
+    /// The counter is materialised on the run row rather than computed on read
+    /// because `03-storage-schema.md` §4.2 declares it a stored `int` and §6's
+    /// run-list projection selects it straight off `workflow_run` with no join
+    /// to `run_node` — a run list has to stay one row read per run. Every node
+    /// write refreshes it from the authoritative statuses instead of
+    /// incrementing, so a node leaving a terminal status (a restart) or a
+    /// replayed write can never leave the counter above or below the truth.
+    async fn refresh_nodes_done(&self, run: &RunId) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let terminal: Vec<String> = TERMINAL_NODE_STATUSES
+            .iter()
+            .map(|status| node_status_str(*status).to_string())
+            .collect();
+        let response = self
+            .db
+            .query(
+                "UPDATE $run SET nodes_done = array::len((SELECT VALUE id FROM run_node \
+                 WHERE run = $run AND status IN $terminal))",
+            )
+            .bind(("run", run_id))
+            .bind(("terminal", terminal))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    /// Settles one materialised edge's firing record.
+    ///
+    /// The edge is addressed by `(run, from, to, kind)` — the same identity
+    /// `list_run_edges` reports it back under — rather than by its relation id,
+    /// which the engine's in-memory graph never learns.
+    ///
+    /// `fired_at` is the *instant* of the firing, so a re-settled edge keeps
+    /// the one it already has; an edge that goes back to unfired (§3.1 resolves
+    /// a `Data` edge only while its source holds a validated result, and a
+    /// restart clears that) drops the stamp instead of keeping one that no
+    /// longer describes the run.
+    async fn write_run_edge(
+        &self,
+        run: RunId,
+        from: crate::workflow::model::InstancePath,
+        to: crate::workflow::model::InstancePath,
+        kind: EdgeKind,
+        condition_result: Option<bool>,
+        fired: bool,
+    ) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let from_id = self.find_run_node_id(&run, &from).await?;
+        let to_id = self.find_run_node_id(&run, &to).await?;
+        let response = self
+            .db
+            .query(
+                "UPDATE run_edge SET condition_result = $condition_result, \
+                 fired_at = IF $fired THEN \
+                     (IF fired_at = NONE THEN time::now() ELSE fired_at END) \
+                 ELSE NONE END \
+                 WHERE run = $run AND in = $from AND out = $to AND kind = $kind",
+            )
+            .bind(("run", run_id))
+            .bind(("from", from_id))
+            .bind(("to", to_id))
+            .bind(("kind", edge_kind_str(kind).to_string()))
+            .bind(("condition_result", condition_result))
+            .bind(("fired", fired))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
         Ok(())
     }
 
@@ -1510,6 +1675,74 @@ mod tests {
         assert_eq!(VersionOrigin::Authored.as_str(), "authored");
         assert_eq!(VersionOrigin::SelfImprovement.as_str(), "self_improvement");
         assert_eq!(VersionOrigin::RestoreRewrite.as_str(), "restore_rewrite");
+    }
+
+    #[test]
+    fn version_origin_parse_round_trips_every_variant() {
+        for origin in [
+            VersionOrigin::Authored,
+            VersionOrigin::Imported,
+            VersionOrigin::SelfImprovement,
+            VersionOrigin::RestoreRewrite,
+        ] {
+            let parsed = VersionOrigin::parse(origin.as_str()).expect("known origin string");
+            assert_eq!(parsed, origin);
+        }
+    }
+
+    #[test]
+    fn version_origin_parse_rejects_garbage() {
+        assert!(VersionOrigin::parse("not-a-real-origin").is_err());
+    }
+
+    /// `nodes_done` is recomputed with a `status IN $terminal` comparison, so
+    /// the string set it binds has to be exactly the statuses the model calls
+    /// terminal. A new `NodeStatus` variant that closes a node and is not
+    /// added here would silently stop being counted.
+    #[test]
+    fn terminal_node_statuses_match_the_model() {
+        // Deliberately exhaustive rather than a slice of variants: adding a
+        // `NodeStatus` stops this compiling until someone decides whether the
+        // new status closes a node, which is exactly the decision
+        // `TERMINAL_NODE_STATUSES` encodes.
+        const EVERY_NODE_STATUS: [NodeStatus; 10] = [
+            NodeStatus::Pending,
+            NodeStatus::Ready,
+            NodeStatus::Running,
+            NodeStatus::NeedsAttention,
+            NodeStatus::Blocked,
+            NodeStatus::Succeeded,
+            NodeStatus::Failed,
+            NodeStatus::Skipped,
+            NodeStatus::Restored,
+            NodeStatus::Cancelled,
+        ];
+        fn closes_a_node(status: NodeStatus) -> bool {
+            match status {
+                NodeStatus::Succeeded
+                | NodeStatus::Failed
+                | NodeStatus::Skipped
+                | NodeStatus::Restored
+                | NodeStatus::Cancelled => true,
+                NodeStatus::Pending
+                | NodeStatus::Ready
+                | NodeStatus::Running
+                | NodeStatus::NeedsAttention
+                | NodeStatus::Blocked => false,
+            }
+        }
+        for status in EVERY_NODE_STATUS {
+            assert_eq!(
+                closes_a_node(status),
+                status.is_terminal(),
+                "{status:?} disagrees with NodeStatus::is_terminal"
+            );
+            assert_eq!(
+                TERMINAL_NODE_STATUSES.contains(&status),
+                status.is_terminal(),
+                "{status:?} is missing from the nodes_done terminal set"
+            );
+        }
     }
 }
 

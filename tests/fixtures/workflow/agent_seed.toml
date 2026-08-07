@@ -1,0 +1,30 @@
+# End-to-end fixture for the seed prompt of
+# `docs/design/workflow-builder/04-kvdag-and-execution.md` §4.2.
+#
+# The only fixture here with `runner = "agent"`: it makes karvex build the real
+# `claude` argv — absolute seed prompt included — and open the real
+# managed-agent launch window. The `claude` it resolves on PATH is
+# `agent_stub.sh`, which swallows the seed exactly as claude's first-run
+# workspace-trust dialog does.
+
+name = "e2e-agent-seed"
+description = "an agent node whose seed prompt is swallowed at startup"
+contract = """
+Reply only through result.json.
+"""
+max_depth = 3
+max_nodes = 24
+
+[[arg]]
+name = "goal"
+required = true
+description = "what to build"
+
+[[node]]
+key = "solo"
+label = "Solo"
+kind = "agent"
+runner = "agent"
+demand = "light"
+prompt_template = "Work on: {{goal}}"
+output_schema = { type = "object", required = ["done"], properties = { done = { type = "boolean" } } }

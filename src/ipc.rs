@@ -49,8 +49,116 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
 /// Unix targets we support (Linux allows 108). Test helpers that build socket
 /// paths assert against this so a path that is fine on Linux cannot silently
 /// break the macOS CI leg.
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 pub(crate) const MACOS_SUN_PATH_LIMIT: usize = 104;
+
+/// Capacity of `sockaddr_un.sun_path` on Linux.
+#[cfg(unix)]
+pub(crate) const LINUX_SUN_PATH_LIMIT: usize = 108;
+
+/// This platform's `sockaddr_un.sun_path` capacity, in bytes.
+///
+/// A pure cross-platform policy constant: both arms compile on every Unix
+/// target we ship, so `cfg!` (not `#[cfg]`) is what picks between them, per
+/// the platform-code convention in `CLAUDE.md`.
+#[cfg(unix)]
+pub(crate) fn sun_path_limit() -> usize {
+    if cfg!(target_os = "macos") {
+        MACOS_SUN_PATH_LIMIT
+    } else {
+        LINUX_SUN_PATH_LIMIT
+    }
+}
+
+/// H1: fails fast, with a clear and actionable message, when `path` will not
+/// fit in `sockaddr_un.sun_path` on this platform.
+///
+/// Without this, the failure happens deep inside `bind()`/`connect()` in a
+/// server process spawned with its stdio redirected to `/dev/null`
+/// (`server::autodetect::build_server_daemon_command`): the process exits
+/// before `tracing` ever gets a line to write, leaving a 0-byte
+/// `karvex-server.log` and a client that only learns "server did not become
+/// ready within 15s" after paying the full wait.
+#[cfg(unix)]
+pub(crate) fn check_socket_path_len(path: &Path) -> Result<(), String> {
+    check_socket_path_len_against(path, sun_path_limit())
+}
+
+#[cfg(unix)]
+fn check_socket_path_len_against(path: &Path, limit: usize) -> Result<(), String> {
+    let len = path.as_os_str().len();
+    if len <= limit {
+        return Ok(());
+    }
+    Err(format!(
+        "socket path is too long for this platform: {len} bytes, but \
+         sockaddr_un.sun_path holds at most {limit}.\n  path: {}\n\n\
+         Karvex derives this path from XDG_CONFIG_HOME (or the platform config \
+         directory) plus the session name. Fix it with a shorter XDG_CONFIG_HOME \
+         or a shorter `--session <name>`.",
+        path.display()
+    ))
+}
+
+#[cfg(all(test, unix))]
+mod sun_path_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn macos_and_linux_limits_match_the_documented_values() {
+        assert_eq!(MACOS_SUN_PATH_LIMIT, 104);
+        assert_eq!(LINUX_SUN_PATH_LIMIT, 108);
+    }
+
+    #[test]
+    fn a_path_at_or_under_the_limit_passes() {
+        let path = PathBuf::from("a".repeat(104));
+        assert!(check_socket_path_len_against(&path, MACOS_SUN_PATH_LIMIT).is_ok());
+        let path = PathBuf::from("a".repeat(108));
+        assert!(check_socket_path_len_against(&path, LINUX_SUN_PATH_LIMIT).is_ok());
+    }
+
+    #[test]
+    fn a_path_one_byte_over_the_macos_limit_fails_with_the_path_length_and_limit() {
+        let path = PathBuf::from("a".repeat(105));
+        let err =
+            check_socket_path_len_against(&path, MACOS_SUN_PATH_LIMIT).expect_err("over limit");
+        assert!(err.contains("105 bytes"), "{err}");
+        assert!(err.contains("104"), "{err}");
+        assert!(err.contains("XDG_CONFIG_HOME"), "{err}");
+        assert!(err.contains("--session"), "{err}");
+    }
+
+    #[test]
+    fn a_path_one_byte_over_the_linux_limit_fails() {
+        let path = PathBuf::from("a".repeat(109));
+        let err =
+            check_socket_path_len_against(&path, LINUX_SUN_PATH_LIMIT).expect_err("over limit");
+        assert!(err.contains("109 bytes"), "{err}");
+        assert!(err.contains("108"), "{err}");
+    }
+
+    /// The reported H1 repro: a long `XDG_CONFIG_HOME` plus a named session
+    /// pushes `.../sessions/<name>/karvex-client.sock` over the limit.
+    #[test]
+    fn a_realistic_long_xdg_config_home_and_session_name_is_caught() {
+        let deep = "x".repeat(80);
+        let path = PathBuf::from(format!(
+            "/home/user/.config-{deep}/karvex/sessions/a-fairly-long-session-name/karvex-client.sock"
+        ));
+        assert!(
+            check_socket_path_len_against(&path, MACOS_SUN_PATH_LIMIT).is_err(),
+            "this path is a realistic overflow and must be caught before bind/connect"
+        );
+    }
+
+    #[test]
+    fn a_typical_short_path_is_never_flagged() {
+        let path = PathBuf::from("/home/user/.config/karvex/karvex-client.sock");
+        assert!(check_socket_path_len_against(&path, MACOS_SUN_PATH_LIMIT).is_ok());
+    }
+}
 
 pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(unix)]

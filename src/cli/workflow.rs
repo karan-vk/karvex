@@ -602,15 +602,18 @@ fn workflow_node_complete(args: &[String]) -> std::io::Result<i32> {
 
     let result_path = result_file.unwrap_or_else(|| default_node_result_path(&env.node_dir));
 
-    let params = match build_node_report_params(&env, &result_path) {
-        Ok(params) => params,
-        Err(message) => {
-            print_workflow_cli_error("invalid_node_result", &message);
-            return Ok(1);
-        }
-    };
+    // `04-kvdag-and-execution.md` §4.3 makes the server the single completion
+    // authority: it owns schema validation, the one corrective re-prompt, and
+    // the `NeedsAttention` fallback for a report that carries no result
+    // artifact. A client-side parse failure is a fast warning, never a veto —
+    // exiting here would strand the node `Running` forever with nothing on the
+    // server side ever learning the node tried to finish.
+    let params = build_node_report_params(&env, &result_path);
+    if let Some(warning) = params.local_error.as_deref() {
+        eprintln!("warning: {warning}");
+    }
 
-    super::runtime::workflow_node_report(params)
+    super::runtime::workflow_node_report(params.params)
 }
 
 fn parse_workflow_node_complete_args(args: &[String]) -> Result<Option<String>, String> {
@@ -658,20 +661,38 @@ fn default_node_result_path(node_dir: &str) -> String {
         .to_string()
 }
 
-fn build_node_report_params(
-    env: &NodeCompleteEnv,
-    result_path: &str,
-) -> Result<WorkflowNodeReportParams, String> {
+/// A report that is always sent, plus whatever the client noticed about the
+/// result file on the way. `local_error` is advisory: the server decides what a
+/// missing or unparseable result means for the node.
+struct NodeReport {
+    params: WorkflowNodeReportParams,
+    local_error: Option<String>,
+}
+
+/// Builds the `workflow.node.report` params. A result file that cannot be read
+/// or parsed reports `null`, which is the wire's "I have no result artifact" —
+/// the server turns that into `NeedsAttention` (§4.3) instead of the node
+/// stalling `Running` behind a client-side exit.
+fn build_node_report_params(env: &NodeCompleteEnv, result_path: &str) -> NodeReport {
+    let (result, local_error) = match read_node_result(result_path) {
+        Ok(result) => (result, None),
+        Err(message) => (serde_json::Value::Null, Some(message)),
+    };
+    NodeReport {
+        params: WorkflowNodeReportParams {
+            run_id: env.run_id.clone(),
+            path: env.node_path.clone(),
+            token: env.node_token.clone(),
+            result,
+        },
+        local_error,
+    }
+}
+
+fn read_node_result(result_path: &str) -> Result<serde_json::Value, String> {
     let text = std::fs::read_to_string(result_path)
         .map_err(|err| format!("failed to read {result_path}: {err}"))?;
-    let result: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|err| format!("invalid JSON in {result_path}: {err}"))?;
-    Ok(WorkflowNodeReportParams {
-        run_id: env.run_id.clone(),
-        path: env.node_path.clone(),
-        token: env.node_token.clone(),
-        result,
-    })
+    serde_json::from_str(&text).map_err(|err| format!("invalid JSON in {result_path}: {err}"))
 }
 
 // ── shared parsing / printing helpers ───────────────────────────────────
@@ -828,6 +849,27 @@ mod tests {
     #[test]
     fn workflow_create_requires_file() {
         assert!(parse_workflow_create_args(&args(&["--name", "ship"])).is_err());
+    }
+
+    /// A9: `--help` advertises `<name|id>` for `show`/`update`/`run start`, so
+    /// the CLI's job is to forward whatever the caller typed — a workflow
+    /// *name*, not just a `workflow:<key>` id — unchanged as `workflow_id`.
+    /// Resolving the name is the server's job (`src/app/api/workflows.rs`'s
+    /// `resolve_workflow_selector`); the CLI must never reject or reshape it
+    /// first.
+    #[test]
+    fn name_and_id_selectors_reach_the_wire_unchanged_for_show_update_and_run_start() {
+        for selector in ["ship-feature", "workflow:abc123"] {
+            let target = parse_workflow_show_args(&args(&[selector])).unwrap();
+            assert_eq!(target.workflow_id, selector);
+
+            let (workflow_id, _file, _change_summary) =
+                parse_workflow_update_args(&args(&[selector, "--file", "def.toml"])).unwrap();
+            assert_eq!(workflow_id, selector);
+
+            let (params, _json) = parse_workflow_run_start_args(&args(&[selector])).unwrap();
+            assert_eq!(params.workflow_id, selector);
+        }
     }
 
     #[test]
@@ -1095,9 +1137,10 @@ mod tests {
             node_dir: dir.to_str().unwrap().to_string(),
             node_token: "tok".to_string(),
         };
-        let params = build_node_report_params(&env, path.to_str().unwrap()).unwrap();
+        let report = build_node_report_params(&env, path.to_str().unwrap());
+        assert_eq!(report.local_error, None);
         assert_eq!(
-            Method::WorkflowNodeReport(params),
+            Method::WorkflowNodeReport(report.params),
             Method::WorkflowNodeReport(WorkflowNodeReportParams {
                 run_id: "run-1".to_string(),
                 path: "plan".to_string(),
@@ -1109,11 +1152,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `04-kvdag-and-execution.md` §4.3: the server owns completion. A result
+    /// file the client cannot read or parse must still be reported — as a
+    /// `null` result, which is the wire's "no result artifact" — so the
+    /// server's `NeedsAttention` path is reachable for a `runner = "command"`
+    /// node, whose only completion signal is this self-report.
     #[test]
-    fn build_node_report_params_rejects_invalid_json() {
+    fn an_unreadable_result_is_still_reported_to_the_server() {
         let dir = unique_temp_dir("node-complete-invalid");
-        let path = dir.join("result.json");
-        std::fs::write(&path, "not json").unwrap();
+        let invalid = dir.join("result.json");
+        std::fs::write(&invalid, "not json").unwrap();
 
         let env = NodeCompleteEnv {
             run_id: "run-1".to_string(),
@@ -1121,7 +1169,28 @@ mod tests {
             node_dir: dir.to_str().unwrap().to_string(),
             node_token: "tok".to_string(),
         };
-        assert!(build_node_report_params(&env, path.to_str().unwrap()).is_err());
+
+        for (result_path, expected_warning) in [
+            (invalid.clone(), "invalid JSON"),
+            (dir.join("absent.json"), "failed to read"),
+        ] {
+            let report = build_node_report_params(&env, result_path.to_str().unwrap());
+            assert_eq!(
+                report.params.result,
+                serde_json::Value::Null,
+                "an unusable result file reports null rather than blocking the report"
+            );
+            assert_eq!(report.params.run_id, "run-1");
+            assert_eq!(report.params.path, "plan");
+            assert_eq!(report.params.token, "tok");
+            let warning = report
+                .local_error
+                .expect("the client still says what it could not do");
+            assert!(
+                warning.contains(expected_warning),
+                "unexpected warning: {warning}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

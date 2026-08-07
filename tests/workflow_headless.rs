@@ -1,6 +1,6 @@
 //! Headless end-to-end tests for the workflow (kvdag) runtime.
 //!
-//! `docs/design/workflow-builder/05-phase-plan.md` W7. Four scenarios against
+//! `docs/design/workflow-builder/05-phase-plan.md` W7. Five scenarios against
 //! a real `kvx server`, over the real JSON API socket:
 //!
 //! 1. a two-node kvdag runs to `succeeded`, each node visibly executing in its
@@ -12,7 +12,12 @@
 //! 3. a node whose pane exits before a valid result ends `failed` and the run
 //!    reaches a terminal status instead of staying live forever (`04` §4.3);
 //! 4. `workflow.node.steer` delivers text into the node's pane, asserted
-//!    through `pane.read`.
+//!    through `pane.read`;
+//! 5. an agent node whose seed prompt is swallowed at startup is re-seeded
+//!    with an absolute `task.md` path instead of hanging forever (`04` §4.2);
+//! 6. a finished run, re-read from a *restarted* server that never executed it,
+//!    describes the same run field for field — the store's read path is not
+//!    allowed to know less than the engine did.
 //!
 //! **On event ordering.** `events.subscribe` gives each requested `type` its own
 //! cursor and the stream loop yields at most one event per subscription per
@@ -20,17 +25,23 @@
 //! Cross-kind causality is asserted from event payloads, never from stream
 //! position.
 //!
-//! **Why the fixtures use `runner = "command"`.** W7 is explicit: the
-//! managed-agent path is closed to a stub by construction —
-//! `begin_managed_agent` takes a `crate::detect::Agent` with no generic
-//! variant, and `agent.prompt` answers `agent_not_ready` unless the pane's
-//! foreground job resolves to a detected agent. So a fake `claude` would be
-//! reported as a spawn failure rather than exercising anything. `runner =
-//! "command"` is a declared node field and a first-class binding
-//! (`04` §4.2), not a test-only escape hatch: the nodes here are plain
-//! processes that write `result.json` and call `kvx workflow node complete`.
-//! The `runner = "agent"` path is exercised by the manual real-`claude` run
-//! only. Nothing here needs the `claude` binary, a network, or an API key.
+//! **Why almost every fixture uses `runner = "command"`.** `runner =
+//! "command"` is a declared node field and a first-class binding (`04` §4.2),
+//! not a test-only escape hatch: the nodes here are plain processes that write
+//! `result.json` and call `kvx workflow node complete`. That makes the
+//! completion, steering, and persistence scenarios deterministic and offline.
+//!
+//! **The one `runner = "agent"` scenario.** W7 assumed the managed-agent path
+//! was closed to a stub. It is not: `confirm_managed_agent` calls
+//! `begin_managed_agent` for *every* `Runner::Agent` node without inspecting
+//! the binary, agent detection is driven entirely by what the pane renders,
+//! and `agent_argv` resolves `claude` through `PATH`. So
+//! `tests/fixtures/workflow/agent_stub.sh` — installed as `claude` on the
+//! server's `PATH` by the harness — is a real managed agent as far as the
+//! runtime is concerned, and `agent_seed.toml` exercises the seed-prompt path
+//! end to end. Still no network, no API key, and no real `claude`; the full
+//! real-`claude` behaviours (tool use, transcripts, tier resolution) remain a
+//! manual run.
 //!
 //! **What is asserted where.** karvex has no library target, so an integration
 //! test cannot link `WorkflowStore`. Per W7 this file asserts only
@@ -79,6 +90,9 @@ struct WorkflowServer {
     socket: PathBuf,
     _master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
+    /// Set only while a restart is in flight, so the base directory (and with
+    /// it the workflow database) outlives the process that owned it.
+    keep_base: bool,
 }
 
 impl WorkflowServer {
@@ -89,6 +103,49 @@ impl WorkflowServer {
     fn shutdown(self) {
         drop(self);
     }
+
+    /// Stops this server and brings a fresh one up on the same base directory,
+    /// so the replacement reopens the same workflow database.
+    ///
+    /// `server.stop` rather than a signal: the store's SurrealKv directory is
+    /// held under an exclusive lock, and the replacement can only take it once
+    /// the previous owner has really gone, so the exit is waited for rather
+    /// than assumed.
+    fn restart(mut self) -> WorkflowServer {
+        let base = self.base.clone();
+        let socket = self.socket.clone();
+        send_server_stop(&socket);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(exited, "the server did not exit after server.stop");
+
+        self.keep_base = true;
+        drop(self);
+        // A stopped server unlinks its own socket; removing it here keeps a
+        // leftover file from making `wait_for_socket` connect to nothing.
+        let _ = fs::remove_file(&socket);
+        spawn_workflow_server_at(base)
+    }
+}
+
+/// Sends `server.stop` without waiting for a reply: the server tears the socket
+/// down as it shuts down, so reading a response back is a race, not a signal.
+fn send_server_stop(socket: &Path) {
+    use std::io::Write;
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return;
+    };
+    let line = format!("{}\n", request("req_stop", "server.stop", json!({})));
+    let _ = stream.write_all(line.as_bytes());
+    let _ = stream.flush();
 }
 
 /// All teardown lives here rather than in `shutdown`, so a panicking assertion
@@ -112,7 +169,9 @@ impl Drop for WorkflowServer {
             }
         }
         unregister_spawned_karvex_pid(pid);
-        cleanup_test_base(&self.base);
+        if !self.keep_base {
+            cleanup_test_base(&self.base);
+        }
     }
 }
 
@@ -156,7 +215,15 @@ fn definition_text(fixture: &str) -> String {
 /// `PATH` carries the `kvx` under test so a node's
 /// `kvx workflow node complete` resolves to it.
 fn spawn_workflow_server(label: &str) -> WorkflowServer {
-    let base = unique_base(label);
+    spawn_workflow_server_at(unique_base(label))
+}
+
+/// Brings a server up on an explicit base directory. Split out of
+/// [`spawn_workflow_server`] so a restart can reuse one — every path the server
+/// is given, including `KARVEX_WORKFLOW_DB_PATH`, is derived from the base, so
+/// re-spawning on the same base is what makes the replacement read the same
+/// store.
+fn spawn_workflow_server_at(base: PathBuf) -> WorkflowServer {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let state_home = base.join("state");
@@ -177,7 +244,21 @@ fn spawn_workflow_server(label: &str) -> WorkflowServer {
     // The node stub calls plain `kvx`, exactly as the prompt contract in
     // `04` §4.3 documents; give it the binary under test rather than whatever
     // the developer happens to have installed.
+    // Removed first so re-spawning on an existing base (a restart) is not a
+    // `symlink` conflict.
+    let _ = fs::remove_file(bin_dir.join("kvx"));
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_kvx"), bin_dir.join("kvx")).unwrap();
+
+    // `agent_argv` resolves the agent runner's executable through `PATH`
+    // (`crate::detect::interactive_agent_executable`), so the `claude` an
+    // `runner = "agent"` node launches is this stub. It is placed for every
+    // server, not just the agent test: what it does is decided entirely by the
+    // fixture that spawns it, and only `agent_seed.toml` uses `runner =
+    // "agent"` at all.
+    let _ = fs::remove_file(bin_dir.join("claude"));
+    std::os::unix::fs::symlink(fixture_dir().join("agent_stub.sh"), bin_dir.join("claude"))
+        .unwrap();
+
     let path_override = format!(
         "{}:{}",
         bin_dir.display(),
@@ -201,6 +282,9 @@ fn spawn_workflow_server(label: &str) -> WorkflowServer {
     cmd.env("KARVEX_SOCKET_PATH", &socket);
     cmd.env("KARVEX_WORKFLOW_DB_PATH", base.join("workflow-db"));
     cmd.env("KARVEX_WORKFLOW_RUNS_DIR", base.join("workflow-runs"));
+    // Inherited by the node pane the agent runner spawns, so the stub records
+    // what it was launched with and what was later delivered into it.
+    cmd.env("AGENT_STUB_LOG", agent_stub_log(&base));
     cmd.env("PATH", &path_override);
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("KARVEX_CLIENT_SOCKET_PATH");
@@ -215,6 +299,7 @@ fn spawn_workflow_server(label: &str) -> WorkflowServer {
         socket,
         _master: Some(pair.master),
         child,
+        keep_base: false,
     };
     wait_for_socket(server.socket(), Duration::from_secs(20));
     server
@@ -868,4 +953,494 @@ fn node_steer_delivers_text_into_the_nodes_pane() {
     let _ = first_event_of_kind(&seen, "workflow_node_created");
 
     server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 4b. An interrupt is a signal the process can actually observe
+// ---------------------------------------------------------------------------
+
+/// `04` §5. The interrupt was being delivered as `agent.send_keys [Escape]`
+/// for every runner. A `runner = "command"` node is by construction not a
+/// detected agent, so that path answered `agent_not_ready` and the keystroke
+/// never reached the PTY — while `workflow.node.interrupt` answered
+/// `workflow_node_interrupted` and journalled it. A control surface reporting
+/// success for a no-op is worse than one that fails.
+///
+/// The stub traps SIGINT and prints on receipt, so this asserts the interrupt
+/// against the process's own acknowledgement rather than against the response.
+#[test]
+fn node_interrupt_is_observed_by_the_nodes_process() {
+    let server = spawn_workflow_server("interrupt");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe(&socket);
+
+    let workflow_id = create_workflow(&socket, "interruptible.toml");
+    let run_id = start_run(&socket, &workflow_id, "add dark mode");
+
+    wait_for_event(&mut reader, &mut seen, "workflow_run_started", SETTLE);
+
+    let pane_id = poll_until(
+        "the node to be bound to a pane",
+        SETTLE,
+        Duration::from_millis(200),
+        || {
+            node_get(&socket, &run_id, "worker")["pane_id"]
+                .as_str()
+                .map(str::to_string)
+        },
+    );
+    // The trap has to be installed before the interrupt, or the default
+    // disposition kills the shell and this proves nothing about delivery.
+    poll_until(
+        "the stub to install its SIGINT trap",
+        SETTLE,
+        Duration::from_millis(200),
+        || {
+            pane_text(&socket, &pane_id)
+                .contains("node-stub trapping")
+                .then_some(())
+        },
+    );
+
+    let interrupted = request_ok(
+        &socket,
+        &request(
+            "req_interrupt",
+            "workflow.node.interrupt",
+            json!({ "run_id": run_id, "path": "worker" }),
+        ),
+    );
+    assert_eq!(
+        interrupted["type"], "workflow_node_interrupted",
+        "{interrupted}"
+    );
+
+    poll_until(
+        "the node's process to acknowledge the interrupt",
+        Duration::from_secs(20),
+        Duration::from_millis(200),
+        || {
+            pane_text(&socket, &pane_id)
+                .contains("node-stub interrupted")
+                .then_some(())
+        },
+    );
+
+    // An interrupt is a delivery, not a completion.
+    let node = node_get(&socket, &run_id, "worker");
+    assert_eq!(
+        node["status"], "running",
+        "an interrupt must not complete the node: {node}"
+    );
+    assert_ne!(run_status(&socket, &run_id), "succeeded");
+
+    drain_events(&mut reader, &mut seen, Duration::from_millis(300));
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 4c. A report with no result.json reaches NeedsAttention through the server
+// ---------------------------------------------------------------------------
+
+/// `04` §4.3. `kvx workflow node complete` was parsing `result.json`
+/// client-side and exiting before it contacted the server, so a node that
+/// could not produce the file never reported at all: it sat `Running` forever
+/// with the server never told the node had tried to finish. A
+/// `runner = "command"` node has no second completion signal to fall back on,
+/// so the report itself has to be what surfaces it.
+#[test]
+fn a_report_with_no_result_file_reaches_needs_attention() {
+    let server = spawn_workflow_server("missing-result");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe(&socket);
+
+    let workflow_id = create_workflow(&socket, "missing_result.toml");
+    let run_id = start_run(&socket, &workflow_id, "add dark mode");
+
+    wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_started",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+
+    let attention = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_node_updated",
+        SETTLE,
+        |event| {
+            event["data"]["node"]["path"] == "empty"
+                && event["data"]["node"]["status"] == "needs_attention"
+        },
+    );
+    assert_eq!(attention["data"]["run_id"], run_id.as_str());
+
+    let node = node_get(&socket, &run_id, "empty");
+    assert_eq!(node["status"], "needs_attention", "{node}");
+    assert!(
+        node["evidence"].is_null(),
+        "a node with no result artifact records no completion evidence: {node}"
+    );
+
+    // The node dir really has no result — the report, not the file, is what
+    // surfaced it.
+    let node_dir = node["node_dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a bound node reports its node dir: {node}"));
+    assert!(
+        !Path::new(node_dir).join("result.json").exists(),
+        "the fixture must not have written a result: {node_dir}"
+    );
+
+    assert_ne!(
+        run_status(&socket, &run_id),
+        "succeeded",
+        "a run with a node in NeedsAttention never reports success"
+    );
+
+    drain_events(&mut reader, &mut seen, Duration::from_millis(300));
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 4d. An agent node's swallowed seed prompt is re-delivered
+// ---------------------------------------------------------------------------
+
+/// Where the agent stub records its argv and everything delivered into it.
+fn agent_stub_log(base: &Path) -> PathBuf {
+    base.join("agent-stub.log")
+}
+
+fn read_agent_stub_log(base: &Path) -> String {
+    fs::read_to_string(agent_stub_log(base)).unwrap_or_default()
+}
+
+/// Lines the stub tagged with `tag`, in order.
+fn agent_stub_lines(log: &str, tag: &str) -> Vec<String> {
+    let prefix = format!("{tag}\t");
+    log.lines()
+        .filter_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `04` §4.2's seed prompt, end to end against a real server, and the only
+/// scenario here that exercises `runner = "agent"`.
+///
+/// Two defects meet in this one path, and both are server-only — the TUI event
+/// loop always did these and the headless loop did not, so neither could be
+/// caught by an engine unit test:
+///
+///   * the seed named `./task.md`, which is relative to the node's *cwd* (the
+///     workspace) while `task.md` lives in the *node dir*, so the path did not
+///     resolve even when the prompt survived; and
+///   * a seed consumed by claude's first-run workspace-trust dialog was never
+///     re-delivered, so the node sat `Running` forever with nothing to
+///     escalate — the sustained-idle rule counts detector *ticks*, and the
+///     server never advanced the engine clock, so the streak never reached
+///     three. Reaching the re-delivery then needs the managed agent to leave
+///     `Pending`, which the server also never did, so `agent.prompt` answered
+///     `agent_not_ready`.
+///
+/// The `claude` on the server's PATH is `agent_stub.sh`, which swallows its
+/// seed and renders what claude's real detection manifest matches. The
+/// assertions are on what that *process* received, not on what the API
+/// reported: an interrupt or a prompt that is only acknowledged by the control
+/// plane is exactly the failure being tested for.
+#[test]
+fn an_agent_that_never_saw_its_seed_prompt_is_reseeded_with_an_absolute_path() {
+    let server = spawn_workflow_server("agent-seed");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let workflow_id = create_workflow(&socket, "agent_seed.toml");
+    let run_id = start_run(&socket, &workflow_id, "add dark mode");
+
+    // Wait for the node to be bound to its pane, which is when the stub has
+    // been execed and has logged the argv it was given.
+    let deadline = Instant::now() + SETTLE;
+    let mut node = node_get(&socket, &run_id, "solo");
+    while Instant::now() < deadline && node["node_dir"].as_str().is_none() {
+        thread::sleep(Duration::from_millis(100));
+        node = node_get(&socket, &run_id, "solo");
+    }
+    let node_dir = node["node_dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the agent node never bound to a pane: {node}"))
+        .to_string();
+    let task_md = Path::new(&node_dir).join("task.md");
+    assert!(
+        task_md.exists(),
+        "the node dir must carry the task the seed points at: {}",
+        task_md.display()
+    );
+
+    // The seed prompt karvex actually execed.
+    let mut log = read_agent_stub_log(&server.base);
+    let seed_deadline = Instant::now() + SETTLE;
+    while Instant::now() < seed_deadline && agent_stub_lines(&log, "SEED").is_empty() {
+        thread::sleep(Duration::from_millis(100));
+        log = read_agent_stub_log(&server.base);
+    }
+    let seeds = agent_stub_lines(&log, "SEED");
+    let seed = seeds
+        .first()
+        .unwrap_or_else(|| panic!("the agent stub never recorded a seed prompt:\n{log}"));
+    assert!(
+        seed.contains(&task_md.display().to_string()),
+        "the seed prompt must name task.md by absolute path, got {seed:?}"
+    );
+    assert!(
+        !seed.contains("./task.md"),
+        "a cwd-relative task.md does not resolve from the node's cwd: {seed:?}"
+    );
+    assert_eq!(
+        agent_stub_lines(&log, "SWALLOWED_SEED").len(),
+        0,
+        "SWALLOWED_SEED carries no payload and is matched as a bare line"
+    );
+    assert!(
+        log.contains("SWALLOWED_SEED"),
+        "the stub must have swallowed its seed for this to be the tested case:\n{log}"
+    );
+
+    // The node never worked, so karvex must re-deliver the seed into the pane.
+    // This is asserted from the stub's own stdin, not from an API response.
+    let redeliver_deadline = Instant::now() + SETTLE;
+    while Instant::now() < redeliver_deadline && agent_stub_lines(&log, "STDIN").is_empty() {
+        thread::sleep(Duration::from_millis(250));
+        log = read_agent_stub_log(&server.base);
+    }
+    let delivered = agent_stub_lines(&log, "STDIN");
+    assert!(
+        !delivered.is_empty(),
+        "the swallowed seed was never re-delivered; the node hangs forever:\n{log}"
+    );
+    assert!(
+        delivered
+            .iter()
+            .any(|line| line.contains(&task_md.display().to_string())),
+        "the re-delivery must carry the absolute task.md path, got {delivered:?}"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 5. A finished run reads back from the store field-equal to its live projection
+// ---------------------------------------------------------------------------
+
+/// A run answered from the journal has to describe the same run the engine
+/// described while it was live. It did not: `nodes_done` came back `0` beside
+/// `status: "succeeded"`, `graph.edges` came back empty, and the run's
+/// workspace binding and every node's `cwd`/`node_dir` were dropped, while
+/// `depth` disagreed outright between the two paths.
+///
+/// The comparison is a whole-projection equality rather than a list of
+/// individual field assertions, so a field that starts diverging later fails
+/// here even though nobody thought to assert it.
+///
+/// The compared shape includes each edge's `fired`/`condition_result`: an edge
+/// that fired live and reads back unfired is the run telling two different
+/// stories about which branch it took.
+#[test]
+fn a_finished_run_reads_back_field_equal_to_its_live_projection() {
+    let server = spawn_workflow_server("restart-fidelity");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    let workspace_id = create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe(&socket);
+
+    let workflow_id = create_workflow(&socket, "two_node_command.toml");
+    let run_id = start_run(&socket, &workflow_id, "add dark mode");
+
+    let finished = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_finished",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        finished["data"]["run"]["status"], "succeeded",
+        "the fixture must reach success before its persistence is compared: {finished}"
+    );
+
+    let live = run_get(&socket, &run_id);
+    let live_shape = run_shape(&live);
+
+    // The live projection is the reference, so it has to carry the facts the
+    // restored one is being checked for — otherwise "equal" could mean "both
+    // empty".
+    assert_eq!(live["run"]["nodes_done"], 2, "live run: {live}");
+    assert_eq!(live["run"]["nodes_total"], 2, "live run: {live}");
+    assert_eq!(
+        live["run"]["workspace_id"],
+        workspace_id.as_str(),
+        "live run: {live}"
+    );
+    assert_eq!(
+        live["graph"]["edges"].as_array().map(Vec::len),
+        Some(1),
+        "live graph: {live}"
+    );
+    for edge in live["graph"]["edges"].as_array().expect("live edges") {
+        assert_eq!(
+            (&edge["fired"], &edge["condition_result"]),
+            (&json!(true), &json!(true)),
+            "the fixture's only edge must have fired live, or comparing the \
+             firing state proves nothing: {edge}"
+        );
+    }
+    for node in live["graph"]["nodes"].as_array().expect("live nodes") {
+        assert!(
+            node["cwd"].is_string() && node["node_dir"].is_string(),
+            "a bound node knows where it ran: {node}"
+        );
+    }
+
+    // Durable writes are queued onto the store thread, which serves its jobs in
+    // order; a completed `workflow.run.list` is therefore a barrier proving
+    // every write submitted before it has already been applied. Without this
+    // the restart could race the last node's write.
+    let listed = request_ok(
+        &socket,
+        &request(
+            "req_run_list_barrier",
+            "workflow.run.list",
+            json!({ "workflow_id": workflow_id }),
+        ),
+    );
+    assert!(
+        listed["runs"]
+            .as_array()
+            .is_some_and(|runs| runs.iter().any(|run| run["run_id"] == run_id.as_str())),
+        "the run must be in the store before the restart: {listed}"
+    );
+
+    // ── the same run, from a server that never executed it ──────────────────
+    let server = server.restart();
+    let socket = server.socket().to_path_buf();
+    require_workflow_api(&socket);
+
+    let restored = run_get(&socket, &run_id);
+    assert_eq!(
+        restored["run"]["run_id"],
+        run_id.as_str(),
+        "the restarted server must answer for the same run: {restored}"
+    );
+    assert_eq!(
+        run_shape(&restored),
+        live_shape,
+        "a run read back from the store must describe the same run the engine \
+         did.\nlive:     {live}\nrestored: {restored}"
+    );
+
+    // `ended_at_unix_ms` is outside `run_shape` because most timestamps are
+    // uninteresting to compare, but this one used to be stamped twice — once by
+    // the app when the run left the live set and once by the store when the
+    // queued write was applied — so the same finished run reported two
+    // different end times tens of milliseconds apart.
+    assert!(
+        live["run"]["ended_at_unix_ms"].is_u64(),
+        "a finished run has an end time: {live}"
+    );
+    assert_eq!(
+        restored["run"]["ended_at_unix_ms"], live["run"]["ended_at_unix_ms"],
+        "the run's close time is stamped once, by the engine that closed it.\n\
+         live:     {live}\nrestored: {restored}"
+    );
+
+    server.shutdown();
+}
+
+/// The comparable shape of a `workflow.run.get` result: the run facts and the
+/// per-node/per-edge facts that both the live engine and the store are supposed
+/// to know, normalised into a stable order.
+///
+/// Deliberately excludes what genuinely cannot survive a restart (timestamps
+/// are equal but pointless to compare, and the pane behind `pane_id` is gone)
+/// and what nothing persists yet (`watchdog_interventions`).
+fn run_shape(response: &Value) -> Value {
+    let run = &response["run"];
+    let mut nodes: Vec<Value> = response["graph"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|node| {
+            json!({
+                "path": node["path"],
+                "node_key": node["node_key"],
+                "depth": node["depth"],
+                "status": node["status"],
+                "demand": node["demand"],
+                "model": node["model"],
+                "effort": node["effort"],
+                "attempt": node["attempt"],
+                "cwd": node["cwd"],
+                "node_dir": node["node_dir"],
+                "evidence": node["evidence"],
+                "succession": node["succession"],
+            })
+        })
+        .collect();
+    nodes.sort_by_key(|node| node["path"].as_str().unwrap_or_default().to_string());
+
+    let mut edges: Vec<Value> = response["graph"]["edges"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|edge| {
+            json!({
+                "from": edge["from"],
+                "to": edge["to"],
+                "kind": edge["kind"],
+                "fired": edge["fired"],
+                "condition_result": edge["condition_result"],
+            })
+        })
+        .collect();
+    edges.sort_by_key(|edge| {
+        format!(
+            "{}->{}",
+            edge["from"].as_str().unwrap_or_default(),
+            edge["to"].as_str().unwrap_or_default()
+        )
+    });
+
+    json!({
+        "status": run["status"],
+        "tier": run["tier"],
+        "args": run["args"],
+        "workspace_id": run["workspace_id"],
+        "tab_id": run["tab_id"],
+        "nodes_total": run["nodes_total"],
+        "nodes_done": run["nodes_done"],
+        "nodes": nodes,
+        "edges": edges,
+    })
 }

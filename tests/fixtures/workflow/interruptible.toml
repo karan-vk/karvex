@@ -1,0 +1,34 @@
+# Phase 1 end-to-end fixture for interruption
+# (`docs/design/workflow-builder/04-kvdag-and-execution.md` §5).
+#
+# One long-lived `runner = "command"` node that traps SIGINT and prints on
+# receipt, so `pane.read` can tell an interrupt that really reached the process
+# from one that was only reported. Escape — the agent-runner interrupt — is a
+# `claude` TUI convention this process would simply ignore; what a plain
+# process observes is `ctrl+c` through the pane's own line discipline.
+#
+# The stub-path placeholder in `command` is substituted by the test with the
+# absolute path of `tests/fixtures/workflow/node_stub.sh`.
+
+name = "e2e-interruptible"
+description = "a plain-process node that acknowledges a real interrupt"
+contract = """
+Reply only through result.json.
+"""
+max_depth = 3
+max_nodes = 24
+
+[[arg]]
+name = "goal"
+required = true
+description = "what to build"
+
+[[node]]
+key = "worker"
+label = "Worker"
+kind = "agent"
+runner = "command"
+command = ["/bin/sh", "@STUB@", "trap"]
+demand = "standard"
+prompt_template = "Work on: {{goal}}"
+output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }

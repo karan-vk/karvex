@@ -274,6 +274,32 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 }
 
 // ---------------------------------------------------------------------------
+// Socket path preflight (H1)
+// ---------------------------------------------------------------------------
+
+/// H1: on Unix, `client_socket_path()` feeds `sockaddr_un.sun_path`, which has
+/// a small, hard OS limit (104 bytes on macOS, 108 on Linux). A path over that
+/// limit fails deep inside a spawned server's `bind()`/`connect()` — a process
+/// whose stdio is redirected to `/dev/null`
+/// (`build_server_daemon_command`) and whose crash predates its first log
+/// line, leaving a 0-byte `karvex-server.log` and nothing but a 15s client
+/// timeout to go on. Checking here, before that process is ever spawned, turns
+/// that into an immediate, actionable error instead.
+///
+/// A named session (`--session <name>`) is the common way to hit this: it
+/// inserts `sessions/<name>/` into the path. Windows named pipes have no such
+/// byte ceiling, so this is a no-op there.
+#[cfg(unix)]
+fn preflight_socket_path(path: &Path) -> io::Result<()> {
+    crate::ipc::check_socket_path_len(path).map_err(io::Error::other)
+}
+
+#[cfg(windows)]
+fn preflight_socket_path(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Auto-detect launch
 // ---------------------------------------------------------------------------
 
@@ -290,6 +316,7 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 pub fn auto_detect_launch() -> io::Result<()> {
     let socket_path = client_socket_path();
     info!(path = %socket_path.display(), "auto-detect launch starting");
+    preflight_socket_path(&socket_path)?;
 
     if is_server_listening_at(&socket_path) {
         validate_running_server_compatibility()?;
@@ -335,6 +362,62 @@ mod tests {
         let dir = unique_test_dir("nonexistent");
         let path = dir.join("s.sock");
         assert!(!is_server_listening_at(&path));
+    }
+
+    /// H1 regression: a socket path over the platform's `sun_path` limit must
+    /// be rejected before anything tries to spawn a server or bind/connect —
+    /// that is what used to produce a silent, stdio-swallowed crash and a
+    /// 0-byte log instead of an actionable error.
+    #[test]
+    fn preflight_socket_path_rejects_a_path_over_the_macos_limit() {
+        let overlong = std::path::PathBuf::from(format!(
+            "/{}/karvex-client.sock",
+            "x".repeat(crate::ipc::MACOS_SUN_PATH_LIMIT)
+        ));
+        let err = preflight_socket_path(&overlong).expect_err("path is over the limit");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        let message = err.to_string();
+        assert!(
+            message.contains("sun_path") || message.contains("bytes"),
+            "{message}"
+        );
+        assert!(message.contains("--session"), "{message}");
+    }
+
+    #[test]
+    fn preflight_socket_path_accepts_a_typical_short_path() {
+        let path = unique_test_dir("short").join("karvex-client.sock");
+        assert!(preflight_socket_path(&path).is_ok());
+    }
+
+    /// `auto_detect_launch` must fail on the overlong-path preflight before it
+    /// ever spawns a server daemon, so this asserts on the *kind* of failure
+    /// (immediate, not a 15s timeout) rather than needing a real spawn.
+    #[test]
+    fn auto_detect_launch_fails_fast_instead_of_waiting_out_the_spawn_timeout() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        crate::session::clear_explicit_session_for_test();
+        std::env::set_var(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            format!(
+                "/{}/karvex.sock",
+                "x".repeat(crate::ipc::MACOS_SUN_PATH_LIMIT)
+            ),
+        );
+
+        let started = std::time::Instant::now();
+        let result = auto_detect_launch();
+        let elapsed = started.elapsed();
+
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+
+        assert!(result.is_err());
+        assert!(
+            elapsed < SERVER_READY_TIMEOUT,
+            "the preflight must reject the path immediately, not after waiting \
+             for a server that can never bind: took {elapsed:?}"
+        );
     }
 
     #[test]

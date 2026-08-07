@@ -24,8 +24,8 @@ use std::collections::BTreeMap;
 use crate::api::schema::{
     ErrorBody, KvdagEdgeInfo, KvdagNodeInfo, KvdagVersionDetail, KvdagVersionSummary,
     ResponseResult, WorkflowArgSpec, WorkflowDefinitionFormat, WorkflowEdgePayload,
-    WorkflowIsolation, WorkflowNodeKind, WorkflowRunGraph, WorkflowRunInfo, WorkflowRunNodeInfo,
-    WorkflowRunner, WorkflowSummary, WorkflowTier, WorkflowVersionOrigin,
+    WorkflowIsolation, WorkflowNodeKind, WorkflowRunEdgeInfo, WorkflowRunGraph, WorkflowRunInfo,
+    WorkflowRunNodeInfo, WorkflowRunner, WorkflowSummary, WorkflowTier, WorkflowVersionOrigin,
 };
 use crate::api::schema::{
     WorkflowCreateParams, WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget,
@@ -48,7 +48,7 @@ use crate::workflow::model::{
     NodeKind, RunGraph, RunId, Runner, WorkflowId,
 };
 #[cfg(feature = "workflow")]
-use crate::workflow::store::{NewRun, StoreError, VersionOrigin};
+use crate::workflow::store::{NewRun, StoreError, VersionOrigin, VersionRecord};
 #[cfg(feature = "workflow")]
 use crate::workflow::tier::Tier;
 
@@ -76,6 +76,13 @@ const INVALID_DEFINITION_CODE: &str = "workflow_invalid_definition";
 /// No workflow, version, run, or node with that id.
 #[cfg(feature = "workflow")]
 const NOT_FOUND_CODE: &str = "workflow_not_found";
+/// A `<name|id>` selector's name half matched more than one workflow.
+/// `workflow_name` carries a UNIQUE index (`migrations/0001_init.surql`), so
+/// this is a defensive backstop rather than a reachable path in the current
+/// schema — matching `agent_target_ambiguous`'s convention in
+/// `src/app/agents.rs` for the same "target might not be unique" shape.
+#[cfg(feature = "workflow")]
+const AMBIGUOUS_NAME_CODE: &str = "workflow_target_ambiguous";
 /// A node method addressed a run this server is not currently executing.
 /// Phase 1 executes one run at a time and only the live run is steerable.
 #[cfg(feature = "workflow")]
@@ -89,6 +96,12 @@ const MISSING_ARG_CODE: &str = "workflow_missing_arg";
 /// refusing.
 #[cfg(feature = "workflow")]
 const NODE_NOT_RUNNING_CODE: &str = "workflow_node_not_running";
+/// A steer or interrupt reached the node's pane path and the runtime refused to
+/// write it. `04-kvdag-and-execution.md` §5 makes these deliveries, not
+/// requests: a control surface that answers `ok` for keystrokes the process
+/// never saw is worse than one that fails loudly.
+#[cfg(feature = "workflow")]
+const DELIVERY_FAILED_CODE: &str = "workflow_node_delivery_failed";
 
 /// Default page size for `workflow.run.list`.
 #[cfg(feature = "workflow")]
@@ -269,26 +282,45 @@ impl App {
         if let Some(error) = require_non_empty(&id, "workflow_id", &target.workflow_id) {
             return error;
         }
-        let workflow_id = WorkflowId::new(target.workflow_id.trim().to_string());
+        let selector = target.workflow_id.trim().to_string();
         let looked_up = self.workflow_store.call(move |cx| {
-            let Some(workflow) = cx.block_on(cx.store().get_workflow(&workflow_id))? else {
-                return Ok::<_, StoreError>(None);
+            let workflow_id = match resolve_workflow_selector(cx, &selector)? {
+                WorkflowSelector::Found(workflow_id) => workflow_id,
+                WorkflowSelector::NotFound => return Ok::<_, StoreError>(LookupResult::NotFound),
+                WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
             };
-            let head = head_version_summary(cx, workflow.head_version.as_ref())?;
-            let versions = head.iter().cloned().collect::<Vec<_>>();
-            Ok(Some((
+            let Some(workflow) = cx.block_on(cx.store().get_workflow(&workflow_id))? else {
+                return Ok(LookupResult::NotFound);
+            };
+            // Walks the immutable parent chain from the head down, so `versions`
+            // is the workflow's whole observable history, not just the head —
+            // `05-phase-plan.md`'s `workflow.get`: "one workflow + its version
+            // chain summary".
+            let records = cx.block_on(
+                cx.store()
+                    .list_version_chain(&workflow_id, workflow.head_version.as_ref()),
+            )?;
+            let versions: Vec<KvdagVersionSummary> =
+                records.iter().map(wire_version_summary).collect();
+            let head = versions.first().cloned();
+            Ok(LookupResult::Found((
                 wire_workflow_summary(workflow, head.as_ref()),
                 versions,
             )))
         });
         match looked_up {
-            Ok(Ok(Some((workflow, versions)))) => {
+            Ok(Ok(LookupResult::Found((workflow, versions)))) => {
                 encode_success(id, ResponseResult::WorkflowGet { workflow, versions })
             }
-            Ok(Ok(None)) => encode_error(
+            Ok(Ok(LookupResult::NotFound)) => encode_error(
                 id,
                 NOT_FOUND_CODE,
                 format!("no workflow with id {}", target.workflow_id),
+            ),
+            Ok(Ok(LookupResult::Ambiguous)) => encode_error(
+                id,
+                AMBIGUOUS_NAME_CODE,
+                format!("multiple workflows matched name {}", target.workflow_id),
             ),
             Ok(Err(error)) => self.store_error(id, &error),
             Err(unavailable) => unavailable_response(id, &unavailable),
@@ -327,12 +359,18 @@ impl App {
                     table: "workflow",
                     id: workflow_id.to_string(),
                 })?;
-            Ok::<_, StoreError>((summary, kvdag))
+            let version_record = cx
+                .block_on(cx.store().get_version_record(&kvdag.version_id))?
+                .ok_or_else(|| StoreError::NotFound {
+                    table: "kvdag_version",
+                    id: kvdag.version_id.to_string(),
+                })?;
+            Ok::<_, StoreError>((summary, version_record))
         });
 
         match created {
-            Ok(Ok((summary, kvdag))) => {
-                let version = wire_version_summary(&kvdag, VersionOrigin::Authored, "");
+            Ok(Ok((summary, version_record))) => {
+                let version = wire_version_summary(&version_record);
                 encode_success(
                     id,
                     ResponseResult::WorkflowCreated {
@@ -361,16 +399,15 @@ impl App {
             Ok(definition) => definition,
             Err(error) => return encode_error(id, INVALID_DEFINITION_CODE, error.to_string()),
         };
-        let workflow_id = WorkflowId::new(params.workflow_id.trim().to_string());
+        let selector = params.workflow_id.trim().to_string();
         let change_summary = params.change_summary.clone();
 
         let created = self.workflow_store.call(move |cx| {
-            if cx
-                .block_on(cx.store().get_workflow(&workflow_id))?
-                .is_none()
-            {
-                return Ok::<_, StoreError>(None);
-            }
+            let workflow_id = match resolve_workflow_selector(cx, &selector)? {
+                WorkflowSelector::Found(workflow_id) => workflow_id,
+                WorkflowSelector::NotFound => return Ok::<_, StoreError>(LookupResult::NotFound),
+                WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
+            };
             let kvdag = cx.block_on(cx.store().create_version(
                 &workflow_id,
                 VersionOrigin::Authored,
@@ -384,13 +421,18 @@ impl App {
                     table: "workflow",
                     id: workflow_id.to_string(),
                 })?;
-            Ok(Some((summary, kvdag)))
+            let version_record = cx
+                .block_on(cx.store().get_version_record(&kvdag.version_id))?
+                .ok_or_else(|| StoreError::NotFound {
+                    table: "kvdag_version",
+                    id: kvdag.version_id.to_string(),
+                })?;
+            Ok(LookupResult::Found((summary, version_record)))
         });
 
         match created {
-            Ok(Ok(Some((summary, kvdag)))) => {
-                let version =
-                    wire_version_summary(&kvdag, VersionOrigin::Authored, &params.change_summary);
+            Ok(Ok(LookupResult::Found((summary, version_record)))) => {
+                let version = wire_version_summary(&version_record);
                 encode_success(
                     id,
                     ResponseResult::WorkflowVersionCreated {
@@ -399,10 +441,15 @@ impl App {
                     },
                 )
             }
-            Ok(Ok(None)) => encode_error(
+            Ok(Ok(LookupResult::NotFound)) => encode_error(
                 id,
                 NOT_FOUND_CODE,
                 format!("no workflow with id {}", params.workflow_id),
+            ),
+            Ok(Ok(LookupResult::Ambiguous)) => encode_error(
+                id,
+                AMBIGUOUS_NAME_CODE,
+                format!("multiple workflows matched name {}", params.workflow_id),
             ),
             Ok(Err(error)) => self.store_error(id, &error),
             Err(unavailable) => unavailable_response(id, &unavailable),
@@ -418,14 +465,21 @@ impl App {
             return error;
         }
         let version_id = KvdagVersionId::new(target.version_id.trim().to_string());
-        let loaded = self
-            .workflow_store
-            .call(move |cx| cx.block_on(cx.store().load_version(&version_id)));
+        let loaded = self.workflow_store.call(move |cx| {
+            let kvdag = cx.block_on(cx.store().load_version(&version_id))?;
+            let record = cx
+                .block_on(cx.store().get_version_record(&version_id))?
+                .ok_or_else(|| StoreError::NotFound {
+                    table: "kvdag_version",
+                    id: version_id.to_string(),
+                })?;
+            Ok::<_, StoreError>((kvdag, record))
+        });
         match loaded {
-            Ok(Ok(kvdag)) => encode_success(
+            Ok(Ok((kvdag, record))) => encode_success(
                 id,
                 ResponseResult::WorkflowVersionGet {
-                    version: wire_version_detail(&kvdag),
+                    version: wire_version_detail(&kvdag, &record),
                 },
             ),
             Ok(Err(StoreError::NotFound { .. })) => encode_error(
@@ -449,28 +503,33 @@ impl App {
             let refused = crate::app::workflow::WorkflowStartError::RunInFlight;
             return encode_error(id, refused.code(), refused.message());
         }
-        let workflow_id = WorkflowId::new(params.workflow_id.trim().to_string());
+        let selector = params.workflow_id.trim().to_string();
         let requested_version = params.version;
 
         // The definition is resolved before the run row is created, so a run
         // whose graph is unusable never leaves a half-started record behind.
         let resolved = self.workflow_store.call(move |cx| {
+            let workflow_id = match resolve_workflow_selector(cx, &selector)? {
+                WorkflowSelector::Found(workflow_id) => workflow_id,
+                WorkflowSelector::NotFound => return Ok::<_, StoreError>(LookupResult::NotFound),
+                WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
+            };
             let Some(summary) = cx.block_on(cx.store().get_workflow(&workflow_id))? else {
-                return Ok::<_, StoreError>(None);
+                return Ok(LookupResult::NotFound);
             };
             let version_id = match requested_version {
                 Some(number) => cx.block_on(cx.store().find_version_id(&workflow_id, number))?,
                 None => summary.head_version,
             };
             let Some(version_id) = version_id else {
-                return Ok(None);
+                return Ok(LookupResult::NotFound);
             };
             let kvdag = cx.block_on(cx.store().load_version(&version_id))?;
-            Ok(Some((summary.default_tier, kvdag)))
+            Ok(LookupResult::Found((summary.default_tier, kvdag)))
         });
         let (default_tier, kvdag) = match resolved {
-            Ok(Ok(Some(resolved))) => resolved,
-            Ok(Ok(None)) => {
+            Ok(Ok(LookupResult::Found(resolved))) => resolved,
+            Ok(Ok(LookupResult::NotFound)) => {
                 return encode_error(
                     id,
                     NOT_FOUND_CODE,
@@ -478,6 +537,13 @@ impl App {
                         "no runnable kvdag version for workflow {}",
                         params.workflow_id
                     ),
+                )
+            }
+            Ok(Ok(LookupResult::Ambiguous)) => {
+                return encode_error(
+                    id,
+                    AMBIGUOUS_NAME_CODE,
+                    format!("multiple workflows matched name {}", params.workflow_id),
                 )
             }
             Ok(Err(StoreError::NotFound { .. })) => {
@@ -504,15 +570,23 @@ impl App {
         let version_id = kvdag.version_id.clone();
         let growth = kvdag.growth;
         let ordered: BTreeMap<String, String> = args.clone().into_iter().collect();
-        let created = self.workflow_store.call(move |cx| {
-            cx.block_on(cx.store().create_run(NewRun {
-                workflow: workflow_id,
-                version: version_id,
-                tier,
-                args: ordered,
-                growth,
-                context_runs: Vec::new(),
-            }))
+        // Recorded on the run row at create time — a run's workspace binding is
+        // a property of the run, not of whichever server happens to be
+        // executing it, so a run read back from the journal keeps it too.
+        let workspace_id = self.active_workspace_public_id();
+        let created = self.workflow_store.call({
+            let workspace_id = workspace_id.clone();
+            move |cx| {
+                cx.block_on(cx.store().create_run(NewRun {
+                    workflow: workflow_id,
+                    version: version_id,
+                    tier,
+                    args: ordered,
+                    growth,
+                    context_runs: Vec::new(),
+                    workspace_id,
+                }))
+            }
         });
         let run_id = match created {
             Ok(Ok(run_id)) => run_id,
@@ -528,7 +602,7 @@ impl App {
             tier,
         )
         .with_args(args)
-        .with_placement(self.active_workspace_public_id(), None);
+        .with_placement(workspace_id, None);
 
         if let Err(error) = self.start_workflow_run(active, kvdag, graph) {
             return encode_error(id, error.code(), error.message());
@@ -579,13 +653,24 @@ impl App {
         if let Some(error) = require_non_empty(&id, "workflow_id", &params.workflow_id) {
             return error;
         }
-        let workflow_id = WorkflowId::new(params.workflow_id.trim().to_string());
+        let selector = params.workflow_id.trim().to_string();
         let limit = params.limit.unwrap_or(DEFAULT_RUN_LIST_LIMIT).max(1);
-        let listed = self
-            .workflow_store
-            .call(move |cx| cx.block_on(cx.store().list_runs(&workflow_id, limit)));
+        // `kvx workflow run list <name|id>` takes the same selector as `show`,
+        // `update`, and `run start`, so it resolves it the same way; listing a
+        // workflow's runs by the name the user gave it must not be the one
+        // verb that only speaks record ids.
+        let listed = self.workflow_store.call(move |cx| {
+            let workflow_id = match resolve_workflow_selector(cx, &selector)? {
+                WorkflowSelector::Found(workflow_id) => workflow_id,
+                WorkflowSelector::NotFound => return Ok::<_, StoreError>(LookupResult::NotFound),
+                WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
+            };
+            Ok(LookupResult::Found(
+                cx.block_on(cx.store().list_runs(&workflow_id, limit))?,
+            ))
+        });
         match listed {
-            Ok(Ok(runs)) => {
+            Ok(Ok(LookupResult::Found(runs))) => {
                 // The live run's authoritative status is the engine's, not the
                 // journal's, so the in-memory projection wins where it applies.
                 let runs = runs
@@ -597,6 +682,16 @@ impl App {
                     .collect();
                 encode_success(id, ResponseResult::WorkflowRunList { runs })
             }
+            Ok(Ok(LookupResult::NotFound)) => encode_error(
+                id,
+                NOT_FOUND_CODE,
+                format!("no workflow with id {}", params.workflow_id),
+            ),
+            Ok(Ok(LookupResult::Ambiguous)) => encode_error(
+                id,
+                AMBIGUOUS_NAME_CODE,
+                format!("multiple workflows matched name {}", params.workflow_id),
+            ),
             Ok(Err(error)) => self.store_error(id, &error),
             Err(unavailable) => unavailable_response(id, &unavailable),
         }
@@ -800,7 +895,18 @@ impl App {
                 format!("node {path_text} has no pane to deliver to"),
             );
         }
+        if delivers_to_pane {
+            self.workflow.clear_delivery_failure();
+        }
         self.apply_workflow_engine_input(input);
+        // A pane delivery the runtime refused is not a success. Reporting one
+        // would tell the caller their interrupt landed on a process that never
+        // saw it — the control surface lying about the system's state.
+        if delivers_to_pane {
+            if let Some(failure) = self.workflow.take_delivery_failure() {
+                return encode_error(id, DELIVERY_FAILED_CODE, failure.describe());
+            }
+        }
         match self.workflow_node_info(path) {
             Some(node) => encode_success(id, result(node)),
             None => node_not_found(
@@ -828,16 +934,18 @@ impl App {
                 return Ok::<_, StoreError>(None);
             };
             let nodes = cx.block_on(cx.store().list_run_nodes(&wanted))?;
-            Ok(Some((record, nodes)))
+            // The `run_edge` relations are written when the run is
+            // materialised and re-settled by `StoreWrite::RunEdge` on every
+            // propagation, so a restored run carries both its topology and the
+            // branches it actually took.
+            let edges = cx.block_on(cx.store().list_run_edges(&wanted))?;
+            Ok(Some((record, nodes, edges)))
         });
         match loaded {
-            Ok(Ok(Some((record, nodes)))) => {
+            Ok(Ok(Some((record, nodes, edges)))) => {
                 let graph = WorkflowRunGraph {
                     nodes: nodes.into_iter().map(wire_run_node_record).collect(),
-                    // Run edges are a `RELATE` projection the Phase 1 read
-                    // surface does not expose; the live graph carries them, and
-                    // a finished run's node statuses already encode the result.
-                    edges: Vec::new(),
+                    edges: edges.into_iter().map(wire_run_edge_record).collect(),
                 };
                 Ok(Some((wire_run_record(record), graph)))
             }
@@ -936,18 +1044,62 @@ fn head_version_summary(
     let Some(head) = head else {
         return Ok(None);
     };
-    match cx.block_on(cx.store().load_version(head)) {
-        Ok(kvdag) => Ok(Some(wire_version_summary(
-            &kvdag,
-            VersionOrigin::Authored,
-            "",
-        ))),
+    match cx.block_on(cx.store().get_version_record(head)) {
+        Ok(Some(record)) => Ok(Some(wire_version_summary(&record))),
         // A workflow whose head version cannot be loaded is still listable;
         // dropping the whole list because one pointer is stale would hide every
         // healthy workflow behind one broken one.
-        Err(StoreError::NotFound { .. }) => Ok(None),
+        Ok(None) => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// The outcome of resolving a `<name|id>` selector against the store, shared
+/// by every `workflow.*` handler that accepts one (`workflow.get`,
+/// `workflow.version.create`, `workflow.run` — `05-phase-plan.md`'s
+/// `kvx workflow show|update|run start <name|id>`). A value already shaped
+/// like a `workflow:<key>` record id is used as that id directly; anything
+/// else is looked up by exact name — the same "resolve the target server-side"
+/// convention `src/app/agents.rs` uses for `agent.get`/`agent.focus`.
+#[cfg(feature = "workflow")]
+enum WorkflowSelector {
+    Found(WorkflowId),
+    NotFound,
+    Ambiguous,
+}
+
+#[cfg(feature = "workflow")]
+fn resolve_workflow_selector(
+    cx: &crate::app::workflow_store::StoreContext<'_>,
+    selector: &str,
+) -> Result<WorkflowSelector, StoreError> {
+    let candidate = WorkflowId::new(selector.to_string());
+    match cx.block_on(cx.store().get_workflow(&candidate)) {
+        Ok(Some(_)) => return Ok(WorkflowSelector::Found(candidate)),
+        Ok(None) => return Ok(WorkflowSelector::NotFound),
+        // Not shaped like a `workflow:<key>` id at all — the selector is a
+        // name candidate, not a broken id.
+        Err(StoreError::Decode(message)) if message.contains("not a workflow id") => {}
+        Err(error) => return Err(error),
+    }
+    let mut matches = cx
+        .block_on(cx.store().find_workflows_by_name(selector))?
+        .into_iter();
+    match (matches.next(), matches.next()) {
+        (None, _) => Ok(WorkflowSelector::NotFound),
+        (Some(found), None) => Ok(WorkflowSelector::Found(found.id)),
+        (Some(_), Some(_)) => Ok(WorkflowSelector::Ambiguous),
+    }
+}
+
+/// A store lookup that first resolves a `<name|id>` selector: `NotFound`/
+/// `Ambiguous` short-circuit before whatever the handler would otherwise have
+/// gone on to read.
+#[cfg(feature = "workflow")]
+enum LookupResult<T> {
+    Found(T),
+    NotFound,
+    Ambiguous,
 }
 
 // ── wire conversions ────────────────────────────────────────────────────────
@@ -974,34 +1126,33 @@ fn wire_workflow_summary(
 }
 
 #[cfg(feature = "workflow")]
-fn wire_version_summary(
-    kvdag: &Kvdag,
-    origin: VersionOrigin,
-    change_summary: &str,
-) -> KvdagVersionSummary {
+fn wire_version_summary(record: &VersionRecord) -> KvdagVersionSummary {
     KvdagVersionSummary {
-        version_id: kvdag.version_id.to_string(),
-        workflow_id: kvdag.workflow_id.to_string(),
-        version: kvdag.version,
-        parent_version_id: kvdag.parent.as_ref().map(std::string::ToString::to_string),
-        origin: wire_origin(origin),
-        change_summary: change_summary.to_string(),
-        spec_digest: kvdag.spec_digest.as_str().to_string(),
-        max_depth: u32::from(kvdag.growth.max_depth),
-        max_nodes: u32::from(kvdag.growth.max_nodes),
-        created_at_unix_ms: 0,
+        version_id: record.version_id.to_string(),
+        workflow_id: record.workflow.to_string(),
+        version: record.version,
+        parent_version_id: record
+            .parent_version_id
+            .as_ref()
+            .map(std::string::ToString::to_string),
+        origin: wire_origin(record.origin),
+        change_summary: record.change_summary.clone(),
+        spec_digest: record.spec_digest.clone(),
+        max_depth: u32::from(record.max_depth),
+        max_nodes: u32::from(record.max_nodes),
+        created_at_unix_ms: record.created_at_unix_ms,
     }
 }
 
 #[cfg(feature = "workflow")]
-fn wire_version_detail(kvdag: &Kvdag) -> KvdagVersionDetail {
+fn wire_version_detail(kvdag: &Kvdag, record: &VersionRecord) -> KvdagVersionDetail {
     KvdagVersionDetail {
         version_id: kvdag.version_id.to_string(),
         workflow_id: kvdag.workflow_id.to_string(),
         version: kvdag.version,
         parent_version_id: kvdag.parent.as_ref().map(std::string::ToString::to_string),
-        origin: WorkflowVersionOrigin::Authored,
-        change_summary: String::new(),
+        origin: wire_origin(record.origin),
+        change_summary: record.change_summary.clone(),
         contract: kvdag.contract.clone(),
         args: kvdag
             .args
@@ -1016,7 +1167,7 @@ fn wire_version_detail(kvdag: &Kvdag) -> KvdagVersionDetail {
         max_depth: u32::from(kvdag.growth.max_depth),
         max_nodes: u32::from(kvdag.growth.max_nodes),
         spec_digest: kvdag.spec_digest.as_str().to_string(),
-        created_at_unix_ms: 0,
+        created_at_unix_ms: record.created_at_unix_ms,
         nodes: kvdag.nodes.iter().map(wire_node_info).collect(),
         edges: kvdag.edges.iter().map(wire_edge_info).collect(),
     }
@@ -1114,10 +1265,10 @@ fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> Workfl
         pane_id: record.pane_id,
         terminal_id: record.terminal_id,
         agent_session_id: record.agent_session_id,
-        cwd: None,
-        node_dir: None,
-        started_at_unix_ms: None,
-        ended_at_unix_ms: None,
+        cwd: record.cwd,
+        node_dir: record.node_dir,
+        started_at_unix_ms: record.started_at_unix_ms,
+        ended_at_unix_ms: record.ended_at_unix_ms,
         total_tokens: record.total_tokens,
         tool_uses: record.tool_uses,
         duration_ms: record.duration_ms,
@@ -1125,6 +1276,17 @@ fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> Workfl
         succession: record.succession.as_ref().map(wire_succession),
         blocker: record.succession.as_ref().and_then(wire_blocker),
         watchdog_interventions: 0,
+    }
+}
+
+#[cfg(feature = "workflow")]
+fn wire_run_edge_record(record: crate::workflow::store::RunEdgeRecord) -> WorkflowRunEdgeInfo {
+    WorkflowRunEdgeInfo {
+        from: record.from.to_string(),
+        to: record.to.to_string(),
+        kind: wire_edge_kind(record.kind),
+        condition_result: record.condition_result,
+        fired: record.fired,
     }
 }
 
@@ -1558,5 +1720,482 @@ output_schema = { type = "object" }
             },
         );
         assert_eq!(error_code(&response), NOT_FOUND_CODE, "{response}");
+    }
+
+    #[cfg(feature = "workflow")]
+    fn single_node_definition(name: &str, prompt: &str) -> WorkflowDefinitionDocument {
+        WorkflowDefinitionDocument {
+            format: WorkflowDefinitionFormat::Toml,
+            text: format!(
+                r#"
+name = "{name}"
+[[node]]
+key = "only"
+label = "Only"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "{prompt}"
+output_schema = {{ type = "object" }}
+"#
+            ),
+        }
+    }
+
+    #[cfg(feature = "workflow")]
+    fn required_arg_definition(name: &str) -> WorkflowDefinitionDocument {
+        WorkflowDefinitionDocument {
+            format: WorkflowDefinitionFormat::Toml,
+            text: format!(
+                r#"
+name = "{name}"
+[[arg]]
+name = "goal"
+required = true
+[[node]]
+key = "only"
+label = "Only"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "do {{{{goal}}}}"
+output_schema = {{ type = "object" }}
+"#
+            ),
+        }
+    }
+
+    /// A7: `workflow.get`'s plural `versions` field must expose the whole
+    /// immutable parent chain — including v1 with its real `origin` and
+    /// `change_summary` — not just a copy of the head.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_get_returns_the_full_version_chain_with_real_metadata() {
+        let mut app = app();
+        let created = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: single_node_definition("ship-feature", "v1 prompt"),
+            },
+        );
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let workflow_id = created["result"]["workflow"]["workflow_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let updated = app.handle_workflow_version_create(
+            "req".into(),
+            WorkflowVersionCreateParams {
+                workflow_id: workflow_id.clone(),
+                definition: single_node_definition("ship-feature", "v2 prompt"),
+                change_summary: "widened the prompt".into(),
+            },
+        );
+        let updated: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            updated["result"]["type"], "workflow_version_created",
+            "unexpected: {updated}"
+        );
+        assert_eq!(updated["result"]["version"]["version"], 2);
+
+        let shown = app.handle_workflow_get(
+            "req".into(),
+            WorkflowTarget {
+                workflow_id: workflow_id.clone(),
+            },
+        );
+        let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        let versions = shown["result"]["versions"].as_array().unwrap_or_else(|| {
+            panic!("`versions` must be an array: {shown}");
+        });
+        assert_eq!(
+            versions.len(),
+            2,
+            "v1 must stay listable after v2 exists, not just the head: {shown}"
+        );
+
+        assert_eq!(versions[0]["version"], 2, "newest first");
+        assert_eq!(versions[0]["origin"], "authored");
+        assert_eq!(versions[0]["change_summary"], "widened the prompt");
+        assert_eq!(
+            versions[0]["parent_version_id"], versions[1]["version_id"],
+            "the chain must actually be parent-linked"
+        );
+
+        assert_eq!(versions[1]["version"], 1);
+        assert_eq!(versions[1]["origin"], "authored");
+        assert_eq!(
+            versions[1]["change_summary"], "",
+            "v1 has no change_summary (none was supplied at create time)"
+        );
+        assert_ne!(
+            versions[0]["version_id"], versions[1]["version_id"],
+            "v1 and v2 must be distinct, inspectable versions"
+        );
+    }
+
+    /// A8: `created_at_unix_ms` must be the store's real timestamp, not the
+    /// hardcoded `0` every create/update/show response used to carry.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn created_at_unix_ms_is_populated_on_create_update_and_show() {
+        let mut app = app();
+        let created = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: single_node_definition("timestamped", "v1"),
+            },
+        );
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let created_at = created["result"]["version"]["created_at_unix_ms"]
+            .as_u64()
+            .expect("created_at_unix_ms must be a number");
+        assert!(created_at > 0, "unexpected: {created}");
+
+        let workflow_id = created["result"]["workflow"]["workflow_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let updated = app.handle_workflow_version_create(
+            "req".into(),
+            WorkflowVersionCreateParams {
+                workflow_id: workflow_id.clone(),
+                definition: single_node_definition("timestamped", "v2"),
+                change_summary: String::new(),
+            },
+        );
+        let updated: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        let updated_at = updated["result"]["version"]["created_at_unix_ms"]
+            .as_u64()
+            .expect("created_at_unix_ms must be a number");
+        assert!(updated_at > 0, "unexpected: {updated}");
+
+        let shown = app.handle_workflow_get("req".into(), WorkflowTarget { workflow_id });
+        let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        for version in shown["result"]["versions"].as_array().unwrap() {
+            assert!(
+                version["created_at_unix_ms"].as_u64().unwrap_or(0) > 0,
+                "unexpected: {version}"
+            );
+        }
+    }
+
+    /// A9: `workflow show <name|id>` — the CLI passes the selector through
+    /// verbatim (`src/cli/workflow.rs`'s `parse_workflow_show_args`), so the
+    /// name has to resolve here, server-side.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_get_resolves_a_unique_name_to_its_id() {
+        let mut app = app();
+        let created = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: single_node_definition("ship-feature", "v1"),
+            },
+        );
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let workflow_id = created["result"]["workflow"]["workflow_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let fetched = app.handle_workflow_get(
+            "req".into(),
+            WorkflowTarget {
+                workflow_id: "ship-feature".into(),
+            },
+        );
+        let fetched: serde_json::Value = serde_json::from_str(&fetched).unwrap();
+        assert_eq!(
+            fetched["result"]["workflow"]["workflow_id"], workflow_id,
+            "unexpected: {fetched}"
+        );
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_get_reports_not_found_for_an_unknown_name() {
+        let mut app = app();
+        let response = app.handle_workflow_get(
+            "req".into(),
+            WorkflowTarget {
+                workflow_id: "does-not-exist".into(),
+            },
+        );
+        assert_eq!(error_code(&response), NOT_FOUND_CODE, "{response}");
+    }
+
+    /// A9: `workflow update <name|id>` — same server-side resolution as show.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_version_create_resolves_a_unique_name_to_its_id() {
+        let mut app = app();
+        app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: single_node_definition("ship-feature", "v1"),
+            },
+        );
+
+        let response = app.handle_workflow_version_create(
+            "req".into(),
+            WorkflowVersionCreateParams {
+                workflow_id: "ship-feature".into(),
+                definition: single_node_definition("ship-feature", "v2"),
+                change_summary: "by name".into(),
+            },
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["type"], "workflow_version_created",
+            "unexpected: {response}"
+        );
+        assert_eq!(response["result"]["version"]["version"], 2);
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_version_create_reports_not_found_for_an_unknown_name() {
+        let mut app = app();
+        let response = app.handle_workflow_version_create(
+            "req".into(),
+            WorkflowVersionCreateParams {
+                workflow_id: "does-not-exist".into(),
+                definition: single_node_definition("does-not-exist", "v1"),
+                change_summary: String::new(),
+            },
+        );
+        assert_eq!(error_code(&response), NOT_FOUND_CODE, "{response}");
+    }
+
+    /// A9: `workflow run start <name|id>` — reaching the missing-argument
+    /// check (rather than `workflow_not_found`) proves the name resolved to
+    /// the workflow just created, without this test having to drive a real
+    /// pane spawn.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_run_resolves_a_unique_name_to_its_id() {
+        let mut app = app();
+        app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: required_arg_definition("ship-feature"),
+            },
+        );
+
+        let response = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id: "ship-feature".into(),
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+            },
+        );
+        assert_eq!(error_code(&response), MISSING_ARG_CODE, "{response}");
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_run_reports_not_found_for_an_unknown_name() {
+        let mut app = app();
+        let response = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id: "does-not-exist".into(),
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+            },
+        );
+        assert_eq!(error_code(&response), NOT_FOUND_CODE, "{response}");
+    }
+
+    /// A9: `workflow run list <name|id>` takes the same selector every other
+    /// targeted verb does. It was the one left speaking record ids only, so a
+    /// user who created and listed a workflow by name could not list its runs
+    /// by that name — the store answered `not a workflow id: <name>`.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_run_list_resolves_a_unique_name_to_its_id() {
+        let mut app = app();
+        app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: single_node_definition("ship-feature", "v1"),
+            },
+        );
+
+        let response = app.handle_workflow_run_list(
+            "req".into(),
+            WorkflowRunListParams {
+                workflow_id: "ship-feature".into(),
+                limit: None,
+            },
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["result"]["type"], "workflow_run_list",
+            "unexpected: {response}"
+        );
+        assert_eq!(
+            response["result"]["runs"].as_array().map(Vec::len),
+            Some(0),
+            "a freshly created workflow has no runs yet: {response}"
+        );
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_run_list_reports_not_found_for_an_unknown_name() {
+        let mut app = app();
+        let response = app.handle_workflow_run_list(
+            "req".into(),
+            WorkflowRunListParams {
+                workflow_id: "does-not-exist".into(),
+                limit: None,
+            },
+        );
+        assert_eq!(error_code(&response), NOT_FOUND_CODE, "{response}");
+    }
+
+    /// Starts a single-node `runner = "command"` workflow and binds its node to
+    /// `pane`, so the node methods have a live run and a bound node to address.
+    /// The pane need not exist: what the delivery path does with a pane it
+    /// cannot write to is exactly what these tests are about.
+    #[cfg(feature = "workflow")]
+    fn app_with_a_bound_command_node(pane: &str) -> (App, String) {
+        use crate::workflow::model::{NodeBinding, NodeToken};
+        use std::path::PathBuf;
+
+        let mut app = app();
+        let created = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: WorkflowDefinitionDocument {
+                    format: WorkflowDefinitionFormat::Toml,
+                    text: r#"
+name = "control-surface"
+[[node]]
+key = "only"
+label = "Only"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "run it"
+output_schema = { type = "object", required = ["done"] }
+"#
+                    .to_string(),
+                },
+            },
+        );
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let workflow_id = created["result"]["workflow"]["workflow_id"]
+            .as_str()
+            .expect("the workflow was created")
+            .to_string();
+
+        let started = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id,
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+            },
+        );
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let run_id = started["result"]["run"]["run_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the run started: {started}"))
+            .to_string();
+
+        app.workflow
+            .record_node_token(&InstancePath::new("only"), NodeToken::new("node-token"));
+        app.bind_workflow_node(
+            &InstancePath::new("only"),
+            NodeBinding {
+                pane_id: crate::workflow::model::PublicPaneId::new(pane),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                agent_session_id: "session-1".to_string(),
+                transcript_path: PathBuf::from("transcript.jsonl"),
+                node_dir: PathBuf::from("/runs/test/only"),
+                cwd: PathBuf::from("/repo"),
+            },
+        );
+        (app, run_id)
+    }
+
+    /// E4: `workflow.node.interrupt` is a *delivery*. When the runtime refuses
+    /// to write the keystroke — here because the bound pane does not exist —
+    /// answering `workflow_node_interrupted` would tell the caller their
+    /// interrupt landed on a process that never saw it.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn an_interrupt_that_was_not_delivered_is_not_reported_as_success() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+
+        let response = app.handle_workflow_node_interrupt(
+            "req".into(),
+            WorkflowNodeTarget {
+                run_id: run_id.clone(),
+                path: "only".into(),
+            },
+        );
+        assert_eq!(error_code(&response), DELIVERY_FAILED_CODE, "{response}");
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("pane.send_keys"),
+            "the error names the delivery that failed: {message}"
+        );
+
+        // A steer is the same shape of delivery and must fail the same way.
+        let response = app.handle_workflow_node_steer(
+            "req".into(),
+            WorkflowNodeSteerParams {
+                run_id,
+                path: "only".into(),
+                text: "keep going".into(),
+            },
+        );
+        assert_eq!(error_code(&response), DELIVERY_FAILED_CODE, "{response}");
+    }
+
+    /// D4: `kvx workflow node complete` reports `null` when it cannot read or
+    /// parse `result.json`, and the server — not the client — is what turns
+    /// that into `NeedsAttention`. A `runner = "command"` node has no other
+    /// completion signal, so without this it stalls `Running` forever.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_report_with_no_result_reaches_needs_attention_through_the_server() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        assert_eq!(
+            app.workflow_node_info(&InstancePath::new("only"))
+                .map(|node| node.status),
+            Some(crate::api::schema::WorkflowNodeStatus::Running)
+        );
+
+        let response = app.handle_workflow_node_report(
+            "req".into(),
+            WorkflowNodeReportParams {
+                run_id,
+                path: "only".into(),
+                token: "node-token".into(),
+                result: serde_json::Value::Null,
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["type"], "workflow_node_reported",
+            "the report is accepted by the server, not refused: {value}"
+        );
+        assert_eq!(
+            value["result"]["node"]["status"], "needs_attention",
+            "a report with no result artifact never completes a node: {value}"
+        );
+        assert!(
+            value["result"]["node"]["evidence"].is_null(),
+            "a node with no result artifact records no completion evidence: {value}"
+        );
     }
 }

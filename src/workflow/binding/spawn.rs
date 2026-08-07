@@ -49,13 +49,25 @@ pub const RESULT_FILE: &str = "result.json";
 pub const INPUTS_DIR: &str = "inputs";
 pub const ARTIFACTS_DIR: &str = "artifacts";
 
-/// The `claude` argv's trailing positional. `SpawnSpec::seed_prompt` overrides
-/// it; this is the fallback so an empty spec still produces a working spawn.
-pub const SEED_PROMPT: &str = "Read ./task.md and follow it.";
+/// The `claude` argv's trailing positional, and the same text when it has to be
+/// re-delivered through `agent.prompt`. `SpawnSpec::seed_prompt` overrides it;
+/// this is the fallback so an empty spec still produces a working spawn.
+///
+/// The path is **absolute**. A node's cwd is the workspace directory (§4.2), not
+/// its node directory, so a relative `./task.md` names a file that does not
+/// exist and the agent has nothing to read; `--add-dir <node_dir>` is what makes
+/// the absolute path readable.
+pub fn seed_prompt_for(node_dir: &Path) -> String {
+    format!("Read {} and follow it.", node_dir.join(TASK_FILE).display())
+}
 
-/// §5: interrupt is `agent.send_keys [Escape]`. Spelled exactly as the engine
-/// emits it in `RunEffect::SendKeys`, so the two cannot drift.
-pub const INTERRUPT_KEYS: [&str; 1] = ["Escape"];
+/// §5: an agent node's interrupt is `agent.send_keys [Escape]` — what a
+/// `claude` TUI reads as "stop this turn". A `Runner::Command` node is a plain
+/// process with no such convention, so its interrupt is the terminal's own
+/// `ctrl+c`, which the line discipline turns into SIGINT. Spelled exactly as
+/// the engine emits them in `RunEffect::SendKeys`, so the two cannot drift.
+pub const AGENT_INTERRUPT_KEYS: [&str; 1] = ["Escape"];
+pub const COMMAND_INTERRUPT_KEYS: [&str; 1] = ["ctrl+c"];
 
 /// Mirrors the settle delay and launch window `agent.start` uses. Those
 /// constants are private to `src/app/agents.rs`; a node spawn is the same shape
@@ -369,7 +381,7 @@ pub fn agent_argv(spec: &SpawnSpec) -> Vec<String> {
     }
     argv.push("--add-dir".to_string());
     argv.push(spec.node_dir.to_string_lossy().into_owned());
-    argv.push(seed_prompt(spec).to_string());
+    argv.push(seed_prompt(spec));
     argv
 }
 
@@ -397,11 +409,11 @@ pub fn argv_for(spec: &SpawnSpec) -> Result<Vec<String>, SpawnError> {
     Ok(argv)
 }
 
-fn seed_prompt(spec: &SpawnSpec) -> &str {
+fn seed_prompt(spec: &SpawnSpec) -> String {
     if spec.seed_prompt.trim().is_empty() {
-        SEED_PROMPT
+        seed_prompt_for(&spec.node_dir)
     } else {
-        spec.seed_prompt.as_str()
+        spec.seed_prompt.clone()
     }
 }
 
@@ -636,12 +648,13 @@ pub fn close_node_pane(workspace: &mut Workspace, pane_id: PaneId) -> bool {
     workspace.close_pane(pane_id)
 }
 
-/// The keys `RunEffect::SendKeys` carries for an interrupt (§5).
-pub fn interrupt_keys() -> Vec<String> {
-    INTERRUPT_KEYS
-        .iter()
-        .map(|key| (*key).to_string())
-        .collect()
+/// The keys `RunEffect::SendKeys` carries for an interrupt (§5), by runner.
+pub fn interrupt_keys(runner: Runner) -> Vec<String> {
+    let keys: &[&str] = match runner {
+        Runner::Agent => &AGENT_INTERRUPT_KEYS,
+        Runner::Command => &COMMAND_INTERRUPT_KEYS,
+    };
+    keys.iter().map(|key| (*key).to_string()).collect()
 }
 
 // ── steering and delivery (§5, §5.1) ────────────────────────────────────────
@@ -749,8 +762,35 @@ mod tests {
                 "Reply only through result.json.".to_string(),
                 "--add-dir".to_string(),
                 "/runs/run-1/plan".to_string(),
-                SEED_PROMPT.to_string(),
+                seed_prompt_for(&PathBuf::from("/runs/run-1/plan")),
             ]
+        );
+    }
+
+    /// The node's cwd is the workspace, not the node directory, so a relative
+    /// `./task.md` in the seed prompt names a file the agent cannot open. The
+    /// path has to be the absolute one `--add-dir` just made readable.
+    #[test]
+    fn the_default_seed_prompt_names_task_md_by_absolute_path() {
+        let spec = agent_spec();
+        let seed = agent_argv(&spec)
+            .last()
+            .cloned()
+            .expect("the argv ends with the seed prompt");
+
+        let task = PathBuf::from("/runs/run-1/plan").join(TASK_FILE);
+        assert!(
+            seed.contains(&task.display().to_string()),
+            "the seed prompt must name {}: {seed}",
+            task.display()
+        );
+        assert!(
+            !seed.contains("./task.md"),
+            "a cwd-relative task.md does not resolve from the node's cwd: {seed}"
+        );
+        assert!(
+            std::path::Path::new(&task).is_absolute(),
+            "the node dir the seed points at is absolute"
         );
     }
 
@@ -1112,9 +1152,24 @@ mod tests {
 
     #[test]
     fn interrupt_uses_a_key_the_api_key_parser_accepts() {
-        assert_eq!(interrupt_keys(), vec!["Escape".to_string()]);
-        let (code, modifiers) = crate::config::parse_key_combo(INTERRUPT_KEYS[0]).unwrap();
+        assert_eq!(
+            interrupt_keys(Runner::Agent),
+            vec!["Escape".to_string()],
+            "an agent's turn is stopped with Escape"
+        );
+        let (code, modifiers) = crate::config::parse_key_combo(AGENT_INTERRUPT_KEYS[0]).unwrap();
         assert_eq!(code, crossterm::event::KeyCode::Esc);
         assert!(modifiers.is_empty());
+    }
+
+    /// Escape is a convention of the `claude` TUI. A `Runner::Command` node is
+    /// a plain process that ignores it; the interrupt it does observe is
+    /// `ctrl+c`, which the PTY line discipline turns into SIGINT.
+    #[test]
+    fn a_command_node_is_interrupted_with_a_signal_it_can_observe() {
+        assert_eq!(interrupt_keys(Runner::Command), vec!["ctrl+c".to_string()]);
+        let (code, modifiers) = crate::config::parse_key_combo(COMMAND_INTERRUPT_KEYS[0]).unwrap();
+        assert_eq!(code, crossterm::event::KeyCode::Char('c'));
+        assert!(modifiers.contains(crossterm::event::KeyModifiers::CONTROL));
     }
 }

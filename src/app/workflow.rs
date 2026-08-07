@@ -28,8 +28,8 @@ use tracing::{debug, warn};
 
 use crate::api::schema::{
     AgentPromptParams, AgentSendKeysParams, ErrorResponse, EventData, EventEnvelope, EventKind,
-    Method, PaneSendTextParams, WorkflowDemand, WorkflowEdgeKind, WorkflowEvidence,
-    WorkflowNodeStatus, WorkflowRunEdgeInfo, WorkflowRunGraph, WorkflowRunInfo,
+    Method, PaneSendKeysParams, PaneSendTextParams, WorkflowDemand, WorkflowEdgeKind,
+    WorkflowEvidence, WorkflowNodeStatus, WorkflowRunEdgeInfo, WorkflowRunGraph, WorkflowRunInfo,
     WorkflowRunNodeInfo, WorkflowRunStatus, WorkflowSuccession, WorkflowTier,
 };
 use crate::app::state::{ToastKind, ToastNotification};
@@ -154,6 +154,30 @@ pub(crate) struct WorkflowRuntimeState {
     /// carry it, and it is what authenticates `workflow.node.report`.
     node_tokens: HashMap<InstancePath, NodeToken>,
     next_tick_at: Option<Instant>,
+    /// The last pane delivery the runtime could not make. A control-plane call
+    /// that answers `ok` for an interrupt or a steer whose keystrokes never
+    /// reached the process is a lie about the system's state, so the API layer
+    /// takes this after driving the engine and answers with the failure.
+    delivery_failure: Option<DeliveryFailure>,
+}
+
+/// A `RunEffect` delivery into a node's pane that the in-process API refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeliveryFailure {
+    /// The API method that was attempted, e.g. `agent.send_keys`.
+    pub(crate) method: String,
+    pub(crate) pane: String,
+    pub(crate) code: String,
+    pub(crate) message: String,
+}
+
+impl DeliveryFailure {
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{} to pane {} failed: {}: {}",
+            self.method, self.pane, self.code, self.message
+        )
+    }
 }
 
 impl WorkflowRuntimeState {
@@ -170,7 +194,22 @@ impl WorkflowRuntimeState {
             spawn_failures: HashMap::new(),
             node_tokens: HashMap::new(),
             next_tick_at: None,
+            delivery_failure: None,
         }
+    }
+
+    pub(crate) fn record_delivery_failure(&mut self, failure: DeliveryFailure) {
+        self.delivery_failure = Some(failure);
+    }
+
+    /// Clears any delivery failure left by an earlier effect batch, so a call
+    /// only ever answers for its own delivery.
+    pub(crate) fn clear_delivery_failure(&mut self) {
+        self.delivery_failure = None;
+    }
+
+    pub(crate) fn take_delivery_failure(&mut self) -> Option<DeliveryFailure> {
+        self.delivery_failure.take()
     }
 
     pub(crate) fn config(&self) -> EngineConfig {
@@ -290,6 +329,11 @@ impl WorkflowRuntimeState {
             (true, Some(deadline)) if deadline > now => Some(deadline),
             (true, _) => Some(now + WORKFLOW_TICK_INTERVAL),
         };
+        // Fallback only: a run that leaves the live set through a path the
+        // engine did not close (so no `StoreWrite::RunStatus` carried a stamp)
+        // still gets an end time. `queue_write` overwrites this with the
+        // engine's stamp whenever there is one, so the live run and the journal
+        // agree.
         if let Some(run) = self.run.as_mut() {
             if !live && run.ended_at_unix_ms.is_none() {
                 run.ended_at_unix_ms = Some(current_unix_ms());
@@ -309,6 +353,20 @@ impl WorkflowRuntimeState {
     /// entry and marks the run's persistence degraded rather than blocking a
     /// node transition on I/O.
     pub(crate) fn queue_write(&mut self, write: StoreWrite) {
+        // The engine stamps the run's close time as it closes the run, and both
+        // the live projection and the journal report *that* stamp. Without this
+        // the live run kept the stamp `settle` took and the store took its own
+        // when the queued write was finally applied, so the same run reported
+        // two end times tens of milliseconds apart.
+        if let StoreWrite::RunStatus {
+            ended_at_unix_ms: Some(ended),
+            ..
+        } = &write
+        {
+            if let Some(run) = self.run.as_mut() {
+                run.ended_at_unix_ms = Some(*ended);
+            }
+        }
         if self.pending_writes.len() >= PENDING_WRITE_BUDGET {
             self.pending_writes.pop_front();
             self.dropped_writes = self.dropped_writes.saturating_add(1);
@@ -704,20 +762,10 @@ impl App {
                 }
             }
             RunEffect::PromptNode { pane, text } => self.deliver_workflow_text(&pane, &text),
-            RunEffect::SendKeys { pane, keys } => {
-                let response = self.dispatch_api_request(
-                    "workflow.node.send_keys",
-                    Method::AgentSendKeys(AgentSendKeysParams {
-                        target: pane.to_string(),
-                        keys,
-                    }),
-                );
-                report_workflow_api_error("agent.send_keys", &pane, &response);
-                true
-            }
+            RunEffect::SendKeys { pane, keys } => self.deliver_workflow_keys(&pane, keys),
             RunEffect::ClosePane { pane } => {
                 let response = self.runtime_pane_close("workflow.node.close", pane.to_string());
-                report_workflow_api_error("pane.close", &pane, &response);
+                self.record_workflow_api_error("pane.close", &pane, &response);
                 true
             }
             RunEffect::Persist(write) => {
@@ -758,8 +806,54 @@ impl App {
             ),
         };
         let response = self.dispatch_api_request("workflow.node.deliver", method);
-        report_workflow_api_error(label, pane, &response);
+        self.record_workflow_api_error(label, pane, &response);
         true
+    }
+
+    /// The interrupt half of `04` §5. `agent.send_keys` verifies the pane still
+    /// hosts the expected agent before writing, which is exactly right for a
+    /// `Runner::Agent` node and exactly wrong for a `Runner::Command` one: a
+    /// plain process is by construction not a detected agent, so that path
+    /// answers `agent_not_ready` and the keystroke never reaches the PTY. A
+    /// command node's keys go through `pane.send_keys`, which writes to the
+    /// terminal itself — that is what makes `ctrl+c` a real SIGINT.
+    fn deliver_workflow_keys(&mut self, pane: &PublicPaneId, keys: Vec<String>) -> bool {
+        let (method, label) = match self.workflow.runner_for_pane(pane) {
+            Runner::Agent => (
+                Method::AgentSendKeys(AgentSendKeysParams {
+                    target: pane.to_string(),
+                    keys,
+                }),
+                "agent.send_keys",
+            ),
+            Runner::Command => (
+                Method::PaneSendKeys(PaneSendKeysParams {
+                    pane_id: pane.to_string(),
+                    keys,
+                }),
+                "pane.send_keys",
+            ),
+        };
+        let response = self.dispatch_api_request("workflow.node.send_keys", method);
+        self.record_workflow_api_error(label, pane, &response);
+        true
+    }
+
+    /// An in-process API call answers with the same envelope a client would
+    /// get, so a failed delivery is logged *and* kept: the caller that asked for
+    /// the delivery has to be able to tell that it did not happen.
+    fn record_workflow_api_error(&mut self, method: &str, pane: &PublicPaneId, response: &str) {
+        let Some(failure) = workflow_api_error(method, pane, response) else {
+            return;
+        };
+        warn!(
+            method,
+            pane = %pane,
+            code = %failure.code,
+            message = %failure.message,
+            "workflow effect delivery failed"
+        );
+        self.workflow.record_delivery_failure(failure);
     }
 
     /// Puts every admitted node into a pane through `workflow::binding::spawn`,
@@ -1030,7 +1124,7 @@ impl App {
                 cwd,
                 isolation: spec_node.isolation,
                 contract,
-                seed_prompt: spawn::SEED_PROMPT.to_string(),
+                seed_prompt: spawn::seed_prompt_for(&layout.root),
                 token: spawn::mint_node_token(),
             },
             output_schema: spec_node.output_schema.clone(),
@@ -1219,8 +1313,8 @@ impl App {
             agent_session_id: binding.map(|binding| binding.agent_session_id.clone()),
             cwd: binding.map(|binding| binding.cwd.display().to_string()),
             node_dir: binding.map(|binding| binding.node_dir.display().to_string()),
-            started_at_unix_ms: None,
-            ended_at_unix_ms: None,
+            started_at_unix_ms: node.started_at_unix_ms,
+            ended_at_unix_ms: node.ended_at_unix_ms,
             total_tokens: node.usage.total_tokens,
             tool_uses: node.usage.tool_uses,
             duration_ms: node.usage.duration_ms,
@@ -1265,18 +1359,19 @@ impl App {
 }
 
 /// An in-process API call answers with the same envelope a client would get, so
-/// a failed delivery is visible in the log instead of being dropped.
-fn report_workflow_api_error(method: &str, pane: &PublicPaneId, response: &str) {
-    let Ok(error) = serde_json::from_str::<ErrorResponse>(response) else {
-        return;
-    };
-    warn!(
-        method,
-        pane = %pane,
-        code = %error.error.code,
-        message = %error.error.message,
-        "workflow effect delivery failed"
-    );
+/// a failed delivery is recoverable from the response instead of being dropped.
+fn workflow_api_error(
+    method: &str,
+    pane: &PublicPaneId,
+    response: &str,
+) -> Option<DeliveryFailure> {
+    let error = serde_json::from_str::<ErrorResponse>(response).ok()?;
+    Some(DeliveryFailure {
+        method: method.to_string(),
+        pane: pane.to_string(),
+        code: error.error.code,
+        message: error.error.message,
+    })
 }
 
 fn current_unix_ms() -> u64 {
@@ -1722,6 +1817,116 @@ mod tests {
         );
     }
 
+    /// E4: `agent.send_keys` verifies the pane still hosts the expected agent,
+    /// which a plain process never is — the keystroke was being dropped before
+    /// it reached the PTY. A command node's interrupt goes through
+    /// `pane.send_keys` as `ctrl+c`, which the line discipline turns into
+    /// SIGINT, and a delivery the runtime refuses is *recorded* rather than
+    /// only logged, so the caller can be told it did not happen.
+    #[test]
+    fn a_command_node_interrupt_is_a_signal_and_a_failed_delivery_is_recorded() {
+        let mut app = test_app_with_hub(EventHub::default());
+        let definition = definition_with(Runner::Command);
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+        app.bind_workflow_node(&InstancePath::new("plan"), binding_for("w9:p9"));
+
+        let effects = app.workflow.apply(
+            EngineInput::Interrupt {
+                path: InstancePath::new("plan"),
+            },
+            Instant::now(),
+        );
+        let keys = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RunEffect::SendKeys { pane, keys } => Some((pane.clone(), keys.clone())),
+                _ => None,
+            })
+            .expect("an interrupt on a bound node sends keys");
+        assert_eq!(keys.0, PublicPaneId::new("w9:p9"));
+        assert_eq!(
+            keys.1,
+            vec!["ctrl+c".to_string()],
+            "Escape is a claude TUI convention a plain process ignores"
+        );
+
+        // `App::new(no_session)` has no workspace, so the pane cannot be
+        // written to and the delivery fails.
+        app.workflow.clear_delivery_failure();
+        app.apply_workflow_engine_input(EngineInput::Interrupt {
+            path: InstancePath::new("plan"),
+        });
+        let failure = app
+            .workflow
+            .take_delivery_failure()
+            .expect("a refused delivery is recorded, not just logged");
+        assert_eq!(failure.method, "pane.send_keys");
+        assert_eq!(failure.pane, "w9:p9");
+        assert!(
+            failure.describe().contains("pane.send_keys"),
+            "unexpected description: {}",
+            failure.describe()
+        );
+        assert!(
+            app.workflow.take_delivery_failure().is_none(),
+            "taking the failure clears it, so a later call answers for itself"
+        );
+    }
+
+    /// D4: the server owns completion. A self-report with no result artifact is
+    /// `NeedsAttention` (§4.3) — never a client-side veto that leaves the node
+    /// `Running` with the server never told the node tried to finish.
+    #[test]
+    fn a_report_with_a_null_result_needs_attention_instead_of_stalling() {
+        let mut app = test_app_with_hub(EventHub::default());
+        let definition = definition_with(Runner::Command);
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+        app.bind_workflow_node(&InstancePath::new("plan"), binding_for("pane-1"));
+        app.workflow
+            .record_node_token(&InstancePath::new("plan"), NodeToken::new("node-token"));
+        let _ = app.workflow.take_pending_writes(usize::MAX);
+
+        app.report_workflow_node("plan", "node-token", Some(serde_json::Value::Null))
+            .expect("a report with no result still reaches the engine");
+
+        let node = app
+            .workflow_node_info(&InstancePath::new("plan"))
+            .expect("the node projects onto the wire");
+        assert_eq!(node.status, WorkflowNodeStatus::NeedsAttention);
+        assert_eq!(
+            node.evidence, None,
+            "a node with no result artifact records no completion evidence"
+        );
+        assert!(
+            app.workflow
+                .take_pending_writes(usize::MAX)
+                .iter()
+                .any(|write| match write {
+                    StoreWrite::RunEvent {
+                        kind: RunEventKind::Error,
+                        payload,
+                        ..
+                    } => payload["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("no result.json"),
+                    _ => false,
+                }),
+            "the journal records why the node was surfaced"
+        );
+
+        // The wire shape is the only way to say "no result"; an internal caller
+        // that passes nothing at all is still a shape error.
+        assert_eq!(
+            app.report_workflow_node("plan", "node-token", None),
+            Err(observe::ReportRejected::MissingResult)
+        );
+    }
+
     #[test]
     fn an_input_without_a_run_is_a_no_op() {
         let mut state = WorkflowRuntimeState::new(EngineConfig::default());
@@ -1863,6 +2068,14 @@ mod tests {
         app.bind_workflow_node(&InstancePath::new("plan"), binding_for("pane-1"));
 
         let now = Instant::now();
+        // An agent that has worked read its seed prompt, so its idle is the
+        // "went quiet with nothing to show" case rather than the swallowed-seed
+        // one the engine answers with a re-delivery.
+        app.apply_workflow_engine_input(EngineInput::AgentStatus {
+            pane: PublicPaneId::new("pane-1"),
+            state: crate::detect::AgentState::Working,
+            at: now,
+        });
         for _ in 0..3 {
             app.apply_workflow_engine_input(EngineInput::AgentStatus {
                 pane: PublicPaneId::new("pane-1"),

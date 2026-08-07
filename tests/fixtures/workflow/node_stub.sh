@@ -13,6 +13,13 @@
 #                   turns a schema-invalid result from a corrective re-prompt
 #                   into NeedsAttention (§4.3)
 #   idle            never write result.json and never report; just sit there
+#   noresult        report *without* writing result.json. The server, not the
+#                   client, decides what that means (§4.3): a self-report with
+#                   no result artifact is NeedsAttention, and it is the only
+#                   completion signal a `runner = "command"` node has
+#   trap            trap SIGINT and print on receipt, so an interrupt that
+#                   really reached the process is visible in the pane and one
+#                   that did not is visible by its absence (§5)
 #   die   [code]    exit immediately without a result, which §4.3 defines as a
 #                   node failure once the retry policy is exhausted
 #
@@ -48,6 +55,20 @@ case "$mode" in
     ;;
   idle)
     printf 'node-stub idle\n'
+    ;;
+  noresult)
+    # Deliberately no result.json. `kvx workflow node complete` must still
+    # reach the server; a client that vetoes the report here leaves the node
+    # Running forever with nothing to escalate.
+    rm -f "$node_dir/result.json"
+    kvx workflow node complete || printf 'node-stub: report exited non-zero\n'
+    printf 'node-stub reported without a result\n'
+    ;;
+  trap)
+    # `sh` runs a trap once the command in progress returns, so the `sleep` in
+    # the loop below bounds how long the acknowledgement takes.
+    trap 'printf "node-stub interrupted\n"' INT
+    printf 'node-stub trapping\n'
     ;;
   die)
     printf 'node-stub exiting without a result\n'

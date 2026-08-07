@@ -6,15 +6,16 @@
 use std::collections::BTreeMap;
 
 use crate::workflow::model::{
-    CheckpointKind, Demand, Evidence, InstancePath, KvdagVersionId, NodeKey, NodeStatus,
+    CheckpointKind, Demand, EdgeKind, Evidence, InstancePath, KvdagVersionId, NodeKey, NodeStatus,
     RunEventKind, RunId, RunStatus, Succession, WorkflowId,
 };
 use crate::workflow::tier::Tier;
 
 use super::records::{self, parse_record_id, record_id_to_string};
 use super::{
-    parse_demand, parse_evidence, parse_node_status, parse_run_status, parse_succession,
-    query_error, StoreError, WorkflowStore, TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
+    parse_demand, parse_edge_kind, parse_evidence, parse_node_status, parse_run_status,
+    parse_succession, query_error, StoreError, VersionOrigin, WorkflowStore, TABLE_KVDAG_VERSION,
+    TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
 };
 
 /// One `workflow` row, projected for listing.
@@ -28,6 +29,24 @@ pub struct WorkflowSummary {
     pub archived: bool,
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
+}
+
+/// One `kvdag_version` row's metadata — everything about a version except its
+/// nodes/edges, which `load_version` still owns because the engine needs the
+/// full validated [`crate::workflow::model::Kvdag`]. Cheap enough to list a
+/// workflow's whole version chain in one query (`workflow.get`'s `versions`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VersionRecord {
+    pub version_id: KvdagVersionId,
+    pub workflow: WorkflowId,
+    pub version: u32,
+    pub parent_version_id: Option<KvdagVersionId>,
+    pub origin: VersionOrigin,
+    pub change_summary: String,
+    pub spec_digest: String,
+    pub max_depth: u16,
+    pub max_nodes: u16,
+    pub created_at_unix_ms: u64,
 }
 
 /// One `workflow_run` row.
@@ -71,11 +90,32 @@ pub struct RunNodeRecord {
     pub pane_id: Option<String>,
     pub terminal_id: Option<String>,
     pub agent_session_id: Option<String>,
+    /// The node's on-disk binding, written alongside the pane binding
+    /// (`03-storage-schema.md` §4.2). Without these a restored node cannot be
+    /// traced back to the `task.md`, `inputs/`, and `artifacts/` it produced.
+    pub cwd: Option<String>,
+    pub node_dir: Option<String>,
     pub evidence: Option<Evidence>,
     pub succession: Option<Succession>,
     pub total_tokens: u64,
     pub tool_uses: u32,
     pub duration_ms: u64,
+    pub started_at_unix_ms: Option<u64>,
+    pub ended_at_unix_ms: Option<u64>,
+}
+
+/// One `run_edge` relation, with both endpoints resolved to the instance paths
+/// the rest of the run surface addresses nodes by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEdgeRecord {
+    pub from: InstancePath,
+    pub to: InstancePath,
+    pub kind: EdgeKind,
+    pub condition_result: Option<bool>,
+    /// Whether the edge has been recorded as fired, i.e. whether `fired_at` is
+    /// set. Written by `StoreWrite::RunEdge` every time the scheduler settles
+    /// the edge, so a restored run reports the branches it actually took.
+    pub fired: bool,
 }
 
 /// One `run_event` row.
@@ -169,6 +209,87 @@ impl WorkflowStore {
             .map(|row| KvdagVersionId::new(record_id_to_string(&row.id))))
     }
 
+    /// Every workflow whose name matches exactly. `workflow_name` carries a
+    /// UNIQUE index (`migrations/0001_init.surql`), so at most one row can
+    /// ever come back — callers that resolve a `<name|id>` selector still
+    /// treat more than one as ambiguous rather than assuming the constraint
+    /// holds.
+    pub async fn find_workflows_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Vec<WorkflowSummary>, StoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM workflow WHERE name = $name")
+            .bind(("name", name.to_string()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::WorkflowRow> = response.take(0).map_err(query_error)?;
+        rows.into_iter().map(workflow_summary).collect()
+    }
+
+    /// One version's metadata (origin/change_summary/created_at/digest/growth),
+    /// without loading its nodes or edges.
+    pub async fn get_version_record(
+        &self,
+        version: &KvdagVersionId,
+    ) -> Result<Option<VersionRecord>, StoreError> {
+        let id = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a kvdag_version id: {version}")))?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM $id")
+            .bind(("id", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::KvdagVersionRow> = response.take(0).map_err(query_error)?;
+        rows.into_iter().next().map(version_record).transpose()
+    }
+
+    /// A workflow's version chain, walking the immutable `parent` link from
+    /// `head` back to the root version. `kvdag_version` rows form a tree in
+    /// general — an explicit non-linear `parent` override is reserved for a
+    /// future, currently-unused origin — so this walks the ancestry `head`
+    /// actually points through rather than returning every row that has ever
+    /// existed for the workflow; an abandoned branch is not part of the
+    /// observable history of the current head. Newest (`head`) first.
+    pub async fn list_version_chain(
+        &self,
+        workflow: &WorkflowId,
+        head: Option<&KvdagVersionId>,
+    ) -> Result<Vec<VersionRecord>, StoreError> {
+        let Some(head) = head else {
+            return Ok(Vec::new());
+        };
+        let workflow_id = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow id: {workflow}")))?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM kvdag_version WHERE workflow = $workflow")
+            .bind(("workflow", workflow_id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::KvdagVersionRow> = response.take(0).map_err(query_error)?;
+        let mut by_id: BTreeMap<String, records::KvdagVersionRow> = rows
+            .into_iter()
+            .map(|row| (record_id_to_string(&row.id), row))
+            .collect();
+
+        let mut chain = Vec::new();
+        let mut cursor = Some(head.to_string());
+        while let Some(current) = cursor {
+            let Some(row) = by_id.remove(&current) else {
+                // The head (or an ancestor) is not among this workflow's own
+                // rows — a stale pointer, not a reason to fail the whole
+                // chain read.
+                break;
+            };
+            cursor = row.parent.as_ref().map(record_id_to_string);
+            chain.push(version_record(row)?);
+        }
+        Ok(chain)
+    }
+
     pub async fn get_run(&self, run: &RunId) -> Result<Option<RunRecord>, StoreError> {
         let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
@@ -217,6 +338,73 @@ impl WorkflowStore {
             .map_err(query_error)?;
         let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
         rows.into_iter().map(run_node_record).collect()
+    }
+
+    /// Every `run_edge` for a run, with both endpoints resolved to instance
+    /// paths.
+    ///
+    /// `run_edge` is a `RELATE` whose `in`/`out` are `run_node` record ids, so
+    /// the endpoints are resolved through this run's own `run_node` rows rather
+    /// than with a graph traversal in the query: the node set is already needed
+    /// beside the edges by every caller, and one extra `SELECT` per run is
+    /// cheaper than a per-edge join. An edge whose endpoint is missing (a
+    /// partially pruned run) is dropped rather than failing the whole read —
+    /// half a topology is still more useful than none, and `prune_run_history`
+    /// only ever removes whole runs.
+    ///
+    /// Ordered by `(from, to, kind)` so a restored graph is stable across
+    /// reads.
+    pub async fn list_run_edges(&self, run: &RunId) -> Result<Vec<RunEdgeRecord>, StoreError> {
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_node WHERE run = $run")
+            .bind(("run", id.clone()))
+            .await
+            .map_err(query_error)?;
+        let node_rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
+        let path_by_id: BTreeMap<String, InstancePath> = node_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    record_id_to_string(&row.id),
+                    InstancePath::new(row.instance_path),
+                )
+            })
+            .collect();
+
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_edge WHERE run = $run")
+            .bind(("run", id))
+            .await
+            .map_err(query_error)?;
+        let edge_rows: Vec<records::RunEdgeRow> = response.take(0).map_err(query_error)?;
+
+        let mut edges = Vec::with_capacity(edge_rows.len());
+        for row in edge_rows {
+            let (Some(from), Some(to)) = (
+                path_by_id.get(&record_id_to_string(&row.r#in)).cloned(),
+                path_by_id.get(&record_id_to_string(&row.out)).cloned(),
+            ) else {
+                continue;
+            };
+            edges.push(RunEdgeRecord {
+                from,
+                to,
+                kind: parse_edge_kind(&row.kind)?,
+                condition_result: row.condition_result,
+                fired: row.fired_at.is_some(),
+            });
+        }
+        edges.sort_by(|left, right| {
+            left.from
+                .cmp(&right.from)
+                .then_with(|| left.to.cmp(&right.to))
+                .then_with(|| edge_kind_order(left.kind).cmp(&edge_kind_order(right.kind)))
+        });
+        Ok(edges)
     }
 
     /// Replays a run's journal in order (`03-storage-schema.md` §6).
@@ -321,6 +509,25 @@ fn unix_ms(value: &surrealdb_types::Datetime) -> u64 {
     u64::try_from(value.timestamp_millis()).unwrap_or(0)
 }
 
+fn version_record(row: records::KvdagVersionRow) -> Result<VersionRecord, StoreError> {
+    Ok(VersionRecord {
+        version_id: KvdagVersionId::new(record_id_to_string(&row.id)),
+        workflow: WorkflowId::new(record_id_to_string(&row.workflow)),
+        version: row.version as u32,
+        parent_version_id: row
+            .parent
+            .as_ref()
+            .map(record_id_to_string)
+            .map(KvdagVersionId::new),
+        origin: VersionOrigin::parse(&row.origin)?,
+        change_summary: row.change_summary,
+        spec_digest: row.spec_digest,
+        max_depth: row.max_depth as u16,
+        max_nodes: row.max_nodes as u16,
+        created_at_unix_ms: unix_ms(&row.created_at),
+    })
+}
+
 fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
     let args = row
         .args
@@ -376,12 +583,27 @@ fn run_node_record(row: records::RunNodeRow) -> Result<RunNodeRecord, StoreError
         pane_id: row.pane_id,
         terminal_id: row.terminal_id,
         agent_session_id: row.agent_session_id,
+        cwd: row.cwd,
+        node_dir: row.node_dir,
         evidence: row.evidence.as_deref().map(parse_evidence).transpose()?,
         succession: parse_succession(row.succession.as_deref(), row.blocker.as_ref())?,
         total_tokens: row.total_tokens as u64,
         tool_uses: row.tool_uses as u32,
         duration_ms: row.duration_ms as u64,
+        started_at_unix_ms: row.started_at.as_ref().map(unix_ms),
+        ended_at_unix_ms: row.ended_at.as_ref().map(unix_ms),
     })
+}
+
+/// A total order over [`EdgeKind`], which is a plain tag with no meaningful
+/// ordering of its own; used only to break ties between two edges that share
+/// both endpoints.
+fn edge_kind_order(kind: EdgeKind) -> u8 {
+    match kind {
+        EdgeKind::Sequence => 0,
+        EdgeKind::Data => 1,
+        EdgeKind::Conditional => 2,
+    }
 }
 
 fn run_event_record(row: records::RunEventRow) -> Result<RunEventRecord, StoreError> {

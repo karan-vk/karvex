@@ -139,6 +139,15 @@ async fn setup_workflow(store: &WorkflowStore) -> (WorkflowId, Kvdag) {
 }
 
 async fn create_run(store: &WorkflowStore, workflow: &WorkflowId, kvdag: &Kvdag) -> RunId {
+    create_run_in_workspace(store, workflow, kvdag, None).await
+}
+
+async fn create_run_in_workspace(
+    store: &WorkflowStore,
+    workflow: &WorkflowId,
+    kvdag: &Kvdag,
+    workspace_id: Option<&str>,
+) -> RunId {
     store
         .create_run(NewRun {
             workflow: workflow.clone(),
@@ -147,6 +156,7 @@ async fn create_run(store: &WorkflowStore, workflow: &WorkflowId, kvdag: &Kvdag)
             args: BTreeMap::new(),
             growth: GrowthLimits::default(),
             context_runs: Vec::new(),
+            workspace_id: workspace_id.map(str::to_string),
         })
         .await
         .expect("create_run")
@@ -432,6 +442,151 @@ async fn version_chain_is_stable_and_old_versions_stay_immutable() {
     assert_eq!(v1_keys, v3_keys, "node_key is stable across versions");
 }
 
+/// `workflow.get`'s `versions` field walks the whole parent chain, not just
+/// the head — this is the store-level guarantee the A7 fix depends on.
+#[tokio::test]
+async fn list_version_chain_walks_every_ancestor_with_real_metadata_newest_first() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("demo", "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+
+    let v1 = store
+        .create_version(
+            &workflow,
+            VersionOrigin::Authored,
+            "v1 summary",
+            diamond_spec(),
+        )
+        .await
+        .expect("v1");
+    store
+        .set_head_version(&workflow, &v1.version_id)
+        .await
+        .expect("head -> v1");
+
+    let mut v2_spec = diamond_spec();
+    v2_spec.nodes[1].prompt_template = "Other half of {{plan}}".to_string();
+    let v2 = store
+        .create_version(&workflow, VersionOrigin::Authored, "v2 summary", v2_spec)
+        .await
+        .expect("v2");
+    store
+        .set_head_version(&workflow, &v2.version_id)
+        .await
+        .expect("head -> v2");
+
+    let chain = store
+        .list_version_chain(&workflow, Some(&v2.version_id))
+        .await
+        .expect("list_version_chain");
+
+    assert_eq!(
+        chain.len(),
+        2,
+        "both versions must be observable, not just the head"
+    );
+    assert_eq!(chain[0].version_id, v2.version_id, "newest first");
+    assert_eq!(chain[0].version, 2);
+    assert_eq!(chain[0].parent_version_id.as_ref(), Some(&v1.version_id));
+    assert_eq!(chain[0].origin, VersionOrigin::Authored);
+    assert_eq!(chain[0].change_summary, "v2 summary");
+    assert!(
+        chain[0].created_at_unix_ms > 0,
+        "created_at must be real, not fabricated"
+    );
+
+    assert_eq!(chain[1].version_id, v1.version_id);
+    assert_eq!(chain[1].version, 1);
+    assert_eq!(chain[1].parent_version_id, None, "v1 has no parent");
+    assert_eq!(chain[1].change_summary, "v1 summary");
+    assert!(chain[1].created_at_unix_ms > 0);
+}
+
+#[tokio::test]
+async fn list_version_chain_is_empty_for_a_workflow_with_no_head() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("headless", "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+
+    let chain = store
+        .list_version_chain(&workflow, None)
+        .await
+        .expect("list_version_chain");
+    assert!(chain.is_empty());
+}
+
+#[tokio::test]
+async fn get_version_record_reports_the_real_origin_change_summary_and_timestamp() {
+    let store = open_mem_store().await;
+    let (workflow, v1) = setup_workflow(&store).await;
+    let v2 = store
+        .create_version(
+            &workflow,
+            VersionOrigin::Authored,
+            "hand-edited the prompt",
+            fanout_spec(2),
+        )
+        .await
+        .expect("v2");
+
+    let record = store
+        .get_version_record(&v2.version_id)
+        .await
+        .expect("get_version_record")
+        .expect("v2 exists");
+    assert_eq!(record.version_id, v2.version_id);
+    assert_eq!(record.parent_version_id.as_ref(), Some(&v1.version_id));
+    assert_eq!(record.origin, VersionOrigin::Authored);
+    assert_eq!(record.change_summary, "hand-edited the prompt");
+    assert_eq!(record.spec_digest, v2.spec_digest.as_str());
+    assert!(record.created_at_unix_ms > 0);
+}
+
+#[tokio::test]
+async fn get_version_record_reports_none_for_an_unknown_version() {
+    let store = open_mem_store().await;
+    let missing = KvdagVersionId::new("kvdag_version:does-not-exist");
+    let record = store
+        .get_version_record(&missing)
+        .await
+        .expect("get_version_record");
+    assert_eq!(record, None);
+}
+
+#[tokio::test]
+async fn find_workflows_by_name_matches_exactly_and_empty_is_not_an_error() {
+    let store = open_mem_store().await;
+    store
+        .create_workflow("ship-feature", "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+
+    let matches = store
+        .find_workflows_by_name("ship-feature")
+        .await
+        .expect("find_workflows_by_name");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].name, "ship-feature");
+
+    let no_match = store
+        .find_workflows_by_name("does-not-exist")
+        .await
+        .expect("find_workflows_by_name");
+    assert!(no_match.is_empty());
+
+    // Case-sensitive: the schema's UNIQUE index is exact-string, and this
+    // resolver must not silently widen the match.
+    let wrong_case = store
+        .find_workflows_by_name("Ship-Feature")
+        .await
+        .expect("find_workflows_by_name");
+    assert!(wrong_case.is_empty());
+}
+
 // ── 4: RELATE traversal, including a fan-out of 12 ──────────────────────
 
 #[tokio::test]
@@ -489,6 +644,340 @@ async fn relate_edges_reload_correctly_for_a_diamond_and_a_fanout_of_twelve() {
     assert_eq!(children.len(), 12);
     for index in 0..12 {
         assert!(children.contains(&NodeKey::new(format!("child{index}"))));
+    }
+}
+
+// ── 4b: run-level persistence fidelity ──────────────────────────────────
+//
+// A run read back from the store has to carry the same facts the live
+// projection does. Each case here covers one field that came back empty or
+// disagreed after a server restart.
+
+/// `name` rather than a fixed literal because `workflow_name` is UNIQUE, so a
+/// test that sets up two runs needs two workflows.
+async fn setup_diamond_run(
+    store: &WorkflowStore,
+    name: &str,
+    workspace_id: Option<&str>,
+) -> (WorkflowId, RunId) {
+    let workflow = store
+        .create_workflow(name, "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let kvdag = store
+        .create_version(
+            &workflow,
+            VersionOrigin::Authored,
+            "diamond",
+            diamond_spec(),
+        )
+        .await
+        .expect("create_version");
+    let run = create_run_in_workspace(store, &workflow, &kvdag, workspace_id).await;
+    (workflow, run)
+}
+
+fn node_status_write(run: &RunId, path: &str, status: NodeStatus) -> StoreWrite {
+    StoreWrite::RunNode {
+        run: run.clone(),
+        path: InstancePath::new(path),
+        status,
+        attempt: 1,
+        binding: None,
+        usage: NodeUsage::default(),
+        evidence: None,
+        succession: None,
+        started_at_unix_ms: None,
+        ended_at_unix_ms: None,
+    }
+}
+
+/// C2: `nodes_done` had a schema field and a read path but no write site, so
+/// every run read from the store reported `0` beside `status: succeeded`.
+#[tokio::test]
+async fn nodes_done_counts_the_runs_terminal_nodes() {
+    let store = open_mem_store().await;
+    let (_, run) = setup_diamond_run(&store, "nodes-done", None).await;
+
+    let before = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("the run exists");
+    assert_eq!(before.nodes_total, 4);
+    assert_eq!(before.nodes_done, 0, "no node has closed yet");
+
+    store
+        .write(node_status_write(&run, "plan", NodeStatus::Running))
+        .await
+        .expect("plan running");
+    assert_eq!(
+        store
+            .get_run(&run)
+            .await
+            .expect("get_run")
+            .map(|r| r.nodes_done),
+        Some(0),
+        "a running node has not closed"
+    );
+
+    store
+        .write(node_status_write(&run, "plan", NodeStatus::Succeeded))
+        .await
+        .expect("plan succeeded");
+    store
+        .write(node_status_write(&run, "left", NodeStatus::Failed))
+        .await
+        .expect("left failed");
+    store
+        .write(node_status_write(&run, "right", NodeStatus::Skipped))
+        .await
+        .expect("right skipped");
+    assert_eq!(
+        store
+            .get_run(&run)
+            .await
+            .expect("get_run")
+            .map(|r| r.nodes_done),
+        Some(3),
+        "every terminal status closes a node, not just Succeeded"
+    );
+
+    // Restarting a node reopens it, so the counter has to come back down —
+    // which an increment-on-write would never do.
+    store
+        .write(node_status_write(&run, "left", NodeStatus::Ready))
+        .await
+        .expect("left restarted");
+    assert_eq!(
+        store
+            .get_run(&run)
+            .await
+            .expect("get_run")
+            .map(|r| r.nodes_done),
+        Some(2),
+        "a node leaving a terminal status must decrement the counter"
+    );
+}
+
+/// C3: the `run_edge` relations were written at run creation but never read
+/// back, so a restored run had no topology at all.
+#[tokio::test]
+async fn run_edges_reload_with_both_endpoints_and_their_kind() {
+    let store = open_mem_store().await;
+    let (_, run) = setup_diamond_run(&store, "run-edges", None).await;
+
+    let edges = store.list_run_edges(&run).await.expect("list_run_edges");
+    let shape: Vec<(String, String, EdgeKind)> = edges
+        .iter()
+        .map(|edge| (edge.from.to_string(), edge.to.to_string(), edge.kind))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("left".to_string(), "join".to_string(), EdgeKind::Data),
+            ("plan".to_string(), "left".to_string(), EdgeKind::Data),
+            ("plan".to_string(), "right".to_string(), EdgeKind::Data),
+            ("right".to_string(), "join".to_string(), EdgeKind::Data),
+        ],
+        "the diamond's four edges must come back in (from, to) order"
+    );
+    assert!(
+        edges.iter().all(|edge| !edge.fired),
+        "a freshly materialised run has settled no edge yet"
+    );
+}
+
+/// `run_edge.fired_at`/`condition_result` had a schema, a read path, and a
+/// scheduler that settles them in memory, but no write site — so a run restored
+/// after a server restart reported `fired: false` on every edge it had actually
+/// taken.
+#[tokio::test]
+async fn run_edge_firing_state_round_trips_through_the_store() {
+    let store = open_mem_store().await;
+    let (_, run) = setup_diamond_run(&store, "run-edge-firing", None).await;
+
+    let firing = |from: &str, to: &str, condition_result, fired| StoreWrite::RunEdge {
+        run: run.clone(),
+        from: InstancePath::new(from),
+        to: InstancePath::new(to),
+        kind: EdgeKind::Data,
+        condition_result,
+        fired,
+    };
+    store
+        .write(firing("plan", "left", Some(true), true))
+        .await
+        .expect("left fired");
+    store
+        .write(firing("plan", "right", Some(false), false))
+        .await
+        .expect("right dead");
+
+    let settled: Vec<(String, String, Option<bool>, bool)> = store
+        .list_run_edges(&run)
+        .await
+        .expect("list_run_edges")
+        .into_iter()
+        .map(|edge| {
+            (
+                edge.from.to_string(),
+                edge.to.to_string(),
+                edge.condition_result,
+                edge.fired,
+            )
+        })
+        .collect();
+    assert_eq!(
+        settled,
+        vec![
+            ("left".to_string(), "join".to_string(), None, false),
+            ("plan".to_string(), "left".to_string(), Some(true), true),
+            ("plan".to_string(), "right".to_string(), Some(false), false),
+            ("right".to_string(), "join".to_string(), None, false),
+        ],
+        "each edge must read back with the firing state it was settled at, and \
+         a write must not touch the edges it does not address"
+    );
+
+    // §3.1 resolution is not one-way: restarting `plan` clears the result its
+    // outbound edges resolved on, so the journal has to un-fire them rather
+    // than keep a stamp describing a branch the run is no longer taking.
+    store
+        .write(firing("plan", "left", None, false))
+        .await
+        .expect("left un-fired");
+    let left = store
+        .list_run_edges(&run)
+        .await
+        .expect("list_run_edges")
+        .into_iter()
+        .find(|edge| edge.from.to_string() == "plan" && edge.to.to_string() == "left")
+        .expect("the plan -> left edge survives");
+    assert_eq!(
+        (left.condition_result, left.fired),
+        (None, false),
+        "an edge whose source was restarted reads back unfired"
+    );
+}
+
+/// C4: `workspace_id` is where a run's panes live; it was present live and
+/// absent from every restored run.
+#[tokio::test]
+async fn create_run_persists_the_workspace_binding() {
+    let store = open_mem_store().await;
+    let (_, bound) = setup_diamond_run(&store, "bound", Some("w1")).await;
+    assert_eq!(
+        store
+            .get_run(&bound)
+            .await
+            .expect("get_run")
+            .and_then(|record| record.workspace_id),
+        Some("w1".to_string())
+    );
+
+    let (_, unbound) = setup_diamond_run(&store, "unbound", None).await;
+    assert_eq!(
+        store
+            .get_run(&unbound)
+            .await
+            .expect("get_run")
+            .and_then(|record| record.workspace_id),
+        None,
+        "a run started with no active workspace records none"
+    );
+}
+
+/// C5: `cwd` and `node_dir` were written with the pane binding but dropped on
+/// the read path, so a restored node could not be traced to its node dir.
+#[tokio::test]
+async fn run_node_binding_reloads_its_filesystem_paths() {
+    let store = open_mem_store().await;
+    let (_, run) = setup_diamond_run(&store, "node-binding", Some("w1")).await;
+
+    store
+        .write(StoreWrite::RunNode {
+            run: run.clone(),
+            path: InstancePath::new("plan"),
+            status: NodeStatus::Running,
+            attempt: 1,
+            binding: Some(NodeBinding {
+                pane_id: crate::workflow::model::PublicPaneId::new("w1:p2"),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                agent_session_id: "457f6939".to_string(),
+                transcript_path: std::path::PathBuf::from("/tmp/runs/r1/plan.jsonl"),
+                node_dir: std::path::PathBuf::from("/tmp/runs/r1/plan"),
+                cwd: std::path::PathBuf::from("/tmp/work"),
+            }),
+            usage: NodeUsage::default(),
+            evidence: None,
+            succession: None,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+        })
+        .await
+        .expect("bind plan");
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    let plan = nodes
+        .iter()
+        .find(|node| node.instance_path == InstancePath::new("plan"))
+        .expect("the plan node");
+    assert_eq!(plan.node_dir.as_deref(), Some("/tmp/runs/r1/plan"));
+    assert_eq!(plan.cwd.as_deref(), Some("/tmp/work"));
+    assert_eq!(plan.pane_id.as_deref(), Some("w1:p2"));
+
+    let unbound = nodes
+        .iter()
+        .find(|node| node.instance_path == InstancePath::new("join"))
+        .expect("the join node");
+    assert_eq!(unbound.node_dir, None, "an unbound node has no node dir");
+    assert_eq!(unbound.cwd, None);
+}
+
+/// C6: `depth` disagreed between the live graph (always 0) and the store
+/// (longest path from a root). `depth` pairs with `run_node.parent` and is what
+/// `04` §3.4 budgets with `max_depth`, so a statically declared graph consumes
+/// none of it — the live reading is the correct one.
+#[tokio::test]
+async fn statically_materialised_run_nodes_all_sit_at_expansion_depth_zero() {
+    let store = open_mem_store().await;
+    let (_, run) = setup_diamond_run(&store, "depth", None).await;
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(nodes.len(), 4);
+    for node in &nodes {
+        assert_eq!(
+            node.depth, 0,
+            "{} is statically declared, so it spends no expansion budget",
+            node.instance_path
+        );
+    }
+
+    // The same graph materialised in memory, which is what a live run answers
+    // from. The two projections have to agree field for field.
+    let kvdag = store
+        .load_version(
+            &store
+                .get_run(&run)
+                .await
+                .expect("get_run")
+                .expect("the run exists")
+                .version,
+        )
+        .await
+        .expect("load_version");
+    let live = crate::workflow::model::RunGraph::materialise(&kvdag, run.clone(), Tier::Auto);
+    for node in &nodes {
+        let live_node = live
+            .node_by_path(&node.instance_path)
+            .unwrap_or_else(|| panic!("the live graph has {}", node.instance_path));
+        assert_eq!(
+            u32::from(node.depth),
+            u32::from(live_node.depth),
+            "depth disagrees for {}",
+            node.instance_path
+        );
     }
 }
 

@@ -149,6 +149,14 @@ impl SignalLedger {
         self.idle_ticks
     }
 
+    /// Restarts the idle streak without touching the evidence recorded so far.
+    /// The sustained edge fires once per streak, so a caller that acted on that
+    /// edge and wants the *next* streak to fire again resets it here rather
+    /// than clearing the ledger and losing the signals it holds.
+    pub fn reset_idle_streak(&mut self) {
+        self.idle_ticks = 0;
+    }
+
     pub fn reset(&mut self) {
         *self = Self::default();
     }

@@ -164,9 +164,13 @@ pub fn node_self_report(
     if !tokens_match(expected.0.as_bytes(), token.as_bytes()) {
         return Err(ReportRejected::InvalidToken);
     }
-    let result = match result {
-        Some(serde_json::Value::Null) | None => return Err(ReportRejected::MissingResult),
-        Some(result) => result,
+    // A caller that passes no result at all is a shape error and never reaches
+    // the engine. An explicit `null` is different: it is the wire's "I tried to
+    // finish and have no result artifact", which §4.3 answers with
+    // `NeedsAttention` in the engine. Rejecting it here would put completion
+    // authority back on the client and leave the node `Running` forever.
+    let Some(result) = result else {
+        return Err(ReportRejected::MissingResult);
     };
     Ok(EngineInput::NodeSelfReport {
         path: InstancePath(path.to_string()),
@@ -404,15 +408,40 @@ mod tests {
         let minted = NodeToken("d0b3".to_string());
         assert_eq!(
             node_self_report("plan", "d0b3", Some(&minted), None),
-            Err(ReportRejected::MissingResult)
-        );
-        assert_eq!(
-            node_self_report("plan", "d0b3", Some(&minted), Some(serde_json::Value::Null)),
-            Err(ReportRejected::MissingResult)
+            Err(ReportRejected::MissingResult),
+            "an internal caller that passes no result at all is a shape error"
         );
         assert_eq!(
             node_self_report("  ", "d0b3", Some(&minted), Some(serde_json::json!({}))),
             Err(ReportRejected::UnknownNode)
+        );
+    }
+
+    /// §4.3 makes the engine the completion authority, and an explicit `null`
+    /// on the wire is the node saying "I tried to finish and have no result
+    /// artifact". Rejecting it here would hand that decision back to the
+    /// client, which is what left a `runner = "command"` node stuck `Running`
+    /// with the server never told it had reported.
+    #[test]
+    fn an_authenticated_report_of_no_result_reaches_the_engine() {
+        let minted = NodeToken("d0b3".to_string());
+        assert_eq!(
+            node_self_report("plan", "d0b3", Some(&minted), Some(serde_json::Value::Null)),
+            Ok(EngineInput::NodeSelfReport {
+                path: InstancePath("plan".to_string()),
+                token: minted.clone(),
+                result: RawJson(serde_json::Value::Null),
+            })
+        );
+        assert_eq!(
+            node_self_report(
+                "plan",
+                "wrong",
+                Some(&minted),
+                Some(serde_json::Value::Null)
+            ),
+            Err(ReportRejected::InvalidToken),
+            "a null result is still authenticated"
         );
     }
 

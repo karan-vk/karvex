@@ -1082,6 +1082,14 @@ pub struct NodeResult {
     pub evidence: Evidence,
 }
 
+/// `total_tokens` and `tool_uses` only ever advance through
+/// `EngineInput::ProgressObserved`, which is documented (`04-kvdag-and-execution.md`
+/// §6.1) to be fed by a tail of the node's transcript JSONL. That transcript-tail
+/// producer is not implemented yet — no caller in this build ever constructs a
+/// `ProgressDelta` with a nonzero `tokens`/`tool_calls` — so both fields read `0`
+/// for every run today. This is a known gap, not silent data loss: wiring a real
+/// source would be a new subsystem (transcript tailing/parsing), out of scope for
+/// the timestamp/duration fix that populates `duration_ms`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NodeUsage {
     pub total_tokens: u64,
@@ -1126,6 +1134,12 @@ pub struct RunNode {
     pub binding: Option<NodeBinding>,
     pub result: Option<NodeResult>,
     pub usage: NodeUsage,
+    /// Stamped the first time the node reaches `Running` (`engine::record_status`).
+    /// Cleared on restart, so a new attempt gets its own `started_at`.
+    pub started_at_unix_ms: Option<u64>,
+    /// Stamped the first time the node reaches a terminal status
+    /// (`NodeStatus::is_terminal`). Cleared on restart alongside `started_at_unix_ms`.
+    pub ended_at_unix_ms: Option<u64>,
     pub progress: ProgressTracker,
     pub succession: Option<Succession>,
     /// Per-node checkpoint counter, starting at 1 for the node's first
@@ -1298,6 +1312,13 @@ pub enum StoreWrite {
     RunStatus {
         run: RunId,
         status: RunStatus,
+        /// When the run closed, stamped once by the engine as it closes the run
+        /// (`None` for every non-terminal status). The engine is the single
+        /// authority: without it the store stamped its own `time::now()` when
+        /// the queued write was finally applied, so a restored run's end time
+        /// disagreed with the live one by however far the store thread was
+        /// behind.
+        ended_at_unix_ms: Option<u64>,
     },
     RunNode {
         run: RunId,
@@ -1308,6 +1329,19 @@ pub enum StoreWrite {
         usage: NodeUsage,
         evidence: Option<Evidence>,
         succession: Option<Succession>,
+        started_at_unix_ms: Option<u64>,
+        ended_at_unix_ms: Option<u64>,
+    },
+    /// One edge's settled firing state. Addressed by its endpoints and kind,
+    /// which is the identity the read path (`store::list_run_edges`) reports it
+    /// back under.
+    RunEdge {
+        run: RunId,
+        from: InstancePath,
+        to: InstancePath,
+        kind: EdgeKind,
+        condition_result: Option<bool>,
+        fired: bool,
     },
     Checkpoint {
         run: RunId,

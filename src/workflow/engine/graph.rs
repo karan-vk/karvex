@@ -51,6 +51,8 @@ impl RunGraph {
                 binding: None,
                 result: None,
                 usage: NodeUsage::default(),
+                started_at_unix_ms: None,
+                ended_at_unix_ms: None,
                 progress: ProgressTracker::default(),
                 succession: None,
                 checkpoint_seq: 0,

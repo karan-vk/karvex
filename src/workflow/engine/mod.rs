@@ -60,6 +60,18 @@ pub struct Engine {
     /// How many results each node has had rejected by the completion gate, which
     /// is what limits it to exactly one corrective re-prompt.
     reports: HashMap<InstancePath, u8>,
+    /// Whether each node's seed prompt is known to have registered, and whether
+    /// it has already been re-delivered. See [`Engine::redeliver_seed`].
+    seeds: HashMap<InstancePath, SeedState>,
+}
+
+/// What the engine knows about a node's seed prompt (§4.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SeedState {
+    /// The agent has been observed working, so it read what it was seeded with.
+    acted: bool,
+    /// The seed has already been re-delivered once; it is not offered again.
+    redelivered: bool,
 }
 
 impl Engine {
@@ -70,6 +82,7 @@ impl Engine {
             definition: None,
             signals: HashMap::new(),
             reports: HashMap::new(),
+            seeds: HashMap::new(),
         }
     }
 
@@ -152,6 +165,7 @@ impl Engine {
         let mut effects = Vec::new();
         self.signals.clear();
         self.reports.clear();
+        self.seeds.clear();
 
         graph.status = RunStatus::Running;
         let changed = schedule::propagate(&mut graph);
@@ -159,6 +173,7 @@ impl Engine {
         effects.push(RunEffect::Persist(Box::new(StoreWrite::RunStatus {
             run: graph.run_id.clone(),
             status: RunStatus::Running,
+            ended_at_unix_ms: None,
         })));
         let payload = json!({ "tier": graph.tier, "nodes": graph.nodes.len() });
         effects.push(journal(&mut graph, RunEventKind::RunStarted, None, payload));
@@ -180,7 +195,8 @@ impl Engine {
                 path,
             }));
         }
-        for idx in changed {
+        record_edges(&graph, &changed.edges, &mut effects);
+        for idx in changed.nodes {
             record_status(&mut graph, idx, &mut effects);
         }
 
@@ -212,6 +228,18 @@ impl Engine {
             return Vec::new();
         }
         let key = node.key.clone();
+
+        // §4.3: a self-report that carries no result artifact never completes a
+        // node — it lands on `missing_result`, exactly like a sustained-idle
+        // observation with nothing to validate. This is the only completion
+        // signal a `Runner::Command` node has, so without it a node that cannot
+        // produce `result.json` stalls `Running` with nothing to escalate.
+        if result.0.is_null() {
+            return match complete::missing_result(Signal::SelfReport) {
+                Completion::NeedsAttention { reason } => self.needs_attention(idx, &reason),
+                Completion::Accepted(_) | Completion::Reprompt { .. } => Vec::new(),
+            };
+        }
 
         let ledger = self.signals.entry(path.clone()).or_default();
         ledger.observe(Signal::SelfReport);
@@ -297,9 +325,15 @@ impl Engine {
         if !Signal::SustainedIdle.available_for(self.runner_of(idx)) {
             return Vec::new();
         }
+        // An agent that is doing anything has read its seed. This is the fact
+        // the re-delivery below turns on, so it is recorded before the idle
+        // streak is consulted.
+        if state == AgentState::Working {
+            self.seeds.entry(path.clone()).or_default().acted = true;
+        }
         let sustained = self
             .signals
-            .entry(path)
+            .entry(path.clone())
             .or_default()
             .observe_agent_state(state);
         if !sustained {
@@ -315,11 +349,72 @@ impl Engine {
             return Vec::new();
         }
 
+        if let Some(effects) = self.redeliver_seed(idx, &path) {
+            return effects;
+        }
+
         // §4.3: idle with no valid result never completes a node.
         match complete::missing_result(Signal::SustainedIdle) {
             Completion::NeedsAttention { reason } => self.needs_attention(idx, &reason),
             Completion::Accepted(_) | Completion::Reprompt { .. } => Vec::new(),
         }
+    }
+
+    /// §4.2's seed prompt is the `claude` argv's trailing positional, and a
+    /// first-run workspace-trust dialog interrupts startup and consumes it —
+    /// which happens on the first run in every fresh workspace. What karvex
+    /// then observes is an agent that is up, settled at its prompt, and has
+    /// never worked: `Running` forever with nothing to escalate and nothing to
+    /// wait for.
+    ///
+    /// So the first sustained idle on a node that has never been observed
+    /// working re-delivers the seed through `PromptNode`, which is the verified
+    /// `agent.prompt` path for an `Agent` runner. Exactly once, in the spirit of
+    /// §4.3's single corrective re-prompt: a second sustained idle with nothing
+    /// done falls through to `NeedsAttention`, so a re-delivery that also fails
+    /// surfaces instead of looping.
+    ///
+    /// Returns `None` when the node is not in that state, leaving the caller's
+    /// normal completion path untouched.
+    fn redeliver_seed(&mut self, idx: RunNodeIdx, path: &InstancePath) -> Option<Vec<RunEffect>> {
+        let seed = self.seeds.entry(path.clone()).or_default();
+        if seed.acted || seed.redelivered {
+            return None;
+        }
+        // Both halves are resolved before anything is recorded: a node with no
+        // pane has nowhere to receive the seed, and spending the single
+        // re-delivery on a message that was never sent would leave the node
+        // exactly as stuck with its one retry gone.
+        let binding = self
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.node(idx))?
+            .binding
+            .as_ref()?;
+        let text = crate::workflow::binding::spawn::seed_prompt_for(&binding.node_dir);
+        let pane = binding.pane_id.clone();
+
+        self.seeds.entry(path.clone()).or_default().redelivered = true;
+        // The sustained-idle edge fires once per idle streak, so an agent that
+        // silently swallows this re-delivery too would never produce a second
+        // edge. Restarting the streak is what guarantees the fallback below is
+        // eventually reached instead of the node hanging a second time.
+        if let Some(ledger) = self.signals.get_mut(path) {
+            ledger.reset_idle_streak();
+        }
+        debug!(path = %path, "workflow node seed prompt re-delivered");
+
+        let mut effects = Vec::new();
+        let graph = self.graph.as_mut()?;
+        let payload = json!({ "text": text, "reason": "seed_not_registered" });
+        effects.push(journal(
+            graph,
+            RunEventKind::MessageDelivered,
+            Some(path.clone()),
+            payload,
+        ));
+        effects.push(RunEffect::PromptNode { pane, text });
+        Some(effects)
     }
 
     /// Materiality bookkeeping (§6.1). Phase 1 records the evidence; the
@@ -383,6 +478,7 @@ impl Engine {
         // an attempt that inherited the dead pane's strike would never get one.
         self.signals.remove(&path);
         self.reports.remove(&path);
+        self.seeds.remove(&path);
         let mut effects = Vec::new();
         let exit = code.map_or_else(|| "no exit code".to_string(), |code| format!("code {code}"));
         let Some(graph) = self.graph.as_mut() else {
@@ -474,13 +570,20 @@ impl Engine {
 
     fn interrupt(&mut self, path: &InstancePath) -> Vec<RunEffect> {
         let mut effects = Vec::new();
+        let Some(idx) = self.graph.as_ref().and_then(|graph| graph.index_of(path)) else {
+            return effects;
+        };
+        // §5's `agent.send_keys [Escape]` is the agent-runner interrupt: Escape
+        // is what a `claude` TUI reads as "stop this turn". A `Runner::Command`
+        // node is a plain process with no such convention, and Escape is a byte
+        // it will simply ignore — the interrupt it can observe is the terminal's
+        // own `ctrl+c`, which the line discipline turns into SIGINT. Same split
+        // as the steer row: the primitive follows the runner.
+        let keys = crate::workflow::binding::spawn::interrupt_keys(self.runner_of(idx));
         let Some(graph) = self.graph.as_mut() else {
             return effects;
         };
-        let Some(idx) = graph.index_of(path) else {
-            return effects;
-        };
-        let payload = json!({});
+        let payload = json!({ "keys": keys });
         effects.push(journal(
             graph,
             RunEventKind::Interrupt,
@@ -488,10 +591,7 @@ impl Engine {
             payload,
         ));
         if let Some(pane) = pane_of(graph, idx) {
-            effects.push(RunEffect::SendKeys {
-                pane,
-                keys: vec!["Escape".to_string()],
-            });
+            effects.push(RunEffect::SendKeys { pane, keys });
         }
         effects
     }
@@ -503,6 +603,7 @@ impl Engine {
         let mut effects = Vec::new();
         self.signals.remove(path);
         self.reports.remove(path);
+        self.seeds.remove(path);
         let Some(graph) = self.graph.as_mut() else {
             return effects;
         };
@@ -518,6 +619,12 @@ impl Engine {
             node.result = None;
             node.succession = None;
             node.progress = crate::workflow::model::ProgressTracker::default();
+            // A restart is a fresh attempt: the previous attempt's timing is not
+            // this one's, so `started_at`/`ended_at` reset alongside `binding`
+            // and get restamped when the new attempt reaches `Running`/closes.
+            node.started_at_unix_ms = None;
+            node.ended_at_unix_ms = None;
+            node.usage.duration_ms = 0;
             node.status = NodeStatus::Ready;
         }
         let payload = json!({ "restart": true });
@@ -590,7 +697,9 @@ impl Engine {
         if !matches!(graph.status, RunStatus::Running | RunStatus::Paused) {
             return;
         }
-        for idx in schedule::propagate(graph) {
+        let settled = schedule::propagate(graph);
+        record_edges(graph, &settled.edges, effects);
+        for idx in settled.nodes {
             record_status(graph, idx, effects);
         }
 
@@ -671,6 +780,7 @@ impl Engine {
         }
 
         let changed = schedule::propagate(graph);
+        record_edges(graph, &changed.edges, &mut effects);
         match complete::resolve_succession(graph, idx) {
             Ok(succession) => {
                 let payload = json!({ "succession": &succession });
@@ -697,7 +807,7 @@ impl Engine {
             }
         }
         record_status(graph, idx, &mut effects);
-        for other in changed {
+        for other in changed.nodes {
             if other != idx {
                 record_status(graph, other, &mut effects);
             }
@@ -777,6 +887,23 @@ fn next_seq(graph: &mut RunGraph) -> u64 {
     graph.seq
 }
 
+/// Wall-clock epoch milliseconds for node `started_at`/`ended_at` stamps.
+///
+/// The engine's own contract is "deterministic given a supplied clock"
+/// (module doc), which `EngineInput::AgentStatus`/`Tick`'s `Instant` honours for
+/// scheduling; but `Instant` is monotonic and process-local, not an epoch, so it
+/// cannot produce the wire's `_unix_ms` timestamps. `src/app/workflow.rs`'s
+/// `ActiveRun::started_at_unix_ms`/`ended_at_unix_ms` already stamp the run
+/// itself the same way, directly from the wall clock rather than a threaded
+/// parameter — this mirrors that existing, accepted precedent for node-level
+/// timestamps instead of introducing a second clock-injection mechanism.
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 fn journal(
     graph: &mut RunGraph,
     kind: RunEventKind,
@@ -802,6 +929,23 @@ fn pane_of(graph: &RunGraph, idx: RunNodeIdx) -> Option<PublicPaneId> {
 }
 
 fn record_status(graph: &mut RunGraph, idx: RunNodeIdx, effects: &mut Vec<RunEffect>) {
+    // Stamp timing before reading the node back for the store write, so the
+    // persisted record and the in-memory node agree in the same call: a node
+    // reaching `Running` gets `started_at` once, and a node reaching any
+    // terminal status gets `ended_at` plus a `duration_ms` derived from the two
+    // (`docs/design/workflow-builder/04-kvdag-and-execution.md` node lifecycle).
+    if let Some(node) = graph.node_mut(idx) {
+        if node.status == NodeStatus::Running && node.started_at_unix_ms.is_none() {
+            node.started_at_unix_ms = Some(current_unix_ms());
+        }
+        if node.status.is_terminal() && node.ended_at_unix_ms.is_none() {
+            let ended = current_unix_ms();
+            node.ended_at_unix_ms = Some(ended);
+            if let Some(started) = node.started_at_unix_ms {
+                node.usage.duration_ms = ended.saturating_sub(started);
+            }
+        }
+    }
     let Some(node) = graph.node(idx) else {
         return;
     };
@@ -816,6 +960,8 @@ fn record_status(graph: &mut RunGraph, idx: RunNodeIdx, effects: &mut Vec<RunEff
         usage: node.usage,
         evidence: node.result.as_ref().map(|result| result.evidence),
         succession: node.succession.clone(),
+        started_at_unix_ms: node.started_at_unix_ms,
+        ended_at_unix_ms: node.ended_at_unix_ms,
     })));
     let payload = json!({ "status": status });
     effects.push(journal(
@@ -831,11 +977,38 @@ fn record_status(graph: &mut RunGraph, idx: RunNodeIdx, effects: &mut Vec<RunEff
     }));
 }
 
+/// The edge counterpart of [`record_status`]: persists the firing state of the
+/// edges a [`schedule::propagate`] pass settled.
+///
+/// Resolution is not one-way (§3.1), so this writes the *current* state rather
+/// than only recording a first firing — a restarted source un-fires its
+/// outbound edges, and a journal that kept the stale `fired` would describe a
+/// branch the run is no longer taking.
+fn record_edges(graph: &RunGraph, edges: &[usize], effects: &mut Vec<RunEffect>) {
+    for index in edges {
+        let Some(edge) = graph.edges.get(*index) else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (graph.node(edge.from), graph.node(edge.to)) else {
+            continue;
+        };
+        effects.push(RunEffect::Persist(Box::new(StoreWrite::RunEdge {
+            run: graph.run_id.clone(),
+            from: from.path.clone(),
+            to: to.path.clone(),
+            kind: edge.kind,
+            condition_result: edge.condition_result,
+            fired: edge.fired,
+        })));
+    }
+}
+
 fn finish(graph: &mut RunGraph, status: RunStatus, effects: &mut Vec<RunEffect>) {
     graph.status = status;
     effects.push(RunEffect::Persist(Box::new(StoreWrite::RunStatus {
         run: graph.run_id.clone(),
         status,
+        ended_at_unix_ms: Some(current_unix_ms()),
     })));
     let payload = json!({ "status": status });
     effects.push(journal(graph, RunEventKind::RunFinished, None, payload));
@@ -853,6 +1026,7 @@ fn resume(graph: &mut RunGraph, effects: &mut Vec<RunEffect>) {
     effects.push(RunEffect::Persist(Box::new(StoreWrite::RunStatus {
         run: graph.run_id.clone(),
         status: RunStatus::Running,
+        ended_at_unix_ms: None,
     })));
     effects.push(RunEffect::Emit(WorkflowEvent::RunUpdated {
         run: graph.run_id.clone(),
@@ -865,6 +1039,7 @@ fn pause(graph: &mut RunGraph, blocker: &TerminalBlocker, effects: &mut Vec<RunE
     effects.push(RunEffect::Persist(Box::new(StoreWrite::RunStatus {
         run: graph.run_id.clone(),
         status: RunStatus::Paused,
+        ended_at_unix_ms: None,
     })));
     let payload = json!({ "blocker": blocker.to_string() });
     effects.push(journal(graph, RunEventKind::Error, None, payload));
@@ -1039,6 +1214,19 @@ mod tests {
         );
     }
 
+    /// Drives `pane` through one full sustained-idle streak.
+    fn idle_streak(engine: &mut Engine, pane: &PublicPaneId, now: Instant) -> Vec<RunEffect> {
+        let mut effects = Vec::new();
+        for _ in 0..3 {
+            effects.extend(engine.apply(EngineInput::AgentStatus {
+                pane: pane.clone(),
+                state: AgentState::Idle,
+                at: now,
+            }));
+        }
+        effects
+    }
+
     #[test]
     fn sustained_idle_without_a_result_needs_attention_and_never_succeeds() {
         let (mut engine, graph) = two_node_engine();
@@ -1049,6 +1237,13 @@ mod tests {
 
         let pane = PublicPaneId::new("pane-1");
         let now = Instant::now();
+        // An agent that has been working read its seed, so idling afterwards is
+        // the "went quiet with nothing to show" case, not the swallowed-seed one.
+        engine.apply(EngineInput::AgentStatus {
+            pane: pane.clone(),
+            state: AgentState::Working,
+            at: now,
+        });
         for _ in 0..2 {
             engine.apply(EngineInput::AgentStatus {
                 pane: pane.clone(),
@@ -1068,6 +1263,150 @@ mod tests {
             engine.graph().map(|graph| graph.status),
             Some(RunStatus::Succeeded)
         );
+    }
+
+    /// F9: `claude`'s first-run workspace-trust dialog interrupts startup and
+    /// consumes the argv's trailing positional, so the agent comes up having
+    /// never been told anything. It settles idle with no work done — the one
+    /// state that distinguishes a swallowed seed from a finished turn — and the
+    /// seed is re-delivered once through the verified `agent.prompt` path.
+    #[test]
+    fn an_agent_that_never_saw_its_seed_prompt_is_reseeded_once_then_surfaced() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+        let pane = PublicPaneId::new("pane-1");
+        let now = Instant::now();
+        let effects = idle_streak(&mut engine, &pane, now);
+
+        let text = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RunEffect::PromptNode { pane, text } if *pane == PublicPaneId::new("pane-1") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .expect("the seed is re-delivered rather than left swallowed");
+        assert_eq!(
+            text,
+            crate::workflow::binding::spawn::seed_prompt_for(&std::path::PathBuf::from("node")),
+            "the re-delivery is the seed itself, by absolute node-dir path"
+        );
+        assert_eq!(
+            status_of(&engine, "plan"),
+            NodeStatus::Running,
+            "a node that has just been reseeded has not failed"
+        );
+
+        // Once, not in a loop: a second streak with still nothing done surfaces
+        // the node instead of reseeding it again.
+        let effects = idle_streak(&mut engine, &pane, now);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "the seed is offered exactly once"
+        );
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+    }
+
+    /// The re-delivery is for a seed that never registered. An agent that has
+    /// been observed working read it, so its idle is a completion question and
+    /// must not be answered by re-sending the task.
+    #[test]
+    fn an_agent_that_worked_is_never_reseeded() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+        let pane = PublicPaneId::new("pane-1");
+        let now = Instant::now();
+        engine.apply(EngineInput::AgentStatus {
+            pane: pane.clone(),
+            state: AgentState::Working,
+            at: now,
+        });
+        let effects = idle_streak(&mut engine, &pane, now);
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "an agent that worked already had its seed"
+        );
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+    }
+
+    /// D4: the only completion signal a `Runner::Command` node has is its own
+    /// report, so a report that carries no result artifact has to be the thing
+    /// that surfaces it. Reaching `NeedsAttention` here is what makes
+    /// `kvx workflow node complete` safe to run unconditionally.
+    #[test]
+    fn a_self_report_with_no_result_artifact_needs_attention() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: RawJson(serde_json::Value::Null),
+        });
+
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "there is no result to correct, so no corrective re-prompt is spent"
+        );
+        assert_ne!(
+            engine.graph().map(|graph| graph.status),
+            Some(RunStatus::Succeeded)
+        );
+    }
+
+    /// An interrupt is only useful if the process can observe it. Escape is a
+    /// `claude` TUI convention; a plain process needs `ctrl+c`.
+    #[test]
+    fn the_interrupt_key_follows_the_node_runner() {
+        for (runner, expected) in [(Runner::Agent, "Escape"), (Runner::Command, "ctrl+c")] {
+            let definition = kvdag_of(
+                vec![spec_node(&TestNode {
+                    runner,
+                    ..TestNode::requiring("plan", &["plan"])
+                })],
+                Vec::new(),
+            );
+            let graph =
+                RunGraph::materialise(&definition, RunId::new("workflow_run:1"), Tier::High);
+            let mut engine = Engine::new(EngineConfig::default());
+            engine.install_definition(definition);
+            engine.apply(EngineInput::Start {
+                graph: Box::new(graph),
+            });
+            engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+            let effects = engine.apply(EngineInput::Interrupt {
+                path: InstancePath::new("plan"),
+            });
+            let keys = effects
+                .iter()
+                .find_map(|effect| match effect {
+                    RunEffect::SendKeys { keys, .. } => Some(keys.clone()),
+                    _ => None,
+                })
+                .expect("an interrupt on a bound node sends keys");
+            assert_eq!(keys, vec![expected.to_string()], "runner {runner:?}");
+        }
     }
 
     #[test]
@@ -1153,6 +1492,175 @@ mod tests {
             .expect("the node exists");
         assert_eq!(node.attempt, 2);
         assert!(node.binding.is_none());
+    }
+
+    fn node_of<'a>(engine: &'a Engine, path: &str) -> &'a crate::workflow::model::RunNode {
+        engine
+            .graph()
+            .and_then(|graph| graph.node_by_path(&InstancePath::new(path)))
+            .expect("the node exists")
+    }
+
+    /// Regression for B10: `started_at_unix_ms`/`ended_at_unix_ms`/`duration_ms`
+    /// used to stay unset/zero for the whole run, on both the in-memory node
+    /// and the persisted `StoreWrite::RunNode` effect.
+    #[test]
+    fn bind_node_stamps_started_at_and_leaves_ended_at_unset() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        assert!(
+            node_of(&engine, "plan").started_at_unix_ms.is_none(),
+            "a node that has not run yet has no started_at"
+        );
+
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+        let node = node_of(&engine, "plan");
+        assert!(
+            node.started_at_unix_ms.is_some(),
+            "binding a node to a pane moves it to Running and stamps started_at"
+        );
+        assert!(
+            node.ended_at_unix_ms.is_none(),
+            "a still-running node has no ended_at"
+        );
+        assert_eq!(node.usage.duration_ms, 0);
+    }
+
+    #[test]
+    fn a_succeeded_node_gets_ended_at_and_a_duration_derived_from_the_two_stamps() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        let started = node_of(&engine, "plan")
+            .started_at_unix_ms
+            .expect("stamped on bind");
+
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"plan":"do it"}"#),
+        });
+
+        let node = node_of(&engine, "plan");
+        assert_eq!(node.status, NodeStatus::Succeeded);
+        let ended = node
+            .ended_at_unix_ms
+            .expect("a terminal node has ended_at set");
+        assert!(ended >= started);
+        assert_eq!(
+            node.usage.duration_ms,
+            ended - started,
+            "duration_ms is derived from ended_at - started_at"
+        );
+
+        // The persisted write for this node carries the same stamps the
+        // in-memory node holds — B10 was also missing on the persisted path.
+        let persisted = effects.iter().find_map(|effect| match effect {
+            RunEffect::Persist(write) => match write.as_ref() {
+                StoreWrite::RunNode {
+                    path,
+                    started_at_unix_ms,
+                    ended_at_unix_ms,
+                    ..
+                } if path == &InstancePath::new("plan") => {
+                    Some((*started_at_unix_ms, *ended_at_unix_ms))
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            persisted,
+            Some((Some(started), Some(ended))),
+            "the StoreWrite::RunNode effect for the closing status change carries \
+             the same started_at/ended_at the in-memory node just got stamped with"
+        );
+    }
+
+    /// `run_edge.fired`/`condition_result` had no write site: the scheduler
+    /// settled them in memory and nothing ever persisted them, so a restored
+    /// run reported `fired: false` on the edges it had actually taken.
+    #[test]
+    fn settling_an_edge_persists_its_firing_state() {
+        fn edge_writes(effects: &[RunEffect]) -> Vec<(String, String, Option<bool>, bool)> {
+            effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    RunEffect::Persist(write) => match write.as_ref() {
+                        StoreWrite::RunEdge {
+                            from,
+                            to,
+                            condition_result,
+                            fired,
+                            ..
+                        } => Some((from.to_string(), to.to_string(), *condition_result, *fired)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let (mut engine, graph) = two_node_engine();
+        let started = engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        assert!(
+            edge_writes(&started).is_empty(),
+            "no edge has settled at run start, so there is nothing to persist"
+        );
+
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"plan":"do it"}"#),
+        });
+
+        assert_eq!(
+            edge_writes(&effects),
+            vec![(
+                "plan".to_string(),
+                "implement".to_string(),
+                Some(true),
+                true
+            )],
+            "the edge the succeeding node just fired must be persisted once, \
+             carrying the same state the in-memory graph holds"
+        );
+        let edge = engine
+            .graph()
+            .and_then(|graph| graph.edges.first())
+            .expect("the fixture has one edge");
+        assert_eq!((edge.condition_result, edge.fired), (Some(true), true));
+    }
+
+    #[test]
+    fn restart_clears_timing_so_the_next_attempt_gets_fresh_stamps() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        assert!(node_of(&engine, "plan").started_at_unix_ms.is_some());
+
+        engine.apply(EngineInput::RestartNode {
+            path: InstancePath::new("plan"),
+        });
+
+        let node = node_of(&engine, "plan");
+        assert!(
+            node.started_at_unix_ms.is_none(),
+            "restart hands the node back to the scheduler, and its previous \
+             attempt's started_at is not this attempt's"
+        );
+        assert!(node.ended_at_unix_ms.is_none());
+        assert_eq!(node.usage.duration_ms, 0);
     }
 
     #[test]

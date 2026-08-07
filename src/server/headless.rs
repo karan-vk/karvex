@@ -129,6 +129,10 @@ enum LoopEvent {
     Api(Box<api::ApiRequestMessage>),
     ServerEvent(ServerEvent),
     RenderRequested,
+    /// The workflow engine's clock is due. Mirrors the TUI loop's arm in
+    /// `src/app/mod.rs`: workflow runs execute on the server, so the engine's
+    /// clock has to advance here too.
+    WorkflowTick,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -761,6 +765,15 @@ impl HeadlessServer {
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
                 });
+            // Workflow runs execute on the server, never in a client, so this
+            // is the only loop that can advance the engine's clock. Without
+            // this arm `EngineInput::Tick` never arrives and
+            // `sample_workflow_agent_states` never runs, so the detector-driven
+            // signals of `04-kvdag-and-execution.md` §4.3 — sustained idle
+            // above all — can never fire: a pane that settles at `Idle` and
+            // stays there produces exactly one state change, and the sustained
+            // rule counts detector *ticks*.
+            let workflow_tick_deadline = self.app.workflow_tick_deadline();
             let event = {
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
@@ -776,6 +789,7 @@ impl HeadlessServer {
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = sleep_until_or_pending(workflow_tick_deadline) => LoopEvent::WorkflowTick,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
@@ -834,6 +848,12 @@ impl HeadlessServer {
                 LoopEvent::RenderRequested => {
                     if self.app.render_dirty.is_pending() {
                         needs_render = true;
+                    }
+                }
+                LoopEvent::WorkflowTick => {
+                    if self.app.tick_workflow_engine(Instant::now()) {
+                        needs_render = true;
+                        needs_full_render = true;
                     }
                 }
             }
@@ -4373,6 +4393,33 @@ impl HeadlessServer {
             }
         }
 
+        // `next_managed_agent_deadline` is already one of the deadlines this
+        // loop sleeps on (`next_headless_loop_deadline_with_git_refresh`), but
+        // nothing acted on it here, so a managed agent stayed
+        // `ManagedAgentPhase::Pending` on the server forever and every
+        // `agent.prompt`/`agent.send_keys` to it answered `agent_not_ready`.
+        // Only `agent.get` reconciles on demand, so the failure was masked
+        // whenever something happened to inspect the agent first. Mirrors
+        // `App::handle_scheduled_tasks`.
+        if self
+            .app
+            .state
+            .next_managed_agent_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            let panes = self.app.state.reconcile_managed_agents_at(now);
+            if !panes.is_empty() {
+                for (ws_idx, pane_id) in panes {
+                    self.app.emit_pane_updated(ws_idx, pane_id);
+                }
+                // `reconcile_managed_agents_at` already marked the session
+                // dirty; this is the `pub(crate)` way to turn that into a
+                // debounced save from outside the `app` module.
+                self.app.sync_session_save_schedule();
+                changed = true;
+            }
+        }
+
         if self
             .app
             .copy_feedback_deadline
@@ -4670,6 +4717,22 @@ pub fn run_server() -> io::Result<()> {
     init_logging();
     crate::platform::raise_server_nofile_limit();
 
+    // H1: check this before anything binds. A server spawned by
+    // `server::autodetect::spawn_server_daemon` has stdio redirected to
+    // `/dev/null`, so a `bind()`/`connect()` failure this early would
+    // otherwise exit silently, before `tracing` — initialized just above —
+    // ever gets a line to write: a 0-byte `karvex-server.log` and nothing for
+    // the client but a 15s "did not become ready" timeout. Logging the
+    // failure here, before the bind is even attempted, is what makes it
+    // diagnosable. `auto_detect_launch` also checks this client-side so the
+    // common path fails before a server is spawned at all; this is the
+    // backstop for every other way the server gets started (direct `kvx
+    // server`, a resumed session, etc.).
+    if let Err(message) = preflight_server_socket_paths() {
+        tracing::error!("{message}");
+        return Err(io::Error::other(message));
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.get(2).map(String::as_str) == Some("--handoff-import") {
         let socket_path = args
@@ -4899,6 +4962,22 @@ fn print_ready_message(api_socket: &Path, client_socket: &Path) {
 /// Initialize logging for the server process.
 fn init_logging() {
     crate::logging::init_file_logging("karvex-server.log");
+}
+
+/// H1: both sockets the server binds derive from the same session data
+/// directory, so both are checked; `client_socket_path()`'s `-client.sock`
+/// suffix makes it the tighter one, but the API socket is checked too rather
+/// than relying on that never changing.
+#[cfg(unix)]
+fn preflight_server_socket_paths() -> Result<(), String> {
+    crate::ipc::check_socket_path_len(&api::socket_path())?;
+    crate::ipc::check_socket_path_len(&client_socket_path())?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn preflight_server_socket_paths() -> Result<(), String> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -6681,6 +6760,63 @@ next_tab = ""
 
         assert!(!server.handle_scheduled_tasks_headless(now, false));
         assert_eq!(server.app.next_agent_manifest_update_check, None);
+    }
+
+    /// A managed agent launched on the server must leave
+    /// `ManagedAgentPhase::Pending` on its own. Only `agent.get` reconciles on
+    /// demand, so while this was missing here a server-side agent stayed
+    /// `launch_pending` forever and every `agent.prompt`/`agent.send_keys` to
+    /// it answered `agent_not_ready` — including the workflow runtime's seed
+    /// re-delivery and an agent node's `workflow.node.steer`.
+    #[test]
+    fn headless_scheduled_tasks_activate_a_settled_managed_agent() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("managed");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+
+        let now = Instant::now();
+        let terminal = server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal");
+        terminal.begin_managed_agent(
+            "Solo".into(),
+            crate::detect::Agent::Claude,
+            now,
+            Duration::from_millis(1),
+            Duration::from_secs(30),
+        );
+        // What the detector would see once the agent is up at its prompt.
+        terminal.state = crate::detect::AgentState::Idle;
+        terminal.detected_agent = Some(crate::detect::Agent::Claude);
+        assert!(
+            terminal.managed_agent_launch_pending(),
+            "the launch starts out pending"
+        );
+
+        let deadline = server
+            .app
+            .state
+            .next_managed_agent_deadline()
+            .expect("a pending managed agent has a deadline");
+        server.handle_scheduled_tasks_headless(deadline + Duration::from_millis(1), false);
+
+        assert!(
+            !server
+                .app
+                .state
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal")
+                .managed_agent_launch_pending(),
+            "the settled managed agent is still pending, so agent.prompt would \
+             answer agent_not_ready forever"
+        );
     }
 
     #[tokio::test]

@@ -119,9 +119,23 @@ pub fn resolve_edge(graph: &RunGraph, edge_index: usize) -> EdgeResolution {
     }
 }
 
+/// What one [`propagate`] pass settled, in index order.
+///
+/// Edges are reported alongside nodes because an edge's firing state is a
+/// durable run fact, not a derived one: it is the only record of *why* a
+/// branch was taken, and a caller that persists node statuses without it reads
+/// every restored edge back unfired.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Propagation {
+    /// Nodes whose `status` changed.
+    pub nodes: Vec<RunNodeIdx>,
+    /// Indices into `RunGraph::edges` whose `fired`/`condition_result` changed.
+    pub edges: Vec<usize>,
+}
+
 /// Settles every edge against its source's *current* state, then moves every
-/// node between `Pending` and `Ready`/`Skipped` accordingly. Returns the nodes
-/// whose status changed, in index order.
+/// node between `Pending` and `Ready`/`Skipped` accordingly. Returns what
+/// changed.
 ///
 /// `Skipped` propagates: a `Sequence`/`Data`/`Conditional` edge out of a
 /// `Skipped` source is dead, so a whole conditional branch collapses in one
@@ -132,8 +146,9 @@ pub fn resolve_edge(graph: &RunGraph, edge_index: usize) -> EdgeResolution {
 /// strength waits again — §3.1 resolves a `Data` edge only while its source is
 /// `Succeeded`/`Restored` *with* a validated result, and a stale `fired` would
 /// run a fan-in node with the restarted branch's port missing.
-pub fn propagate(graph: &mut RunGraph) -> Vec<RunNodeIdx> {
+pub fn propagate(graph: &mut RunGraph) -> Propagation {
     let mut changed: Vec<RunNodeIdx> = Vec::new();
+    let mut changed_edges: Vec<usize> = Vec::new();
     // An edge resolves purely from its source's status, and the only status
     // moves this function makes are Pending → Ready/Skipped and Ready →
     // Pending — neither of which turns a settled edge back into an unresolved
@@ -158,6 +173,7 @@ pub fn propagate(graph: &mut RunGraph) -> Vec<RunNodeIdx> {
             if edge.fired != fired || edge.condition_result != condition_result {
                 edge.fired = fired;
                 edge.condition_result = condition_result;
+                changed_edges.push(index);
                 progressed = true;
             }
         }
@@ -209,7 +225,12 @@ pub fn propagate(graph: &mut RunGraph) -> Vec<RunNodeIdx> {
 
     changed.sort_unstable();
     changed.dedup();
-    changed
+    changed_edges.sort_unstable();
+    changed_edges.dedup();
+    Propagation {
+        nodes: changed,
+        edges: changed_edges,
+    }
 }
 
 /// Nodes admitted to run now, in `(depth, path)` order so breadth stays
@@ -372,7 +393,7 @@ mod tests {
         let mut graph = linear(&["plan", "implement"]);
         let changed = propagate(&mut graph);
 
-        assert_eq!(changed, vec![RunNodeIdx(0)]);
+        assert_eq!(changed.nodes, vec![RunNodeIdx(0)]);
         assert_eq!(node_at(&graph, "plan").status, NodeStatus::Ready);
         assert_eq!(node_at(&graph, "implement").status, NodeStatus::Pending);
     }
@@ -385,7 +406,7 @@ mod tests {
 
         set_result(&mut graph, "plan", json(r#"{"plan":"do it"}"#));
         let changed = propagate(&mut graph);
-        assert_eq!(changed, vec![RunNodeIdx(1), RunNodeIdx(2)]);
+        assert_eq!(changed.nodes, vec![RunNodeIdx(1), RunNodeIdx(2)]);
 
         // "left" and "right" are both Ready; (depth, path) puts left first.
         assert_eq!(
@@ -436,7 +457,7 @@ mod tests {
         set_result(&mut graph, "gate", json(r#"{"verdict":"pass"}"#));
         let changed = propagate(&mut graph);
 
-        assert_eq!(changed, vec![RunNodeIdx(1), RunNodeIdx(2)]);
+        assert_eq!(changed.nodes, vec![RunNodeIdx(1), RunNodeIdx(2)]);
         assert_eq!(node_at(&graph, "hotfix").status, NodeStatus::Skipped);
         assert_eq!(
             node_at(&graph, "ship").status,
