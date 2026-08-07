@@ -1,9 +1,10 @@
 #!/bin/sh
 set -eu
 
-BIN="herdr"
-MANIFEST_URL="https://herdr.dev/latest.json"
-INSTALL_DIR="${HERDR_INSTALL_DIR:-$HOME/.local/bin}"
+BIN="kvx"
+# override with KVX_MANIFEST_URL, same style as KVX_INSTALL_DIR/HERDR_INSTALL_DIR
+MANIFEST_URL="${KVX_MANIFEST_URL:-https://herdr.dev/latest.json}"
+INSTALL_DIR="${KVX_INSTALL_DIR:-${HERDR_INSTALL_DIR:-$HOME/.local/bin}}"
 
 main() {
     echo ""
@@ -34,7 +35,7 @@ main() {
     need curl
     need awk
 
-    # use the same manifest as `herdr update` so installs and updates agree
+    # use the same manifest as `kvx update` so installs and updates agree
     # on the public latest release.
     TARGET="${os}-${arch}"
     log "fetching latest release manifest..."
@@ -91,7 +92,7 @@ main() {
     # verify
     if command -v "$BIN" >/dev/null 2>&1; then
         echo ""
-        log "ready. run 'herdr' to get started."
+        log "ready. run '${BIN}' to get started."
     fi
 
     echo ""
