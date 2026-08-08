@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.9.4] - 2026-08-08
+
 ### Added
 - `kvx workflow` now appears in `kvx --help`'s Usage and Common commands, and in `cli-reference.mdx` (all three locales), so the feature is discoverable without already knowing `workflows.mdx` exists.
 - `kvx workflow show` now renders a workflow's summary, version history (with formatted timestamps instead of raw epoch milliseconds), and — for the head version — its nodes (key, label, runner, demand), edges (from, to, kind, port), and declared args, in human-readable text by default. Pass `--json` for the previous machine-readable envelope.
