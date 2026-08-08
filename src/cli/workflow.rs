@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::api::schema::{
     Method, Request, WorkflowCreateParams, WorkflowDefinitionDocument, WorkflowDefinitionFormat,
-    WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRunListParams,
-    WorkflowRunParams, WorkflowRunTarget, WorkflowTarget, WorkflowTier,
-    WorkflowVersionCreateParams, WorkflowVersionTarget,
+    WorkflowNodeExpandParams, WorkflowNodeReportParams, WorkflowNodeSteerParams,
+    WorkflowNodeTarget, WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget,
+    WorkflowTarget, WorkflowTier, WorkflowVersionCreateParams, WorkflowVersionTarget,
 };
 
 /// Env karvex injects into a node's pane
@@ -44,6 +44,7 @@ pub(super) const VERB_PATHS: &[&[&str]] = &[
     &["node", "interrupt"],
     &["node", "restart"],
     &["node", "complete"],
+    &["node", "expand"],
 ];
 
 pub(super) fn run_workflow_command(args: &[String]) -> std::io::Result<i32> {
@@ -104,6 +105,7 @@ fn run_workflow_node_command(args: &[String]) -> std::io::Result<i32> {
         "interrupt" => workflow_node_interrupt(&args[1..]),
         "restart" => workflow_node_restart(&args[1..]),
         "complete" => workflow_node_complete(&args[1..]),
+        "expand" => workflow_node_expand(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workflow_node_help();
             Ok(0)
@@ -834,6 +836,193 @@ fn parse_workflow_node_pair_args(
     }
 }
 
+/// `04-kvdag-and-execution.md` §3.4: "the node calls `kvx workflow node
+/// expand` mid-run." Like `node complete`, this is normally run by the node's
+/// own process, so the token is read from `KARVEX_WORKFLOW_NODE_TOKEN` rather
+/// than taken as an argument — the same env `node complete` reads, minted for
+/// this node alone. `run_id`/`path` are explicit positionals, matching
+/// `steer`/`interrupt`/`restart`, so the command still works from outside the
+/// node's own pane for anyone holding that token.
+///
+/// A rejected proposal is a **success** response (§3 frozen interface 7): only
+/// a missing token, a bad run/path, or a closed run exits non-zero.
+fn workflow_node_expand(args: &[String]) -> std::io::Result<i32> {
+    let (mut params, json) = match parse_workflow_node_expand_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
+
+    let token = match required_env(NODE_ENV_NODE_TOKEN) {
+        Ok(token) => token,
+        Err(message) => {
+            return Ok(print_workflow_local_error(
+                "missing_node_environment",
+                &message,
+                json,
+            ));
+        }
+    };
+    params.token = token;
+
+    let response = super::send_request(&Request {
+        id: "cli:workflow:node:expand".into(),
+        method: Method::WorkflowNodeExpand(params),
+    })?;
+    print_workflow_node_expand_response(&response, json)
+}
+
+fn parse_workflow_node_expand_args(
+    args: &[String],
+) -> Result<(WorkflowNodeExpandParams, bool), String> {
+    let usage = "usage: kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]";
+    let (Some(run_id), Some(path)) = (args.first(), args.get(1)) else {
+        return Err(usage.into());
+    };
+    let run_id = run_id.clone();
+    let path = path.clone();
+
+    let mut template = None;
+    let mut label = None;
+    let mut inputs = HashMap::new();
+    let mut count = None;
+    let mut json = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--template" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --template".into());
+                };
+                template = Some(value.clone());
+                index += 2;
+            }
+            "--label" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --label".into());
+                };
+                label = Some(value.clone());
+                index += 2;
+            }
+            "--input" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --input".into());
+                };
+                let (key, value) = parse_arg_assignment(value)?;
+                inputs.insert(key, value);
+                index += 2;
+            }
+            "--count" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --count".into());
+                };
+                count = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid value for --count: {value}"))?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+
+    let Some(template) = template else {
+        return Err(usage.into());
+    };
+    let Some(label) = label else {
+        return Err(usage.into());
+    };
+
+    Ok((
+        WorkflowNodeExpandParams {
+            run_id,
+            path,
+            token: String::new(),
+            template,
+            label,
+            inputs,
+            count,
+        },
+        json,
+    ))
+}
+
+/// One accepted child or one rejection line, borrowed straight from the
+/// response so [`summarize_expand_response`] allocates nothing beyond the two
+/// `Vec`s.
+struct ExpandRejectionLine<'a> {
+    template: &'a str,
+    reason: &'a str,
+    message: &'a str,
+}
+
+struct ExpandSummary<'a> {
+    accepted: Vec<&'a str>,
+    rejected: Vec<ExpandRejectionLine<'a>>,
+}
+
+/// Pure extraction half of [`print_workflow_node_expand_response`], so the
+/// partial-acceptance shape (some accepted, some rejected, both non-empty) is
+/// unit-testable without a live server.
+fn summarize_expand_response(response: &serde_json::Value) -> ExpandSummary<'_> {
+    let accepted = response["result"]["accepted"]
+        .as_array()
+        .map(|accepted| accepted.iter().filter_map(|path| path.as_str()).collect())
+        .unwrap_or_default();
+    let rejected = response["result"]["rejected"]
+        .as_array()
+        .map(|rejected| {
+            rejected
+                .iter()
+                .map(|rejection| ExpandRejectionLine {
+                    template: rejection["template"].as_str().unwrap_or(""),
+                    reason: rejection["reason"].as_str().unwrap_or(""),
+                    message: rejection["message"].as_str().unwrap_or(""),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ExpandSummary { accepted, rejected }
+}
+
+/// §3 frozen interface 7: a rejection is a **success** response, so this never
+/// routes through [`print_workflow_error`] for a rejection — only a genuine
+/// error envelope (bad run/path/token, closed run) does.
+fn print_workflow_node_expand_response(
+    response: &serde_json::Value,
+    json: bool,
+) -> std::io::Result<i32> {
+    if json {
+        return super::print_response(response);
+    }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
+    }
+    let summary = summarize_expand_response(response);
+    println!("accepted: {}", summary.accepted.len());
+    for path in &summary.accepted {
+        println!("  {path}");
+    }
+    println!("rejected: {}", summary.rejected.len());
+    for rejection in &summary.rejected {
+        println!(
+            "  template={} reason={}",
+            rejection.template, rejection.reason
+        );
+        if !rejection.message.is_empty() {
+            println!("    {}", rejection.message);
+        }
+    }
+    Ok(0)
+}
+
 fn workflow_node_complete(args: &[String]) -> std::io::Result<i32> {
     let result_file = match parse_workflow_node_complete_args(args) {
         Ok(result_file) => result_file,
@@ -1015,6 +1204,9 @@ fn print_workflow_run_response(response: &serde_json::Value, json: bool) -> std:
         run["nodes_done"].as_u64().unwrap_or(0),
         run["nodes_total"].as_u64().unwrap_or(0)
     );
+    if let Some(line) = format_run_growth_line(run) {
+        println!("{line}");
+    }
 
     for node in &blocking {
         println!("blocked: {} ({})", node.path, node.status);
@@ -1072,6 +1264,71 @@ fn blocking_run_nodes(nodes: &[serde_json::Value]) -> Vec<BlockingRunNode<'_>> {
         .collect()
 }
 
+/// §3.4 / §4 D11's headline guarantee, CLI half: a run that ever hit a growth
+/// guardrail says so on `run show`, human and `--json` alike (the wire's
+/// `growth_limited` field on `WorkflowRunInfo` already carries it either way —
+/// this only builds the human line). `None` when the run has never been
+/// limited, matching WS-I's "prints a `growth:` line ... whenever the run has
+/// a growth limit recorded" — an unlimited run gets no line at all rather than
+/// a reassuring "not limited" one nobody asked for.
+///
+/// `nodes_live`/`max_nodes` come from the run's own effective ceilings (WS-A/
+/// WS-E's one authority — §4 D9), not from the specific rejection's own
+/// requested/accepted counts, so the line always describes the run's current
+/// state rather than a snapshot of whichever proposal happened to trip the
+/// guardrail.
+fn format_run_growth_line(run: &serde_json::Value) -> Option<String> {
+    let limit = run.get("growth_limited")?;
+    if limit.is_null() {
+        return None;
+    }
+    let nodes_live = run["nodes_live"].as_u64().unwrap_or(0);
+    let max_nodes = run["max_nodes"].as_u64().unwrap_or(0);
+    let kind = limit["kind"].as_str().unwrap_or("limit");
+    let at = limit["at_unix_ms"].as_u64().unwrap_or(0);
+    Some(format!(
+        "growth:  {nodes_live} of {max_nodes} nodes · limited: {kind} reached at {}",
+        format_unix_ms_clock(at)
+    ))
+}
+
+/// The node's own last rejection as a *proposer* (`WorkflowRunNodeInfo.
+/// growth_limited`) — distinct from [`format_run_growth_line`], which reports
+/// the run's most recent limit regardless of which node hit it. `None` when
+/// this node has never proposed into a guardrail.
+fn format_node_growth_limited_line(node: &serde_json::Value) -> Option<String> {
+    let limit = node.get("growth_limited")?;
+    if limit.is_null() {
+        return None;
+    }
+    let kind = limit["kind"].as_str().unwrap_or("limit");
+    let requested = limit["requested"].as_u64().unwrap_or(0);
+    let accepted = limit["accepted"].as_u64().unwrap_or(0);
+    let at = limit["at_unix_ms"].as_u64().unwrap_or(0);
+    Some(format!(
+        "growth_limited: {kind} reached at {} ({accepted} of {requested} accepted)",
+        format_unix_ms_clock(at)
+    ))
+}
+
+/// The last pane delivery the runtime refused for this node (`04-kvdag-and-
+/// execution.md` §5) — a runtime fact carried on `WorkflowRunNodeInfo`, not a
+/// TUI-only one, so `node show` names it exactly as the DAG overlay does.
+fn format_node_delivery_failure_line(node: &serde_json::Value) -> Option<String> {
+    let text = node["delivery_failure"].as_str()?;
+    Some(format!("delivery_failure: {text}"))
+}
+
+/// `HH:MM` for a growth-limit timestamp — the plan's own example
+/// ("... reached at 14:22") is clock time, not a full date, so this is
+/// deliberately narrower than [`format_unix_ms`].
+fn format_unix_ms_clock(ms: u64) -> String {
+    let secs_of_day = (ms / 1000) % 86_400;
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    format!("{hour:02}:{minute:02}")
+}
+
 /// §2.10: `node show`'s human output printed `path`/`status`/`model`/
 /// `effort`/`pane_id` but silently dropped `blocker` — the one field that
 /// says *why* a `needs_attention` or `failed` node is stuck and what would
@@ -1097,6 +1354,12 @@ fn print_workflow_node_response(response: &serde_json::Value, json: bool) -> std
     }
     if let Some(resume_when) = node["blocker"]["resume_when"].as_str() {
         println!("resume:  {resume_when}");
+    }
+    if let Some(line) = format_node_growth_limited_line(node) {
+        println!("{line}");
+    }
+    if let Some(line) = format_node_delivery_failure_line(node) {
+        println!("{line}");
     }
     Ok(0)
 }
@@ -1464,6 +1727,9 @@ fn print_workflow_node_help() {
     eprintln!(
         "  kvx workflow node complete [--result-file <path>]   # run by the node itself; reads KARVEX_WORKFLOW_RUN_ID/NODE_PATH/NODE_DIR/NODE_TOKEN"
     );
+    eprintln!(
+        "  kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]   # run by the node itself; reads KARVEX_WORKFLOW_NODE_TOKEN"
+    );
 }
 
 #[cfg(test)]
@@ -1829,6 +2095,248 @@ mod tests {
                 path: "plan".to_string(),
             })
         );
+    }
+
+    // ── node expand ──────────────────────────────────────────────────────
+
+    #[test]
+    fn workflow_node_expand_builds_workflow_node_expand() {
+        let (params, json) = parse_workflow_node_expand_args(&args(&[
+            "run-1",
+            "plan",
+            "--template",
+            "worker",
+            "--label",
+            "Worker",
+            "--count",
+            "4",
+            "--json",
+        ]))
+        .unwrap();
+        assert!(json);
+        assert_eq!(params.run_id, "run-1");
+        assert_eq!(params.path, "plan");
+        assert_eq!(params.template, "worker");
+        assert_eq!(params.label, "Worker");
+        assert_eq!(params.count, Some(4));
+        // The token is never taken from argv: it is read from
+        // `KARVEX_WORKFLOW_NODE_TOKEN` by the leaf function, exactly like
+        // `node complete`'s env-sourced credential.
+        assert_eq!(params.token, "");
+    }
+
+    #[test]
+    fn workflow_node_expand_json_flag_defaults_to_false() {
+        let (_params, json) = parse_workflow_node_expand_args(&args(&[
+            "run-1",
+            "plan",
+            "--template",
+            "worker",
+            "--label",
+            "Worker",
+        ]))
+        .unwrap();
+        assert!(!json);
+    }
+
+    #[test]
+    fn workflow_node_expand_requires_template_and_label() {
+        assert!(parse_workflow_node_expand_args(&args(&["run-1", "plan"])).is_err());
+        assert!(
+            parse_workflow_node_expand_args(&args(&["run-1", "plan", "--template", "worker"]))
+                .is_err()
+        );
+        assert!(
+            parse_workflow_node_expand_args(&args(&["run-1", "plan", "--label", "Worker"]))
+                .is_err()
+        );
+    }
+
+    /// The `--input k=v` case §WS-I's "Tested" section names explicitly: a
+    /// value that itself contains `=` still parses whole, because
+    /// `parse_arg_assignment` splits on the *first* `=` only.
+    #[test]
+    fn workflow_node_expand_input_with_equals_in_the_value_parses_whole() {
+        let (params, _json) = parse_workflow_node_expand_args(&args(&[
+            "run-1",
+            "plan",
+            "--template",
+            "worker",
+            "--label",
+            "Worker",
+            "--input",
+            "goal=a=b=c",
+        ]))
+        .unwrap();
+        assert_eq!(params.inputs.get("goal").map(String::as_str), Some("a=b=c"));
+    }
+
+    #[test]
+    fn workflow_node_expand_accepts_repeated_inputs() {
+        let (params, _json) = parse_workflow_node_expand_args(&args(&[
+            "run-1",
+            "plan",
+            "--template",
+            "worker",
+            "--label",
+            "Worker",
+            "--input",
+            "a=1",
+            "--input",
+            "b=2",
+        ]))
+        .unwrap();
+        assert_eq!(params.inputs.get("a").map(String::as_str), Some("1"));
+        assert_eq!(params.inputs.get("b").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn workflow_node_expand_rejects_unparseable_count() {
+        assert!(parse_workflow_node_expand_args(&args(&[
+            "run-1",
+            "plan",
+            "--template",
+            "worker",
+            "--label",
+            "Worker",
+            "--count",
+            "many",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn workflow_node_expand_omits_count_when_not_given() {
+        let (params, _json) = parse_workflow_node_expand_args(&args(&[
+            "run-1",
+            "plan",
+            "--template",
+            "worker",
+            "--label",
+            "Worker",
+        ]))
+        .unwrap();
+        assert_eq!(params.count, None);
+    }
+
+    /// §3 frozen interface 7: a rejection is a success response, never routed
+    /// through the error renderer, and partial acceptance (both non-empty) is
+    /// the interesting case — never accept-all, never reject-all reported as
+    /// though it were an error.
+    #[test]
+    fn summarize_expand_response_reports_partial_acceptance() {
+        let response = serde_json::json!({
+            "result": {
+                "type": "workflow_node_expanded",
+                "accepted": ["plan/worker/1", "plan/worker/2"],
+                "rejected": [
+                    {
+                        "template": "worker",
+                        "reason": "truncated",
+                        "requested": 4,
+                        "accepted": 2,
+                        "message": "expand_max 2 reached; 2 of 4 requested nodes created",
+                    }
+                ],
+            }
+        });
+        let summary = summarize_expand_response(&response);
+        assert_eq!(summary.accepted, vec!["plan/worker/1", "plan/worker/2"]);
+        assert_eq!(summary.rejected.len(), 1);
+        assert_eq!(summary.rejected[0].template, "worker");
+        assert_eq!(summary.rejected[0].reason, "truncated");
+        assert!(summary.rejected[0].message.contains("2 of 4"));
+    }
+
+    #[test]
+    fn summarize_expand_response_is_empty_for_a_wholly_accepted_proposal() {
+        let response = serde_json::json!({
+            "result": { "accepted": ["plan/worker/1"], "rejected": [] }
+        });
+        let summary = summarize_expand_response(&response);
+        assert_eq!(summary.accepted, vec!["plan/worker/1"]);
+        assert!(summary.rejected.is_empty());
+    }
+
+    // ── growth/rejection lines (run show / node show) ───────────────────
+
+    #[test]
+    fn format_run_growth_line_is_none_when_the_run_has_never_been_limited() {
+        let run = serde_json::json!({
+            "nodes_live": 3, "max_nodes": 12, "growth_limited": null
+        });
+        assert_eq!(format_run_growth_line(&run), None);
+
+        let run_without_field = serde_json::json!({ "nodes_live": 3, "max_nodes": 12 });
+        assert_eq!(format_run_growth_line(&run_without_field), None);
+    }
+
+    #[test]
+    fn format_run_growth_line_names_the_kind_and_clock_time() {
+        let run = serde_json::json!({
+            "nodes_live": 3,
+            "max_nodes": 12,
+            "growth_limited": {
+                "kind": "max_nodes",
+                "at_unix_ms": 1_700_000_000_000u64,
+            }
+        });
+        let line = format_run_growth_line(&run).expect("a limited run has a growth line");
+        assert!(line.starts_with("growth:"), "{line}");
+        assert!(line.contains("3 of 12 nodes"), "{line}");
+        assert!(line.contains("max_nodes reached at"), "{line}");
+    }
+
+    #[test]
+    fn format_node_growth_limited_line_is_none_without_a_rejection() {
+        let node = serde_json::json!({ "path": "plan" });
+        assert_eq!(format_node_growth_limited_line(&node), None);
+    }
+
+    #[test]
+    fn format_node_growth_limited_line_names_accepted_of_requested() {
+        let node = serde_json::json!({
+            "growth_limited": {
+                "kind": "expand_max",
+                "requested": 4,
+                "accepted": 2,
+                "at_unix_ms": 1_700_000_000_000u64,
+            }
+        });
+        let line =
+            format_node_growth_limited_line(&node).expect("a limited node has a growth line");
+        assert!(
+            line.starts_with("growth_limited: expand_max reached at"),
+            "{line}"
+        );
+        assert!(line.contains("(2 of 4 accepted)"), "{line}");
+    }
+
+    /// §H6's sibling surface: `delivery_failure` is a shared runtime fact
+    /// (`WorkflowRunNodeInfo.delivery_failure`), so `node show` names it in
+    /// prose exactly as it already appears on the wire.
+    #[test]
+    fn format_node_delivery_failure_line_names_the_refused_delivery() {
+        let node = serde_json::json!({
+            "delivery_failure": "steer never reached the process: pane closed"
+        });
+        let line = format_node_delivery_failure_line(&node)
+            .expect("a node with a delivery failure has a line");
+        assert_eq!(
+            line,
+            "delivery_failure: steer never reached the process: pane closed"
+        );
+
+        let clean_node = serde_json::json!({ "path": "plan" });
+        assert_eq!(format_node_delivery_failure_line(&clean_node), None);
+    }
+
+    #[test]
+    fn format_unix_ms_clock_renders_hour_and_minute() {
+        // 1970-01-01T00:00:00Z
+        assert_eq!(format_unix_ms_clock(0), "00:00");
+        // 2024-01-01T14:22:00Z
+        assert_eq!(format_unix_ms_clock(1_704_118_920_000), "14:22");
     }
 
     #[test]

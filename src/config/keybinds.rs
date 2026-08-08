@@ -355,6 +355,11 @@ pub struct Keybinds {
     /// entry: the overlay is the one surface that says a run needs a human, so
     /// it has to be reachable from the keyboard and rebindable in config.toml.
     pub open_workflow_dag: ActionKeybinds,
+    /// Opens the workflow launcher (`06-phase2-plan.md` §4 D18): the list of
+    /// workflows, their required arguments, and the tier row that seeds the
+    /// run. Bound rather than menu-only for the same reason the DAG view is —
+    /// it is how a run is started without leaving karvex.
+    pub open_workflow_launcher: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
 }
 
@@ -518,6 +523,7 @@ impl Config {
             resize_mode: empty_action!(),
             toggle_sidebar: empty_action!(),
             open_workflow_dag: empty_action!(),
+            open_workflow_launcher: empty_action!(),
             custom_commands: Vec::new(),
         };
 
@@ -660,6 +666,11 @@ impl Config {
             apply_action!(keybinds.resize_mode, resize_mode, source);
             apply_action!(keybinds.toggle_sidebar, toggle_sidebar, source);
             apply_action!(keybinds.open_workflow_dag, open_workflow_dag, source);
+            apply_action!(
+                keybinds.open_workflow_launcher,
+                open_workflow_launcher,
+                source
+            );
 
             if source == field_source!(indexed) {
                 append_legacy_indexed_bindings(
@@ -1603,6 +1614,41 @@ open_workflow_dag = "prefix+ctrl+d"
             binding_triggers(&config.keybinds().open_workflow_dag),
             vec![BindingTrigger::Prefix((
                 KeyCode::Char('d'),
+                KeyModifiers::CONTROL
+            ))]
+        );
+    }
+
+    /// The launcher is how a run is started without leaving karvex
+    /// (`06-phase2-plan.md` §4 D18), so it is a bound action like the DAG view
+    /// rather than a menu-only entry — and it sits beside it on `prefix+f`.
+    #[test]
+    fn open_workflow_launcher_defaults_to_prefix_f_and_is_rebindable() {
+        let kb = Config::default().keybinds();
+        assert_eq!(
+            binding_triggers(&kb.open_workflow_launcher),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('f'),
+                KeyModifiers::empty()
+            ))]
+        );
+        assert_ne!(
+            binding_triggers(&kb.open_workflow_launcher),
+            binding_triggers(&kb.open_workflow_dag),
+            "the two workflow bindings must not collide"
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+open_workflow_launcher = "prefix+ctrl+w"
+"#,
+        )
+        .expect("the key parses");
+        assert_eq!(
+            binding_triggers(&config.keybinds().open_workflow_launcher),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('w'),
                 KeyModifiers::CONTROL
             ))]
         );

@@ -1209,6 +1209,9 @@ impl App {
             Method::WorkflowNodeRestart(target) => {
                 return self.handle_workflow_node_restart(request.id, target);
             }
+            Method::WorkflowNodeExpand(params) => {
+                return self.handle_workflow_node_expand(request.id, params);
+            }
             _ => {
                 return responses::encode_error(
                     request.id,

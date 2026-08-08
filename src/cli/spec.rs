@@ -971,6 +971,28 @@ fn workflow_node_command() -> Command {
                 .about("Report a node's structured result (used by the node itself)")
                 .arg(path_option("result-file", "PATH")),
         )
+        .subcommand(
+            Command::new("expand")
+                .about("Propose new nodes from a running workflow node (used by the node itself)")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(required("path", "PATH"))
+                .arg(
+                    option("template", "TEMPLATE")
+                        .required(true)
+                        .help("kvdag key of the template node to instantiate"),
+                )
+                .arg(
+                    option("label", "LABEL")
+                        .required(true)
+                        .help("Label for the instantiated child node(s)"),
+                )
+                .arg(
+                    repeatable_option("input", "KEY=VALUE")
+                        .help("Override a slot the template's prompt_template already declares"),
+                )
+                .arg(option("count", "N").help("How many children to instantiate; defaults to 1"))
+                .arg(json_flag()),
+        )
 }
 
 fn current_pane_args() -> [Arg; 2] {

@@ -161,7 +161,9 @@ pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuA
 /// Returns whether it opened. The menu entry is only offered when a run exists,
 /// but `keys.open_workflow_dag` can be pressed at any time, and a bound key
 /// that does nothing at all is indistinguishable from a broken one — the caller
-/// that has the runtime turns `false` into a notice.
+/// that has the runtime turns `false` into the workflow launcher
+/// (`06-phase2-plan.md` §4 D18) and, only when there is nothing to launch
+/// either, into a notice.
 pub(super) fn open_workflow_dag(state: &mut AppState) -> bool {
     if state.workflow_run_graph().is_none() {
         return false;
@@ -499,6 +501,20 @@ pub(super) const WORKFLOW_DAG_ACTIONS: &[ModalActionSpec<ModalAction>] = &[Modal
     action: ModalAction::Close,
     bindings: &[ModalKeyBinding::Esc],
 }];
+
+/// The workflow launcher's action row: `Enter` runs the selected workflow,
+/// `Esc` closes through the same `leave_modal` path
+/// (`06-phase2-plan.md` §4 D18).
+pub(super) const WORKFLOW_LAUNCH_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
+    ModalActionSpec {
+        action: ModalAction::Confirm,
+        bindings: &[ModalKeyBinding::Enter],
+    },
+    ModalActionSpec {
+        action: ModalAction::Close,
+        bindings: &[ModalKeyBinding::Esc],
+    },
+];
 
 pub(super) const RENAME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
     ModalActionSpec {
@@ -1567,6 +1583,7 @@ mod tests {
             version_id: crate::workflow::model::KvdagVersionId::new("kvdag_version:1"),
             tier: crate::workflow::tier::Tier::High,
             growth: crate::workflow::model::GrowthLimits::default(),
+            assignments: std::collections::BTreeMap::new(),
             nodes: Vec::new(),
             edges: Vec::new(),
             status: crate::workflow::model::RunStatus::Running,

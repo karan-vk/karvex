@@ -227,6 +227,13 @@ impl App {
             return true;
         }
 
+        if self.state.mode == Mode::WorkflowLaunch {
+            // Same rule as the DAG overlay: the hit-test reads the rectangles
+            // the view-computation pass stored, so there is no second geometry
+            // to keep in sync (`06-phase2-plan.md` §4 D18).
+            return self.handle_workflow_launch_mouse(mouse);
+        }
+
         if self.state.mode == Mode::KeybindHelp {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)

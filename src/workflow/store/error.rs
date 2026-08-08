@@ -40,6 +40,13 @@ pub enum StoreError {
     /// (`create_version` / `load_version`). Store-level, not engine-level: the
     /// engine never sees a graph that hasn't already passed this gate.
     InvalidGraph(KvdagError),
+    /// A caller asked the store to write something the schema's own rules
+    /// forbid — a run wider than the version it runs
+    /// (`workflow_run.max_nodes <= kvdag_version.max_nodes`,
+    /// `04-kvdag-and-execution.md` §3.4), or a materialised node with no
+    /// resolved assignment. Distinct from [`Self::Query`]: nothing was
+    /// attempted against the database, so there is no engine error to report.
+    Invariant(String),
     Io(io::Error),
 }
 
@@ -81,6 +88,7 @@ impl fmt::Display for StoreError {
             Self::Decode(message) => write!(f, "workflow store decode failed: {message}"),
             Self::NotFound { table, id } => write!(f, "no {table} with id {id}"),
             Self::InvalidGraph(error) => write!(f, "invalid kvdag: {error}"),
+            Self::Invariant(message) => write!(f, "workflow store invariant violated: {message}"),
             Self::Io(error) => write!(f, "{error}"),
         }
     }
@@ -119,6 +127,14 @@ mod tests {
         assert_eq!(error.api_code(), WORKFLOW_UNAVAILABLE_CODE);
         assert!(error.to_string().contains(STORE_LOCKED));
         assert!(error.to_string().contains("pid 4242"));
+    }
+
+    #[test]
+    fn invariant_violations_report_as_a_store_error_not_unavailable() {
+        let error = StoreError::Invariant("run growth exceeds the version".to_string());
+        assert!(!error.is_unavailable());
+        assert_eq!(error.api_code(), WORKFLOW_STORE_ERROR_CODE);
+        assert!(error.to_string().contains("run growth exceeds the version"));
     }
 
     #[test]

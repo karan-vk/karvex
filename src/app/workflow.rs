@@ -29,19 +29,21 @@ use tracing::{debug, warn};
 use crate::api::schema::{
     AgentPromptParams, AgentSendKeysParams, ErrorResponse, EventData, EventEnvelope, EventKind,
     Method, PaneSendKeysParams, PaneSendTextParams, WorkflowDemand, WorkflowEdgeKind,
-    WorkflowEvidence, WorkflowNodeStatus, WorkflowRunEdgeInfo, WorkflowRunGraph, WorkflowRunInfo,
-    WorkflowRunNodeInfo, WorkflowRunStatus, WorkflowSuccession, WorkflowTier,
+    WorkflowEvidence, WorkflowGrowthLimit, WorkflowGrowthLimitKind, WorkflowNodeStatus,
+    WorkflowRunEdgeInfo, WorkflowRunGraph, WorkflowRunInfo, WorkflowRunNodeInfo, WorkflowRunStatus,
+    WorkflowSuccession, WorkflowTier,
 };
 use crate::app::state::{ToastKind, ToastNotification};
 use crate::app::App;
 use crate::events::WorkflowAppEvent;
 use crate::workflow::binding::{observe, spawn};
+use crate::workflow::engine::expand::ExpandLimit;
 use crate::workflow::engine::{DeliveryFailureNote, Engine, EngineConfig};
 use crate::workflow::model::{
-    Demand, EdgeKind, EdgePayload, EngineInput, Evidence, InstancePath, Kvdag, KvdagVersionId,
-    NodeBinding, NodeStatus, NodeToken, NoticeLevel, OutputSchema, PublicPaneId, RunEffect,
-    RunGraph, RunId, RunNode, RunStatus, Runner, SpawnSpec, StoreWrite, Succession, UserNotice,
-    WorkflowEvent, WorkflowId,
+    Demand, EdgeKind, EdgePayload, EngineInput, Evidence, GrowthLimits, InstancePath, Kvdag,
+    KvdagVersionId, NodeBinding, NodeStatus, NodeToken, NoticeLevel, OutputSchema, PublicPaneId,
+    RunEffect, RunGraph, RunId, RunNode, RunStatus, Runner, SpawnSpec, StoreWrite, Succession,
+    UserNotice, WorkflowEvent, WorkflowId,
 };
 use crate::workflow::tier::Tier;
 
@@ -167,6 +169,19 @@ pub(crate) struct WorkflowRuntimeState {
     /// leaves `NeedsAttention`, so a restarted node that gets stuck again is
     /// announced again rather than silently.
     announced_attention: HashSet<InstancePath>,
+    /// The last growth guardrail each *proposing* node ran into, and the run's
+    /// most recent one.
+    ///
+    /// A growth limit is a live fact with no `workflow_run`/`run_node` column
+    /// to live in — the journal records it as a `growth_limited` event, which
+    /// is an audit trail rather than a projection. Keeping it here is what
+    /// makes §4 D11's guarantee ("a rejection is always surfaced") true on the
+    /// API, the DAG overlay, and the CLI rather than only on the event stream,
+    /// and it is the same shape as `Engine::delivery_failure`: state the run
+    /// holds, mirrored into whatever is showing it.
+    growth_limits: HashMap<InstancePath, WorkflowGrowthLimit>,
+    /// The run-level view of the same fact: whichever limit was recorded last.
+    last_growth_limit: Option<WorkflowGrowthLimit>,
 }
 
 /// A `RunEffect` delivery into a node's pane that the in-process API refused.
@@ -188,6 +203,15 @@ impl DeliveryFailure {
     }
 }
 
+/// Whether a buffered write brings a row into existence rather than updating
+/// one. Creates are never evicted by queue overflow (§4 D7).
+fn is_create_write(write: &StoreWrite) -> bool {
+    matches!(
+        write,
+        StoreWrite::RunNodeCreated { .. } | StoreWrite::RunEdgeCreated { .. }
+    )
+}
+
 impl WorkflowRuntimeState {
     pub(crate) fn new(config: EngineConfig) -> Self {
         Self {
@@ -205,7 +229,29 @@ impl WorkflowRuntimeState {
             delivery_failure: None,
             announced_run_status: None,
             announced_attention: HashSet::new(),
+            growth_limits: HashMap::new(),
+            last_growth_limit: None,
         }
+    }
+
+    /// Records the growth guardrail `path`'s proposal ran into.
+    ///
+    /// Last-write-wins per node and for the run: a node that proposes twice has
+    /// one current answer to "what stopped you", and the banner names the most
+    /// recent breach rather than the first.
+    pub(crate) fn record_growth_limit(&mut self, path: &InstancePath, limit: WorkflowGrowthLimit) {
+        self.growth_limits.insert(path.clone(), limit.clone());
+        self.last_growth_limit = Some(limit);
+    }
+
+    /// The last growth guardrail this node ran into as a proposer.
+    pub(crate) fn node_growth_limit(&self, path: &InstancePath) -> Option<&WorkflowGrowthLimit> {
+        self.growth_limits.get(path)
+    }
+
+    /// The run's most recent growth guardrail, whichever node hit it.
+    pub(crate) fn last_growth_limit(&self) -> Option<&WorkflowGrowthLimit> {
+        self.last_growth_limit.as_ref()
     }
 
     /// Everything the user has not been told yet about the run's current shape.
@@ -218,8 +264,9 @@ impl WorkflowRuntimeState {
     /// model: the caller shows these exactly the way it shows the engine's own
     /// [`UserNotice`]s.
     ///
-    /// Ordered node-first so the run-level notice is the last one shown, which
-    /// is the one the single-slot toast keeps.
+    /// Ordered node-first, which is now just an ordering: the notice queue
+    /// (`AppState::push_toast`, §4 D10) renders both, so this no longer has to
+    /// choose which one survives a single slot.
     pub(crate) fn take_pending_announcements(&mut self) -> Vec<UserNotice> {
         let Some(graph) = self.engine.graph() else {
             return Vec::new();
@@ -371,6 +418,10 @@ impl WorkflowRuntimeState {
         // must not suppress this one's.
         self.announced_run_status = None;
         self.announced_attention.clear();
+        // Growth is a property of the run too: the previous run's ceiling
+        // breach must not banner this one.
+        self.growth_limits.clear();
+        self.last_growth_limit = None;
         self.run = Some(run);
         self.engine.install_definition(definition);
         let effects = self.engine.apply(EngineInput::Start {
@@ -452,8 +503,9 @@ impl WorkflowRuntimeState {
     }
 
     /// Buffers a durable write for the store task. Overflow drops the oldest
-    /// entry and marks the run's persistence degraded rather than blocking a
-    /// node transition on I/O.
+    /// *evictable* entry and marks the run's persistence degraded rather than
+    /// blocking a node transition on I/O — see [`Self::evict_one_pending_write`]
+    /// for why "evictable" is not simply "oldest".
     pub(crate) fn queue_write(&mut self, write: StoreWrite) {
         // The engine stamps the run's close time as it closes the run, and both
         // the live projection and the journal report *that* stamp. Without this
@@ -470,11 +522,47 @@ impl WorkflowRuntimeState {
             }
         }
         if self.pending_writes.len() >= PENDING_WRITE_BUDGET {
-            self.pending_writes.pop_front();
-            self.dropped_writes = self.dropped_writes.saturating_add(1);
-            self.persistence_degraded = true;
+            self.evict_one_pending_write();
         }
         self.pending_writes.push_back(write);
+    }
+
+    /// Makes room for one more buffered write by dropping the oldest entry the
+    /// journal can survive losing (`06-phase2-plan.md` §4 D7).
+    ///
+    /// A create is not such an entry. [`StoreWrite::RunNode`] and
+    /// [`StoreWrite::RunEdge`] are find-then-`UPDATE` and error on a missing
+    /// row, so dropping a [`StoreWrite::RunNodeCreated`] while keeping the
+    /// updates queued behind it does not lose one row — it turns every later
+    /// write naming that path into a permanent failure. Eviction therefore
+    /// scans from the front for the first non-create entry.
+    ///
+    /// When the queue is *all* creates there is nothing safe to drop, so it
+    /// grows past [`PENDING_WRITE_BUDGET`] and the run is marked persistence
+    /// degraded instead. The bound is a memory guard; a corrupted journal is
+    /// worse than a temporarily larger queue, and the in-memory [`RunGraph`]
+    /// stays authoritative either way.
+    fn evict_one_pending_write(&mut self) {
+        let victim = self
+            .pending_writes
+            .iter()
+            .position(|write| !is_create_write(write));
+        match victim {
+            Some(index) => {
+                self.pending_writes.remove(index);
+                self.dropped_writes = self.dropped_writes.saturating_add(1);
+                self.persistence_degraded = true;
+            }
+            None => {
+                if self.mark_persistence_degraded() {
+                    warn!(
+                        queued = self.pending_writes.len(),
+                        "workflow write queue is over budget and holds only node/edge creates; \
+                         growing it rather than dropping a create"
+                    );
+                }
+            }
+        }
     }
 
     /// Takes at most `limit` buffered writes, oldest first. The cap is what
@@ -684,9 +772,68 @@ impl App {
         if !self.workflow.tick_due(now) {
             return false;
         }
-        let mut changed = self.sample_workflow_agent_states(now);
+        // Before sampling, because a node whose pane is gone has no agent state
+        // to sample and must not be counted as idle for another tick.
+        let mut changed = self.reconcile_workflow_pane_bindings();
+        changed |= self.sample_workflow_agent_states(now);
         changed |= self.apply_workflow_engine_input_at(EngineInput::Tick { now }, now);
         changed
+    }
+
+    /// Fails, or retries, every node whose pane has left the layout without a
+    /// `PaneExited` ever reaching the engine (`06-phase2-plan.md` §4 D14 / H6).
+    ///
+    /// Two paths report a pane's disappearance directly: `AppEvent::PaneDied`
+    /// for a process that exited, and `App::close_pane` for the API verb and
+    /// the TUI keybinding that routes through it. Neither covers bulk removal —
+    /// `handle_tab_close` and `handle_workspace_close` drop every pane they own
+    /// without telling anyone — and neither would cover a future path. So the
+    /// live-run tick reconciles the engine's bindings against the layout
+    /// instead of chasing call sites: detection is immediate for the direct
+    /// paths and bounded at one [`WORKFLOW_TICK_INTERVAL`] for everything else.
+    ///
+    /// A node is reconciled at most once. `Engine::pane_exited` either clears
+    /// the binding for a retry or leaves the node terminal, and both are
+    /// filtered out below, so a run does not re-report the same dead pane every
+    /// 20 seconds.
+    pub(crate) fn reconcile_workflow_pane_bindings(&mut self) -> bool {
+        let Some(graph) = self.workflow.graph() else {
+            return false;
+        };
+        let orphaned: Vec<PublicPaneId> = graph
+            .nodes
+            .iter()
+            .filter(|node| !node.status.is_terminal())
+            .filter_map(|node| node.binding.as_ref().map(|binding| binding.pane_id.clone()))
+            .filter(|pane| !self.workflow_pane_is_live(pane))
+            .collect();
+
+        let mut changed = false;
+        for pane in orphaned {
+            warn!(
+                pane = %pane,
+                "workflow node pane left the layout without a close event; failing the node"
+            );
+            changed |= self.apply_workflow_engine_input(observe::pane_exited(pane, None));
+        }
+        changed
+    }
+
+    /// Whether a bound public pane id still names *this* pane in this layout.
+    ///
+    /// Resolving the id is not enough in either direction. Public pane numbers
+    /// are per workspace, so a stale id can parse into a different live pane —
+    /// which would leave a dead node `running` forever. And a pane moved across
+    /// workspaces keeps working under its previous id through
+    /// `public_pane_id_aliases`, so demanding the *current* id would kill a node
+    /// whose pane is perfectly alive. Both are checked.
+    fn workflow_pane_is_live(&self, pane: &PublicPaneId) -> bool {
+        let id = pane.as_str();
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(id) else {
+            return false;
+        };
+        self.public_pane_id(ws_idx, pane_id).as_deref() == Some(id)
+            || self.state.public_pane_id_aliases.get(id) == Some(&pane_id)
     }
 
     fn sample_workflow_agent_states(&mut self, now: Instant) -> bool {
@@ -903,9 +1050,30 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        // A growth limit lives on the runtime for the same reason a refused
+        // delivery does — no column carries it — so the overlay gets it the
+        // same way: one banner for the run and one notice on the node that
+        // proposed (§4 D11, WS-G).
+        let growth_banner = self.workflow.last_growth_limit().map(format_growth_banner);
+        let growth_notices = self
+            .workflow
+            .graph()
+            .map(|graph| {
+                graph
+                    .nodes
+                    .iter()
+                    .filter_map(|node| {
+                        let limit = self.workflow.node_growth_limit(&node.path)?;
+                        Some((node.path.to_string(), format_growth_notice(limit)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.state.set_workflow_run_graph(graph);
         self.state.set_workflow_node_labels(labels);
         self.state.set_workflow_delivery_failures(delivery_failures);
+        self.state
+            .set_workflow_growth(growth_banner, growth_notices);
     }
 
     /// Hands whatever `RunEffect::Persist` queued to the store. Every effect
@@ -1392,15 +1560,23 @@ impl App {
         };
         match self.state.toast_config.delivery {
             crate::config::ToastDelivery::Karvex => {
-                let previous_toast = self.state.toast.clone();
-                self.state.toast = Some(ToastNotification {
+                // One rendered slot, but a workflow batch routinely raises a
+                // per-node notice immediately followed by the run-level one,
+                // and assigning the slot destroyed the first (H4). `push_toast`
+                // shows this one now or queues it behind whatever is showing;
+                // the expiry pop in `App::expire_toast_or_show_next` is what
+                // drains it. The `Terminal`/`System` arms below fire one OS
+                // notification per notice and never contended for the slot, so
+                // they are unchanged.
+                if self.state.push_toast(ToastNotification {
                     kind,
                     title,
                     context: notice.message,
                     position: None,
                     target: None,
-                });
-                self.sync_toast_deadline(previous_toast);
+                }) {
+                    self.arm_toast_deadline();
+                }
             }
             crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
                 if self.local_terminal_notifications =>
@@ -1473,6 +1649,60 @@ impl App {
                     summary,
                 },
             )),
+            WorkflowEvent::GrowthLimited {
+                run,
+                path,
+                template,
+                limit,
+                limit_value,
+                requested,
+                accepted,
+                message,
+            } => {
+                // §4 D11: a growth rejection lands on three independent
+                // surfaces and the toast is the fourth, optional one. It is
+                // raised here rather than as a `RunEffect::Notify` because the
+                // engine's `commit` deliberately does not know the proposal's
+                // template — the caller that still holds it builds both the
+                // wire event and the notice from the same facts.
+                //
+                // Recorded before it is emitted, so the run and node
+                // projections below — which the DAG banner, `run show`, and
+                // `node show` all read — already carry the limit by the time
+                // any client asks. An event is a notification; the projection
+                // is the fact, and a client that connects after the event was
+                // sent must still be able to see it.
+                self.workflow.record_growth_limit(
+                    &path,
+                    WorkflowGrowthLimit {
+                        kind: wire_growth_limit_kind(limit),
+                        limit_value: u32::from(limit_value),
+                        requested: u32::from(requested),
+                        accepted: u32::from(accepted),
+                        at_unix_ms: current_unix_ms(),
+                        message: message.clone(),
+                    },
+                );
+                self.show_workflow_notice(UserNotice {
+                    level: NoticeLevel::Warning,
+                    run: Some(run.clone()),
+                    path: Some(path.clone()),
+                    message: message.clone(),
+                });
+                Some((
+                    EventKind::WorkflowGrowthLimited,
+                    EventData::WorkflowGrowthLimited {
+                        run_id: run.to_string(),
+                        path: path.to_string(),
+                        template: template.as_str().to_string(),
+                        limit: wire_growth_limit_kind(limit),
+                        limit_value: u32::from(limit_value),
+                        requested: u32::from(requested),
+                        accepted: u32::from(accepted),
+                        message,
+                    },
+                ))
+            }
         };
         let Some((event, data)) = envelope else {
             return;
@@ -1519,6 +1749,14 @@ impl App {
             )
             .unwrap_or(u32::MAX),
             failure: None,
+            max_depth: u32::from(graph.growth.max_depth),
+            max_nodes: u32::from(graph.growth.max_nodes),
+            nodes_live: u32::from(GrowthLimits::live_node_count(&graph.nodes)),
+            // §4 D11: the run's most recent guardrail breach, whichever node
+            // hit it. A durable read of a finished run cannot report this —
+            // `workflow_run` has no column for it — which is exactly why the
+            // live projection wins for the active run.
+            growth_limited: self.workflow.last_growth_limit().cloned(),
         })
     }
 
@@ -1562,6 +1800,17 @@ impl App {
             succession: node.succession.as_ref().map(wire_succession),
             blocker: node.succession.as_ref().and_then(wire_blocker),
             watchdog_interventions: u32::from(node.progress.interventions),
+            assignment_reason: node.assignment_reason.clone(),
+            // A shared runtime fact that used to be reachable only through the
+            // private TUI path; the DAG overlay reads the same map.
+            delivery_failure: self
+                .workflow
+                .node_delivery_failure(&node.path)
+                .map(|failure| format!("{}: {}", failure.method, failure.reason)),
+            // The limit this node ran into *as a proposer*, so a reader can
+            // attribute the run-level breach to the node that caused it
+            // without replaying the event stream.
+            growth_limited: self.workflow.node_growth_limit(&node.path).cloned(),
         })
     }
 
@@ -1721,6 +1970,55 @@ pub(crate) fn wire_node_status(status: NodeStatus) -> WorkflowNodeStatus {
     }
 }
 
+/// The wire spelling of a growth guardrail. The engine's [`ExpandLimit`] and
+/// the wire's `WorkflowGrowthLimitKind` are declared separately on purpose —
+/// `src/api/schema` names no `crate::workflow` type — so this is the one place
+/// the two vocabularies are joined.
+pub(crate) fn wire_growth_limit_kind(limit: ExpandLimit) -> WorkflowGrowthLimitKind {
+    match limit {
+        ExpandLimit::ExpandMax => WorkflowGrowthLimitKind::ExpandMax,
+        ExpandLimit::MaxDepth => WorkflowGrowthLimitKind::MaxDepth,
+        ExpandLimit::MaxNodes => WorkflowGrowthLimitKind::MaxNodes,
+    }
+}
+
+/// The guardrail's name as the author spelled it in the kvdag, which is also
+/// its wire spelling. Kept beside [`wire_growth_limit_kind`] rather than read
+/// back off `ExpandLimit::as_str` so the notice a user reads and the `kind` a
+/// client parses cannot drift.
+fn growth_limit_kind_str(kind: WorkflowGrowthLimitKind) -> &'static str {
+    match kind {
+        WorkflowGrowthLimitKind::ExpandMax => "expand_max",
+        WorkflowGrowthLimitKind::MaxDepth => "max_depth",
+        WorkflowGrowthLimitKind::MaxNodes => "max_nodes",
+    }
+}
+
+/// The DAG's run banner: one line naming the ceiling and the shortfall
+/// (`06-phase2-plan.md` §1 WS-G).
+fn format_growth_banner(limit: &WorkflowGrowthLimit) -> String {
+    format!(
+        "growth limited · {} {} reached · {} of {} requested nodes created",
+        growth_limit_kind_str(limit.kind),
+        limit.limit_value,
+        limit.accepted,
+        limit.requested
+    )
+}
+
+/// The per-node notice drawn inside the proposing node's box. Shorter than the
+/// banner because it shares a box with the node's own status, and truncated by
+/// the renderer when even that does not fit.
+fn format_growth_notice(limit: &WorkflowGrowthLimit) -> String {
+    format!(
+        "growth limited: {} {} · {} of {}",
+        growth_limit_kind_str(limit.kind),
+        limit.limit_value,
+        limit.accepted,
+        limit.requested
+    )
+}
+
 pub(crate) fn wire_evidence(evidence: Evidence) -> WorkflowEvidence {
     match evidence {
         Evidence::SelfReport => WorkflowEvidence::SelfReport,
@@ -1835,6 +2133,25 @@ mod tests {
         definition_with(Runner::Agent)
     }
 
+    /// One node with one attempt, so a dead pane is terminal: the pane-exit
+    /// tests want the engine's verdict, not a retry that spawns a real PTY.
+    fn single_attempt_definition() -> Kvdag {
+        let mut plan = definition_node("plan", Runner::Agent, "plan");
+        plan.max_attempts = 1;
+        Kvdag::try_new(KvdagSpec {
+            version_id: KvdagVersionId::new("kvdag_version:test"),
+            workflow_id: WorkflowId::new("workflow:test"),
+            version: 1,
+            parent: None,
+            contract: "Reply only through result.json.".to_string(),
+            growth: GrowthLimits::default(),
+            args: Vec::new(),
+            nodes: vec![plan],
+            edges: Vec::new(),
+        })
+        .expect("fixture kvdag is valid")
+    }
+
     /// `plan --(port "plan")--> implement`, so the downstream node's template
     /// slot resolves to the upstream checkpoint instead of a run argument.
     fn ported_definition() -> Kvdag {
@@ -1903,6 +2220,27 @@ mod tests {
     fn test_app_with_hub(event_hub: EventHub) -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(&Config::default(), true, None, api_rx, event_hub)
+    }
+
+    /// Every notice the user will see, in the order they will see it: the
+    /// rendered slot first, then whatever is waiting behind it. Before the
+    /// notice queue only the last notice of a batch survived, so a test could
+    /// read `state.toast` and call that "the notification"; now the batch is
+    /// the answer.
+    fn surfaced_toasts(app: &App) -> Vec<ToastNotification> {
+        app.state
+            .toast
+            .iter()
+            .chain(app.state.toast_queue.iter())
+            .cloned()
+            .collect()
+    }
+
+    fn surfaced_notices(app: &App) -> Vec<String> {
+        surfaced_toasts(app)
+            .into_iter()
+            .map(|toast| toast.context)
+            .collect()
     }
 
     fn status_of(state: &WorkflowRuntimeState, path: &str) -> NodeStatus {
@@ -2721,7 +3059,10 @@ mod tests {
         let graph = graph_of(&definition);
         app.start_workflow_run(active_run(), definition, graph)
             .expect("the run starts");
+        // The spawn failures the workspace-less fixture produces are notices
+        // like any other, so both the slot and the queue behind it are cleared.
         app.state.toast = None;
+        app.state.toast_queue.clear();
 
         for (path, result) in [
             ("plan", r#"{"plan":"do it"}"#),
@@ -2736,9 +3077,13 @@ mod tests {
         }
 
         assert_eq!(app.workflow.run_status(), Some(RunStatus::Succeeded));
-        let toast = app.state.toast.as_ref().expect("the run's end is shown");
-        assert_eq!(toast.title, "Workflow run");
-        assert!(toast.context.contains("finished"), "{}", toast.context);
+        // The run notice is the last of the batch and no longer has to win a
+        // single slot to be seen: the node notices ahead of it render first and
+        // it follows as each expires (§4 D10).
+        let surfaced = surfaced_toasts(&app);
+        let end = surfaced.last().expect("the run's end is shown");
+        assert_eq!(end.title, "Workflow run");
+        assert!(end.context.contains("finished"), "{:?}", end.context);
     }
 
     #[test]
@@ -2784,11 +3129,13 @@ mod tests {
             std::slice::from_ref(&path),
             "a failed spawn leaves the node admitted so a later tick retries it"
         );
-        assert!(app
-            .state
-            .toast
-            .as_ref()
-            .is_some_and(|toast| toast.context.contains("retrying")));
+        assert!(
+            surfaced_notices(&app)
+                .iter()
+                .any(|notice| notice.contains("retrying")),
+            "{:?}",
+            surfaced_notices(&app)
+        );
 
         app.tick_workflow_engine(
             app.workflow_tick_deadline()
@@ -2798,11 +3145,16 @@ mod tests {
             app.workflow.spawn_failure_count(&path),
             SPAWN_ATTEMPT_BUDGET
         );
-        assert!(app
-            .state
-            .toast
-            .as_ref()
-            .is_some_and(|toast| !toast.context.contains("retrying")));
+        // The give-up notice is the newest one the user will see. It no longer
+        // has to *replace* the retry notice to be surfaced — that is the point
+        // of the queue (§4 D10).
+        let surfaced = surfaced_notices(&app);
+        assert!(
+            surfaced
+                .last()
+                .is_some_and(|notice| !notice.contains("retrying")),
+            "{surfaced:?}"
+        );
 
         // A node nothing will ever start must not sit `Ready` forever: it takes
         // the failure as a status, which lets §3.2's conjunction stall the run
@@ -2863,5 +3215,512 @@ mod tests {
         assert!(app
             .workflow_node_info(&InstancePath::new("missing"))
             .is_none());
+    }
+
+    fn edge_create(to: &str) -> StoreWrite {
+        StoreWrite::RunEdgeCreated {
+            run: RunId::new("workflow_run:test"),
+            from: InstancePath::new("plan"),
+            to: InstancePath::new(to),
+            kind: EdgeKind::Sequence,
+            kvdag_edge: None,
+            condition_result: None,
+            fired: false,
+        }
+    }
+
+    fn node_status_write(path: &str) -> StoreWrite {
+        StoreWrite::RunNode {
+            run: RunId::new("workflow_run:test"),
+            path: InstancePath::new(path),
+            status: NodeStatus::Running,
+            attempt: 1,
+            binding: None,
+            usage: crate::workflow::model::NodeUsage::default(),
+            evidence: None,
+            succession: None,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+        }
+    }
+
+    fn queued_paths(state: &WorkflowRuntimeState) -> Vec<String> {
+        state
+            .pending_writes
+            .iter()
+            .map(|write| match write {
+                StoreWrite::RunEdgeCreated { to, .. } => format!("create:{to}"),
+                StoreWrite::RunNode { path, .. } => format!("update:{path}"),
+                other => format!("other:{other:?}"),
+            })
+            .collect()
+    }
+
+    /// §4 D7. `write_run_edge`/`write_run_node` are find-then-`UPDATE` and error
+    /// on a missing row, so evicting the oldest write blindly would drop a
+    /// create and turn every later write for that path into a permanent
+    /// failure. The oldest *update* goes instead.
+    #[test]
+    fn write_queue_overflow_evicts_an_update_and_never_a_create() {
+        let mut state = WorkflowRuntimeState::new(EngineConfig::default());
+        state.queue_write(edge_create("child/1"));
+        state.queue_write(node_status_write("oldest"));
+        state.queue_write(edge_create("child/2"));
+        while state.pending_write_count() < PENDING_WRITE_BUDGET {
+            state.queue_write(node_status_write("filler"));
+        }
+
+        state.queue_write(node_status_write("newest"));
+
+        assert_eq!(state.pending_write_count(), PENDING_WRITE_BUDGET);
+        assert_eq!(state.dropped_write_count(), 1);
+        assert!(state.persistence_degraded());
+        let queued = queued_paths(&state);
+        assert_eq!(
+            queued.first().map(String::as_str),
+            Some("create:child/1"),
+            "the create at the head survives: {queued:?}",
+        );
+        assert!(
+            queued.contains(&"create:child/2".to_string()),
+            "every create survives: {queued:?}",
+        );
+        assert!(
+            !queued.contains(&"update:oldest".to_string()),
+            "the oldest evictable write is the one that goes: {queued:?}",
+        );
+    }
+
+    /// §4 D7's other half: with nothing safe to drop the queue grows past its
+    /// budget and says so, because a corrupted journal is worse than a larger
+    /// queue and the in-memory graph is authoritative either way.
+    #[test]
+    fn a_write_queue_of_only_creates_grows_past_budget_instead_of_dropping_one() {
+        let mut state = WorkflowRuntimeState::new(EngineConfig::default());
+        for index in 0..PENDING_WRITE_BUDGET {
+            state.queue_write(edge_create(&format!("child/{index}")));
+        }
+        assert!(!state.persistence_degraded());
+
+        state.queue_write(edge_create("child/overflow"));
+
+        assert_eq!(state.pending_write_count(), PENDING_WRITE_BUDGET + 1);
+        assert_eq!(
+            state.dropped_write_count(),
+            0,
+            "a create is never dropped, so nothing was dropped"
+        );
+        assert!(
+            state.persistence_degraded(),
+            "the run reports the overflow instead of hiding it"
+        );
+        let queued = queued_paths(&state);
+        assert_eq!(queued.first().map(String::as_str), Some("create:child/0"));
+        assert_eq!(
+            queued.last().map(String::as_str),
+            Some("create:child/overflow")
+        );
+    }
+
+    /// H6 / §4 D14. `handle_tab_close` and `handle_workspace_close` drop every
+    /// pane they own without telling the engine, so the live-run tick
+    /// reconciles bindings against the layout. Exactly once per dead pane.
+    #[test]
+    fn a_bound_pane_missing_from_the_layout_is_reconciled_once() {
+        let mut app = test_app_with_hub(EventHub::default());
+        let definition = definition();
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+        let path = InstancePath::new("plan");
+        // `App::new(no_session)` has no workspace at all, so this binding names
+        // a pane the layout cannot resolve — exactly the state a bulk close
+        // leaves behind.
+        app.bind_workflow_node(&path, binding_for("w1:p1"));
+        assert_eq!(
+            app.workflow.node(&path).map(|node| node.status),
+            Some(NodeStatus::Running)
+        );
+
+        assert!(
+            app.reconcile_workflow_pane_bindings(),
+            "the orphaned binding is reported to the engine"
+        );
+        let node = app.workflow.node(&path).expect("the node exists").clone();
+        assert!(
+            node.binding.is_none() || node.status.is_terminal(),
+            "a reconciled node either retries in a fresh pane or fails; it never stays running \
+             with a dead binding: {node:?}",
+        );
+        assert_ne!(node.status, NodeStatus::Running);
+
+        assert!(
+            !app.reconcile_workflow_pane_bindings(),
+            "a dead pane is reported once, not every tick"
+        );
+        assert!(!app.reconcile_workflow_pane_bindings());
+    }
+
+    /// The retry budget is 2, so the second dead pane is terminal — the node
+    /// reaches a settled status rather than sitting `running` forever (H6).
+    #[test]
+    fn a_node_whose_pane_keeps_disappearing_reaches_a_terminal_status() {
+        let mut app = test_app_with_hub(EventHub::default());
+        let definition = definition();
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+        let path = InstancePath::new("plan");
+
+        for attempt in 0..4 {
+            app.bind_workflow_node(&path, binding_for(&format!("w1:p{attempt}")));
+            app.reconcile_workflow_pane_bindings();
+        }
+
+        let status = app
+            .workflow
+            .node(&path)
+            .map(|node| node.status)
+            .expect("the node exists");
+        assert!(
+            status.is_terminal(),
+            "the node settled instead of staying running: {status:?}"
+        );
+    }
+
+    /// The bulk closes are exactly what `close_pane` does *not* cover
+    /// (§4 D14): `handle_tab_close` and `handle_workspace_close` drop every
+    /// pane they own without telling anyone, so the backstop has to catch them
+    /// within one tick.
+    #[tokio::test]
+    async fn a_bulk_close_is_reconciled_within_one_tick() {
+        for (label, close) in [
+            (
+                "workspace",
+                Method::WorkspaceClose(crate::api::schema::WorkspaceTarget {
+                    workspace_id: "closed".to_string(),
+                }),
+            ),
+            (
+                "tab",
+                Method::TabClose(crate::api::schema::TabTarget {
+                    tab_id: "closed:t1".to_string(),
+                }),
+            ),
+        ] {
+            let mut app = test_app_with_hub(EventHub::default());
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("bulk")];
+            app.state.workspaces[0].id = "closed".to_string();
+            app.state.ensure_test_terminals();
+            app.state.active = Some(0);
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let public = app
+                .public_pane_id(0, pane_id)
+                .expect("the test workspace has a root pane");
+
+            let definition = single_attempt_definition();
+            let graph = graph_of(&definition);
+            let path = InstancePath::new("plan");
+            app.workflow
+                .start(active_run(), definition, graph, Instant::now())
+                .expect("the run starts");
+            app.workflow
+                .bind_node(&path, binding_for(&public), Instant::now());
+
+            app.handle_api_request(crate::api::schema::Request {
+                id: "close".into(),
+                method: close,
+            });
+            assert_eq!(
+                app.workflow.node(&path).map(|node| node.status),
+                Some(NodeStatus::Running),
+                "{label} close does not tell the engine anything by itself"
+            );
+
+            let deadline = app
+                .workflow_tick_deadline()
+                .expect("a live run arms the tick");
+            app.tick_workflow_engine(deadline);
+
+            assert_eq!(
+                app.workflow.node(&path).map(|node| node.status),
+                Some(NodeStatus::Failed),
+                "the {label} close is caught by the next tick"
+            );
+        }
+    }
+
+    /// A pane that is still in the layout is never reconciled away.
+    #[test]
+    fn a_live_pane_binding_is_left_alone() {
+        let mut app = test_app_with_hub(EventHub::default());
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("reconcile")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public = app
+            .public_pane_id(0, pane_id)
+            .expect("the test workspace has a root pane");
+
+        // The engine is driven directly: this test is about the layout lookup,
+        // and `start_workflow_run` would try to spawn a real pane in the
+        // workspace it needs.
+        let definition = definition();
+        let graph = graph_of(&definition);
+        let path = InstancePath::new("plan");
+        app.workflow
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the run starts");
+        app.workflow
+            .bind_node(&path, binding_for(&public), Instant::now());
+
+        assert!(!app.reconcile_workflow_pane_bindings());
+        assert_eq!(
+            app.workflow.node(&path).map(|node| node.status),
+            Some(NodeStatus::Running),
+            "a live pane leaves its node alone"
+        );
+    }
+
+    /// H6's direct path (§4 D14). A pane that is *closed* rather than dying
+    /// used to leave its node `running` forever, because only
+    /// `AppEvent::PaneDied` ever reached the engine. `App::close_pane` now
+    /// reports the exit itself, which covers `pane.close` and the TUI
+    /// keybinding that routes through it.
+    // `pane.close` shuts down the pane's terminal runtime, which needs a
+    // reactor.
+    #[tokio::test]
+    async fn closing_a_node_pane_through_the_api_fails_the_node() {
+        let mut app = test_app_with_hub(EventHub::default());
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("close")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public = app
+            .public_pane_id(0, pane_id)
+            .expect("the test workspace has a root pane");
+
+        // The engine is driven directly and the node gets one attempt, so the
+        // close is the whole story: no spawn retry, no real PTY.
+        let definition = single_attempt_definition();
+        let graph = graph_of(&definition);
+        let path = InstancePath::new("plan");
+        app.workflow
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the run starts");
+        app.workflow
+            .bind_node(&path, binding_for(&public), Instant::now());
+        assert_eq!(
+            app.workflow.node(&path).map(|node| node.status),
+            Some(NodeStatus::Running)
+        );
+
+        app.handle_api_request(crate::api::schema::Request {
+            id: "close".into(),
+            method: Method::PaneClose(crate::api::schema::PaneTarget {
+                pane_id: public.clone(),
+            }),
+        });
+
+        let node = app.workflow.node(&path).expect("the node exists").clone();
+        assert_eq!(
+            node.status,
+            NodeStatus::Failed,
+            "a closed pane is as fatal to the node as a dead one: {node:?}"
+        );
+        assert!(
+            !app.reconcile_workflow_pane_bindings(),
+            "the direct call already reported it, so the tick backstop has nothing to do"
+        );
+    }
+
+    /// §4 D5 + D11: the one new wire event, plus the toast that is its fourth
+    /// and only optional surface.
+    #[test]
+    fn a_growth_limit_reaches_the_wire_and_the_toast() {
+        let event_hub = EventHub::default();
+        let mut app = test_app_with_hub(event_hub.clone());
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
+        let cursor = event_hub.current_sequence();
+
+        app.emit_workflow_event(WorkflowEvent::GrowthLimited {
+            run: RunId::new("workflow_run:test"),
+            path: InstancePath::new("plan"),
+            template: NodeKey::new("reviewer"),
+            limit: ExpandLimit::MaxNodes,
+            limit_value: 12,
+            requested: 4,
+            accepted: 2,
+            message: "max_nodes reached".to_string(),
+        });
+
+        let data = event_hub
+            .events_after(cursor)
+            .into_iter()
+            .find_map(|(_, event)| {
+                (event.event == EventKind::WorkflowGrowthLimited).then_some(event.data)
+            })
+            .expect("workflow.growth.limited is emitted");
+        let EventData::WorkflowGrowthLimited {
+            run_id,
+            path,
+            template,
+            limit,
+            limit_value,
+            requested,
+            accepted,
+            message,
+        } = data
+        else {
+            panic!("unexpected event data");
+        };
+        assert_eq!(run_id, "workflow_run:test");
+        assert_eq!(path, "plan");
+        assert_eq!(template, "reviewer");
+        assert_eq!(limit, WorkflowGrowthLimitKind::MaxNodes);
+        assert_eq!((limit_value, requested, accepted), (12, 4, 2));
+        assert_eq!(message, "max_nodes reached");
+
+        let toast = app.state.toast.as_ref().expect("the notice surfaces");
+        assert_eq!(toast.kind, ToastKind::NeedsAttention);
+        assert!(toast.title.contains("plan"));
+        assert_eq!(toast.context, "max_nodes reached");
+        assert!(app.toast_deadline.is_some());
+    }
+
+    /// §4 D11's other two non-optional surfaces. The event is a notification —
+    /// a client that connects after it was sent has missed it — so the limit
+    /// has to survive as a *fact* on the run and on the node that proposed,
+    /// which is what `run show`, `node show`, and the DAG banner all read. The
+    /// durable store has no column for it, so the live projection is the only
+    /// authority while the run is active.
+    #[test]
+    fn a_growth_limit_becomes_a_fact_on_the_run_the_node_and_the_overlay() {
+        let mut app = test_app_with_hub(EventHub::default());
+        let definition = definition();
+        let graph = graph_of(&definition);
+        let run_id = RunId::new("workflow_run:test");
+        let path = InstancePath::new("plan");
+        app.workflow
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the run starts");
+        assert!(
+            app.workflow_run_info(&run_id)
+                .expect("the run projects")
+                .growth_limited
+                .is_none(),
+            "an unlimited run reports no limit rather than a reassuring zero"
+        );
+
+        app.emit_workflow_event(WorkflowEvent::GrowthLimited {
+            run: run_id.clone(),
+            path: path.clone(),
+            template: NodeKey::new("reviewer"),
+            limit: ExpandLimit::MaxNodes,
+            limit_value: 12,
+            requested: 4,
+            accepted: 2,
+            message: "max_nodes 12 reached; 2 of 4 requested nodes created".to_string(),
+        });
+        app.mirror_workflow_run_graph();
+
+        let run_limit = app
+            .workflow_run_info(&run_id)
+            .expect("the run projects")
+            .growth_limited
+            .expect("the run reports the limit it hit");
+        assert_eq!(run_limit.kind, WorkflowGrowthLimitKind::MaxNodes);
+        assert_eq!(
+            (
+                run_limit.limit_value,
+                run_limit.requested,
+                run_limit.accepted
+            ),
+            (12, 4, 2)
+        );
+        assert!(
+            run_limit.at_unix_ms > 0,
+            "the breach is stamped: {run_limit:?}"
+        );
+
+        let node_limit = app
+            .workflow_node_info(&path)
+            .expect("the node projects")
+            .growth_limited
+            .expect("the limit is attributed to the node that proposed");
+        assert_eq!(node_limit, run_limit);
+        assert!(
+            app.workflow_node_info(&InstancePath::new("implement"))
+                .expect("a sibling projects")
+                .growth_limited
+                .is_none(),
+            "a node that never proposed is not blamed for the run's ceiling"
+        );
+
+        let presentation = app.state.workflow_run_presentation();
+        assert_eq!(
+            presentation.growth_banner.as_deref(),
+            Some("growth limited · max_nodes 12 reached · 2 of 4 requested nodes created"),
+            "the DAG banner names the ceiling and the shortfall"
+        );
+        assert_eq!(
+            presentation.growth_notices.get("plan").map(String::as_str),
+            Some("growth limited: max_nodes 12 · 2 of 4"),
+            "and the proposing node carries its own notice: {presentation:?}"
+        );
+    }
+
+    /// H4's data half seen from the producer: a node notice and the run notice
+    /// raised in one batch both survive. `App::expire_toast_or_show_next` is
+    /// what drains the queue, and `src/app/mod.rs` pins that across an expiry.
+    #[test]
+    fn two_workflow_notices_in_one_batch_both_survive() {
+        let mut app = test_app_with_hub(EventHub::default());
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
+
+        app.show_workflow_notice(UserNotice {
+            level: NoticeLevel::Warning,
+            run: Some(RunId::new("workflow_run:test")),
+            path: Some(InstancePath::new("plan")),
+            message: "needs attention: the node is waiting for a human".to_string(),
+        });
+        app.show_workflow_notice(UserNotice {
+            level: NoticeLevel::Info,
+            run: Some(RunId::new("workflow_run:test")),
+            path: None,
+            message: "the run finished".to_string(),
+        });
+
+        let toast = app.state.toast.as_ref().expect("the node notice shows");
+        assert!(toast.title.contains("plan"));
+        assert_eq!(
+            app.state
+                .toast_queue
+                .front()
+                .map(|queued| queued.context.as_str()),
+            Some("the run finished"),
+            "the run-level notice waits instead of destroying the node notice"
+        );
+    }
+
+    /// The escalating deliveries never touched the slot, so they must not start
+    /// queueing either.
+    #[test]
+    fn a_non_karvex_delivery_queues_nothing() {
+        let mut app = test_app_with_hub(EventHub::default());
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Off;
+
+        for index in 0..3 {
+            app.show_workflow_notice(UserNotice {
+                level: NoticeLevel::Warning,
+                run: None,
+                path: None,
+                message: format!("notice {index}"),
+            });
+        }
+
+        assert!(app.state.toast.is_none());
+        assert!(app.state.toast_queue.is_empty());
+        assert!(app.toast_deadline.is_none());
     }
 }

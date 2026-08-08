@@ -19,6 +19,20 @@
 //!    describes the same run field for field — the store's read path is not
 //!    allowed to know less than the engine did.
 //!
+//! Phase 2 (`06-phase2-plan.md` WS-J) adds three more, all against
+//! `tests/fixtures/workflow/expand.toml`:
+//!
+//! 7. an accepted expansion creates children that inherit their parent's
+//!    outbound edges, so the downstream fan-in node waits for the whole
+//!    generation (`04` §3.4, §4 D4);
+//! 8. a `--tier low` run whose proposal does not fit creates what fits and
+//!    **reports the shortfall** on the event stream, on the run projection, and
+//!    to the proposing node — the phase's headline guarantee, which is an e2e
+//!    and not a unit test precisely because it is a claim about surfaces
+//!    (§4 D2, §5 R-6);
+//! 9. a proposal naming a template outside the proposer's `expand_allow` is
+//!    refused with no side effects at all.
+//!
 //! **On event ordering.** `events.subscribe` gives each requested `type` its own
 //! cursor and the stream loop yields at most one event per subscription per
 //! poll pass, so only events of the *same* kind arrive in a guaranteed order.
@@ -428,13 +442,22 @@ fn create_workspace(socket: &Path, cwd: &Path) -> String {
 }
 
 fn create_workflow(socket: &Path, fixture: &str) -> String {
+    create_workflow_from_text(socket, &definition_text(fixture))
+}
+
+/// [`create_workflow`] for a definition the caller has already substituted.
+///
+/// The expansion fixture is parameterised (see [`expand_definition_text`]), so
+/// its three scenarios are three documents built from one file rather than
+/// three near-identical files.
+fn create_workflow_from_text(socket: &Path, text: &str) -> String {
     let result = request_ok(
         socket,
         &request(
             "req_create",
             "workflow.create",
             json!({
-                "definition": { "format": "toml", "text": definition_text(fixture) }
+                "definition": { "format": "toml", "text": text }
             }),
         ),
     );
@@ -446,14 +469,20 @@ fn create_workflow(socket: &Path, fixture: &str) -> String {
 }
 
 fn start_run(socket: &Path, workflow_id: &str, goal: &str) -> String {
-    let result = request_ok(
-        socket,
-        &request(
-            "req_run",
-            "workflow.run",
-            json!({ "workflow_id": workflow_id, "args": { "goal": goal } }),
-        ),
-    );
+    start_run_at_tier(socket, workflow_id, goal, None)
+}
+
+/// [`start_run`] with an explicit tier.
+///
+/// `tier` is what narrows the run's growth ceilings (`06-phase2-plan.md` §4
+/// D17 / `engine/graph.rs::narrow_growth`), so a truncation scenario is a
+/// property of the run rather than of the document it runs.
+fn start_run_at_tier(socket: &Path, workflow_id: &str, goal: &str, tier: Option<&str>) -> String {
+    let mut params = json!({ "workflow_id": workflow_id, "args": { "goal": goal } });
+    if let (Some(tier), Some(object)) = (tier, params.as_object_mut()) {
+        object.insert("tier".into(), json!(tier));
+    }
+    let result = request_ok(socket, &request("req_run", "workflow.run", params));
     assert_eq!(
         result["type"], "workflow_run_started",
         "unexpected: {result}"
@@ -527,6 +556,141 @@ fn created_node_paths(events: &[Value]) -> BTreeSet<String> {
         .into_iter()
         .filter_map(|event| event["data"]["node"]["path"].as_str())
         .map(str::to_string)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Expansion harness (`06-phase2-plan.md` WS-J)
+// ---------------------------------------------------------------------------
+
+/// Expansion fans out real panes, and `max_parallel_nodes` defaults to 4, so
+/// the truncation scenario's generation settles in waves rather than at once.
+const EXPANSION_SETTLE: Duration = Duration::from_secs(120);
+
+/// The proposing node of `expand.toml`, and the template it is allowed to
+/// instantiate. Named once because every expansion assertion is written against
+/// them.
+const PROPOSER: &str = "fanout";
+const TEMPLATE: &str = "worker";
+/// A real template that is deliberately outside the proposer's `expand_allow`.
+const DISALLOWED_TEMPLATE: &str = "quarantined";
+
+/// `expand.toml` with its four placeholders resolved: both stub scripts, the
+/// template the proposing node names, and the `--count` it asks for.
+///
+/// One fixture, three scenarios — the graph is identical and only the proposal
+/// differs, so an assertion about the accepted case and one about the refused
+/// case are comparing the same run shape.
+fn expand_definition_text(template: &str, count: u16) -> String {
+    let fanout_stub = fixture_dir().join("expand_stub.sh");
+    assert!(
+        fanout_stub.exists(),
+        "missing fan-out stub at {}",
+        fanout_stub.display()
+    );
+    let text = definition_text("expand.toml")
+        .replace("@FANOUT@", &fanout_stub.to_string_lossy())
+        .replace("@TEMPLATE@", template)
+        .replace("@COUNT@", &count.to_string());
+    assert!(
+        !text.contains("@FANOUT@") && !text.contains("@TEMPLATE@") && !text.contains("@COUNT@"),
+        "unresolved placeholder in expand.toml"
+    );
+    text
+}
+
+/// The verdict the *proposing node* was handed, read back from the file
+/// `expand_stub.sh` wrote into its own node directory.
+///
+/// The expand response goes to the node, not to the operator — §3 frozen
+/// interface 7 makes a rejection a **success** response on that one channel —
+/// so this is the only way to assert what the node was actually told. Read as
+/// the whole response envelope, exactly as `--json` printed it.
+fn expand_verdict(socket: &Path, run_id: &str) -> Value {
+    let node = node_get(socket, run_id, PROPOSER);
+    let node_dir = node["node_dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the proposing node has no node_dir: {node}"));
+    let verdict_path = Path::new(node_dir).join("expand.json");
+    let text = poll_until(
+        &format!("the proposal verdict at {}", verdict_path.display()),
+        SETTLE,
+        Duration::from_millis(100),
+        || fs::read_to_string(&verdict_path).ok(),
+    );
+    serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("the verdict is not JSON ({err}): {text}"))
+}
+
+/// Accepted instance paths, in the order the response listed them.
+fn accepted_paths(verdict: &Value) -> Vec<String> {
+    verdict["result"]["accepted"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the verdict carries no accepted list: {verdict}"))
+        .iter()
+        .filter_map(|path| path.as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn rejections(verdict: &Value) -> Vec<Value> {
+    verdict["result"]["rejected"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A subscription carrying everything the expansion scenarios assert on,
+/// including the one event kind Phase 2 adds.
+///
+/// Separate from [`subscribe`] so the Phase 1 scenarios keep the exact stream
+/// they were written against.
+fn subscribe_expansion(socket: &Path) -> (JsonLineReader, Vec<Value>) {
+    let mut reader = open_subscription(
+        socket,
+        &request(
+            "sub_expand",
+            "events.subscribe",
+            json!({
+                "subscriptions": [
+                    { "type": "workflow.run.started" },
+                    { "type": "workflow.run.finished" },
+                    { "type": "workflow.node.created" },
+                    { "type": "workflow.growth.limited" },
+                ]
+            }),
+        ),
+    );
+    let ack = reader.read_json_line(Duration::from_secs(5));
+    assert_eq!(ack["id"], "sub_expand", "unexpected subscribe ack: {ack}");
+    assert_eq!(
+        ack["result"]["type"], "subscription_started",
+        "subscribe was rejected: {ack}"
+    );
+    (reader, Vec::new())
+}
+
+/// Every `workflow.node.created` event announcing a child of the proposer.
+fn spawned_child_events(events: &[Value]) -> Vec<&Value> {
+    events_of_kind(events, "workflow_node_created")
+        .into_iter()
+        .filter(|event| event["data"]["node"]["parent_path"] == PROPOSER)
+        .collect()
+}
+
+/// The run graph's edges as `from -> to` pairs.
+fn edge_pairs(run: &Value) -> BTreeSet<String> {
+    run["graph"]["edges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("workflow.run.get returned no run graph: {run}"))
+        .iter()
+        .filter_map(|edge| {
+            Some(format!(
+                "{} -> {}",
+                edge["from"].as_str()?,
+                edge["to"].as_str()?
+            ))
+        })
         .collect()
 }
 
@@ -1443,4 +1607,523 @@ fn run_shape(response: &Value) -> Value {
         "nodes": nodes,
         "edges": edges,
     })
+}
+
+// ---------------------------------------------------------------------------
+// 7. An accepted expansion: children are created, inherit the fan-in point,
+//    and the downstream node waits for the whole generation
+// ---------------------------------------------------------------------------
+
+/// `04-kvdag-and-execution.md` §3.4 / `06-phase2-plan.md` WS-J scenario 1.
+///
+/// The proposing node asks for two children of a template it is allowed to
+/// instantiate. Both are created, both are announced as `workflow.node.created`
+/// with the proposer as `parent_path` and `depth: 1` — §4 D5's reason for not
+/// adding a second "spawned" event — both run, and the downstream fan-in node
+/// starts only once all three of its upstreams have closed.
+///
+/// The fan-in half is the interesting one: a child inherits a copy of its
+/// parent's *outbound* edges, so `collect` acquires two inbound edges it was
+/// not authored with, and `propagate` admits it only when every inbound edge
+/// has settled. Without inheritance the run would still succeed — `collect`
+/// would simply start early — so the assertion is on the edge set and the
+/// ordering, not on the status.
+#[test]
+fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
+    let server = spawn_workflow_server("expand-accepted");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_expansion(&socket);
+
+    let workflow_id = create_workflow_from_text(&socket, &expand_definition_text(TEMPLATE, 2));
+    let run_id = start_run(&socket, &workflow_id, "ship the thing");
+
+    let started = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_started",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        started["data"]["run"]["nodes_total"], 2,
+        "a template is never materialised as a static node, so the run starts \
+         with the proposer and the fan-in node only: {started}"
+    );
+
+    let finished = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_finished",
+        EXPANSION_SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        finished["data"]["run"]["status"], "succeeded",
+        "a run whose expansion was wholly accepted must still succeed: {finished}"
+    );
+    drain_events(&mut reader, &mut seen, Duration::from_millis(500));
+
+    // ── the proposing node's own channel ────────────────────────────────────
+    let verdict = expand_verdict(&socket, &run_id);
+    assert_eq!(
+        accepted_paths(&verdict),
+        vec!["fanout/worker/1".to_string(), "fanout/worker/2".to_string()],
+        "the response names the children it created, in `<parent>/<template>/<n>` \
+         form with `n` 1-based (§3 frozen interface 8): {verdict}"
+    );
+    assert!(
+        rejections(&verdict).is_empty(),
+        "nothing was refused, so nothing may be reported as refused: {verdict}"
+    );
+
+    // ── the event stream ────────────────────────────────────────────────────
+    assert_eq!(
+        created_node_paths(&seen),
+        BTreeSet::from([
+            "fanout".to_string(),
+            "collect".to_string(),
+            "fanout/worker/1".to_string(),
+            "fanout/worker/2".to_string(),
+        ]),
+        "every node that entered the run graph is announced on the one existing \
+         event kind; saw {:?}",
+        event_kinds(&seen)
+    );
+    let children = spawned_child_events(&seen);
+    assert_eq!(
+        children.len(),
+        2,
+        "both children must be announced as children of the proposer; saw {:?}",
+        event_kinds(&seen)
+    );
+    for event in &children {
+        assert_eq!(
+            event["data"]["node"]["depth"], 1,
+            "static nodes are depth 0, so a first generation child is depth 1 \
+             (§4 D13): {event}"
+        );
+        assert_eq!(
+            event["data"]["node"]["node_key"], TEMPLATE,
+            "a child's kvdag key is the template it instantiates: {event}"
+        );
+    }
+    assert!(
+        events_of_kind(&seen, "workflow_growth_limited").is_empty(),
+        "no guardrail was reached, so nothing may claim one was; saw {:?}",
+        event_kinds(&seen)
+    );
+
+    // ── the run graph, read back over the API ───────────────────────────────
+    let run = run_get(&socket, &run_id);
+    assert_eq!(run["run"]["status"], "succeeded", "run: {run}");
+    assert_eq!(
+        run["run"]["nodes_total"], 4,
+        "two static nodes plus two children: {run}"
+    );
+    assert_eq!(
+        run["run"]["nodes_live"], 4,
+        "`max_nodes` counts every materialised node regardless of status \
+         (§4 D12): {run}"
+    );
+
+    // Two synthetic `sequence` edges parent -> child, plus the authored data
+    // edge, plus one inherited copy of it per child. The inherited pair is what
+    // preserves the fan-in point §3.4 requires.
+    assert_eq!(
+        edge_pairs(&run),
+        BTreeSet::from([
+            "fanout -> collect".to_string(),
+            "fanout -> fanout/worker/1".to_string(),
+            "fanout -> fanout/worker/2".to_string(),
+            "fanout/worker/1 -> collect".to_string(),
+            "fanout/worker/2 -> collect".to_string(),
+        ]),
+        "a child inherits a copy of its parent's outbound edges (§4 D4): {run}"
+    );
+
+    let mut pane_ids = BTreeSet::new();
+    let mut upstream_ended = 0_u64;
+    for path in ["fanout", "fanout/worker/1", "fanout/worker/2"] {
+        let node = node_get(&socket, &run_id, path);
+        assert_eq!(node["status"], "succeeded", "node {path}: {node}");
+        assert_eq!(
+            node["evidence"], "self_report",
+            "node {path} completes through its own report: {node}"
+        );
+        let pane_id = node["pane_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("node {path} has no pane binding: {node}"));
+        assert!(
+            pane_ids.insert(pane_id.to_string()),
+            "node {path} reuses another node's pane {pane_id}"
+        );
+        let ended = node["ended_at_unix_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("node {path} has no end time: {node}"));
+        upstream_ended = upstream_ended.max(ended);
+    }
+    assert_eq!(
+        pane_ids.len(),
+        3,
+        "each child is a visible teammate in its own pane"
+    );
+
+    let collect = node_get(&socket, &run_id, "collect");
+    assert_eq!(collect["status"], "succeeded", "collect: {collect}");
+    let collect_started = collect["started_at_unix_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("collect never started: {collect}"));
+    assert!(
+        collect_started >= upstream_ended,
+        "the fan-in node must wait for the whole generation, not just for its \
+         authored upstream: it started at {collect_started} and its last \
+         upstream closed at {upstream_ended}"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 8. A truncated expansion is surfaced — the phase's headline guarantee
+// ---------------------------------------------------------------------------
+
+/// `06-phase2-plan.md` WS-J scenario 2, §4 D2, §5 R-6.
+///
+/// A `--tier low` run narrows `max_nodes` from the version's 24 to 12
+/// (`narrow_growth`), leaving room for ten children beside the two static
+/// nodes. The proposal asks for twelve. Accept-all would violate the ceiling
+/// and reject-all would waste the budget, so ten are created and the shortfall
+/// is **reported** — that reporting is the guarantee, and it is asserted here
+/// end to end rather than in a unit test because the surfaces it has to reach
+/// are the event stream, the run projection, and the proposing node's own
+/// response.
+///
+/// **`growth_limited` on the run and on the node is the assertion that is
+/// currently unmet**, and it is left in rather than softened. §4 D11 puts the
+/// guarantee on three surfaces so that it does not rest on the one that is
+/// off by default, and two of the three — the DAG banner and `kvx workflow run
+/// show` — read the run's `growth_limited` rather than the event stream. With
+/// it permanently `None` the guarantee is carried by the event alone, which is
+/// exactly the single-channel failure §5 R-6 exists to prevent. Both
+/// projections say the other one owns it: `src/app/api/workflows.rs`'s
+/// `wire_run_record` defers to "the live projection in `src/app/workflow.rs`",
+/// and `App::workflow_run_info` / `App::workflow_node_info` in that file
+/// hardcode `growth_limited: None` under a comment deferring back to WS-E. The
+/// limit is already in hand where it needs to be recorded: the
+/// `WorkflowEvent::GrowthLimited` arm of `App::emit_workflow_event` builds the
+/// whole `WorkflowGrowthLimit` a line above, next to the `show_workflow_notice`
+/// call.
+#[test]
+fn a_truncated_expansion_is_surfaced_and_the_run_still_succeeds() {
+    /// The version ceiling narrowed by `low`.
+    const LOW_TIER_MAX_NODES: u64 = 12;
+    /// `fanout` and `collect`.
+    const STATIC_NODES: u64 = 2;
+    const REQUESTED: u16 = 12;
+    const EXPECTED_ACCEPTED: u64 = LOW_TIER_MAX_NODES - STATIC_NODES;
+
+    let server = spawn_workflow_server("expand-truncated");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_expansion(&socket);
+
+    let workflow_id =
+        create_workflow_from_text(&socket, &expand_definition_text(TEMPLATE, REQUESTED));
+    let run_id = start_run_at_tier(&socket, &workflow_id, "shard the corpus", Some("low"));
+
+    // ── the one event no client can derive ──────────────────────────────────
+    let limited = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_growth_limited",
+        EXPANSION_SETTLE,
+        |event| event["data"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        limited["data"]["path"], PROPOSER,
+        "the event names the node that proposed, not the children: {limited}"
+    );
+    assert_eq!(
+        limited["data"]["template"], TEMPLATE,
+        "the event names the template that was truncated: {limited}"
+    );
+    assert_eq!(
+        limited["data"]["limit"], "max_nodes",
+        "the run-level ceiling is what ran out here; the node's own expand_max \
+         is deliberately set above it in the fixture so the reported cause is \
+         unambiguous: {limited}"
+    );
+    assert_eq!(
+        limited["data"]["limit_value"],
+        json!(LOW_TIER_MAX_NODES),
+        "the exact ceiling is on the event so no reader has to look it up: \
+         {limited}"
+    );
+    assert_eq!(
+        limited["data"]["requested"],
+        json!(REQUESTED),
+        "the event reports what was asked for: {limited}"
+    );
+    assert_eq!(
+        limited["data"]["accepted"],
+        json!(EXPECTED_ACCEPTED),
+        "and how many of it fit — a shortfall reported is what makes partial \
+         acceptance legitimate (§4 D2): {limited}"
+    );
+    assert!(
+        limited["data"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.trim().is_empty()),
+        "the event carries a human-readable reason: {limited}"
+    );
+
+    let finished = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_finished",
+        EXPANSION_SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        finished["data"]["run"]["status"], "succeeded",
+        "a truncated expansion is a reported shortfall, not a failure: {finished}"
+    );
+    drain_events(&mut reader, &mut seen, Duration::from_millis(500));
+
+    // ── the proposing node's own channel ────────────────────────────────────
+    let verdict = expand_verdict(&socket, &run_id);
+    assert_eq!(
+        accepted_paths(&verdict).len() as u64,
+        EXPECTED_ACCEPTED,
+        "some children are created — reject-all would waste the budget: {verdict}"
+    );
+    let rejected = rejections(&verdict);
+    assert_eq!(
+        rejected.len(),
+        1,
+        "one proposal produced one shortfall: {verdict}"
+    );
+    let truncation = &rejected[0];
+    assert_eq!(truncation["reason"], "truncated", "{truncation}");
+    assert_eq!(truncation["template"], TEMPLATE, "{truncation}");
+    assert_eq!(truncation["requested"], json!(REQUESTED), "{truncation}");
+    assert_eq!(
+        truncation["accepted"],
+        json!(EXPECTED_ACCEPTED),
+        "{truncation}"
+    );
+    assert_eq!(truncation["limit"]["kind"], "max_nodes", "{truncation}");
+    assert_eq!(
+        truncation["limit"]["limit_value"],
+        json!(LOW_TIER_MAX_NODES),
+        "{truncation}"
+    );
+
+    // ── the run projection ──────────────────────────────────────────────────
+    let run = run_get(&socket, &run_id);
+    assert_eq!(
+        run["run"]["tier"], "low",
+        "the run really did start at the narrowing tier: {run}"
+    );
+    assert_eq!(
+        run["run"]["max_nodes"],
+        json!(LOW_TIER_MAX_NODES),
+        "one authority: what the run graph enforced is what the run reports, \
+         narrowed from the version's 24 (§5 R-3): {run}"
+    );
+    assert_eq!(
+        run["run"]["nodes_total"],
+        json!(LOW_TIER_MAX_NODES),
+        "the budget is exactly exhausted, never exceeded: {run}"
+    );
+    assert_eq!(
+        run["run"]["nodes_live"],
+        json!(LOW_TIER_MAX_NODES),
+        "`nodes_live` counts every materialised node regardless of status: {run}"
+    );
+
+    let children = spawned_child_events(&seen);
+    assert_eq!(
+        children.len() as u64,
+        EXPECTED_ACCEPTED,
+        "every child that was created is announced; saw {:?}",
+        event_kinds(&seen)
+    );
+
+    // Read now, asserted after the shutdown below. This run holds a whole
+    // generation of panes, and a panic here would skip `shutdown` and leave
+    // them — and their server — alive for however long the harness watchdog
+    // takes to notice, which is long enough to starve the sibling tests this
+    // file runs in parallel with. A failing assertion has to fail this test
+    // only.
+    let run_growth = run["run"]["growth_limited"].clone();
+    let node_growth = node_get(&socket, &run_id, PROPOSER)["growth_limited"].clone();
+
+    server.shutdown();
+
+    // §4 D11 — the guarantee lands on the API as a durable *fact* about the run
+    // and about the node that ran into the ceiling, not only as a transient
+    // event. Two of the three non-optional surfaces (the DAG banner and
+    // `kvx workflow run show`) read these fields and never the event stream, so
+    // without them the "always surfaced" guarantee rests on one channel again.
+    // See this test's doc comment for where the projection is missing.
+    assert_eq!(
+        run_growth["kind"], "max_nodes",
+        "the run must report the limit it hit: {run_growth}"
+    );
+    assert_eq!(
+        run_growth["limit_value"],
+        json!(LOW_TIER_MAX_NODES),
+        "{run_growth}"
+    );
+    assert_eq!(run_growth["requested"], json!(REQUESTED), "{run_growth}");
+    assert_eq!(
+        run_growth["accepted"],
+        json!(EXPECTED_ACCEPTED),
+        "{run_growth}"
+    );
+    assert_eq!(
+        node_growth["kind"], "max_nodes",
+        "the limit is also a fact about the node that proposed, so the DAG can \
+         badge that node without replaying the stream: {node_growth}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. A disallowed template is refused, and refusing it changes nothing
+// ---------------------------------------------------------------------------
+
+/// `06-phase2-plan.md` WS-J scenario 3.
+///
+/// The proposal names a template that exists and is a real template, but is not
+/// in the proposing node's `expand_allow`. It is refused, no node is created,
+/// the run graph is byte-for-byte the graph it started with, and the run still
+/// succeeds — a node being wrong about what it may instantiate is not a run
+/// failure.
+///
+/// **Drift from the plan's bullet, and why the code is right.** WS-J scenario 3
+/// as written also expects a `workflow.growth.limited` event. §4 D5 — and the
+/// engine that implements it (`engine/mod.rs`, the `ExpandProposed` arm) —
+/// says the opposite in as many words: that event is emitted for "exactly the
+/// rejections a guardrail produced", and "a validation refusal — unknown
+/// template, not allowed, unknown input — is the node being wrong, not the run
+/// running out of room". The two statements are in the same document and the
+/// decision is the more specific of them, so this asserts the *absence* of the
+/// event. Emitting it here would tell every client the run had hit a ceiling it
+/// has not come near, and `run.growth_limited` would then be permanently set on
+/// a run that never lost a single node to a guardrail.
+#[test]
+fn a_disallowed_template_is_refused_and_creates_nothing() {
+    let server = spawn_workflow_server("expand-refused");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_expansion(&socket);
+
+    let workflow_id =
+        create_workflow_from_text(&socket, &expand_definition_text(DISALLOWED_TEMPLATE, 2));
+    let run_id = start_run(&socket, &workflow_id, "try to escape the allowlist");
+
+    let started = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_started",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    let nodes_at_start = started["data"]["run"]["nodes_total"].clone();
+    assert_eq!(nodes_at_start, json!(2), "started: {started}");
+
+    let finished = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_finished",
+        EXPANSION_SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        finished["data"]["run"]["status"], "succeeded",
+        "a refused proposal is the node being wrong, not the run failing: \
+         {finished}"
+    );
+    drain_events(&mut reader, &mut seen, Duration::from_millis(500));
+
+    // ── the refusal reached the node that proposed ──────────────────────────
+    let verdict = expand_verdict(&socket, &run_id);
+    assert!(
+        accepted_paths(&verdict).is_empty(),
+        "a refused proposal creates nothing: {verdict}"
+    );
+    let rejected = rejections(&verdict);
+    assert_eq!(rejected.len(), 1, "one refusal: {verdict}");
+    assert_eq!(
+        rejected[0]["reason"], "not_allowed",
+        "the reason names the allowlist, not a guardrail: {verdict}"
+    );
+    assert_eq!(
+        rejected[0]["template"], DISALLOWED_TEMPLATE,
+        "the refusal names the template that was asked for: {verdict}"
+    );
+    assert!(
+        rejected[0]["limit"].is_null(),
+        "no guardrail was reached, so there is no limit to report: {verdict}"
+    );
+    assert!(
+        rejected[0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("expand_allow")),
+        "the message says what to change: {verdict}"
+    );
+
+    // ── and changed nothing else ────────────────────────────────────────────
+    assert_eq!(
+        created_node_paths(&seen),
+        BTreeSet::from(["fanout".to_string(), "collect".to_string()]),
+        "no node entered the run graph; saw {:?}",
+        event_kinds(&seen)
+    );
+    assert!(
+        spawned_child_events(&seen).is_empty(),
+        "the proposer has no children; saw {:?}",
+        event_kinds(&seen)
+    );
+    assert!(
+        events_of_kind(&seen, "workflow_growth_limited").is_empty(),
+        "a validation refusal is not a guardrail; see this test's doc comment. \
+         Saw {:?}",
+        event_kinds(&seen)
+    );
+
+    let run = run_get(&socket, &run_id);
+    assert_eq!(
+        run["run"]["nodes_total"], nodes_at_start,
+        "`nodes_total` is unchanged by a refused proposal: {run}"
+    );
+    assert_eq!(run["run"]["nodes_live"], json!(2), "run: {run}");
+    assert!(
+        run["run"]["growth_limited"].is_null(),
+        "the run never ran out of room, so nothing may say it did: {run}"
+    );
+    assert_eq!(
+        edge_pairs(&run),
+        BTreeSet::from(["fanout -> collect".to_string()]),
+        "the graph is the one the author drew: {run}"
+    );
+
+    server.shutdown();
 }

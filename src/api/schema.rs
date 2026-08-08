@@ -263,6 +263,8 @@ pub enum Method {
     WorkflowNodeInterrupt(WorkflowNodeTarget),
     #[serde(rename = "workflow.node.report")]
     WorkflowNodeReport(WorkflowNodeReportParams),
+    #[serde(rename = "workflow.node.expand")]
+    WorkflowNodeExpand(WorkflowNodeExpandParams),
     #[serde(rename = "workflow.node.restart")]
     WorkflowNodeRestart(WorkflowNodeTarget),
 }

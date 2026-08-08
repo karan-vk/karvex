@@ -79,6 +79,7 @@ pub fn graph_of(nodes: &[TestNode], edges: &[TestEdge]) -> RunGraph {
         version_id: KvdagVersionId::new("kvdag_version:test"),
         tier: Tier::High,
         growth: GrowthLimits::default(),
+        assignments: std::collections::BTreeMap::new(),
         nodes: nodes
             .iter()
             .enumerate()
@@ -90,6 +91,7 @@ pub fn graph_of(nodes: &[TestNode], edges: &[TestEdge]) -> RunGraph {
                 depth: 0,
                 status: NodeStatus::Pending,
                 assignment: tier::resolve(Tier::High, node.demand, None),
+                assignment_reason: String::new(),
                 attempt: 1,
                 binding: None,
                 result: None,

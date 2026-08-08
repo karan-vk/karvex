@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::common::{AgentStatus, ReadSource};
 use super::panes::{PaneInfo, PaneReadResult, PaneScrollInfo};
 use super::tabs::TabInfo;
-use super::workflows::{WorkflowRunInfo, WorkflowRunNodeInfo};
+use super::workflows::{WorkflowGrowthLimitKind, WorkflowRunInfo, WorkflowRunNodeInfo};
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::WorktreeInfo;
 
@@ -95,6 +95,8 @@ pub enum Subscription {
     WorkflowNodeUpdated {},
     #[serde(rename = "workflow.node.output_checkpoint")]
     WorkflowNodeOutputCheckpoint {},
+    #[serde(rename = "workflow.growth.limited")]
+    WorkflowGrowthLimited {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -237,6 +239,7 @@ pub enum EventKind {
     WorkflowNodeCreated,
     WorkflowNodeUpdated,
     WorkflowNodeOutputCheckpoint,
+    WorkflowGrowthLimited,
 }
 
 impl EventKind {
@@ -274,6 +277,7 @@ impl EventKind {
             EventKind::WorkflowNodeCreated => "workflow.node.created",
             EventKind::WorkflowNodeUpdated => "workflow.node.updated",
             EventKind::WorkflowNodeOutputCheckpoint => "workflow.node.output_checkpoint",
+            EventKind::WorkflowGrowthLimited => "workflow.growth.limited",
         }
     }
 }
@@ -312,6 +316,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::WorkflowNodeCreated,
     EventKind::WorkflowNodeUpdated,
     EventKind::WorkflowNodeOutputCheckpoint,
+    EventKind::WorkflowGrowthLimited,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -414,6 +419,10 @@ mod workflow_event_tests {
             nodes_total: 1,
             nodes_done: 0,
             failure: None,
+            max_depth: 3,
+            max_nodes: 24,
+            nodes_live: 1,
+            growth_limited: None,
         }
     }
 
@@ -442,6 +451,9 @@ mod workflow_event_tests {
             succession: None,
             blocker: None,
             watchdog_interventions: 0,
+            assignment_reason: String::new(),
+            delivery_failure: None,
+            growth_limited: None,
         }
     }
 
@@ -506,6 +518,22 @@ mod workflow_event_tests {
                 },
                 "workflow.node.output_checkpoint",
             ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowGrowthLimited,
+                    data: EventData::WorkflowGrowthLimited {
+                        run_id: "workflow_run:1".into(),
+                        path: "fanout".into(),
+                        template: "worker".into(),
+                        limit: WorkflowGrowthLimitKind::MaxNodes,
+                        limit_value: 12,
+                        requested: 4,
+                        accepted: 2,
+                        message: "max_nodes 12 reached; 2 of 4 requested nodes created".into(),
+                    },
+                },
+                "workflow.growth.limited",
+            ),
         ] {
             assert_eq!(event.event.dot_name(), dot_name);
             let json = serde_json::to_value(&event).unwrap();
@@ -526,6 +554,7 @@ mod workflow_event_tests {
                     Subscription::WorkflowNodeCreated {},
                     Subscription::WorkflowNodeUpdated {},
                     Subscription::WorkflowNodeOutputCheckpoint {},
+                    Subscription::WorkflowGrowthLimited {},
                 ],
             }),
         };
@@ -537,6 +566,7 @@ mod workflow_event_tests {
             "workflow.node.created",
             "workflow.node.updated",
             "workflow.node.output_checkpoint",
+            "workflow.growth.limited",
         ] {
             assert!(
                 json.contains(&format!("\"type\":\"{dot_name}\"")),
@@ -765,5 +795,23 @@ pub enum EventData {
         path: String,
         seq: u64,
         summary: String,
+    },
+    /// A growth guardrail refused or truncated a proposal.
+    ///
+    /// The only new event kind in Phase 2: an accepted proposal already emits
+    /// `workflow.node.created`, whose `WorkflowRunNodeInfo` carries
+    /// `parent_path` and `depth`, so a second "spawned" event would give
+    /// clients two events for one fact. What no client can derive is the node
+    /// that was asked for and never created.
+    WorkflowGrowthLimited {
+        run_id: String,
+        /// The proposing node's instance path.
+        path: String,
+        template: String,
+        limit: WorkflowGrowthLimitKind,
+        limit_value: u32,
+        requested: u32,
+        accepted: u32,
+        message: String,
     },
 }

@@ -450,6 +450,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorkflowNodeSteer(_) => "workflow.node.steer",
         Method::WorkflowNodeInterrupt(_) => "workflow.node.interrupt",
         Method::WorkflowNodeReport(_) => "workflow.node.report",
+        Method::WorkflowNodeExpand(_) => "workflow.node.expand",
         Method::WorkflowNodeRestart(_) => "workflow.node.restart",
     }
 }

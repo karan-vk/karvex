@@ -418,9 +418,21 @@ impl App {
             NavigateAction::OpenNavigator => {
                 self.state.open_navigator_from(&self.terminal_runtimes)
             }
+            // With no run to show, the binding falls through to the workflow
+            // launcher rather than dead-ending in a toast
+            // (`06-phase2-plan.md` §4 D18); the notice is what is left when
+            // there is nothing to launch either.
             NavigateAction::OpenWorkflowDag => {
-                if !super::modal::open_workflow_dag(&mut self.state) {
+                if !super::modal::open_workflow_dag(&mut self.state)
+                    && !self.open_workflow_launcher()
+                {
                     self.notify_no_workflow_run();
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
+            NavigateAction::OpenWorkflowLauncher => {
+                if !self.open_workflow_launcher() {
+                    self.notify_no_workflows_to_launch();
                     leave_navigate_mode(&mut self.state);
                 }
             }
@@ -1383,6 +1395,7 @@ pub(crate) enum NavigateAction {
     Detach,
     OpenNavigator,
     OpenWorkflowDag,
+    OpenWorkflowLauncher,
 }
 
 fn copy_mode_survives_prefix_action(action: NavigateAction) -> bool {
@@ -1526,6 +1539,10 @@ fn non_indexed_action_for_key(
         (&kb.detach, NavigateAction::Detach),
         (&kb.goto, NavigateAction::OpenNavigator),
         (&kb.open_workflow_dag, NavigateAction::OpenWorkflowDag),
+        (
+            &kb.open_workflow_launcher,
+            NavigateAction::OpenWorkflowLauncher,
+        ),
     ] {
         if action_matches(bindings, key, dispatch) {
             return Some(action);
@@ -1787,6 +1804,10 @@ pub(super) fn execute_navigate_action_in_context(
                 leave_navigate_mode(state);
             }
         }
+        // The launcher is seeded from `workflow.list`, which needs the runtime
+        // this `&mut AppState` path does not have; the `App` arm above is the
+        // one that opens it.
+        NavigateAction::OpenWorkflowLauncher => leave_navigate_mode(state),
     }
 
     finish_action_context(state, context, previous_mode);
@@ -2707,6 +2728,7 @@ last_pane = "prefix+tab"
             version_id: crate::workflow::model::KvdagVersionId::new("kvdag_version:1"),
             tier: crate::workflow::tier::Tier::High,
             growth: crate::workflow::model::GrowthLimits::default(),
+            assignments: std::collections::BTreeMap::new(),
             nodes: Vec::new(),
             edges: Vec::new(),
             status: crate::workflow::model::RunStatus::Running,
@@ -2714,6 +2736,31 @@ last_pane = "prefix+tab"
         }));
         execute_navigate_action(&mut state, NavigateAction::OpenWorkflowDag);
         assert_eq!(state.mode, Mode::WorkflowDag);
+    }
+
+    /// The launcher's binding is a peer of the DAG's, on the unshifted key
+    /// beside it (`06-phase2-plan.md` §4 D18).
+    #[test]
+    fn the_workflow_launcher_is_a_real_keybind_action() {
+        let state = state_with_workspaces(&["one"]);
+
+        assert_eq!(
+            action_for_key(
+                &state,
+                TerminalKey::new(KeyCode::Char('f'), KeyModifiers::empty()),
+                BindingDispatch::Prefix,
+            ),
+            Some(NavigateAction::OpenWorkflowLauncher)
+        );
+        assert_eq!(
+            action_for_key(
+                &state,
+                TerminalKey::new(KeyCode::Char('f'), KeyModifiers::SHIFT),
+                BindingDispatch::Prefix,
+            ),
+            Some(NavigateAction::OpenWorkflowDag),
+            "the two bindings stay distinct"
+        );
     }
 
     /// A user who rebinds it gets their key, and only their key.

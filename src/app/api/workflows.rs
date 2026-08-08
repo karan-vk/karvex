@@ -23,14 +23,16 @@ use std::collections::BTreeMap;
 #[cfg(feature = "workflow")]
 use crate::api::schema::{
     ErrorBody, KvdagEdgeInfo, KvdagNodeInfo, KvdagVersionDetail, KvdagVersionSummary,
-    ResponseResult, WorkflowArgSpec, WorkflowDefinitionFormat, WorkflowEdgePayload,
-    WorkflowIsolation, WorkflowNodeKind, WorkflowRunEdgeInfo, WorkflowRunGraph, WorkflowRunInfo,
-    WorkflowRunNodeInfo, WorkflowRunner, WorkflowSummary, WorkflowTier, WorkflowVersionOrigin,
+    ResponseResult, WorkflowArgSpec, WorkflowDefinitionFormat, WorkflowDetail, WorkflowEdgePayload,
+    WorkflowExpandRejection, WorkflowExpandRejectionReason, WorkflowGrowthLimit,
+    WorkflowGrowthLimitKind, WorkflowIsolation, WorkflowNodeKind, WorkflowRunEdgeInfo,
+    WorkflowRunGraph, WorkflowRunInfo, WorkflowRunNodeInfo, WorkflowRunner, WorkflowSummary,
+    WorkflowTier, WorkflowVersionOrigin,
 };
 use crate::api::schema::{
-    WorkflowCreateParams, WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget,
-    WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget, WorkflowTarget,
-    WorkflowVersionCreateParams, WorkflowVersionTarget,
+    WorkflowCreateParams, WorkflowNodeExpandParams, WorkflowNodeReportParams,
+    WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRunListParams, WorkflowRunParams,
+    WorkflowRunTarget, WorkflowTarget, WorkflowVersionCreateParams, WorkflowVersionTarget,
 };
 #[cfg(feature = "workflow")]
 use crate::app::workflow::{
@@ -41,18 +43,27 @@ use crate::app::workflow::{
 use crate::app::workflow_store::StoreUnavailable;
 use crate::app::App;
 #[cfg(feature = "workflow")]
+use crate::workflow::binding::observe::ReportRejected;
+#[cfg(feature = "workflow")]
 use crate::workflow::definition::{Definition, DefinitionError};
+#[cfg(feature = "workflow")]
+use crate::workflow::engine::expand::{
+    self, ExpandLimit, ExpandOutcome, ExpandProposal, ExpandRejection,
+};
+#[cfg(feature = "workflow")]
+use crate::workflow::engine::graph::{narrow_growth, resolve_assignments};
 #[cfg(feature = "workflow")]
 use crate::workflow::engine::{is_closed_run, ReportOutcome, ReportVerdict};
 #[cfg(feature = "workflow")]
 use crate::workflow::model::{
-    EdgePayload, EngineInput, InstancePath, Isolation, Kvdag, KvdagEdge, KvdagNode, KvdagVersionId,
-    NodeKind, NodeStatus, RunGraph, RunId, RunStatus, Runner, WorkflowId,
+    EdgePayload, EngineInput, GrowthLimits, InstancePath, Isolation, Kvdag, KvdagEdge, KvdagNode,
+    KvdagVersionId, NodeKey, NodeKind, NodeStatus, NodeToken, RunGraph, RunId, RunStatus, Runner,
+    WorkflowId,
 };
 #[cfg(feature = "workflow")]
-use crate::workflow::store::{NewRun, StoreError, VersionOrigin, VersionRecord};
+use crate::workflow::store::{NewRun, StoreError, VersionMetadata, VersionOrigin, VersionRecord};
 #[cfg(feature = "workflow")]
-use crate::workflow::tier::Tier;
+use crate::workflow::tier::{HistoryIndex, Tier};
 
 use super::responses::encode_error;
 #[cfg(feature = "workflow")]
@@ -112,14 +123,24 @@ const DELIVERY_FAILED_CODE: &str = "workflow_node_delivery_failed";
 #[cfg(feature = "workflow")]
 const RESULT_INVALID_CODE: &str = "workflow_node_result_invalid";
 /// A node method addressed a run that has already reached a final status.
-/// Restarting a node inside a closed run resurrects a process nothing will
-/// collect a result from, so it is refused rather than performed.
+/// A closed run will never settle again, so anything handed back to it —
+/// a restart, a steer, an interrupt, or an expand proposal — is work nothing
+/// will ever collect. Every one of them is refused rather than performed
+/// (`06-phase2-plan.md` H2).
 #[cfg(feature = "workflow")]
 const RUN_CLOSED_CODE: &str = "workflow_run_closed";
 
 /// Default page size for `workflow.run.list`.
 #[cfg(feature = "workflow")]
 const DEFAULT_RUN_LIST_LIMIT: u32 = 50;
+
+/// How many of a workflow's most recent closed runs `auto` measures a node
+/// against (`04-kvdag-and-execution.md` §7.3 step 2's "last N runs"). Wide
+/// enough for §7.3's own thresholds — "≥ 3 prior runs" for the downgrade and
+/// "the last two runs" for the escalation — to be reachable without letting a
+/// node's distant past outvote its recent record.
+#[cfg(feature = "workflow")]
+const NODE_HISTORY_WINDOW: usize = 10;
 
 #[cfg(not(feature = "workflow"))]
 impl App {
@@ -271,6 +292,17 @@ impl App {
         }
         self.workflow_unavailable(id)
     }
+
+    pub(super) fn handle_workflow_node_expand(
+        &mut self,
+        id: String,
+        params: WorkflowNodeExpandParams,
+    ) -> String {
+        if let Some(error) = require_expand_params(&id, &params) {
+            return error;
+        }
+        self.workflow_unavailable(id)
+    }
 }
 
 #[cfg(feature = "workflow")]
@@ -317,14 +349,39 @@ impl App {
             let versions: Vec<KvdagVersionSummary> =
                 records.iter().map(wire_version_summary).collect();
             let head = versions.first().cloned();
+            // The head document, so `workflow.get` can describe the graph the
+            // workflow currently *is* and not only its revision list. A head
+            // pointer that will not load is survivable — the workflow is still
+            // listable and its version chain still readable — so the detail
+            // arrives with empty node/edge/arg sets rather than failing the
+            // whole call.
+            let head_kvdag = match workflow.head_version.clone() {
+                Some(version_id) => cx.block_on(cx.store().load_version(&version_id)).ok(),
+                None => None,
+            };
             Ok(LookupResult::Found((
                 wire_workflow_summary(workflow, head.as_ref()),
                 versions,
+                head_kvdag,
             )))
         });
         match looked_up {
-            Ok(Ok(LookupResult::Found((workflow, versions)))) => {
-                encode_success(id, ResponseResult::WorkflowGet { workflow, versions })
+            Ok(Ok(LookupResult::Found((workflow, versions, head_kvdag)))) => {
+                // H3 / §4 D16: **one** projection. The human renderer and the
+                // `--json` path both read `detail`, so the two cannot describe
+                // different field sets. `description` comes from the `workflow`
+                // row, which `create_version_with_metadata` keeps equal to the
+                // head document (H5) — `kvdag_version` has no `description`
+                // column to read instead.
+                let detail = workflow_detail(&workflow, &versions, head_kvdag.as_ref());
+                encode_success(
+                    id,
+                    ResponseResult::WorkflowGet {
+                        workflow,
+                        versions,
+                        detail: Some(detail),
+                    },
+                )
             }
             Ok(Ok(LookupResult::NotFound)) => encode_error(
                 id,
@@ -415,6 +472,15 @@ impl App {
         };
         let selector = params.workflow_id.trim().to_string();
         let change_summary = params.change_summary.clone();
+        // H5, caller side. `kvdag_version` carries neither `description` nor
+        // `default_tier`, so an update that changed either used to leave
+        // `workflow.get` reporting v1's metadata beside `head_version: 2`. The
+        // store makes the mutable `workflow` row track its head; this is where
+        // the head's metadata comes from (§4 D16/D17).
+        let metadata = VersionMetadata {
+            description: definition.description.clone(),
+            default_tier: definition.tier(),
+        };
 
         let created = self.workflow_store.call(move |cx| {
             let workflow_id = match resolve_workflow_selector(cx, &selector)? {
@@ -422,11 +488,12 @@ impl App {
                 WorkflowSelector::NotFound => return Ok::<_, StoreError>(LookupResult::NotFound),
                 WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
             };
-            let kvdag = cx.block_on(cx.store().create_version(
+            let kvdag = cx.block_on(cx.store().create_version_with_metadata(
                 &workflow_id,
                 VersionOrigin::Authored,
                 &change_summary,
                 definition.spec(&workflow_id),
+                Some(&metadata),
             ))?;
             cx.block_on(cx.store().set_head_version(&workflow_id, &kvdag.version_id))?;
             let summary = cx
@@ -587,14 +654,36 @@ impl App {
 
         let workflow_id = kvdag.workflow_id.clone();
         let version_id = kvdag.version_id.clone();
-        let growth = kvdag.growth;
+        // §4 D4 / R-3: the tier narrows the version's ceilings, and the run row
+        // has to persist the *effective* limits the `RunGraph` enforces —
+        // `materialise_with` narrows the same way. Narrowing here is what keeps
+        // a `--tier low` run's banner from contradicting its own database row.
+        // `narrow_growth` is idempotent, so narrowing once and re-narrowing
+        // downstream cannot drift.
+        let growth = narrow_growth(kvdag.growth, tier);
         let ordered: BTreeMap<String, String> = args.clone().into_iter().collect();
         // Recorded on the run row at create time — a run's workspace binding is
         // a property of the run, not of whichever server happens to be
         // executing it, so a run read back from the journal keeps it too.
         let workspace_id = self.active_workspace_public_id();
+        // §4 D15 / H1: stamped **once** here and handed to both `NewRun` (which
+        // binds `workflow_run.started_at` explicitly) and `ActiveRun`, so the
+        // run the journal describes and the run the live projection describes
+        // start at the same instant.
+        let started_at_unix_ms = unix_now_ms();
+        // §4 D9: one resolver for the whole subsystem. The table is resolved
+        // here, once, and handed to **both** `NewRun` (which
+        // `materialise_run_nodes` writes verbatim) and `RunGraph::materialise_with`
+        // — so the DAG view and the durable row cannot disagree about which
+        // model a node ran on.
+        let history = match self.node_history_index(&kvdag, tier) {
+            Ok(history) => history,
+            Err(response) => return response(id),
+        };
+        let assignments = resolve_assignments(&kvdag, tier, &history);
         let created = self.workflow_store.call({
             let workspace_id = workspace_id.clone();
+            let assignments = assignments.clone();
             move |cx| {
                 cx.block_on(cx.store().create_run(NewRun {
                     workflow: workflow_id,
@@ -602,6 +691,8 @@ impl App {
                     tier,
                     args: ordered,
                     growth,
+                    started_at_unix_ms,
+                    assignments,
                     context_runs: Vec::new(),
                     workspace_id,
                 }))
@@ -617,8 +708,8 @@ impl App {
         // workflow; the run graph itself only carries record ids.
         self.state.set_workflow_run_name(workflow_name);
 
-        let graph = RunGraph::materialise(&kvdag, run_id.clone(), tier);
-        let active = ActiveRun::new(
+        let graph = RunGraph::materialise_with(&kvdag, run_id.clone(), tier, &assignments);
+        let mut active = ActiveRun::new(
             run_id.clone(),
             kvdag.workflow_id.clone(),
             kvdag.version_id.clone(),
@@ -626,6 +717,12 @@ impl App {
         )
         .with_args(args)
         .with_placement(workspace_id, None);
+        // The last of the three clocks H1 describes. `ActiveRun::new` stamps
+        // its own `now`, which is a second reading of the same instant; the run
+        // row was bound from `started_at_unix_ms`, so the live projection is
+        // moved onto that one value rather than left milliseconds apart from
+        // the journal (§4 D15).
+        active.started_at_unix_ms = started_at_unix_ms;
 
         if let Err(error) = self.start_workflow_run(active, kvdag, graph) {
             let message = match error {
@@ -881,30 +978,11 @@ impl App {
         if let Some(error) = require_node_target(&id, &target) {
             return error;
         }
-        // A run that has closed will never settle again, so a node handed back
-        // to it becomes a live process inside a `cancelled`/`failed`/`succeeded`
-        // run that nothing will ever collect a result from — and whose pane
-        // leaks. `apply_node_input` would happily report that as a success.
-        let run = RunId::new(target.run_id.trim().to_string());
-        if self.workflow_run_info(&run).is_none() {
-            return not_the_active_run(id, &target.run_id);
-        }
-        if let Some(status) = self
-            .workflow
-            .run_status()
-            .filter(|status| is_closed_run(*status))
-        {
-            return encode_error(
-                id,
-                RUN_CLOSED_CODE,
-                format!(
-                    "run {run} is already {}; a closed run cannot restart node {}. \
-                     Start a new run with `kvx workflow run start <name|id>`.",
-                    run_status_label(status),
-                    target.path.trim()
-                ),
-            );
-        }
+        // The closed-run guard is `apply_node_input`'s now (H2): a run that has
+        // closed will never settle again, so a node handed back to it becomes a
+        // live process inside a `cancelled`/`failed`/`succeeded` run that
+        // nothing will ever collect a result from — and the same is true of a
+        // steer or an interrupt delivered into it.
         let path = InstancePath::new(target.path.trim().to_string());
         self.apply_node_input(
             id,
@@ -914,6 +992,192 @@ impl App {
             &path,
             |node| ResponseResult::WorkflowNodeRestarted { node },
         )
+    }
+
+    /// `workflow.node.expand` — a node proposing new nodes
+    /// (`04-kvdag-and-execution.md` §3.4). **A node cannot create nodes; it
+    /// proposes, and karvex decides.**
+    ///
+    /// Token-authenticated exactly like `workflow.node.report`, because an
+    /// expand proposal is a node speaking and not an operator. A *rejected*
+    /// proposal is a **successful** response carrying the rejection: the run
+    /// continues, and the caller learns exactly which guardrail it hit. Only a
+    /// bad run, path, or token — or a closed run — is an error.
+    pub(super) fn handle_workflow_node_expand(
+        &mut self,
+        id: String,
+        params: WorkflowNodeExpandParams,
+    ) -> String {
+        if let Some(error) = require_expand_params(&id, &params) {
+            return error;
+        }
+        let run = RunId::new(params.run_id.trim().to_string());
+        if self.workflow_run_info(&run).is_none() {
+            return not_the_active_run(id, &params.run_id);
+        }
+        let path_text = params.path.trim().to_string();
+        if let Some(error) =
+            self.require_open_run(&id, &run, &format!("expand from node {path_text}"))
+        {
+            return error;
+        }
+        let path = InstancePath::new(path_text.clone());
+        if self.workflow_node_info(&path).is_none() {
+            return node_not_found(
+                id,
+                &WorkflowNodeTarget {
+                    run_id: params.run_id.clone(),
+                    path: params.path.clone(),
+                },
+            );
+        }
+        let token = match self.authenticate_node_token(&path_text, params.token.trim()) {
+            Ok(token) => token,
+            Err(rejected) => return encode_error(id, rejected.code(), rejected.message()),
+        };
+        // A node that has already closed cannot grow the graph: its children
+        // would hang off a `sequence` edge from a settled parent. The engine
+        // refuses it silently, and a silent refusal is exactly what §3.4
+        // forbids — so the refusal is named here instead.
+        if self
+            .workflow
+            .node(&path)
+            .is_some_and(|node| node.status.is_terminal())
+        {
+            return encode_error(
+                id,
+                NODE_NOT_RUNNING_CODE,
+                format!(
+                    "node {path_text} has already closed; a closed node cannot propose new nodes"
+                ),
+            );
+        }
+        let proposal = match expand_proposal(&params) {
+            Ok(proposal) => proposal,
+            Err(message) => return encode_error(id, "invalid_params", message),
+        };
+
+        // The verdict is computed **before** the engine applies the same input.
+        // `expand::evaluate` is pure and deterministic, and nothing mutates the
+        // graph between these two lines, so the engine reaches the identical
+        // outcome — this is one evaluator read twice, not a second policy. It
+        // is read here because the engine reports its verdict through effects,
+        // and this response is the proposing node's only channel back.
+        let Some((outcome, growth, expand_max)) = self.evaluate_expansion(&path, &proposal) else {
+            return encode_error(
+                id,
+                NO_ACTIVE_RUN_CODE,
+                format!("run {run} has no installed definition to judge a proposal against"),
+            );
+        };
+
+        self.apply_workflow_engine_input(EngineInput::ExpandProposed {
+            path: path.clone(),
+            token,
+            proposals: vec![proposal.clone()],
+        });
+
+        // Reported children are confirmed against the graph the engine actually
+        // produced, so the response can never claim a node that does not exist.
+        let mut accepted = Vec::with_capacity(outcome.accepted.len());
+        for child in &outcome.accepted {
+            let exists = self
+                .workflow
+                .graph()
+                .is_some_and(|graph| graph.index_of(&child.path).is_some());
+            if exists {
+                accepted.push(child.path.to_string());
+            } else {
+                tracing::warn!(
+                    path = %child.path,
+                    "expansion child was accepted but is not in the run graph"
+                );
+            }
+        }
+        let at_unix_ms = unix_now_ms();
+        let rejected = outcome
+            .rejected
+            .iter()
+            .map(|rejection| {
+                wire_expand_rejection(rejection, &proposal, growth, expand_max, at_unix_ms)
+            })
+            .collect();
+        encode_success(
+            id,
+            ResponseResult::WorkflowNodeExpanded { accepted, rejected },
+        )
+    }
+
+    /// Authenticates a node-token-bearing call that is not a report, returning
+    /// the minted token the engine input has to carry.
+    ///
+    /// Delegates to the binder's `node_self_report`, whose constant-time
+    /// comparison is the subsystem's one token check — a second implementation
+    /// here would be a second thing to get wrong, and a capability check is the
+    /// wrong place to keep two. The `EngineInput` it builds is discarded: the
+    /// call *is* the check, and it performs no effects.
+    fn authenticate_node_token(
+        &self,
+        path: &str,
+        token: &str,
+    ) -> Result<NodeToken, ReportRejected> {
+        let expected = self
+            .workflow
+            .node_token(&InstancePath::new(path.trim()))
+            .cloned();
+        crate::workflow::binding::observe::node_self_report(
+            path,
+            token,
+            expected.as_ref(),
+            Some(serde_json::Value::Null),
+        )?;
+        // `node_self_report` refuses a node with no minted token, so the check
+        // above already established this is `Some`.
+        expected.ok_or(ReportRejected::UnknownNode)
+    }
+
+    /// Judges one proposal against the live run, returning the outcome plus the
+    /// two numbers a limit's `limit_value` is read from — the run's effective
+    /// [`GrowthLimits`] and the proposing node's own `expand_max`.
+    ///
+    /// `None` when the run has no graph or no installed definition, which is
+    /// the one state in which the engine cannot judge a proposal at all.
+    fn evaluate_expansion(
+        &self,
+        path: &InstancePath,
+        proposal: &ExpandProposal,
+    ) -> Option<(ExpandOutcome, GrowthLimits, u16)> {
+        let graph = self.workflow.graph()?;
+        let definition = self.workflow.definition()?;
+        let proposer = graph.index_of(path)?;
+        let expand_max = graph
+            .node(proposer)
+            .and_then(|node| definition.node(&node.key))
+            .map_or(0, |spec| spec.expand_max);
+        let outcome = expand::evaluate(graph, definition, proposer, proposal);
+        Some((outcome, graph.growth, expand_max))
+    }
+
+    /// H2 — the one closed-run guard, applied to every node method that hands
+    /// work back to a run: `steer`, `interrupt`, `restart`, and `expand`.
+    ///
+    /// A closed run will never settle again, so anything delivered into it is
+    /// answered `ok` for work nothing will ever collect. `action` completes the
+    /// sentence "a closed run cannot …".
+    fn require_open_run(&self, id: &str, run: &RunId, action: &str) -> Option<String> {
+        let status = self
+            .workflow
+            .run_status()
+            .filter(|status| is_closed_run(*status))?;
+        Some(encode_error(
+            id.to_string(),
+            RUN_CLOSED_CODE,
+            format!(
+                "run {run} is already {}; a closed run cannot {action}. \
+                 Start a new run with `kvx workflow run start <name|id>`.",
+                run_status_label(status),
+            ),
+        ))
     }
 
     /// `workflow_run_in_flight`, told truthfully. A *paused* run is not
@@ -987,6 +1251,13 @@ impl App {
         let run = RunId::new(run_id.trim().to_string());
         if self.workflow_run_info(&run).is_none() {
             return not_the_active_run(id, run_id);
+        }
+        // H2: one guard for all three verbs. It runs before the node lookup so
+        // a closed run is reported as closed rather than as a path problem —
+        // the ordering `restart` established when it was the only guarded verb.
+        if let Some(error) = self.require_open_run(&id, &run, &closed_run_action(&input, path_text))
+        {
+            return error;
         }
         if self.workflow_node_info(path).is_none() {
             return node_not_found(
@@ -1085,6 +1356,51 @@ impl App {
         encode_error(id, error.api_code(), error.to_string())
     }
 
+    /// The measured history the single resolver reads (§4 D9), one entry per
+    /// kvdag node key — templates included, so an expansion child resolves from
+    /// the same table with no mid-run query.
+    ///
+    /// Only `auto` consults it: `tier::resolve`'s four fixed tiers are table
+    /// lookups that ignore `history` entirely (`tier.rs`'s own doc), so a fixed
+    /// tier is answered with an empty index rather than one store round trip
+    /// per node for a value nothing reads.
+    // The error arm is a response builder so the caller keeps ownership of the
+    // request id — the same shape `stored_run` uses, and the reason the return
+    // type is nested.
+    #[allow(clippy::type_complexity)]
+    fn node_history_index(
+        &mut self,
+        kvdag: &Kvdag,
+        tier: Tier,
+    ) -> Result<HistoryIndex, Box<dyn FnOnce(String) -> String>> {
+        if tier != Tier::Auto {
+            return Ok(HistoryIndex::new());
+        }
+        let workflow = kvdag.workflow_id.clone();
+        let keys: Vec<NodeKey> = kvdag.nodes.iter().map(|node| node.key.clone()).collect();
+        let loaded = self.workflow_store.call(move |cx| {
+            let mut index = HistoryIndex::new();
+            for key in keys {
+                let history = cx.block_on(cx.store().node_history(
+                    &workflow,
+                    &key,
+                    NODE_HISTORY_WINDOW,
+                ))?;
+                index.insert(key, history);
+            }
+            Ok::<_, StoreError>(index)
+        });
+        match loaded {
+            Ok(Ok(index)) => Ok(index),
+            Ok(Err(error)) => {
+                let code = error.api_code();
+                let message = error.to_string();
+                Err(Box::new(move |id| encode_error(id, code, message)))
+            }
+            Err(unavailable) => Err(Box::new(move |id| unavailable_response(id, &unavailable))),
+        }
+    }
+
     /// `ActiveRun.workspace_id` is what pins a run's panes to one workspace, so
     /// a run started over the API records the workspace it was started from.
     fn active_workspace_public_id(&self) -> Option<String> {
@@ -1102,6 +1418,174 @@ fn unavailable_response(id: String, unavailable: &StoreUnavailable) -> String {
             message: unavailable.message.clone(),
         },
     )
+}
+
+/// Wall-clock now, in milliseconds. One reading per call site: a run's start
+/// instant and a growth limit's timestamp are both stamped exactly once (§4
+/// D15).
+#[cfg(feature = "workflow")]
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Completes the sentence "a closed run cannot …" for the three verbs that
+/// hand work back to a run through [`App::apply_node_input`].
+#[cfg(feature = "workflow")]
+fn closed_run_action(input: &EngineInput, path: &str) -> String {
+    let verb = match input {
+        EngineInput::Steer { .. } => "steer",
+        EngineInput::Interrupt { .. } => "interrupt",
+        EngineInput::RestartNode { .. } => "restart",
+        // No other input reaches `apply_node_input`; naming the node is still
+        // the truthful half of the sentence.
+        _ => "deliver to",
+    };
+    format!("{verb} node {}", path.trim())
+}
+
+/// The wire proposal, narrowed to the engine's vocabulary.
+///
+/// `count` is `u32` on the wire and `u16` in [`ExpandProposal`], so an
+/// out-of-range value is **refused** rather than truncated — silently turning
+/// `70000` into `4464` is exactly the kind of quiet reinterpretation §3.4
+/// forbids. An explicit `0` is normalised to 1, which is what
+/// `ExpandProposal::requested` means by it: a proposal is a request for at
+/// least one child.
+#[cfg(feature = "workflow")]
+fn expand_proposal(params: &WorkflowNodeExpandParams) -> Result<ExpandProposal, String> {
+    let count = match params.count {
+        Some(count) => Some(u16::try_from(count.max(1)).map_err(|_| {
+            format!(
+                "count {count} is larger than the {} a proposal can ask for",
+                u16::MAX
+            )
+        })?),
+        None => None,
+    };
+    Ok(ExpandProposal {
+        template: NodeKey::new(params.template.trim().to_string()),
+        label: params.label.trim().to_string(),
+        inputs: params
+            .inputs
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        count,
+    })
+}
+
+/// One engine rejection in the wire's vocabulary.
+///
+/// The two vocabularies are declared separately on purpose
+/// (`src/api/schema/workflows.rs`'s module doc), and this is the only place
+/// that maps between them, so a new engine variant cannot reach the wire under
+/// an invented name. `growth`/`expand_max` are the run's effective ceilings and
+/// the proposing node's own budget: [`ExpandLimit::value_in`] is the single
+/// authority for "what number was hit", which is what keeps this response, the
+/// `workflow.growth.limited` event, the journal, and the CLI in agreement.
+#[cfg(feature = "workflow")]
+fn wire_expand_rejection(
+    rejection: &ExpandRejection,
+    proposal: &ExpandProposal,
+    growth: GrowthLimits,
+    expand_max: u16,
+    at_unix_ms: u64,
+) -> WorkflowExpandRejection {
+    let reason = match rejection {
+        ExpandRejection::NotAllowed { .. } => WorkflowExpandRejectionReason::NotAllowed,
+        ExpandRejection::UnknownTemplate { .. } => WorkflowExpandRejectionReason::UnknownTemplate,
+        ExpandRejection::NotATemplate { .. } => WorkflowExpandRejectionReason::NotATemplate,
+        ExpandRejection::ExpandMaxReached { .. } => WorkflowExpandRejectionReason::ExpandMaxReached,
+        ExpandRejection::MaxDepthReached { .. } => WorkflowExpandRejectionReason::MaxDepthReached,
+        ExpandRejection::MaxNodesReached { .. } => WorkflowExpandRejectionReason::MaxNodesReached,
+        ExpandRejection::Truncated { .. } => WorkflowExpandRejectionReason::Truncated,
+        ExpandRejection::UnknownInput { .. } => WorkflowExpandRejectionReason::UnknownInput,
+    };
+    // Every rejection but `Truncated` created nothing, and the count it was
+    // refused is the proposal's own.
+    let (requested, accepted) = rejection
+        .counts()
+        .unwrap_or_else(|| (proposal.requested(), 0));
+    let limit = rejection.limit().map(|limit| {
+        let limit_value = rejection
+            .limit_value()
+            .unwrap_or_else(|| limit.value_in(growth, expand_max));
+        WorkflowGrowthLimit {
+            kind: wire_growth_limit_kind(limit),
+            limit_value: u32::from(limit_value),
+            requested: u32::from(requested),
+            accepted: u32::from(accepted),
+            at_unix_ms,
+            message: rejection.message(Some(limit_value)),
+        }
+    });
+    WorkflowExpandRejection {
+        template: rejection
+            .template()
+            .cloned()
+            .unwrap_or_else(|| proposal.template.clone())
+            .to_string(),
+        reason,
+        message: limit
+            .as_ref()
+            .map_or_else(|| rejection.message(None), |limit| limit.message.clone()),
+        limit,
+        requested: u32::from(requested),
+        accepted: u32::from(accepted),
+    }
+}
+
+#[cfg(feature = "workflow")]
+fn wire_growth_limit_kind(limit: ExpandLimit) -> WorkflowGrowthLimitKind {
+    match limit {
+        ExpandLimit::ExpandMax => WorkflowGrowthLimitKind::ExpandMax,
+        ExpandLimit::MaxDepth => WorkflowGrowthLimitKind::MaxDepth,
+        ExpandLimit::MaxNodes => WorkflowGrowthLimitKind::MaxNodes,
+    }
+}
+
+/// H3 / §4 D16 — the **one** `workflow.get` projection. Both the human
+/// renderer and `--json` read this, so the two cannot describe different
+/// node/edge/arg sets.
+///
+/// `workflow` is the `workflow` row's own summary, which `create_version`'s
+/// metadata refresh keeps equal to the head document (H5); `nodes`/`edges`/
+/// `args` come from the head version's kvdag. A head pointer that would not
+/// load yields the summary and the version chain with empty graph sets, rather
+/// than failing a call whose other half is perfectly readable.
+#[cfg(feature = "workflow")]
+fn workflow_detail(
+    workflow: &WorkflowSummary,
+    versions: &[KvdagVersionSummary],
+    head: Option<&Kvdag>,
+) -> WorkflowDetail {
+    WorkflowDetail {
+        workflow: workflow.clone(),
+        nodes: head
+            .map(|head| head.nodes.iter().map(wire_node_info).collect())
+            .unwrap_or_default(),
+        edges: head
+            .map(|head| head.edges.iter().map(wire_edge_info).collect())
+            .unwrap_or_default(),
+        args: head
+            .map(|head| {
+                head.args
+                    .iter()
+                    .map(|arg| WorkflowArgSpec {
+                        name: arg.name.clone(),
+                        required: arg.required,
+                        default: arg.default.clone(),
+                        description: arg.description.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        versions: versions.to_vec(),
+    }
 }
 
 #[cfg(feature = "workflow")]
@@ -1426,6 +1910,17 @@ fn wire_run_record(record: crate::workflow::store::RunRecord) -> WorkflowRunInfo
         nodes_total: record.nodes_total,
         nodes_done: record.nodes_done,
         failure: record.failure,
+        max_depth: u32::from(record.max_depth),
+        max_nodes: u32::from(record.max_nodes),
+        // Every materialised node counts against `max_nodes` regardless of
+        // status, which is exactly what `nodes_total` records.
+        nodes_live: record.nodes_total,
+        // A growth limit is a *live* fact: it is journalled as `growth_limited`
+        // and emitted as `workflow.growth.limited`, but `workflow_run` carries
+        // no column for it, so a run read back from the journal has nothing to
+        // project. The live projection in `src/app/workflow.rs` is where a
+        // recorded limit surfaces.
+        growth_limited: None,
     }
 }
 
@@ -1455,6 +1950,15 @@ fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> Workfl
         succession: record.succession.as_ref().map(wire_succession),
         blocker: record.succession.as_ref().and_then(wire_blocker),
         watchdog_interventions: 0,
+        // Written verbatim from the run's assignment table (§4 D9), so a
+        // finished run can still explain why a node ran on the model it did.
+        // Empty for a fixed tier, whose §7.1/§7.2 row *is* the explanation.
+        assignment_reason: record.assignment_reason,
+        // Delivery failures and growth limits both live on the engine rather
+        // than on a `run_node` column, so the durable projection cannot report
+        // either. The live projection in `src/app/workflow.rs` does.
+        delivery_failure: None,
+        growth_limited: None,
     }
 }
 
@@ -1517,6 +2021,13 @@ fn require_report_params(id: &str, params: &WorkflowNodeReportParams) -> Option<
     require_non_empty(id, "run_id", &params.run_id)
         .or_else(|| require_non_empty(id, "path", &params.path))
         .or_else(|| require_non_empty(id, "token", &params.token))
+}
+
+fn require_expand_params(id: &str, params: &WorkflowNodeExpandParams) -> Option<String> {
+    require_non_empty(id, "run_id", &params.run_id)
+        .or_else(|| require_non_empty(id, "path", &params.path))
+        .or_else(|| require_non_empty(id, "token", &params.token))
+        .or_else(|| require_non_empty(id, "template", &params.template))
 }
 
 #[cfg(test)]
@@ -1662,6 +2173,15 @@ mod tests {
                 run_id: "workflow_run:1".into(),
                 path: "plan".into(),
             }),
+            Method::WorkflowNodeExpand(crate::api::schema::WorkflowNodeExpandParams {
+                run_id: "workflow_run:1".into(),
+                path: "plan".into(),
+                token: "node-token".into(),
+                template: "worker".into(),
+                label: String::new(),
+                inputs: HashMap::new(),
+                count: None,
+            }),
         ];
 
         for method in methods {
@@ -1709,6 +2229,15 @@ mod tests {
                 run_id: "workflow_run:1".into(),
                 path: "plan".into(),
                 text: "keep going".into(),
+            }),
+            Method::WorkflowNodeExpand(crate::api::schema::WorkflowNodeExpandParams {
+                run_id: "workflow_run:1".into(),
+                path: "plan".into(),
+                token: "node-token".into(),
+                template: "worker".into(),
+                label: String::new(),
+                inputs: HashMap::new(),
+                count: None,
             }),
         ];
 
@@ -2559,6 +3088,656 @@ output_schema = { type = "object", required = ["done"] }
             message.contains(&format!("kvx workflow run cancel {run_id}"))
                 && message.contains(&format!("kvx workflow node restart {run_id} only")),
             "the refusal names both ways out: {message}"
+        );
+    }
+
+    // ── Phase 2 (WS-E) ─────────────────────────────────────────────────────
+
+    /// A root that may fan out into one template, plus a downstream node the
+    /// children inherit the parent's edge to — the shape §3.4's "the fan-in
+    /// point is preserved" is about.
+    #[cfg(feature = "workflow")]
+    fn expanding_definition(max_nodes: Option<u16>) -> WorkflowDefinitionDocument {
+        let growth = max_nodes.map_or(String::new(), |value| format!("max_nodes = {value}\n"));
+        WorkflowDefinitionDocument {
+            format: WorkflowDefinitionFormat::Toml,
+            text: format!(
+                r#"
+name = "grower"
+description = "v1 description"
+{growth}
+[[arg]]
+name = "topic"
+default = "widgets"
+
+[[node]]
+key = "plan"
+label = "Plan"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "plan {{{{topic}}}}"
+output_schema = {{ type = "object" }}
+expand_allow = ["worker"]
+expand_max = 2
+
+[[node]]
+key = "worker"
+label = "Worker"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "work on {{{{topic}}}}"
+output_schema = {{ type = "object" }}
+is_template = true
+
+[[node]]
+key = "review"
+label = "Review"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "review {{{{summary}}}}"
+output_schema = {{ type = "object" }}
+# One attempt, so a dead pane is a failure rather than a retry — which is what
+# lets a test reach `RunStatus::Failed` without a second spawn.
+max_attempts = 1
+
+[[edge]]
+from = "plan"
+to = "review"
+kind = "data"
+payload = "summary"
+port = "summary"
+"#
+            ),
+        }
+    }
+
+    /// Starts the expanding workflow and binds `plan`, so it is a live,
+    /// token-holding node that can propose.
+    #[cfg(feature = "workflow")]
+    fn app_with_an_expanding_run(tier: Option<WorkflowTier>) -> (App, String) {
+        use crate::workflow::model::{NodeBinding, NodeToken};
+        use std::path::PathBuf;
+
+        let mut app = app();
+        let created = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: expanding_definition(None),
+            },
+        );
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let workflow_id = created["result"]["workflow"]["workflow_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the workflow was created: {created}"))
+            .to_string();
+
+        let started = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id,
+                version: None,
+                tier,
+                args: HashMap::new(),
+            },
+        );
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let run_id = started["result"]["run"]["run_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the run started: {started}"))
+            .to_string();
+
+        app.workflow
+            .record_node_token(&InstancePath::new("plan"), NodeToken::new("node-token"));
+        app.bind_workflow_node(
+            &InstancePath::new("plan"),
+            NodeBinding {
+                pane_id: crate::workflow::model::PublicPaneId::new("w9:p9"),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                agent_session_id: "session-1".to_string(),
+                transcript_path: PathBuf::from("transcript.jsonl"),
+                node_dir: PathBuf::from("/runs/test/plan"),
+                cwd: PathBuf::from("/repo"),
+            },
+        );
+        (app, run_id)
+    }
+
+    /// Settles `plan` with a result that fills the `summary` port, which is
+    /// what admits `review`.
+    #[cfg(feature = "workflow")]
+    fn report_plan(app: &mut App, run_id: &str) {
+        app.handle_workflow_node_report(
+            "req".into(),
+            WorkflowNodeReportParams {
+                run_id: run_id.to_string(),
+                path: "plan".into(),
+                token: "node-token".into(),
+                result: serde_json::json!({ "summary": "done" }),
+            },
+        );
+    }
+
+    /// Binds the downstream node to its own pane, the step that moves an
+    /// admitted node from `Ready` to `Running`.
+    #[cfg(feature = "workflow")]
+    fn bind_review(app: &mut App) {
+        use crate::workflow::model::{NodeBinding, NodeToken};
+        use std::path::PathBuf;
+
+        app.workflow
+            .record_node_token(&InstancePath::new("review"), NodeToken::new("node-token"));
+        app.bind_workflow_node(
+            &InstancePath::new("review"),
+            NodeBinding {
+                pane_id: crate::workflow::model::PublicPaneId::new("w9:p8"),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                agent_session_id: "session-2".to_string(),
+                transcript_path: PathBuf::from("transcript.jsonl"),
+                node_dir: PathBuf::from("/runs/test/review"),
+                cwd: PathBuf::from("/repo"),
+            },
+        );
+    }
+
+    #[cfg(feature = "workflow")]
+    fn expand_params(run_id: &str, template: &str, count: Option<u32>) -> WorkflowNodeExpandParams {
+        WorkflowNodeExpandParams {
+            run_id: run_id.to_string(),
+            path: "plan".into(),
+            token: "node-token".into(),
+            template: template.to_string(),
+            label: String::new(),
+            inputs: HashMap::new(),
+            count,
+        }
+    }
+
+    /// An accepted proposal creates the children it names, at the §3 frozen
+    /// instance-path grammar, and reports exactly those paths.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn an_accepted_expand_proposal_creates_the_children_it_reports() {
+        let (mut app, run_id) = app_with_an_expanding_run(None);
+        let response = app
+            .handle_workflow_node_expand("req".into(), expand_params(&run_id, "worker", Some(2)));
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["type"], "workflow_node_expanded",
+            "unexpected: {value}"
+        );
+        let accepted: Vec<&str> = value["result"]["accepted"]
+            .as_array()
+            .unwrap_or_else(|| panic!("accepted is an array: {value}"))
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(accepted, vec!["plan/worker/1", "plan/worker/2"], "{value}");
+        assert!(
+            value["result"]["rejected"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "a wholly accepted proposal reports no rejection: {value}"
+        );
+        for path in accepted {
+            assert!(
+                app.workflow_node_info(&InstancePath::new(path)).is_some(),
+                "the response only names children that exist: {path}"
+            );
+        }
+    }
+
+    /// The headline guarantee, handler-side: a refused proposal is a
+    /// **successful** response carrying the refusal, not an error — the run
+    /// continues and the node learns exactly what it hit.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_rejected_expand_proposal_is_a_success_response_carrying_the_rejection() {
+        let (mut app, run_id) = app_with_an_expanding_run(None);
+        let before = app.workflow.graph().map(|graph| graph.nodes.len());
+
+        let response =
+            app.handle_workflow_node_expand("req".into(), expand_params(&run_id, "review", None));
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["type"], "workflow_node_expanded",
+            "a rejection is not an error: {value}"
+        );
+        assert!(
+            value["result"]["accepted"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "{value}"
+        );
+        let rejected = value["result"]["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1, "{value}");
+        assert_eq!(rejected[0]["reason"], "not_allowed");
+        assert_eq!(rejected[0]["template"], "review");
+        assert_eq!(rejected[0]["requested"], 1);
+        assert_eq!(rejected[0]["accepted"], 0);
+        assert!(
+            rejected[0]["limit"].is_null(),
+            "a validation refusal is not a guardrail: {value}"
+        );
+        assert!(
+            rejected[0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("expand_allow"),
+            "{value}"
+        );
+        assert_eq!(
+            app.workflow.graph().map(|graph| graph.nodes.len()),
+            before,
+            "a refused proposal creates nothing"
+        );
+    }
+
+    /// §4 D2: partial acceptance is the interesting case. Four asked for, two
+    /// created, and the shortfall reported with the exact guardrail — never
+    /// accept-all and never a silent truncation.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_truncated_expand_proposal_reports_both_halves() {
+        let (mut app, run_id) = app_with_an_expanding_run(None);
+        let response = app
+            .handle_workflow_node_expand("req".into(), expand_params(&run_id, "worker", Some(4)));
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["accepted"].as_array().map(Vec::len),
+            Some(2),
+            "expand_max 2 caps the acceptance: {value}"
+        );
+        let rejected = value["result"]["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1, "{value}");
+        assert_eq!(rejected[0]["reason"], "truncated");
+        assert_eq!(rejected[0]["requested"], 4);
+        assert_eq!(rejected[0]["accepted"], 2);
+        assert_eq!(rejected[0]["limit"]["kind"], "expand_max");
+        assert_eq!(rejected[0]["limit"]["limit_value"], 2);
+        assert_eq!(rejected[0]["limit"]["requested"], 4);
+        assert_eq!(rejected[0]["limit"]["accepted"], 2);
+        assert!(
+            rejected[0]["limit"]["at_unix_ms"].as_u64().unwrap_or(0) > 0,
+            "a growth limit is stamped when it is hit: {value}"
+        );
+        assert!(
+            rejected[0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("2 of 4"),
+            "{value}"
+        );
+    }
+
+    /// The token is the node's capability, exactly as it is for
+    /// `workflow.node.report`: an operator holding the run id cannot grow
+    /// someone else's graph.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn an_expand_proposal_with_the_wrong_token_is_refused() {
+        let (mut app, run_id) = app_with_an_expanding_run(None);
+        let mut params = expand_params(&run_id, "worker", Some(1));
+        params.token = "not-the-token".into();
+        let response = app.handle_workflow_node_expand("req".into(), params);
+        assert_eq!(
+            error_code(&response),
+            "workflow_node_token_invalid",
+            "{response}"
+        );
+        assert!(
+            app.workflow_node_info(&InstancePath::new("plan/worker/1"))
+                .is_none(),
+            "an unauthenticated proposal creates nothing"
+        );
+    }
+
+    /// `count` is `u32` on the wire and `u16` in the engine, so an
+    /// out-of-range value is refused rather than truncated to a number the
+    /// caller never asked for.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn an_out_of_range_expand_count_is_refused_rather_than_truncated() {
+        let (mut app, run_id) = app_with_an_expanding_run(None);
+        let response = app.handle_workflow_node_expand(
+            "req".into(),
+            expand_params(&run_id, "worker", Some(u32::from(u16::MAX) + 1)),
+        );
+        assert_eq!(error_code(&response), "invalid_params", "{response}");
+        assert!(app
+            .workflow_node_info(&InstancePath::new("plan/worker/1"))
+            .is_none());
+    }
+
+    /// H2 — the closed-run guard is one helper applied to all four verbs.
+    /// Three terminal statuses × three verbs, each naming the status it
+    /// refused for.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn steer_interrupt_and_expand_are_refused_once_the_run_has_closed() {
+        use crate::workflow::model::PublicPaneId;
+
+        for (label, close) in [
+            (
+                "cancelled",
+                Box::new(|app: &mut App, run_id: &str| {
+                    app.handle_workflow_run_cancel(
+                        "req".into(),
+                        WorkflowRunTarget {
+                            run_id: run_id.to_string(),
+                        },
+                    );
+                }) as Box<dyn Fn(&mut App, &str)>,
+            ),
+            (
+                "succeeded",
+                Box::new(|app: &mut App, run_id: &str| {
+                    // Every node reports a valid result, so the run reaches its
+                    // own terminal status rather than being cancelled into one.
+                    report_plan(app, run_id);
+                    bind_review(app);
+                    app.handle_workflow_node_report(
+                        "req".into(),
+                        WorkflowNodeReportParams {
+                            run_id: run_id.to_string(),
+                            path: "review".into(),
+                            token: "node-token".into(),
+                            result: serde_json::json!({ "summary": "reviewed" }),
+                        },
+                    );
+                }),
+            ),
+            (
+                "failed",
+                Box::new(|app: &mut App, run_id: &str| {
+                    // The last node's pane dies before a result arrives, which
+                    // §4.3 makes a failure with the exit code; every node is
+                    // then terminal and one of them failed.
+                    report_plan(app, run_id);
+                    bind_review(app);
+                    app.apply_workflow_engine_input(EngineInput::PaneExited {
+                        pane: PublicPaneId::new("w9:p8"),
+                        code: Some(1),
+                    });
+                }),
+            ),
+        ] {
+            let (mut app, run_id) = app_with_an_expanding_run(None);
+            close(&mut app, &run_id);
+            let status = app.workflow.run_status();
+            let nodes: Vec<(String, NodeStatus, bool)> = app
+                .workflow
+                .graph()
+                .map(|graph| {
+                    graph
+                        .nodes
+                        .iter()
+                        .map(|node| {
+                            (
+                                node.path.to_string(),
+                                node.status,
+                                node.succession.is_some(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                status.is_some_and(is_closed_run),
+                "the {label} fixture closes the run, got {status:?} with {nodes:?}"
+            );
+
+            let responses = [
+                (
+                    "steer",
+                    app.handle_workflow_node_steer(
+                        "req".into(),
+                        WorkflowNodeSteerParams {
+                            run_id: run_id.clone(),
+                            path: "plan".into(),
+                            text: "keep going".into(),
+                        },
+                    ),
+                ),
+                (
+                    "interrupt",
+                    app.handle_workflow_node_interrupt(
+                        "req".into(),
+                        WorkflowNodeTarget {
+                            run_id: run_id.clone(),
+                            path: "plan".into(),
+                        },
+                    ),
+                ),
+                (
+                    "restart",
+                    app.handle_workflow_node_restart(
+                        "req".into(),
+                        WorkflowNodeTarget {
+                            run_id: run_id.clone(),
+                            path: "plan".into(),
+                        },
+                    ),
+                ),
+                (
+                    "expand",
+                    app.handle_workflow_node_expand(
+                        "req".into(),
+                        expand_params(&run_id, "worker", Some(1)),
+                    ),
+                ),
+            ];
+
+            for (verb, response) in responses {
+                assert_eq!(
+                    error_code(&response),
+                    RUN_CLOSED_CODE,
+                    "{verb} on a {label} run: {response}"
+                );
+                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                let message = value["error"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains(label) && message.contains("kvx workflow run start"),
+                    "{verb} on a {label} run names the status and the way out: {message}"
+                );
+            }
+            assert!(
+                app.workflow_node_info(&InstancePath::new("plan/worker/1"))
+                    .is_none(),
+                "a closed run cannot grow ({label})"
+            );
+        }
+    }
+
+    /// §4 D4 / R-3: the tier narrows the version's ceilings **once**, at run
+    /// create, so what the `RunGraph` enforces is what the run row persists.
+    /// Without the narrowing a `--tier low` run's row says 30 while its graph
+    /// says 12.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn the_persisted_growth_limits_are_the_ones_the_run_graph_enforces() {
+        for (tier, expected) in [
+            (WorkflowTier::Max, 30_u16),
+            (WorkflowTier::High, 30),
+            (WorkflowTier::Auto, 30),
+            (WorkflowTier::Medium, 24),
+            (WorkflowTier::Low, 12),
+        ] {
+            let mut app = app();
+            let created = app.handle_workflow_create(
+                "req".into(),
+                WorkflowCreateParams {
+                    definition: expanding_definition(Some(30)),
+                },
+            );
+            let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+            let workflow_id = created["result"]["workflow"]["workflow_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{created}"))
+                .to_string();
+            let started = app.handle_workflow_run(
+                "req".into(),
+                WorkflowRunParams {
+                    workflow_id,
+                    version: None,
+                    tier: Some(tier),
+                    args: HashMap::new(),
+                },
+            );
+            let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+            let run_id = RunId::new(
+                started["result"]["run"]["run_id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{started}"))
+                    .to_string(),
+            );
+
+            let enforced = app
+                .workflow
+                .graph()
+                .map(|graph| graph.growth.max_nodes)
+                .expect("the run graph is live");
+            assert_eq!(enforced, expected, "{tier:?} narrows the graph's ceiling");
+            assert_eq!(
+                started["result"]["run"]["max_nodes"].as_u64(),
+                Some(u64::from(expected)),
+                "{tier:?}: the projection reports the effective ceiling: {started}"
+            );
+
+            let wanted = run_id.clone();
+            let persisted = app
+                .workflow_store
+                .call(move |cx| cx.block_on(cx.store().get_run(&wanted)))
+                .expect("the in-memory store is available")
+                .expect("the run row reads back")
+                .expect("the run row exists");
+            assert_eq!(
+                persisted.max_nodes, enforced,
+                "{tier:?}: the run row and the run graph must not disagree"
+            );
+            assert_eq!(persisted.max_depth, 3, "{tier:?}: depth is never narrowed");
+        }
+    }
+
+    /// H3 / §4 D16: one projection. `detail` is what both the human renderer
+    /// and `--json` read, so it has to describe the head document's whole
+    /// node/edge/arg set beside the summary and the version chain.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn workflow_get_returns_one_detail_projection_of_the_head_document() {
+        let mut app = app();
+        app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: expanding_definition(None),
+            },
+        );
+        let shown = app.handle_workflow_get(
+            "req".into(),
+            WorkflowTarget {
+                workflow_id: "grower".into(),
+            },
+        );
+        let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        let detail = &shown["result"]["detail"];
+        assert!(!detail.is_null(), "workflow.get carries a detail: {shown}");
+        assert_eq!(
+            detail["workflow"], shown["result"]["workflow"],
+            "the detail's summary is the response's own: {shown}"
+        );
+        assert_eq!(
+            detail["versions"], shown["result"]["versions"],
+            "the detail's chain is the response's own: {shown}"
+        );
+        let nodes = detail["nodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{shown}"));
+        let mut keys: Vec<&str> = nodes
+            .iter()
+            .filter_map(|node| node["node_key"].as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["plan", "review", "worker"],
+            "every node of the head document, templates included: {shown}"
+        );
+        assert_eq!(
+            detail["edges"].as_array().map(Vec::len),
+            Some(1),
+            "the head document's edges: {shown}"
+        );
+        assert_eq!(
+            detail["args"][0]["name"], "topic",
+            "the head document's args: {shown}"
+        );
+        let worker = nodes
+            .iter()
+            .find(|node| node["node_key"] == "worker")
+            .unwrap_or_else(|| panic!("{shown}"));
+        assert_eq!(
+            worker["is_template"], true,
+            "a template is described as one: {shown}"
+        );
+        assert_eq!(worker["expand_allow"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// H5: `create_version` writes the new document's metadata onto the
+    /// `workflow` row, so `workflow.get` cannot report v1's description beside
+    /// `head_version: 2`.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn an_update_that_changes_the_description_is_what_workflow_get_reports() {
+        let mut app = app();
+        app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: expanding_definition(None),
+            },
+        );
+        let mut updated_definition = expanding_definition(None);
+        updated_definition.text = updated_definition
+            .text
+            .replace(
+                "description = \"v1 description\"",
+                "description = \"v2 description\"\ndefault_tier = \"low\"",
+            )
+            // The graph has to move too, or the store recognises the revision
+            // as a no-op and the head stays at v1 — which is the very case that
+            // proves the metadata refresh is not riding on a new version row.
+            .replace("review {{summary}}", "review it: {{summary}}");
+        let updated = app.handle_workflow_version_create(
+            "req".into(),
+            WorkflowVersionCreateParams {
+                workflow_id: "grower".into(),
+                definition: updated_definition,
+                change_summary: "reworded".into(),
+            },
+        );
+        let updated: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            updated["result"]["type"], "workflow_version_created",
+            "unexpected: {updated}"
+        );
+
+        let shown = app.handle_workflow_get(
+            "req".into(),
+            WorkflowTarget {
+                workflow_id: "grower".into(),
+            },
+        );
+        let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        assert_eq!(shown["result"]["workflow"]["head_version"], 2, "{shown}");
+        assert_eq!(
+            shown["result"]["workflow"]["description"], "v2 description",
+            "the head's description, not v1's: {shown}"
+        );
+        assert_eq!(
+            shown["result"]["workflow"]["default_tier"], "low",
+            "the head's tier, not v1's: {shown}"
+        );
+        assert_eq!(
+            shown["result"]["detail"]["workflow"]["description"], "v2 description",
+            "the one projection reports the same thing: {shown}"
         );
     }
 }

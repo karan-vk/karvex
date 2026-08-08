@@ -20,6 +20,7 @@ use tracing::{debug, info};
 
 use crate::detect::AgentState;
 use crate::workflow::engine::complete::{Completion, SchemaViolation, Signal, SignalLedger};
+use crate::workflow::engine::expand::ExpandProposal;
 use crate::workflow::engine::schedule::TerminalBlocker;
 use crate::workflow::model::{
     CheckpointKind, EngineInput, InstancePath, Kvdag, NodeBinding, NodeKey, NodeResult, NodeStatus,
@@ -84,6 +85,29 @@ impl ReportOutcome {
     }
 }
 
+/// The two `NodeHistory` inputs the engine can state truthfully today
+/// (`06-phase2-plan.md` §4 D8).
+///
+/// `tier::NodeHistory` has five fields and the `auto` policy reads four of
+/// them, but only these two are facts the engine already holds: the other three
+/// are Phase 4's watchdog counter, a token total `model.rs` documents as
+/// permanently `0`, and an ordering-sensitive derivation the store computes over
+/// several runs. Shipping "auto over `NodeHistory`" against an all-zero record
+/// would be a silently inert feature, so these two are recorded per node and
+/// the rest are left visibly absent rather than fabricated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeFacts {
+    /// Attempt 1 reached `Succeeded` on the node's first reported result — no
+    /// corrective re-prompt was spent. Assigned, not accumulated: a node that
+    /// succeeds on a later attempt or a later report sets this back to false.
+    pub first_pass_succeeded: bool,
+    /// How many of this node's reported results the completion gate rejected on
+    /// schema-class grounds, across every attempt. Cumulative for the life of
+    /// the run: a retry does not refund a failure the node already made, which
+    /// is the whole point of the measurement.
+    pub schema_failures: u32,
+}
+
 /// A `PromptNode`/`SendKeys` delivery the runtime refused (§5).
 ///
 /// The engine does not perform deliveries, so it cannot observe the refusal
@@ -121,6 +145,11 @@ pub struct Engine {
     /// state rather than a log line: a steer that never landed must not look
     /// identical to one that did.
     delivery_failures: HashMap<InstancePath, DeliveryFailureNote>,
+    /// Per-node [`NodeFacts`], the measured half of what `tier::NodeHistory`
+    /// aggregates across runs. Absent entries read as the default, so a node
+    /// that never reported is "no first pass, no schema failures" rather than
+    /// missing.
+    facts: HashMap<InstancePath, NodeFacts>,
 }
 
 /// What the engine knows about a node's seed prompt (§4.2).
@@ -143,11 +172,32 @@ impl Engine {
             seeds: HashMap::new(),
             reported: HashMap::new(),
             delivery_failures: HashMap::new(),
+            facts: HashMap::new(),
         }
     }
 
     pub fn config(&self) -> EngineConfig {
         self.config
+    }
+
+    /// What this run has measured about `path` so far (§4 D8). An unknown node
+    /// reads as the default rather than `None`: "nothing measured" and "no such
+    /// node" are the same all-zero record to every consumer, and forcing a
+    /// caller to unwrap the difference would invite a fabricated value.
+    pub fn node_facts(&self, path: &InstancePath) -> NodeFacts {
+        self.facts.get(path).copied().unwrap_or_default()
+    }
+
+    /// Records one schema-class rejection against `path`.
+    ///
+    /// Schema-class covers both an output-schema failure and a malformed
+    /// `expand` (§4 D6): in each case the node said something the contract does
+    /// not allow. A signal that arrived with no artifact at all is *not* one of
+    /// these — there was nothing to validate — so `missing_result` never lands
+    /// here.
+    fn note_schema_failure(&mut self, path: &InstancePath) {
+        let facts = self.facts.entry(path.clone()).or_default();
+        facts.schema_failures = facts.schema_failures.saturating_add(1);
     }
 
     /// The verdict the completion gate reached on `path`'s most recent reported
@@ -305,6 +355,11 @@ impl Engine {
                 token,
                 result,
             } => self.report(&path, &token, &result),
+            EngineInput::ExpandProposed {
+                path,
+                token,
+                proposals,
+            } => self.expand_proposed(&path, &token, &proposals),
             EngineInput::TurnEnded { pane } => self.signal_from_pane(&pane, Signal::TurnEnd),
             EngineInput::AgentStatus { pane, state, at } => self.agent_status(&pane, state, at),
             EngineInput::ProgressObserved { path, delta } => self.progress(&path, &delta),
@@ -325,6 +380,7 @@ impl Engine {
         self.seeds.clear();
         self.reported.clear();
         self.delivery_failures.clear();
+        self.facts.clear();
 
         graph.status = RunStatus::Running;
         let changed = schedule::propagate(&mut graph);
@@ -387,6 +443,7 @@ impl Engine {
             return Vec::new();
         }
         let key = node.key.clone();
+        let attempt = node.attempt;
 
         // §4.3: a self-report that carries no result artifact never completes a
         // node — it lands on `missing_result`, exactly like a sustained-idle
@@ -407,6 +464,21 @@ impl Engine {
             };
         }
 
+        // §4 D6: `expand` is lifted out **before** anything treats this JSON as
+        // a result. Everything downstream of here — validation,
+        // `complete::node_result`, `summarise`, `digest`, the persisted
+        // checkpoint — sees `stripped`, so the key can never reach the payload
+        // Phase 3's restore compares digests over.
+        let (stripped, proposed) = complete::strip_expand(result);
+        let (proposals, expand_errors) = match proposed.as_ref().map(complete::parse_expand) {
+            None => (Vec::new(), Vec::new()),
+            Some(Ok(proposals)) => (proposals, Vec::new()),
+            // A malformed `expand` is a schema-class violation of the result: it
+            // rides through the same gate, spends the same single corrective
+            // re-prompt, and names the field it is about.
+            Some(Err(errors)) => (Vec::new(), errors),
+        };
+
         let ledger = self.signals.entry(path.clone()).or_default();
         ledger.observe(Signal::SelfReport);
         let evidence = ledger.best().unwrap_or(Signal::SelfReport).evidence();
@@ -425,7 +497,27 @@ impl Engine {
             return self.needs_attention(idx, reason);
         };
 
-        match complete::accept(&schema, result, evidence, report_ordinal) {
+        let completion = complete::accept_with(
+            &schema,
+            &stripped,
+            evidence,
+            report_ordinal,
+            expand_errors.clone(),
+        );
+        if !proposals.is_empty() && !matches!(completion, Completion::Accepted(_)) {
+            // §3.4 step 1: a node's **validated** result may propose. A result
+            // the gate refused is not one, so its proposals go with it rather
+            // than growing the graph from a payload the node is about to be
+            // told to fix. Nothing is lost: the node re-proposes in the result
+            // it gets right, and instance numbering is monotone either way.
+            debug!(
+                path = %path,
+                proposals = proposals.len(),
+                "expand proposals discarded with the result the completion gate refused"
+            );
+        }
+
+        match completion {
             Completion::Accepted(accepted) => {
                 self.reports.remove(path);
                 self.record_report(
@@ -434,9 +526,30 @@ impl Engine {
                     Vec::new(),
                     "the reported result validated against the node's output schema",
                 );
-                self.succeed(idx, *accepted)
+                // §4 D8's "first pass": the node's first attempt produced a
+                // valid result on its first report, so no correction was spent.
+                // `attempt` starts at 1 (`graph::FIRST_ATTEMPT`), so a retried
+                // or restarted node can never satisfy this however clean its
+                // later result is — which is exactly the measurement `auto`
+                // wants.
+                let first_pass = attempt <= 1 && report_ordinal <= complete::FIRST_REPORT;
+                self.facts
+                    .entry(path.clone())
+                    .or_default()
+                    .first_pass_succeeded = first_pass;
+
+                // The expansion is committed **before** the parent succeeds:
+                // `succeed` propagates and settles, and a run that finished on
+                // its last node would otherwise close in the same call that was
+                // supposed to grow it. Committing first means the parent→child
+                // `sequence` edge is already in the graph when the parent's
+                // success propagates through it.
+                let mut effects = self.expand_proposals(idx, path, &proposals);
+                effects.extend(self.succeed(idx, *accepted));
+                effects
             }
             Completion::Reprompt { errors } => {
+                self.note_schema_failure(path);
                 let text = complete::corrective_prompt(&schema, &errors);
                 let quoted: Vec<String> = errors.iter().map(SchemaViolation::quote).collect();
                 let reason = format!(
@@ -485,12 +598,14 @@ impl Engine {
                 effects
             }
             Completion::NeedsAttention { reason } => {
-                let quoted: Vec<String> = complete::validate(&schema, result)
+                self.note_schema_failure(path);
+                let mut quoted: Vec<String> = complete::validate(&schema, &stripped)
                     .err()
                     .unwrap_or_default()
                     .iter()
                     .map(SchemaViolation::quote)
                     .collect();
+                quoted.extend(expand_errors.iter().map(SchemaViolation::quote));
                 info!(
                     path = %path,
                     violations = quoted.len(),
@@ -500,6 +615,160 @@ impl Engine {
                 self.needs_attention(idx, &reason)
             }
         }
+    }
+
+    /// The mid-run proposal channel: `kvx workflow node expand`, which reaches
+    /// the engine as [`EngineInput::ExpandProposed`].
+    ///
+    /// The per-node capability token is minted by the binder and checked by the
+    /// API layer before the input reaches the engine, exactly as it is for
+    /// [`Engine::report`] — the engine never sees the mint and so cannot
+    /// re-check it.
+    ///
+    /// The other route into the same pipeline is the `expand` key lifted out of
+    /// a reported result (§4 D6); that one settles inside `report` so the
+    /// growth and the parent's success land in one effect vector.
+    fn expand_proposed(
+        &mut self,
+        path: &InstancePath,
+        _token: &NodeToken,
+        proposals: &[ExpandProposal],
+    ) -> Vec<RunEffect> {
+        let Some(idx) = self.graph.as_ref().and_then(|graph| graph.index_of(path)) else {
+            debug!(path = %path, "workflow expand proposal for an unknown node");
+            return Vec::new();
+        };
+        // A node that has already closed cannot grow the graph: its children
+        // would hang off a `sequence` edge from a settled parent, admitted
+        // immediately, inside a run that may itself have finished.
+        let closed = self
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.node(idx))
+            .is_some_and(|node| node.status.is_terminal());
+        if closed {
+            debug!(path = %path, "workflow expand proposal for a node that already closed");
+            return Vec::new();
+        }
+
+        let before = self.graph.as_ref().map_or(0, |graph| graph.nodes.len());
+        let mut effects = self.expand_proposals(idx, path, proposals);
+        let after = self.graph.as_ref().map_or(0, |graph| graph.nodes.len());
+        // Only a graph that actually grew needs re-settling. A wholly rejected
+        // proposal changed nothing, and settling anyway would let a run pause
+        // or finish on the back of an input that did not move it.
+        if after > before {
+            self.settle(&mut effects);
+        }
+        effects
+    }
+
+    /// The §3.4 pipeline for one node's proposals: propose → guardrail →
+    /// commit. **A node cannot create nodes; it proposes, and karvex decides.**
+    ///
+    /// Every proposal is journalled as `expand_proposed` before it is judged,
+    /// whatever the verdict turns out to be — that entry is the proposal's home
+    /// now that §4 D6 keeps it out of the result payload, and an audit trail
+    /// that recorded only the accepted half would be the wrong half.
+    ///
+    /// Proposals are evaluated and committed **one at a time, in order**,
+    /// because the guardrails are cumulative: `expand_max` counts every child
+    /// the proposing node has already been granted and `max_nodes` counts the
+    /// whole graph, so judging a batch against the graph as it stood before any
+    /// of them landed would over-accept by exactly the size of the batch.
+    fn expand_proposals(
+        &mut self,
+        proposer: RunNodeIdx,
+        path: &InstancePath,
+        proposals: &[ExpandProposal],
+    ) -> Vec<RunEffect> {
+        let mut effects = Vec::new();
+        for proposal in proposals {
+            let Some(graph) = self.graph.as_mut() else {
+                return effects;
+            };
+            let payload = json!({
+                "template": proposal.template.as_str(),
+                "label": proposal.label,
+                "inputs": proposal.inputs,
+                "count": proposal.count,
+            });
+            effects.push(journal(
+                graph,
+                RunEventKind::ExpandProposed,
+                Some(path.clone()),
+                payload,
+            ));
+
+            // Without the definition there is no template to instantiate and no
+            // `expand_allow` to check against, so the proposal cannot be judged
+            // at all. Journalled above and left at that: silently accepting it
+            // would grow the graph from a node nobody validated.
+            let Some(definition) = self.definition.as_ref() else {
+                debug!(path = %path, "expand proposal not judged: the run's kvdag definition is not installed");
+                continue;
+            };
+            let Some(graph) = self.graph.as_ref() else {
+                return effects;
+            };
+            let outcome = expand::evaluate(graph, definition, proposer, proposal);
+            if outcome.is_empty() {
+                continue;
+            }
+
+            // Read while the definition is still borrowed, because `commit`
+            // needs the graph mutably and `ExpandLimit::value_in` is the one
+            // authority for "what number was hit".
+            let run = graph.run_id.clone();
+            let growth = graph.growth;
+            let expand_max = graph
+                .node(proposer)
+                .and_then(|node| definition.node(&node.key))
+                .map_or(0, |spec| spec.expand_max);
+
+            let Some(graph) = self.graph.as_mut() else {
+                return effects;
+            };
+            // `commit` journals `expand_accepted`/`expand_rejected`/
+            // `growth_limited` and emits `NodeCreated`, and it enqueues
+            // `RunNodeCreated` for a child before anything can update that
+            // child — the ordering the app's bounded write queue depends on.
+            effects.extend(expand::commit(graph, proposer, &outcome));
+
+            for rejection in &outcome.rejected {
+                // §4 D5: `workflow.growth.limited` is the one thing no client
+                // can derive, and it is emitted for exactly the rejections a
+                // guardrail produced. A validation refusal — unknown template,
+                // not allowed, unknown input — is the node being wrong, not the
+                // run running out of room.
+                let Some(limit) = rejection.limit() else {
+                    continue;
+                };
+                let limit_value = rejection
+                    .limit_value()
+                    .unwrap_or_else(|| limit.value_in(growth, expand_max));
+                // Every rejection but `Truncated` created nothing, and the
+                // count it was refused is the proposal's own; `count` defaults
+                // to 1 (§4 D2).
+                let (requested, accepted) = rejection
+                    .counts()
+                    .unwrap_or_else(|| (proposal.count.unwrap_or(1), 0));
+                effects.push(RunEffect::Emit(WorkflowEvent::GrowthLimited {
+                    run: run.clone(),
+                    path: path.clone(),
+                    template: rejection
+                        .template()
+                        .cloned()
+                        .unwrap_or_else(|| proposal.template.clone()),
+                    limit,
+                    limit_value,
+                    requested,
+                    accepted,
+                    message: rejection.message(Some(limit_value)),
+                }));
+            }
+        }
+        effects
     }
 
     /// Signals 2 and 3 arrive keyed by pane. Neither carries an artifact —
@@ -1891,6 +2160,601 @@ mod tests {
             .and_then(|graph| graph.edges.first())
             .expect("the fixture has one edge");
         assert_eq!((edge.condition_result, edge.fired), (Some(true), true));
+    }
+
+    fn checkpoint_of(effects: &[RunEffect]) -> (serde_json::Value, String, String, Vec<String>) {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                RunEffect::Persist(write) => match write.as_ref() {
+                    StoreWrite::Checkpoint {
+                        payload,
+                        summary,
+                        digest,
+                        artifact_paths,
+                        ..
+                    } => Some((
+                        payload.clone(),
+                        summary.clone(),
+                        digest.clone(),
+                        artifact_paths.clone(),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a succeeding node checkpoints its validated result")
+    }
+
+    fn report_plan(engine: &mut Engine, raw: &str) -> Vec<RunEffect> {
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(raw),
+        })
+    }
+
+    fn started_engine() -> Engine {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        engine
+    }
+
+    /// **The Phase 3 restore-compatibility guard** (§4 D6). `complete::check`
+    /// never rejects unknown top-level keys, so an `expand` left in the result
+    /// would validate by accident and then flow into the payload, the summary,
+    /// the artifact index, and the `digest` that Phase 3's restore compares
+    /// across versions. A quiet Phase 2 choice would become a Phase 3
+    /// correctness bug, so the checkpoint a node produces must be *byte*
+    /// identical with and without the key.
+    #[test]
+    fn an_expand_key_never_reaches_the_payload_summary_artifacts_or_digest() {
+        let plain = checkpoint_of(&report_plan(
+            &mut started_engine(),
+            r#"{"plan":"do it","summary":"planned","artifacts":["out/a.md"]}"#,
+        ));
+        let expanding = checkpoint_of(&report_plan(
+            &mut started_engine(),
+            r#"{"plan":"do it","summary":"planned","artifacts":["out/a.md"],
+                "expand":[{"template":"worker","label":"w","inputs":{"focus":"api"},"count":2}]}"#,
+        ));
+
+        assert_eq!(
+            plain, expanding,
+            "the checkpointed payload, summary, digest and artifact index must not \
+             record that the node also proposed an expansion"
+        );
+
+        let (payload, _, _, _) = expanding;
+        assert!(
+            payload.get("expand").is_none(),
+            "the proposal's home is the expand_proposed journal entry, not the payload"
+        );
+    }
+
+    /// The node prompt/output contract is unchanged (§3 frozen interface 11):
+    /// `expand` is an optional *additional* key, so a schema that has never
+    /// heard of it still passes a result that carries it.
+    #[test]
+    fn an_expand_array_validates_against_a_schema_that_never_mentions_it() {
+        let mut engine = started_engine();
+        let effects = report_plan(
+            &mut engine,
+            r#"{"plan":"do it","expand":[{"template":"worker","label":"w"}]}"#,
+        );
+
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Succeeded);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "a well-formed expand costs the node nothing"
+        );
+        assert_eq!(
+            engine
+                .node_facts(&InstancePath::new("plan"))
+                .schema_failures,
+            0
+        );
+    }
+
+    /// A proposal is journalled before it is judged, whatever the verdict: with
+    /// the key stripped from the payload (§4 D6), `expand_proposed` is the only
+    /// durable record that the node asked at all.
+    #[test]
+    fn a_proposal_is_journalled_as_expand_proposed_before_it_is_judged() {
+        let mut engine = started_engine();
+        let effects = report_plan(
+            &mut engine,
+            r#"{"plan":"do it","expand":[{"template":"worker","label":"w","count":2}]}"#,
+        );
+
+        let payload = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RunEffect::Persist(write) => match write.as_ref() {
+                    StoreWrite::RunEvent {
+                        kind: RunEventKind::ExpandProposed,
+                        path,
+                        payload,
+                        ..
+                    } if path.as_ref() == Some(&InstancePath::new("plan")) => Some(payload.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the proposal is journalled");
+
+        assert_eq!(
+            payload.get("template").and_then(|v| v.as_str()),
+            Some("worker")
+        );
+        assert_eq!(payload.get("label").and_then(|v| v.as_str()), Some("w"));
+        assert_eq!(
+            payload.get("count").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+    }
+
+    /// A malformed `expand` is a schema-class violation: it spends the node's
+    /// single corrective re-prompt and no more, and the correction names the
+    /// field rather than sending the node to a schema that never saw the key.
+    #[test]
+    fn a_malformed_expand_spends_exactly_one_reprompt_then_needs_attention() {
+        let mut engine = started_engine();
+
+        let first = report_plan(&mut engine, r#"{"plan":"do it","expand":"just do it"}"#);
+        let prompts: Vec<&String> = first
+            .iter()
+            .filter_map(|effect| match effect {
+                RunEffect::PromptNode { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts.len(), 1, "exactly one corrective re-prompt");
+        assert!(
+            prompts[0].contains("expand"),
+            "the correction names the field it is about: {}",
+            prompts[0]
+        );
+        assert_eq!(
+            status_of(&engine, "plan"),
+            NodeStatus::Running,
+            "a correctable node keeps its pane"
+        );
+        assert_eq!(
+            engine
+                .report_outcome(&InstancePath::new("plan"))
+                .map(|outcome| outcome.verdict),
+            Some(ReportVerdict::Corrected)
+        );
+
+        let second = report_plan(&mut engine, r#"{"plan":"do it","expand":"just do it"}"#);
+        assert!(
+            !second
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "the corrective re-prompt happens exactly once"
+        );
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+        assert_eq!(
+            engine
+                .node_facts(&InstancePath::new("plan"))
+                .schema_failures,
+            2,
+            "both rejections are counted"
+        );
+        assert!(
+            !engine
+                .node_facts(&InstancePath::new("plan"))
+                .first_pass_succeeded
+        );
+    }
+
+    /// §4 D8: the two `NodeHistory` inputs the engine can state truthfully.
+    #[test]
+    fn first_pass_succeeded_is_true_only_without_a_spent_correction() {
+        let mut clean = started_engine();
+        report_plan(&mut clean, r#"{"plan":"do it"}"#);
+        let facts = clean.node_facts(&InstancePath::new("plan"));
+        assert!(facts.first_pass_succeeded);
+        assert_eq!(facts.schema_failures, 0);
+
+        let mut corrected = started_engine();
+        report_plan(&mut corrected, r#"{"notes":"oops"}"#);
+        assert_eq!(status_of(&corrected, "plan"), NodeStatus::Running);
+        report_plan(&mut corrected, r#"{"plan":"do it"}"#);
+
+        assert_eq!(status_of(&corrected, "plan"), NodeStatus::Succeeded);
+        let facts = corrected.node_facts(&InstancePath::new("plan"));
+        assert!(
+            !facts.first_pass_succeeded,
+            "the node reached Succeeded, but only after the correction"
+        );
+        assert_eq!(facts.schema_failures, 1);
+    }
+
+    /// A retry is a second attempt by definition, so however clean its result
+    /// is it is not a first pass. Failures are cumulative across attempts —
+    /// a respawn does not refund a rejection the node already earned.
+    #[test]
+    fn a_retried_node_never_reports_a_first_pass_and_keeps_its_failure_count() {
+        let mut engine = started_engine();
+        report_plan(&mut engine, r#"{"notes":"oops"}"#);
+        assert_eq!(
+            engine
+                .node_facts(&InstancePath::new("plan"))
+                .schema_failures,
+            1
+        );
+
+        engine.apply(EngineInput::PaneExited {
+            pane: PublicPaneId::new("pane-1"),
+            code: Some(1),
+        });
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Ready);
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1b"));
+        report_plan(&mut engine, r#"{"plan":"do it"}"#);
+
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Succeeded);
+        let facts = engine.node_facts(&InstancePath::new("plan"));
+        assert!(!facts.first_pass_succeeded, "attempt 2 is not a first pass");
+        assert_eq!(
+            facts.schema_failures, 1,
+            "a fresh pane does not refund the rejection the node already earned"
+        );
+    }
+
+    /// A signal with no artifact is not a schema failure: there was nothing to
+    /// validate, so counting it would inflate the measurement `auto` reads.
+    #[test]
+    fn a_report_with_no_artifact_is_not_counted_as_a_schema_failure() {
+        let mut engine = started_engine();
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: RawJson(serde_json::Value::Null),
+        });
+
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+        assert_eq!(
+            engine
+                .node_facts(&InstancePath::new("plan"))
+                .schema_failures,
+            0
+        );
+    }
+
+    /// The run's facts are the run's own: a second `Start` must not report the
+    /// previous run's measurements.
+    #[test]
+    fn starting_a_run_clears_the_previous_runs_facts() {
+        let mut engine = started_engine();
+        report_plan(&mut engine, r#"{"notes":"oops"}"#);
+        assert_eq!(
+            engine
+                .node_facts(&InstancePath::new("plan"))
+                .schema_failures,
+            1
+        );
+
+        let (_, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        assert_eq!(
+            engine.node_facts(&InstancePath::new("plan")),
+            NodeFacts::default()
+        );
+    }
+
+    /// The mid-run channel (`kvx workflow node expand`) reaches the same
+    /// pipeline as the result key, and a node that has already closed cannot
+    /// use it — its children would hang off a settled parent inside a run that
+    /// may itself have finished.
+    #[test]
+    fn a_mid_run_proposal_is_journalled_and_a_closed_node_cannot_make_one() {
+        let mut engine = started_engine();
+        let proposals = vec![crate::workflow::engine::expand::ExpandProposal {
+            template: NodeKey::new("worker"),
+            label: "w".to_string(),
+            inputs: std::collections::BTreeMap::new(),
+            count: None,
+        }];
+
+        let effects = engine.apply(EngineInput::ExpandProposed {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            proposals: proposals.clone(),
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RunEffect::Persist(write)
+                    if matches!(**write, StoreWrite::RunEvent { kind: RunEventKind::ExpandProposed, .. })
+            )),
+            "a mid-run proposal is journalled like a result-carried one"
+        );
+
+        report_plan(&mut engine, r#"{"plan":"do it"}"#);
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Succeeded);
+        assert!(
+            engine
+                .apply(EngineInput::ExpandProposed {
+                    path: InstancePath::new("plan"),
+                    token: NodeToken::new("token"),
+                    proposals: proposals.clone(),
+                })
+                .is_empty(),
+            "a closed node cannot grow the graph"
+        );
+        assert!(
+            engine
+                .apply(EngineInput::ExpandProposed {
+                    path: InstancePath::new("nonexistent"),
+                    token: NodeToken::new("token"),
+                    proposals,
+                })
+                .is_empty(),
+            "and neither can a node that is not in the graph"
+        );
+    }
+
+    /// `fanout` may expand the `worker` template four times; `collect` is the
+    /// §3.4 fan-in point, drawn from `fanout` so a child inherits it.
+    fn expanding_engine(expand_max: u16) -> (Engine, RunGraph) {
+        let mut fanout = spec_node(&TestNode::requiring("fanout", &["plan"]));
+        fanout.expand_allow = vec![NodeKey::new("worker")];
+        fanout.expand_max = expand_max;
+        let mut worker = spec_node(&TestNode::requiring("worker", &["report"]));
+        worker.is_template = true;
+
+        let definition = kvdag_of(
+            vec![
+                fanout,
+                worker,
+                spec_node(&TestNode::requiring("collect", &["report"])),
+            ],
+            vec![
+                spec_edge("fanout", "worker", EdgeKind::Sequence),
+                spec_edge("worker", "collect", EdgeKind::Sequence),
+                spec_edge("fanout", "collect", EdgeKind::Sequence),
+            ],
+        );
+        let graph = RunGraph::materialise(&definition, RunId::new("workflow_run:1"), Tier::High);
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.install_definition(definition);
+        (engine, graph)
+    }
+
+    fn expanding_report(engine: &mut Engine, count: u16) -> Vec<RunEffect> {
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("fanout"),
+            token: NodeToken::new("token"),
+            result: report(&format!(
+                r#"{{"plan":"fan out","expand":[{{"template":"worker","label":"w","count":{count}}}]}}"#
+            )),
+        })
+    }
+
+    fn started_expanding_engine(expand_max: u16) -> Engine {
+        let (mut engine, graph) = expanding_engine(expand_max);
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("fanout"), binding("pane-1"));
+        engine
+    }
+
+    fn created_paths(effects: &[RunEffect]) -> Vec<InstancePath> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RunEffect::Persist(write) => match write.as_ref() {
+                    StoreWrite::RunNodeCreated { path, .. } => Some(path.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// D7: `pending_writes` is a bounded, drop-oldest queue, and
+    /// `StoreWrite::RunNode` is find-then-`UPDATE` that errors on a missing
+    /// row. A create that landed after its own update — or that the queue could
+    /// evict while keeping the update — is a permanent decode error for that
+    /// node, so the create must be first in the vector, not merely present.
+    fn assert_creates_precede_their_updates(effects: &[RunEffect]) {
+        let mut created: HashMap<InstancePath, usize> = HashMap::new();
+        for (index, effect) in effects.iter().enumerate() {
+            if let RunEffect::Persist(write) = effect {
+                if let StoreWrite::RunNodeCreated { path, .. } = write.as_ref() {
+                    created.entry(path.clone()).or_insert(index);
+                }
+            }
+        }
+        assert!(
+            !created.is_empty(),
+            "the fixture must create at least one node for this invariant to mean anything"
+        );
+        for (index, effect) in effects.iter().enumerate() {
+            if let RunEffect::Persist(write) = effect {
+                if let StoreWrite::RunNode { path, .. } = write.as_ref() {
+                    if let Some(create) = created.get(path) {
+                        assert!(
+                            *create < index,
+                            "RunNodeCreated for {path} is at {create} but a RunNode update \
+                             for it is at {index}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_accepted_proposal_creates_its_children_before_it_updates_them() {
+        let mut engine = started_expanding_engine(4);
+        let effects = expanding_report(&mut engine, 2);
+
+        assert_eq!(
+            created_paths(&effects),
+            vec![
+                InstancePath::new("fanout/worker/1"),
+                InstancePath::new("fanout/worker/2"),
+            ],
+            "instance paths are <parent>/<template>/<n>, 1-based"
+        );
+        assert_creates_precede_their_updates(&effects);
+        assert_eq!(status_of(&engine, "fanout"), NodeStatus::Succeeded);
+        assert_eq!(
+            status_of(&engine, "fanout/worker/1"),
+            NodeStatus::Ready,
+            "the parent→child sequence edge fired when the parent succeeded"
+        );
+    }
+
+    /// The run must not close in the very call that grew it: `succeed`
+    /// propagates and settles, so an expansion committed after the parent's
+    /// success would arrive at an already-finished run.
+    #[test]
+    fn expanding_on_the_last_result_keeps_the_run_alive() {
+        let mut engine = started_expanding_engine(4);
+        let effects = expanding_report(&mut engine, 1);
+
+        assert_eq!(
+            engine.graph().map(|graph| graph.status),
+            Some(RunStatus::Running)
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::Emit(WorkflowEvent::RunFinished { .. }))),
+            "a run that just grew has not finished"
+        );
+    }
+
+    /// §4 D2: never accept-all, never reject-all, never silently truncated.
+    #[test]
+    fn a_proposal_over_budget_is_partially_accepted_and_reports_the_shortfall() {
+        let mut engine = started_expanding_engine(2);
+        let effects = expanding_report(&mut engine, 5);
+
+        assert_eq!(
+            created_paths(&effects).len(),
+            2,
+            "the two that fit are created"
+        );
+        let limited = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RunEffect::Emit(WorkflowEvent::GrowthLimited {
+                    template,
+                    limit,
+                    limit_value,
+                    requested,
+                    accepted,
+                    message,
+                    ..
+                }) => Some((
+                    template.clone(),
+                    *limit,
+                    *limit_value,
+                    *requested,
+                    *accepted,
+                    message.clone(),
+                )),
+                _ => None,
+            })
+            .expect("the shortfall is reported, never silently truncated");
+
+        assert_eq!(limited.0, NodeKey::new("worker"));
+        assert_eq!(
+            limited.1,
+            crate::workflow::engine::expand::ExpandLimit::ExpandMax
+        );
+        assert_eq!(limited.2, 2, "the ceiling that was hit");
+        assert_eq!((limited.3, limited.4), (5, 2));
+        assert!(limited.5.contains("2 of 5"), "message: {}", limited.5);
+    }
+
+    /// A guardrail refusal is not an error: the node succeeds, the run
+    /// continues, and the refusal is reported.
+    #[test]
+    fn a_wholly_refused_proposal_still_lets_the_node_succeed() {
+        let mut engine = started_expanding_engine(0);
+        let effects = expanding_report(&mut engine, 2);
+
+        assert!(created_paths(&effects).is_empty());
+        assert_eq!(status_of(&engine, "fanout"), NodeStatus::Succeeded);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RunEffect::Emit(WorkflowEvent::GrowthLimited { limit_value: 0, .. })
+        )));
+    }
+
+    /// A validation refusal is the node being wrong, not the run running out of
+    /// room, so it produces no `workflow.growth.limited`.
+    #[test]
+    fn a_validation_refusal_reports_no_growth_limit() {
+        let mut engine = started_expanding_engine(4);
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("fanout"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"plan":"x","expand":[{"template":"nobody","label":"w"}]}"#),
+        });
+
+        assert!(created_paths(&effects).is_empty());
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                RunEffect::Emit(WorkflowEvent::GrowthLimited { .. })
+            )),
+            "an unknown template is a validation failure, not a growth limit"
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RunEffect::Persist(write)
+                if matches!(**write, StoreWrite::RunEvent { kind: RunEventKind::ExpandRejected, .. })
+        )));
+        assert_eq!(status_of(&engine, "fanout"), NodeStatus::Succeeded);
+    }
+
+    /// The mid-run verb reaches the same guardrails as the result key, and
+    /// `expand_max` is cumulative across every proposal a node makes.
+    #[test]
+    fn expand_max_is_cumulative_across_a_nodes_proposals() {
+        let mut engine = started_expanding_engine(2);
+        let proposal = |count: Option<u16>| crate::workflow::engine::expand::ExpandProposal {
+            template: NodeKey::new("worker"),
+            label: "w".to_string(),
+            inputs: std::collections::BTreeMap::new(),
+            count,
+        };
+
+        let first = engine.apply(EngineInput::ExpandProposed {
+            path: InstancePath::new("fanout"),
+            token: NodeToken::new("token"),
+            proposals: vec![proposal(None), proposal(None)],
+        });
+        assert_eq!(created_paths(&first).len(), 2);
+        assert_creates_precede_their_updates(&first);
+
+        let third = engine.apply(EngineInput::ExpandProposed {
+            path: InstancePath::new("fanout"),
+            token: NodeToken::new("token"),
+            proposals: vec![proposal(None)],
+        });
+        assert!(
+            created_paths(&third).is_empty(),
+            "the third child would exceed expand_max 2"
+        );
+        assert!(third
+            .iter()
+            .any(|effect| matches!(effect, RunEffect::Emit(WorkflowEvent::GrowthLimited { .. }))));
     }
 
     #[test]

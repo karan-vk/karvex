@@ -536,6 +536,12 @@
           "description": "Open the workflow DAG view for the run this server is executing."
         },
         {
+          "key": "keys.open_workflow_launcher",
+          "type": "keybinding",
+          "default": "\"prefix+f\"",
+          "description": "Open the workflow launcher: pick a workflow, fill its arguments, pick a tier, run it."
+        },
+        {
           "key": "keys.indexed.tabs",
           "type": "string",
           "default": "unset",

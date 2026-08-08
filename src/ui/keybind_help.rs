@@ -79,6 +79,7 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
                 "open notification target",
             ),
             help_entry(keybind_label(&kb.open_workflow_dag), "workflow dag"),
+            help_entry(keybind_label(&kb.open_workflow_launcher), "run a workflow"),
         ],
     ));
 

@@ -1538,6 +1538,15 @@ impl App {
                 "closing this pane would close a worktree group",
             ));
         }
+        // §4.3 / H6: a pane that is *closed* rather than dying is just as fatal
+        // to the node running in it, but only `AppEvent::PaneDied` ever told
+        // the workflow engine, so a closed pane left its node `running`
+        // forever. This runs after the confirmation guard above — a close the
+        // user has not confirmed yet must not fail the node — and before the
+        // pane is removed, because that is what the node's public pane id is
+        // resolved from. One call covers the API verb and the TUI keybinding,
+        // which reaches here through `runtime_pane_close`.
+        self.observe_workflow_pane_exit(pane_id);
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         let should_close_workspace = {

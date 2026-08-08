@@ -5,18 +5,64 @@
 //! that builds and walks it lives here
 //! (`docs/design/workflow-builder/04-kvdag-and-execution.md` §3.1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::workflow::engine::schedule;
 use crate::workflow::model::{
-    GrowthLimits, InstancePath, Kvdag, NodeStatus, NodeUsage, ProgressTracker, RunEdge, RunGraph,
-    RunId, RunNode, RunNodeIdx, RunStatus,
+    GrowthLimits, InstancePath, Kvdag, NodeAssignment, NodeKey, NodeStatus, NodeUsage,
+    ProgressTracker, RunEdge, RunGraph, RunId, RunNode, RunNodeIdx, RunStatus,
 };
-use crate::workflow::tier::{self, Tier};
+use crate::workflow::tier::{self, HistoryIndex, Tier};
 
 /// The first attempt is numbered 1, matching `run_node.attempt`'s default in
 /// `03-storage-schema.md` §4.2.
-const FIRST_ATTEMPT: u8 = 1;
+///
+/// `pub(crate)` so an expansion child created mid-run by
+/// [`crate::workflow::engine::expand::commit`] starts on the same attempt
+/// number a statically materialised node does.
+pub(crate) const FIRST_ATTEMPT: u8 = 1;
+
+/// Every kvdag node's `(model, effort, reason)`, resolved once at run start.
+///
+/// The **single** tier resolver for the whole subsystem (`06-phase2-plan.md`
+/// §4 D9). Before Phase 2 the pair was resolved in two places that agreed only
+/// because both passed `None` for history; with `auto` reading a node's
+/// measured record that coincidence would end, and a node's persisted row would
+/// start disagreeing with the DAG about which model it ran on.
+///
+/// **Templates are included on purpose.** An accepted expand proposal
+/// instantiates a template mid-run, and a mid-run history query would resolve
+/// against a different `HistoryIndex` than the run started with — the same run
+/// would then contain two nodes cut from one template with different
+/// assignments and no way to explain the difference. Resolving every node up
+/// front, templates included, makes the table a closed, replayable record.
+///
+/// An absent history entry behaves like an all-zero record, which is what
+/// [`tier::resolve`] already documents.
+pub fn resolve_assignments(
+    kvdag: &Kvdag,
+    tier: Tier,
+    history: &HistoryIndex,
+) -> BTreeMap<NodeKey, NodeAssignment> {
+    kvdag
+        .nodes
+        .iter()
+        .map(|node| {
+            let measured = history.get(&node.key);
+            let assignment = tier::resolve(tier, node.demand, measured);
+            // A fixed tier's row *is* the explanation, so it carries no reason
+            // string (`NodeAssignment::reason`'s doc comment).
+            let reason = match tier {
+                Tier::Auto => tier::auto_reason(node.demand, measured).to_string(),
+                Tier::Max | Tier::High | Tier::Medium | Tier::Low => String::new(),
+            };
+            (
+                node.key.clone(),
+                NodeAssignment::from_assignment(assignment, reason),
+            )
+        })
+        .collect()
+}
 
 impl RunGraph {
     /// Materialises a run graph from a validated definition: one `RunNode` per
@@ -30,6 +76,25 @@ impl RunGraph {
     /// graph is never observed in a state where its roots have not been
     /// admitted.
     pub fn materialise(kvdag: &Kvdag, run_id: RunId, tier: Tier) -> Self {
+        let assignments = resolve_assignments(kvdag, tier, &HistoryIndex::new());
+        Self::materialise_with(kvdag, run_id, tier, &assignments)
+    }
+
+    /// [`RunGraph::materialise`] against an assignment table the caller already
+    /// resolved — the entry point a run start uses, because only the caller can
+    /// reach the store for the workflow's [`HistoryIndex`].
+    ///
+    /// The table is carried verbatim onto [`RunGraph::assignments`], so
+    /// `materialise_run_nodes` persists what the run actually decided instead of
+    /// re-deriving it (§4 D9). A node whose key is missing from the table falls
+    /// back to a history-free resolution rather than panicking: the table comes
+    /// from a query, and a run that lost one row should still start.
+    pub fn materialise_with(
+        kvdag: &Kvdag,
+        run_id: RunId,
+        tier: Tier,
+        assignments: &BTreeMap<NodeKey, NodeAssignment>,
+    ) -> Self {
         let mut nodes: Vec<RunNode> = Vec::with_capacity(kvdag.nodes.len());
         let mut index_by_key: HashMap<&str, RunNodeIdx> = HashMap::with_capacity(kvdag.nodes.len());
 
@@ -39,6 +104,12 @@ impl RunGraph {
         for node in kvdag.nodes.iter().filter(|node| !node.is_template) {
             let idx = RunNodeIdx(nodes.len());
             index_by_key.insert(node.key.as_str(), idx);
+            let resolved = assignments.get(&node.key).cloned().unwrap_or_else(|| {
+                NodeAssignment::from_assignment(
+                    tier::resolve(tier, node.demand, None),
+                    String::new(),
+                )
+            });
             nodes.push(RunNode {
                 idx,
                 key: node.key.clone(),
@@ -46,7 +117,8 @@ impl RunGraph {
                 parent: None,
                 depth: 0,
                 status: NodeStatus::Pending,
-                assignment: tier::resolve(tier, node.demand, None),
+                assignment: resolved.assignment(),
+                assignment_reason: resolved.reason,
                 attempt: FIRST_ATTEMPT,
                 binding: None,
                 result: None,
@@ -84,6 +156,7 @@ impl RunGraph {
             version_id: kvdag.version_id.clone(),
             tier,
             growth: narrow_growth(kvdag.growth, tier),
+            assignments: assignments.clone(),
             nodes,
             edges,
             status: RunStatus::Pending,
@@ -115,6 +188,11 @@ impl RunGraph {
 /// The tier's growth influence is purely a narrowing one (§7.4), which is what
 /// keeps `workflow_run.max_nodes <= kvdag_version.max_nodes` a true invariant.
 /// `auto` starts from the `high` row (§7.3), so it narrows nothing.
+///
+/// **Idempotent**: `narrow_growth(narrow_growth(g, t), t) == narrow_growth(g, t)`,
+/// because every rule is a `min` against a constant. That is what lets the run
+/// start narrow once and every later reader re-narrow freely without a run's
+/// banner contradicting its own persisted row (`06-phase2-plan.md` §5 R-3).
 pub fn narrow_growth(growth: GrowthLimits, tier: Tier) -> GrowthLimits {
     let ceiling = match tier {
         Tier::Auto | Tier::Max | Tier::High => None,
@@ -132,7 +210,7 @@ mod tests {
     use super::*;
     use crate::workflow::engine::tests_support::{kvdag_of, spec_edge, spec_node, TestNode};
     use crate::workflow::model::{Demand, EdgeKind, NodeKey};
-    use crate::workflow::tier::{Effort, ModelAlias};
+    use crate::workflow::tier::{Effort, ModelAlias, NodeHistory};
 
     fn node<'a>(graph: &'a RunGraph, key: &str) -> &'a crate::workflow::model::RunNode {
         graph
@@ -244,6 +322,224 @@ mod tests {
             "a run never widens the version's ceiling"
         );
         assert_eq!(narrow_growth(narrow, Tier::Low).max_depth, 2);
+    }
+
+    #[test]
+    fn narrowing_growth_twice_changes_nothing_the_second_time() {
+        let version = GrowthLimits {
+            max_depth: 3,
+            max_nodes: 40,
+        };
+        for tier in [Tier::Auto, Tier::Max, Tier::High, Tier::Medium, Tier::Low] {
+            let once = narrow_growth(version, tier);
+            assert_eq!(
+                narrow_growth(once, tier),
+                once,
+                "{tier} must be idempotent: the run narrows once and every later \
+                 reader re-narrows freely"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_assignments_covers_every_node_including_templates() {
+        let mut template = spec_node(&TestNode::new("worker"));
+        template.is_template = true;
+        template.demand = Demand::Light;
+        let mut fanout = spec_node(&TestNode::new("fanout"));
+        fanout.expand_allow = vec![NodeKey::new("worker")];
+        fanout.expand_max = 2;
+        fanout.demand = Demand::Peak;
+
+        let definition = kvdag_of(
+            vec![fanout, template, spec_node(&TestNode::new("collect"))],
+            vec![
+                spec_edge("fanout", "worker", EdgeKind::Sequence),
+                spec_edge("fanout", "collect", EdgeKind::Sequence),
+            ],
+        );
+        let table = resolve_assignments(&definition, Tier::High, &HistoryIndex::new());
+
+        assert_eq!(
+            table.len(),
+            3,
+            "an expansion child must never need a mid-run lookup"
+        );
+        let worker = table
+            .get(&NodeKey::new("worker"))
+            .expect("the template is resolved at run start");
+        assert_eq!(worker.model, ModelAlias::Sonnet);
+        assert_eq!(worker.effort, Effort::Medium);
+        assert_eq!(
+            worker.reason,
+            String::new(),
+            "a fixed tier's table row is its own explanation"
+        );
+    }
+
+    #[test]
+    fn resolve_assignments_matches_the_tier_tables_for_every_tier_and_demand() {
+        let demands = [
+            Demand::Peak,
+            Demand::Critical,
+            Demand::Standard,
+            Demand::Light,
+        ];
+        let nodes: Vec<crate::workflow::model::KvdagNode> = demands
+            .iter()
+            .map(|demand| {
+                let mut spec = spec_node(&TestNode::new(match demand {
+                    Demand::Peak => "peak",
+                    Demand::Critical => "critical",
+                    Demand::Standard => "standard",
+                    Demand::Light => "light",
+                }));
+                spec.demand = *demand;
+                spec
+            })
+            .collect();
+        let definition = kvdag_of(nodes, Vec::new());
+
+        for tier in [Tier::Auto, Tier::Max, Tier::High, Tier::Medium, Tier::Low] {
+            let table = resolve_assignments(&definition, tier, &HistoryIndex::new());
+            for node in &definition.nodes {
+                let resolved = table
+                    .get(&node.key)
+                    .unwrap_or_else(|| panic!("{tier} resolves {}", node.key));
+                assert_eq!(
+                    resolved.assignment(),
+                    tier::resolve(tier, node.demand, None),
+                    "{tier}/{:?} must not drift from the §7.1/§7.2 tables",
+                    node.demand
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_records_which_policy_step_explained_the_assignment() {
+        let mut standard = spec_node(&TestNode::new("standard"));
+        standard.demand = Demand::Standard;
+        let definition = kvdag_of(vec![standard], Vec::new());
+        let key = NodeKey::new("standard");
+
+        let unmeasured = resolve_assignments(&definition, Tier::Auto, &HistoryIndex::new());
+        assert_eq!(
+            unmeasured.get(&key).map(|node| node.reason.as_str()),
+            Some("auto/high-row"),
+            "no history behaves like an all-zero record"
+        );
+
+        let mut history = HistoryIndex::new();
+        history.insert(
+            key.clone(),
+            NodeHistory {
+                runs: 4,
+                first_pass_successes: 4,
+                ..NodeHistory::default()
+            },
+        );
+        let measured = resolve_assignments(&definition, Tier::Auto, &history);
+        let resolved = measured.get(&key).expect("the node is resolved");
+        assert_eq!(resolved.reason, "auto/downgrade-standard");
+        assert_eq!(resolved.model, ModelAlias::Sonnet);
+        assert_eq!(resolved.effort, Effort::High);
+
+        let mut escalating = HistoryIndex::new();
+        escalating.insert(
+            key.clone(),
+            NodeHistory {
+                runs: 4,
+                first_pass_successes: 4,
+                recent_first_pass_failures: 2,
+                ..NodeHistory::default()
+            },
+        );
+        let both = resolve_assignments(&definition, Tier::Auto, &escalating);
+        assert_eq!(
+            both.get(&key).map(|node| node.reason.as_str()),
+            Some("auto/downgrade-standard+escalate"),
+            "the reason cannot describe a step the assignment did not take"
+        );
+
+        let mut failing = HistoryIndex::new();
+        failing.insert(
+            key.clone(),
+            NodeHistory {
+                runs: 2,
+                recent_first_pass_failures: 2,
+                ..NodeHistory::default()
+            },
+        );
+        let escalated = resolve_assignments(&definition, Tier::Auto, &failing);
+        assert_eq!(
+            escalated.get(&key).map(|node| node.reason.as_str()),
+            Some("auto/escalate")
+        );
+    }
+
+    #[test]
+    fn materialise_with_carries_the_resolved_table_onto_the_run() {
+        let mut plan = spec_node(&TestNode::new("plan"));
+        plan.demand = Demand::Standard;
+        let definition = kvdag_of(vec![plan], Vec::new());
+        let mut history = HistoryIndex::new();
+        history.insert(
+            NodeKey::new("plan"),
+            NodeHistory {
+                runs: 5,
+                first_pass_successes: 5,
+                ..NodeHistory::default()
+            },
+        );
+        let table = resolve_assignments(&definition, Tier::Auto, &history);
+
+        let graph = RunGraph::materialise_with(
+            &definition,
+            RunId::new("workflow_run:1"),
+            Tier::Auto,
+            &table,
+        );
+
+        assert_eq!(graph.assignments, table, "the store writes this verbatim");
+        assert_eq!(node(&graph, "plan").assignment.model, ModelAlias::Sonnet);
+        assert_eq!(
+            node(&graph, "plan").assignment_reason,
+            "auto/downgrade-standard",
+            "a finished run can still be explained"
+        );
+    }
+
+    #[test]
+    fn materialise_resolves_a_history_free_table_of_its_own() {
+        let mut plan = spec_node(&TestNode::new("plan"));
+        plan.demand = Demand::Standard;
+        let definition = kvdag_of(vec![plan], Vec::new());
+        let graph = RunGraph::materialise(&definition, RunId::new("workflow_run:1"), Tier::Auto);
+
+        assert_eq!(
+            graph.assignments.len(),
+            1,
+            "the compatibility wrapper still fills the table"
+        );
+        assert_eq!(node(&graph, "plan").assignment_reason, "auto/high-row");
+    }
+
+    #[test]
+    fn a_node_missing_from_the_table_still_resolves_from_its_tier() {
+        let definition = kvdag_of(vec![spec_node(&TestNode::new("plan"))], Vec::new());
+        let graph = RunGraph::materialise_with(
+            &definition,
+            RunId::new("workflow_run:1"),
+            Tier::Low,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            node(&graph, "plan").assignment,
+            tier::resolve(Tier::Low, Demand::Standard, None),
+            "a run that lost one row still starts"
+        );
     }
 
     #[test]

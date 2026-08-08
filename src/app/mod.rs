@@ -600,6 +600,7 @@ impl App {
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
                 dag: state::DagViewState::default(),
+                workflow_launch: state::WorkflowLaunchState::default(),
             },
             drag: None,
             workspace_press: None,
@@ -613,6 +614,7 @@ impl App {
             update_dismissed: false,
             config_diagnostic,
             toast: None,
+            toast_queue: std::collections::VecDeque::new(),
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
@@ -1394,6 +1396,40 @@ impl App {
         report
     }
 
+    /// Arms the toast expiry clock for whatever is in the slot,
+    /// **unconditionally**.
+    ///
+    /// [`App::sync_toast_deadline`] only re-arms when the slot's content
+    /// changed, which is right for a producer overwriting the slot and wrong
+    /// for the notice queue: two notices with identical `kind`/`title`/`context`
+    /// compare equal, so the deadline would never re-arm and the queue would
+    /// stall permanently behind an immortal toast
+    /// (`06-phase2-plan.md` §5 R-18). Passing `None` as the previous toast
+    /// disarms that guard while reusing the same duration table, rather than
+    /// declaring a second one that can drift.
+    pub(crate) fn arm_toast_deadline(&mut self) {
+        self.sync_toast_deadline(None);
+    }
+
+    /// The toast slot's scheduled expiry, with the notice queue folded in.
+    ///
+    /// Returns whether anything changed, so the caller can redraw. With an
+    /// empty queue this is exactly the behaviour it replaces: clear the slot
+    /// and disarm. With a queue it shows the next notice and re-arms, which is
+    /// what makes "a growth rejection is always surfaced" true rather than
+    /// aspirational (`06-phase2-plan.md` §4 D10 / H4).
+    pub(crate) fn expire_toast_or_show_next(&mut self, now: Instant) -> bool {
+        if self.toast_deadline.is_none_or(|deadline| now < deadline) {
+            return false;
+        }
+        self.toast_deadline = None;
+        self.state.toast = None;
+        if self.state.pop_queued_toast() {
+            self.arm_toast_deadline();
+        }
+        true
+    }
+
     fn apply_live_config(
         &mut self,
         config: &crate::config::Config,
@@ -1880,6 +1916,9 @@ impl App {
             }
             Mode::WorkflowDag => {
                 self.handle_workflow_dag_key(key_event);
+            }
+            Mode::WorkflowLaunch => {
+                self.handle_workflow_launch_key(key_event);
             }
             Mode::Terminal => {
                 // Should not be called in terminal mode.
@@ -2480,6 +2519,110 @@ mod tests {
         assert!(app.handle_scheduled_tasks(deadline, false));
         assert!(app.state.toast.is_none());
         assert!(app.toast_deadline.is_none());
+    }
+
+    fn workflow_notice(path: Option<&str>, message: &str) -> crate::workflow::model::UserNotice {
+        crate::workflow::model::UserNotice {
+            level: crate::workflow::model::NoticeLevel::Warning,
+            run: Some(crate::workflow::model::RunId::new("workflow_run:test")),
+            path: path.map(crate::workflow::model::InstancePath::new),
+            message: message.to_string(),
+        }
+    }
+
+    /// H4 / §4 D10. `state.toast` is one slot and a workflow batch raises a
+    /// per-node notice immediately followed by the run-level one, which used to
+    /// destroy the first outright. Both notices now render — the second when
+    /// the first expires — which is only observable across the expiry clock,
+    /// and that clock lives on `App`.
+    #[test]
+    fn a_queued_workflow_notice_takes_the_slot_when_the_first_expires() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
+
+        app.show_workflow_notice(workflow_notice(Some("plan"), "needs attention"));
+        app.show_workflow_notice(workflow_notice(None, "the run failed"));
+
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("needs attention"),
+            "the node notice shows first"
+        );
+        assert_eq!(app.state.toast_queue.len(), 1);
+        let deadline = app
+            .toast_deadline
+            .expect("the shown notice is on the clock");
+
+        assert!(app.handle_scheduled_tasks(deadline, false));
+
+        assert_eq!(
+            app.state.toast.as_ref().map(|toast| toast.context.as_str()),
+            Some("the run failed"),
+            "the run notice is not destroyed by the node notice ahead of it"
+        );
+        assert!(app.state.toast_queue.is_empty());
+        let next = app
+            .toast_deadline
+            .expect("the notice that took the slot is on the clock too");
+        assert!(
+            next > deadline,
+            "the deadline is fresh, not the expired one"
+        );
+
+        assert!(app.handle_scheduled_tasks(next, false));
+        assert!(app.state.toast.is_none());
+        assert!(app.toast_deadline.is_none());
+    }
+
+    /// §5 R-18: two notices with identical `kind`/`title`/`context` compare
+    /// equal, so a pop that re-armed through `sync_toast_deadline` would skip
+    /// the re-arm and stall the queue behind an immortal toast. The pop arms
+    /// unconditionally, which is what this pins.
+    #[test]
+    fn an_identical_queued_notice_still_rearms_the_expiry_clock() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
+
+        app.show_workflow_notice(workflow_notice(Some("plan"), "needs attention"));
+        app.show_workflow_notice(workflow_notice(Some("plan"), "needs attention"));
+        let first = app.state.toast.clone().expect("the first notice shows");
+        let deadline = app.toast_deadline.expect("armed for the first notice");
+
+        assert!(app.handle_scheduled_tasks(deadline, false));
+
+        assert_eq!(
+            app.state.toast.as_ref(),
+            Some(&first),
+            "the identical successor took the slot"
+        );
+        let next = app
+            .toast_deadline
+            .expect("an identical notice is still a new notice on the clock");
+        assert!(next > deadline);
+
+        assert!(app.handle_scheduled_tasks(next, false));
+        assert!(
+            app.state.toast.is_none(),
+            "the queue drained instead of stalling behind an immortal toast"
+        );
+    }
+
+    /// The expiry is unchanged for every non-workflow producer: an empty queue
+    /// clears the slot and disarms, exactly as before.
+    #[test]
+    fn an_empty_notice_queue_expires_the_slot_as_before() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
+        app.show_workflow_notice(workflow_notice(Some("plan"), "needs attention"));
+        let deadline = app.toast_deadline.expect("armed");
+
+        assert!(!app.expire_toast_or_show_next(deadline - Duration::from_secs(1)));
+        assert!(app.state.toast.is_some());
+
+        assert!(app.expire_toast_or_show_next(deadline));
+        assert!(app.state.toast.is_none());
+        assert!(app.toast_deadline.is_none());
+        assert!(!app.expire_toast_or_show_next(deadline));
     }
 
     #[test]

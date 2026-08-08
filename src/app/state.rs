@@ -828,6 +828,19 @@ pub struct DagNodeView {
     /// The last pane delivery the runtime refused for this node, e.g. a steer
     /// whose keystrokes never reached the process. `None` is the normal case.
     pub delivery_failure: Option<String>,
+    /// The last growth limit this node ran into as a *proposer*, rendered
+    /// inside its box in the palette's warning slot. One of the three
+    /// non-optional surfaces the "a rejection is always surfaced" guarantee
+    /// rests on (`06-phase2-plan.md` §4 D11); the toast is the optional fourth.
+    pub growth_notice: Option<String>,
+    /// Expansion depth, not topological depth: static nodes are 0 and a
+    /// first-generation expansion child is 1 (§4 D13). Mirrors
+    /// `RunNode::depth`.
+    pub depth: u16,
+    /// The proposing node, for an expansion child. Mirrors `RunNode::parent`,
+    /// and is what lets the overlay tell an inherited edge from an authored
+    /// one without a second graph walk.
+    pub parent: Option<crate::workflow::model::RunNodeIdx>,
     /// `reason — resume when …` for a node whose succession is blocked.
     pub blocker: Option<String>,
     /// Public pane id of the node's teammate, once it has been bound.
@@ -862,7 +875,17 @@ pub struct DagViewState {
     /// never report how many nodes happened to fit as if it were how many
     /// exist.
     pub counts: DagRunCounts,
+    /// The run's last growth limit, e.g.
+    /// `growth limited · max_nodes 12 reached · 2 of 4 requested nodes created`.
+    ///
+    /// `None` is the normal case and it costs **zero rows**: the overlay's
+    /// banner band is only allocated when this is `Some`, which is what keeps
+    /// every existing pinned geometry assertion byte-identical
+    /// (`06-phase2-plan.md` §3 frozen interface 10).
+    pub banner: Option<String>,
     pub header_rect: Rect,
+    /// Zero-sized while [`Self::banner`] is `None`.
+    pub banner_rect: Rect,
     pub graph_rect: Rect,
     pub detail_rect: Rect,
     pub footer_rect: Rect,
@@ -998,6 +1021,82 @@ pub struct ViewState {
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
     pub dag: DagViewState,
+    pub workflow_launch: WorkflowLaunchState,
+}
+
+/// The workflow launcher modal's state: pick a workflow, fill its required
+/// args, pick a tier, run it (`06-phase2-plan.md` §4 D18).
+///
+/// It lives beside [`DagViewState`] on [`ViewState`] and for the same reason:
+/// selection, text entry, and hit geometry are client concerns, carried across
+/// frames because `ViewState` is rebuilt wholesale every pass. Nothing here is
+/// a shared runtime fact — the run it starts goes through the same in-process
+/// path `workflow.run` uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowLaunchState {
+    /// Offered workflows, in `workflow.list` order.
+    pub workflows: Vec<WorkflowLaunchEntry>,
+    /// Index into [`Self::workflows`].
+    pub selected: usize,
+    /// One line per declared arg, in declaration order.
+    pub args: Vec<WorkflowLaunchArg>,
+    /// Tier row selection, seeded from the selected workflow's
+    /// `default_tier` — which `workflow.list` already returns, so the row needs
+    /// no new storage and no new query (§4 D17). `None` before the first seed.
+    pub tier: Option<crate::workflow::tier::Tier>,
+    pub focus: WorkflowLaunchFocus,
+    /// Why the last confirm attempt was refused, e.g. a required arg left
+    /// empty. Cleared as soon as the offending field changes.
+    pub error: Option<String>,
+    /// Set while the start request is in flight, so confirm cannot be
+    /// double-submitted.
+    pub submitting: bool,
+    // ── geometry, stored by the layout pass and read by both the renderer and
+    // the mouse hit-test, so what is clickable can never disagree with what
+    // was drawn.
+    pub modal_rect: Rect,
+    pub list_rect: Rect,
+    pub workflow_rects: Vec<Rect>,
+    pub arg_rects: Vec<Rect>,
+    pub tier_rects: Vec<Rect>,
+    pub button_rects: Vec<Rect>,
+}
+
+/// One selectable workflow in the launcher's list section.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowLaunchEntry {
+    pub workflow_id: String,
+    pub name: String,
+    pub description: String,
+    /// The document's `default_tier`, which seeds
+    /// [`WorkflowLaunchState::tier`] when this entry is selected.
+    pub default_tier: Option<crate::workflow::tier::Tier>,
+}
+
+/// One arg line. Required-and-defaultless args are the ones that gate confirm;
+/// the rest are pre-filled and editable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowLaunchArg {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
+    /// Current text, seeded from the arg's declared default.
+    pub value: String,
+}
+
+/// Which section of the launcher takes input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// The launcher's key/mouse handlers land with WS-H at Phase 2 step 4; this
+// enum is part of the step-1b shape landing they code against, so every
+// variant but the default is unconstructed until then.
+#[allow(dead_code)]
+pub enum WorkflowLaunchFocus {
+    #[default]
+    Workflows,
+    /// Index into [`WorkflowLaunchState::args`].
+    Arg(usize),
+    Tier,
+    Confirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1025,13 +1124,25 @@ pub enum Mode {
     /// The live workflow DAG overlay
     /// (`docs/design/workflow-builder/05-phase-plan.md` W6).
     WorkflowDag,
+    /// The workflow launcher: pick a workflow, fill its args, pick a tier, run
+    /// it (`06-phase2-plan.md` §4 D18). Opened from `keys.open_workflow_dag`
+    /// when no run exists — replacing the dead-end toast — and from
+    /// `keys.open_workflow_launcher`.
+    // Entered by WS-H's launcher at Phase 2 step 4; landed here in step 1b so
+    // the mode-dispatch arms it needs are already in place.
+    #[allow(dead_code)]
+    WorkflowLaunch,
 }
 
 impl Mode {
     pub(crate) fn mouse_motion_changes_view(self) -> bool {
         matches!(
             self,
-            Self::GlobalMenu | Self::ContextMenu | Self::Navigator | Self::WorkflowDag
+            Self::GlobalMenu
+                | Self::ContextMenu
+                | Self::Navigator
+                | Self::WorkflowDag
+                | Self::WorkflowLaunch
         )
     }
 
@@ -1042,9 +1153,10 @@ impl Mode {
     /// `sync_prefix_input_source` (gated by `switch_ascii_input_source_in_prefix`) so multi-level
     /// prefix commands keep ASCII until they return to the terminal.
     ///
-    /// Known limitation: the search boxes in `Navigator` and `KeybindHelp`, and the steer input
-    /// line in `WorkflowDag`, are also held on ASCII, since this `Mode`-level predicate can't see
-    /// their focus flags (non-ASCII filtering there would need a runtime check).
+    /// Known limitation: the search boxes in `Navigator` and `KeybindHelp`, the steer input
+    /// line in `WorkflowDag`, and the arg lines in `WorkflowLaunch`, are also held on ASCII,
+    /// since this `Mode`-level predicate can't see their focus flags (non-ASCII filtering
+    /// there would need a runtime check).
     pub(crate) fn wants_ascii_input(self) -> bool {
         matches!(
             self,
@@ -1059,6 +1171,7 @@ impl Mode {
                 | Mode::GlobalMenu
                 | Mode::KeybindHelp
                 | Mode::WorkflowDag
+                | Mode::WorkflowLaunch
         )
     }
 }
@@ -1675,6 +1788,16 @@ pub struct AppState {
     pub update_dismissed: bool,
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
+    /// Notices waiting for [`Self::toast`] to free up.
+    ///
+    /// `toast` is one slot, and a workflow batch routinely queues a per-node
+    /// notice immediately followed by a run-level one — which used to destroy
+    /// the node notice outright, making "a growth rejection is always
+    /// surfaced" false rather than aspirational
+    /// (`06-phase2-plan.md` §4 D10 / H4). The slot stays the only thing
+    /// `render` draws; this is what feeds it. Bounded at
+    /// [`TOAST_QUEUE_CAP`], oldest evicted.
+    pub toast_queue: std::collections::VecDeque<ToastNotification>,
     pub pending_agent_notifications: std::collections::HashMap<PaneId, PendingAgentNotification>,
     pub copy_feedback: Option<CopyFeedback>,
     /// Last reported focus state for the outer terminal hosting karvex.
@@ -1816,9 +1939,64 @@ pub struct WorkflowRunPresentation {
     /// A steer the process never received must not look identical to one it
     /// did, and the overlay is where the user watching the run is looking.
     pub delivery_failures: std::collections::HashMap<String, String>,
+    /// The run's most recent growth guardrail breach, already formatted for the
+    /// DAG's banner band. `None` costs the overlay zero rows.
+    pub growth_banner: Option<String>,
+    /// Node instance path → the last growth guardrail that node ran into as a
+    /// proposer, formatted for its box in the graph.
+    pub growth_notices: std::collections::HashMap<String, String>,
 }
 
 impl AppState {
+    /// How many notices may wait behind the rendered slot. Small on purpose: a
+    /// notice nobody will see for a minute is not a notice.
+    pub const TOAST_QUEUE_CAP: usize = 8;
+
+    /// Shows `toast` now if the slot is free, otherwise queues it behind
+    /// whatever is showing (`06-phase2-plan.md` §4 D10).
+    ///
+    /// Every workflow notice producer goes through here. Returns `true` when
+    /// the notice went straight into the slot, which is the caller's signal
+    /// that the expiry clock needs arming — that clock is `App::toast_deadline`
+    /// and deliberately stays on `App`, because `AppState` is pure data with no
+    /// notion of time.
+    ///
+    /// At capacity the **oldest waiting** notice is dropped, never the head:
+    /// the queue is a buffer for a burst, and the newest rejection is the one
+    /// the user still needs.
+    pub fn push_toast(&mut self, toast: ToastNotification) -> bool {
+        if self.toast.is_none() {
+            self.toast = Some(toast);
+            return true;
+        }
+        if self.toast_queue.len() >= Self::TOAST_QUEUE_CAP {
+            self.toast_queue.pop_front();
+        }
+        self.toast_queue.push_back(toast);
+        false
+    }
+
+    /// Moves the next waiting notice into the rendered slot, returning `true`
+    /// when it did.
+    ///
+    /// Called where the expiry already happens
+    /// (`App::expire_toast_or_show_next`, driven by both
+    /// `App::handle_scheduled_tasks` and the headless loop), so a queue that is
+    /// non-empty at expiry refills the slot instead of clearing it. **The
+    /// caller must arm `toast_deadline` unconditionally** rather than going
+    /// through `App::sync_toast_deadline`, whose `toast != previous_toast`
+    /// guard would skip re-arming for two notices with identical content and
+    /// stall the queue behind an immortal toast (§5 R-18).
+    pub fn pop_queued_toast(&mut self) -> bool {
+        match self.toast_queue.pop_front() {
+            Some(next) => {
+                self.toast = Some(next);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -1960,6 +2138,18 @@ impl AppState {
         failures: std::collections::HashMap<String, String>,
     ) {
         self.run_presentation.delivery_failures = failures;
+    }
+
+    /// Records the run's growth guardrail breaches for the DAG overlay: one
+    /// banner line for the run and one notice per proposing node. Mirrored with
+    /// the run graph; `None` plus an empty map clears both.
+    pub(crate) fn set_workflow_growth(
+        &mut self,
+        banner: Option<String>,
+        notices: std::collections::HashMap<String, String>,
+    ) {
+        self.run_presentation.growth_banner = banner;
+        self.run_presentation.growth_notices = notices;
     }
 
     /// Returns true when the given (workspace, tab, pane) refers to the
@@ -2123,6 +2313,7 @@ impl AppState {
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
                 dag: DagViewState::default(),
+                workflow_launch: WorkflowLaunchState::default(),
             },
             drag: None,
             workspace_press: None,
@@ -2136,6 +2327,7 @@ impl AppState {
             update_dismissed: false,
             config_diagnostic: None,
             toast: None,
+            toast_queue: std::collections::VecDeque::new(),
             pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
@@ -2577,6 +2769,90 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    fn workflow_notice(title: &str) -> ToastNotification {
+        ToastNotification {
+            kind: ToastKind::NeedsAttention,
+            title: title.to_string(),
+            context: "workflow_run:1".to_string(),
+            position: None,
+            target: None,
+        }
+    }
+
+    /// The whole point of the queue (`06-phase2-plan.md` §4 D10 / H4): the
+    /// first notice of a batch renders and the ones behind it survive instead
+    /// of being destroyed by the slot's single occupant.
+    #[test]
+    fn push_toast_fills_the_slot_once_and_queues_the_rest() {
+        let mut state = AppState::test_new();
+
+        assert!(state.push_toast(workflow_notice("node")));
+        assert!(!state.push_toast(workflow_notice("run")));
+
+        assert_eq!(
+            state.toast.as_ref().map(|toast| toast.title.as_str()),
+            Some("node")
+        );
+        assert_eq!(state.toast_queue.len(), 1);
+
+        state.toast = None;
+        assert!(state.pop_queued_toast());
+        assert_eq!(
+            state.toast.as_ref().map(|toast| toast.title.as_str()),
+            Some("run")
+        );
+        assert!(state.toast_queue.is_empty());
+        assert!(!state.pop_queued_toast(), "an empty queue pops nothing");
+    }
+
+    /// At capacity the oldest *waiting* notice goes, never the head: the newest
+    /// rejection is the one the user still needs to see.
+    #[test]
+    fn push_toast_evicts_the_oldest_waiting_notice_at_cap() {
+        let mut state = AppState::test_new();
+
+        state.push_toast(workflow_notice("head"));
+        for index in 0..AppState::TOAST_QUEUE_CAP + 3 {
+            state.push_toast(workflow_notice(&format!("queued-{index}")));
+        }
+
+        assert_eq!(
+            state.toast.as_ref().map(|toast| toast.title.as_str()),
+            Some("head"),
+            "the rendered slot is never evicted"
+        );
+        assert_eq!(state.toast_queue.len(), AppState::TOAST_QUEUE_CAP);
+        assert_eq!(
+            state.toast_queue.front().map(|t| t.title.as_str()),
+            Some("queued-3")
+        );
+        assert_eq!(
+            state.toast_queue.back().map(|t| t.title.as_str()),
+            Some("queued-10")
+        );
+    }
+
+    /// Step 1b's gate: the launcher mode exists and round-trips, and it is a
+    /// member of the two `Mode` predicates the launcher depends on.
+    #[test]
+    fn workflow_launch_mode_round_trips() {
+        let mut state = AppState::test_new();
+        let initial = state.mode;
+
+        state.mode = Mode::WorkflowLaunch;
+        assert_eq!(state.mode, Mode::WorkflowLaunch);
+        assert!(Mode::WorkflowLaunch.mouse_motion_changes_view());
+        assert!(Mode::WorkflowLaunch.wants_ascii_input());
+        assert_eq!(
+            state.view.workflow_launch,
+            WorkflowLaunchState::default(),
+            "the launcher starts empty"
+        );
+
+        state.mode = initial;
+        assert_eq!(state.mode, initial);
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {

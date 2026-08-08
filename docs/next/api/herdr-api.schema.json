@@ -841,6 +841,58 @@
                 "summary"
               ],
               "type": "object"
+            },
+            {
+              "description": "A growth guardrail refused or truncated a proposal.\n\nThe only new event kind in Phase 2: an accepted proposal already emits\n`workflow.node.created`, whose `WorkflowRunNodeInfo` carries\n`parent_path` and `depth`, so a second \"spawned\" event would give\nclients two events for one fact. What no client can derive is the node\nthat was asked for and never created.",
+              "properties": {
+                "accepted": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "limit": {
+                  "$ref": "#/schemas/event/$defs/WorkflowGrowthLimitKind"
+                },
+                "limit_value": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "path": {
+                  "description": "The proposing node's instance path.",
+                  "type": "string"
+                },
+                "requested": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "template": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_growth_limited",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "path",
+                "template",
+                "limit",
+                "limit_value",
+                "requested",
+                "accepted",
+                "message"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -877,7 +929,8 @@
             "workflow_run_finished",
             "workflow_node_created",
             "workflow_node_updated",
-            "workflow_node_output_checkpoint"
+            "workflow_node_output_checkpoint",
+            "workflow_growth_limited"
           ],
           "type": "string"
         },
@@ -1212,6 +1265,68 @@
           ],
           "type": "string"
         },
+        "WorkflowGrowthLimit": {
+          "description": "One growth guardrail being reached, in the one shape reused by\n[`WorkflowRunInfo`], [`WorkflowRunNodeInfo`], the `workflow.growth.limited`\nevent, and the CLI renderers.",
+          "properties": {
+            "accepted": {
+              "description": "How many of `requested` were created anyway. Non-zero means partial\nacceptance, which is the interesting case: the shortfall is reported\nrather than silently truncated.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "$ref": "#/schemas/event/$defs/WorkflowGrowthLimitKind"
+            },
+            "limit_value": {
+              "description": "The ceiling's value, so a reader does not have to look it up.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message": {
+              "type": "string"
+            },
+            "requested": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "limit_value",
+            "requested",
+            "accepted",
+            "at_unix_ms",
+            "message"
+          ],
+          "type": "object"
+        },
+        "WorkflowGrowthLimitKind": {
+          "description": "Which growth guardrail was reached.",
+          "oneOf": [
+            {
+              "const": "expand_max",
+              "description": "The proposing node's own `expand_max`, counted cumulatively across every\nproposal it has made in this run.",
+              "type": "string"
+            },
+            {
+              "const": "max_depth",
+              "description": "The run's `max_depth`, guarded as `parent.depth + 1 <= max_depth`.",
+              "type": "string"
+            },
+            {
+              "const": "max_nodes",
+              "description": "The run's `max_nodes`, counted over every materialised node regardless\nof status — a failed child does not refund budget.",
+              "type": "string"
+            }
+          ]
+        },
         "WorkflowNodeStatus": {
           "enum": [
             "pending",
@@ -1244,8 +1359,39 @@
               ]
             },
             "failure": true,
+            "growth_limited": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/WorkflowGrowthLimit"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The run's most recent growth limit, if any."
+            },
+            "max_depth": {
+              "default": 0,
+              "description": "The run's **effective** growth ceilings — the version's, narrowed by the\ntier. One authority: what the run graph enforces is what the run row\npersists and what this reports.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_nodes": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "nodes_done": {
               "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "nodes_live": {
+              "default": 0,
+              "description": "Nodes materialised so far, counted against `max_nodes` regardless of\nstatus.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -1319,6 +1465,11 @@
                 "null"
               ]
             },
+            "assignment_reason": {
+              "default": "",
+              "description": "Why `model`/`effort` read what they read — the `auto` tier's reason\nstring, empty for a fixed tier whose table row is the explanation.",
+              "type": "string"
+            },
             "attempt": {
               "default": 1,
               "format": "uint32",
@@ -1327,6 +1478,13 @@
             },
             "blocker": true,
             "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delivery_failure": {
+              "description": "The last pane delivery the runtime refused for this node, e.g. a steer\nwhose keystrokes never reached the process. A shared runtime fact, so it\nbelongs on the API and not only in TUI state.",
               "type": [
                 "string",
                 "null"
@@ -1367,6 +1525,17 @@
                   "type": "null"
                 }
               ]
+            },
+            "growth_limited": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/WorkflowGrowthLimit"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The last growth limit this node ran into as a *proposer*."
             },
             "model": {
               "type": "string"
@@ -4531,6 +4700,18 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.growth.limited",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -4664,6 +4845,52 @@
             "json"
           ],
           "type": "string"
+        },
+        "WorkflowNodeExpandParams": {
+          "description": "A node proposing new nodes\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §3.4).\n\nToken-authenticated exactly like [`WorkflowNodeReportParams`]: an expand\nproposal is a node speaking, not an operator. A *rejected* proposal is a\nsuccessful response carrying the rejection — the run continues; only a bad\nrun/path/token or a closed run is an error.",
+          "properties": {
+            "count": {
+              "description": "How many children to instantiate; defaults to 1. `u32` on the wire and\n`u16` internally, so the handler narrows with `u16::try_from` and\nrejects an out-of-range value rather than truncating it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "inputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Slot overrides for the template's `prompt_template`. A key naming no\ndeclared slot is rejected rather than ignored: this is an override\nchannel over the one validated renderer, never a second unvalidated one.",
+              "type": "object"
+            },
+            "label": {
+              "default": "",
+              "type": "string"
+            },
+            "path": {
+              "description": "The proposing node's instance path.",
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "template": {
+              "description": "The kvdag key of the template to instantiate.",
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "path",
+            "token",
+            "template"
+          ],
+          "type": "object"
         },
         "WorkflowNodeReportParams": {
           "description": "The node self-report contract\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §4.3): token-\nauthenticated with `KARVEX_WORKFLOW_NODE_TOKEN`, precedence 1 of the three\ncompletion signals.",
@@ -6774,6 +7001,22 @@
         {
           "properties": {
             "method": {
+              "const": "workflow.node.expand",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowNodeExpandParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "workflow.node.restart",
               "type": "string"
             },
@@ -8019,6 +8262,58 @@
                 "summary"
               ],
               "type": "object"
+            },
+            {
+              "description": "A growth guardrail refused or truncated a proposal.\n\nThe only new event kind in Phase 2: an accepted proposal already emits\n`workflow.node.created`, whose `WorkflowRunNodeInfo` carries\n`parent_path` and `depth`, so a second \"spawned\" event would give\nclients two events for one fact. What no client can derive is the node\nthat was asked for and never created.",
+              "properties": {
+                "accepted": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "limit": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowGrowthLimitKind"
+                },
+                "limit_value": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "message": {
+                  "type": "string"
+                },
+                "path": {
+                  "description": "The proposing node's instance path.",
+                  "type": "string"
+                },
+                "requested": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "template": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_growth_limited",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "path",
+                "template",
+                "limit",
+                "limit_value",
+                "requested",
+                "accepted",
+                "message"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -8070,7 +8365,8 @@
             "workflow_run_finished",
             "workflow_node_created",
             "workflow_node_updated",
-            "workflow_node_output_checkpoint"
+            "workflow_node_output_checkpoint",
+            "workflow_growth_limited"
           ],
           "type": "string"
         },
@@ -11008,6 +11304,17 @@
             },
             {
               "properties": {
+                "detail": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/WorkflowDetail"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The one projection both the human renderer and `--json` read, added\nas a sibling rather than replacing `workflow` so no published\nresponse field changes shape."
+                },
                 "type": {
                   "const": "workflow_get",
                   "type": "string"
@@ -11237,6 +11544,34 @@
               "type": "object"
             },
             {
+              "description": "A rejected proposal is a **successful** response carrying the rejection:\nthe run continues, and `rejected` being non-empty while `accepted` is\ntoo is the partial-acceptance case.",
+              "properties": {
+                "accepted": {
+                  "description": "Instance paths of the children the proposal created.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "rejected": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/WorkflowExpandRejection"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "workflow_node_expanded",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "accepted",
+                "rejected"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "type": {
                   "const": "ok",
@@ -11416,6 +11751,46 @@
           ],
           "type": "string"
         },
+        "WorkflowDetail": {
+          "description": "One projection of a workflow and its head document, read by **both**\n`workflow.get`'s human renderer and its `--json` path so the two cannot\ndescribe different field sets.\n\nIt arrives as a new sibling field on `ResponseResult::WorkflowGet` rather\nthan replacing that response's existing `workflow: WorkflowSummary`:\nre-typing a published response field is the one change in this phase that\nwould be wire-incompatible, and every other addition is additive\nself-describing JSON, which is what keeps `PROTOCOL_VERSION` where it is.\n\n`description` comes from the `workflow` row, which `create_version` keeps\nequal to the head document — `kvdag_version` has no `description` column, so\n\"read it from the head version\" is not implementable.",
+          "properties": {
+            "args": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkflowArgSpec"
+              },
+              "type": "array"
+            },
+            "edges": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/KvdagEdgeInfo"
+              },
+              "type": "array"
+            },
+            "nodes": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/KvdagNodeInfo"
+              },
+              "type": "array"
+            },
+            "versions": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/KvdagVersionSummary"
+              },
+              "type": "array"
+            },
+            "workflow": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowSummary"
+            }
+          },
+          "required": [
+            "workflow"
+          ],
+          "type": "object"
+        },
         "WorkflowEdgeKind": {
           "enum": [
             "sequence",
@@ -11442,6 +11817,148 @@
             "restored"
           ],
           "type": "string"
+        },
+        "WorkflowExpandRejection": {
+          "properties": {
+            "accepted": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "limit": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowGrowthLimit"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The guardrail hit, when the rejection is a limit rather than a\nvalidation failure."
+            },
+            "message": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowExpandRejectionReason"
+            },
+            "requested": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "template": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "template",
+            "reason",
+            "message"
+          ],
+          "type": "object"
+        },
+        "WorkflowExpandRejectionReason": {
+          "description": "Why one proposal was refused, in whole or in part.",
+          "oneOf": [
+            {
+              "enum": [
+                "expand_max_reached",
+                "max_depth_reached",
+                "max_nodes_reached"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "not_allowed",
+              "description": "The template is not in the proposing node's `expand_allow`.",
+              "type": "string"
+            },
+            {
+              "const": "unknown_template",
+              "description": "No kvdag node carries that key.",
+              "type": "string"
+            },
+            {
+              "const": "not_a_template",
+              "description": "The key names a node that is not declared `is_template`.",
+              "type": "string"
+            },
+            {
+              "const": "truncated",
+              "description": "Partial acceptance: some children were created and the rest did not fit.",
+              "type": "string"
+            },
+            {
+              "const": "unknown_input",
+              "description": "An `inputs` key naming no declared slot in the template.",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkflowGrowthLimit": {
+          "description": "One growth guardrail being reached, in the one shape reused by\n[`WorkflowRunInfo`], [`WorkflowRunNodeInfo`], the `workflow.growth.limited`\nevent, and the CLI renderers.",
+          "properties": {
+            "accepted": {
+              "description": "How many of `requested` were created anyway. Non-zero means partial\nacceptance, which is the interesting case: the shortfall is reported\nrather than silently truncated.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowGrowthLimitKind"
+            },
+            "limit_value": {
+              "description": "The ceiling's value, so a reader does not have to look it up.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message": {
+              "type": "string"
+            },
+            "requested": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "limit_value",
+            "requested",
+            "accepted",
+            "at_unix_ms",
+            "message"
+          ],
+          "type": "object"
+        },
+        "WorkflowGrowthLimitKind": {
+          "description": "Which growth guardrail was reached.",
+          "oneOf": [
+            {
+              "const": "expand_max",
+              "description": "The proposing node's own `expand_max`, counted cumulatively across every\nproposal it has made in this run.",
+              "type": "string"
+            },
+            {
+              "const": "max_depth",
+              "description": "The run's `max_depth`, guarded as `parent.depth + 1 <= max_depth`.",
+              "type": "string"
+            },
+            {
+              "const": "max_nodes",
+              "description": "The run's `max_nodes`, counted over every materialised node regardless\nof status — a failed child does not refund budget.",
+              "type": "string"
+            }
+          ]
         },
         "WorkflowIsolation": {
           "description": "Working-directory isolation for a node's pane.",
@@ -11543,8 +12060,39 @@
               ]
             },
             "failure": true,
+            "growth_limited": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowGrowthLimit"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The run's most recent growth limit, if any."
+            },
+            "max_depth": {
+              "default": 0,
+              "description": "The run's **effective** growth ceilings — the version's, narrowed by the\ntier. One authority: what the run graph enforces is what the run row\npersists and what this reports.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_nodes": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "nodes_done": {
               "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "nodes_live": {
+              "default": 0,
+              "description": "Nodes materialised so far, counted against `max_nodes` regardless of\nstatus.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -11618,6 +12166,11 @@
                 "null"
               ]
             },
+            "assignment_reason": {
+              "default": "",
+              "description": "Why `model`/`effort` read what they read — the `auto` tier's reason\nstring, empty for a fixed tier whose table row is the explanation.",
+              "type": "string"
+            },
             "attempt": {
               "default": 1,
               "format": "uint32",
@@ -11626,6 +12179,13 @@
             },
             "blocker": true,
             "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "delivery_failure": {
+              "description": "The last pane delivery the runtime refused for this node, e.g. a steer\nwhose keystrokes never reached the process. A shared runtime fact, so it\nbelongs on the API and not only in TUI state.",
               "type": [
                 "string",
                 "null"
@@ -11666,6 +12226,17 @@
                   "type": "null"
                 }
               ]
+            },
+            "growth_limited": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowGrowthLimit"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The last growth limit this node ran into as a *proposer*."
             },
             "model": {
               "type": "string"

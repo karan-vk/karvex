@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::detect::AgentState;
 use crate::terminal::TerminalId;
-use crate::workflow::tier::{Assignment, Tier};
+use crate::workflow::engine::expand::{ExpandLimit, ExpandProposal};
+use crate::workflow::tier::{Assignment, Effort, ModelAlias, Tier};
 
 // ── identities ──────────────────────────────────────────────────────────────
 
@@ -129,6 +130,25 @@ impl Default for GrowthLimits {
             max_depth: 3,
             max_nodes: 24,
         }
+    }
+}
+
+impl GrowthLimits {
+    /// How many nodes a run has already spent against [`Self::max_nodes`].
+    ///
+    /// The budget is **monotone** (`06-phase2-plan.md` §4 D12): every
+    /// materialised [`RunNode`] counts, whatever its status, so a failed,
+    /// skipped, or cancelled child does not refund budget. Otherwise a node
+    /// could fan out indefinitely by failing and the ceiling would stop being a
+    /// ceiling. Saturates rather than wrapping, so an absurd graph reports
+    /// "full" instead of "empty".
+    pub fn live_node_count(nodes: &[RunNode]) -> u16 {
+        u16::try_from(nodes.len()).unwrap_or(u16::MAX)
+    }
+
+    /// Whether one more node still fits under `max_nodes`.
+    pub fn has_node_budget(&self, nodes: &[RunNode]) -> bool {
+        Self::live_node_count(nodes) < self.max_nodes
     }
 }
 
@@ -1120,6 +1140,41 @@ pub struct ProgressDelta {
     pub screen_digest: Option<String>,
 }
 
+/// A resolved `(model, effort)` **with the reason it was chosen**.
+///
+/// [`crate::workflow::tier::Assignment`] carries the pair alone and stays as it
+/// is; this is the type the run persists, because `auto` resolves from a node's
+/// measured history and an assignment nobody can explain after the fact is not
+/// auditable (`06-phase2-plan.md` §4 D9). One table, computed once at run start
+/// by `graph::resolve_assignments` for **every** kvdag node including templates,
+/// so an expansion child never needs a mid-run history lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeAssignment {
+    pub model: ModelAlias,
+    pub effort: Effort,
+    /// The §7.3 reason string, persisted to `run_node.assignment_reason`.
+    /// Empty for a fixed tier, whose row *is* the explanation.
+    pub reason: String,
+}
+
+impl NodeAssignment {
+    /// The `(model, effort)` half, for the call sites that bind a spawn.
+    pub fn assignment(&self) -> Assignment {
+        Assignment {
+            model: self.model,
+            effort: self.effort,
+        }
+    }
+
+    pub fn from_assignment(assignment: Assignment, reason: impl Into<String>) -> Self {
+        Self {
+            model: assignment.model,
+            effort: assignment.effort,
+            reason: reason.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunNode {
     pub idx: RunNodeIdx,
@@ -1130,6 +1185,11 @@ pub struct RunNode {
     pub status: NodeStatus,
     /// Model and effort, resolved from the run's tier and the node's demand.
     pub assignment: Assignment,
+    /// Why [`Self::assignment`] reads what it reads — the §7.3 reason string
+    /// for `auto`, empty for a fixed tier. Persisted to
+    /// `run_node.assignment_reason` so a finished run can still be explained
+    /// (`06-phase2-plan.md` §4 D9).
+    pub assignment_reason: String,
     pub attempt: u8,
     pub binding: Option<NodeBinding>,
     pub result: Option<NodeResult>,
@@ -1169,6 +1229,15 @@ pub struct RunGraph {
     pub version_id: KvdagVersionId,
     pub tier: Tier,
     pub growth: GrowthLimits,
+    /// Every kvdag node's resolved `(model, effort, reason)`, **including
+    /// templates**, computed once at run start by
+    /// `crate::workflow::engine::graph::resolve_assignments`.
+    ///
+    /// Carrying the whole table is what lets an accepted expand proposal
+    /// instantiate a template without a mid-run history query, and what makes
+    /// the store's `materialise_run_nodes` a verbatim writer rather than a
+    /// second tier resolver (`06-phase2-plan.md` §4 D9).
+    pub assignments: BTreeMap<NodeKey, NodeAssignment>,
     /// Index equals [`RunNodeIdx`].
     pub nodes: Vec<RunNode>,
     pub edges: Vec<RunEdge>,
@@ -1332,6 +1401,61 @@ pub enum StoreWrite {
         started_at_unix_ms: Option<u64>,
         ended_at_unix_ms: Option<u64>,
     },
+    /// A node that did not exist when the run started: an expansion child
+    /// (`06-phase2-plan.md` §4 D7).
+    ///
+    /// [`StoreWrite::RunNode`] is find-then-`UPDATE` and errors on a missing
+    /// row, so before Phase 2 the only create path was `create_run`. The store
+    /// side writes the `run_node` row **and** the `spawned` relation from the
+    /// proposing parent in one batch, which is the first writer that table has
+    /// ever had.
+    ///
+    /// Two ordering rules ride on this variant. `commit` emits it before any
+    /// [`StoreWrite::RunNode`] update for the same path in the same
+    /// `Vec<RunEffect>`, and the app's bounded `pending_writes` queue must
+    /// never evict a create — dropping the create while keeping the update
+    /// would leave a permanent decode error for that node.
+    RunNodeCreated {
+        run: RunId,
+        /// The kvdag key this instance is cut from; also `spawned.template_key`.
+        key: NodeKey,
+        path: InstancePath,
+        /// The proposing node. `None` is not expected for an expansion child
+        /// and exists only so the variant can also express a create with no
+        /// provenance.
+        parent: Option<InstancePath>,
+        /// Expansion depth, not topological depth: first-generation children
+        /// are 1 and static nodes stay 0 (§4 D13).
+        depth: u16,
+        status: NodeStatus,
+        demand: Demand,
+        assignment: Assignment,
+        assignment_reason: String,
+        attempt: u8,
+        /// `spawned.proposal_id` — the audit link back to the `expand_proposed`
+        /// journal entry that produced this child.
+        proposal_id: String,
+    },
+    /// An edge that did not exist when the run started: the parent→child
+    /// `sequence` edge an accepted proposal adds, or the child's inherited copy
+    /// of one of its parent's outbound edges (§4 D4).
+    ///
+    /// The create-shaped sibling of [`StoreWrite::RunEdge`], which is
+    /// find-then-`UPDATE` and errors on a missing row.
+    RunEdgeCreated {
+        run: RunId,
+        from: InstancePath,
+        to: InstancePath,
+        kind: EdgeKind,
+        /// The authored edge this instance copies, addressed by kvdag node keys
+        /// so the store can resolve `run_edge.kvdag_edge`. `None` for the
+        /// synthetic parent→child `sequence` edge, which has no authored
+        /// counterpart — `run_edge.kvdag_edge` is `option<record<kvdag_edge>>`
+        /// for exactly this case.
+        kvdag_edge: Option<(NodeKey, NodeKey)>,
+        condition_result: Option<bool>,
+        fired: bool,
+    },
     /// One edge's settled firing state. Addressed by its endpoints and kind,
     /// which is the identity the read path (`store::list_run_edges`) reports it
     /// back under.
@@ -1386,6 +1510,27 @@ pub enum WorkflowEvent {
         seq: u64,
         summary: String,
     },
+    /// A growth guardrail refused or truncated a proposal.
+    ///
+    /// The **only** new wire event in Phase 2 (`06-phase2-plan.md` §4 D5): an
+    /// expansion child is already announced by
+    /// [`WorkflowEvent::NodeCreated`], and `WorkflowRunNodeInfo` already
+    /// carries `parent_path`/`depth`, so a client can derive everything about
+    /// an *accepted* proposal. What no client can derive is the node that was
+    /// asked for and never created. `src/app/api/workflows.rs` widens the
+    /// counts to the wire's `u32`.
+    GrowthLimited {
+        run: RunId,
+        /// The proposing node.
+        path: InstancePath,
+        template: NodeKey,
+        limit: ExpandLimit,
+        /// The ceiling's value, so a reader does not have to look it up.
+        limit_value: u16,
+        requested: u16,
+        accepted: u16,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1413,6 +1558,20 @@ pub enum EngineInput {
         path: InstancePath,
         token: NodeToken,
         result: RawJson,
+    },
+    /// A node proposed new nodes. **A node cannot create nodes; it proposes,
+    /// and karvex decides** (`04-kvdag-and-execution.md` §3.4).
+    ///
+    /// Token-authenticated exactly like [`EngineInput::NodeSelfReport`] — an
+    /// expand proposal is a node speaking, not an operator — and reached by two
+    /// routes that converge here: the `workflow.node.expand` API verb, and the
+    /// top-level `expand` key lifted out of a node result *before* schema
+    /// validation (§4 D6). A rejected proposal is not an error: the run
+    /// continues and the rejection is reported.
+    ExpandProposed {
+        path: InstancePath,
+        token: NodeToken,
+        proposals: Vec<ExpandProposal>,
     },
     /// The Claude `stop` hook fired for this pane.
     TurnEnded {

@@ -234,6 +234,10 @@ impl ActiveSubscription {
                     last_sequence: 0,
                 }))
             }
+            Subscription::WorkflowGrowthLimited {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowGrowthLimited,
+                last_sequence: 0,
+            })),
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,

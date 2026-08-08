@@ -19,8 +19,8 @@ use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workflows::{
-    KvdagVersionDetail, KvdagVersionSummary, WorkflowRunGraph, WorkflowRunInfo,
-    WorkflowRunNodeInfo, WorkflowSummary,
+    KvdagVersionDetail, KvdagVersionSummary, WorkflowDetail, WorkflowExpandRejection,
+    WorkflowRunGraph, WorkflowRunInfo, WorkflowRunNodeInfo, WorkflowSummary,
 };
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
@@ -255,6 +255,11 @@ pub enum ResponseResult {
     WorkflowGet {
         workflow: WorkflowSummary,
         versions: Vec<KvdagVersionSummary>,
+        /// The one projection both the human renderer and `--json` read, added
+        /// as a sibling rather than replacing `workflow` so no published
+        /// response field changes shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<WorkflowDetail>,
     },
     WorkflowCreated {
         workflow: WorkflowSummary,
@@ -294,6 +299,14 @@ pub enum ResponseResult {
     },
     WorkflowNodeRestarted {
         node: WorkflowRunNodeInfo,
+    },
+    /// A rejected proposal is a **successful** response carrying the rejection:
+    /// the run continues, and `rejected` being non-empty while `accepted` is
+    /// too is the partial-acceptance case.
+    WorkflowNodeExpanded {
+        /// Instance paths of the children the proposal created.
+        accepted: Vec<String>,
+        rejected: Vec<WorkflowExpandRejection>,
     },
     Ok {},
 }

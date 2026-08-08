@@ -60,7 +60,11 @@ payload = "summary"
 port = "plan"
 ```
 
-`contract` is prepended to every node's system prompt — put cross-cutting rules here instead of repeating them per node. `max_depth` and `max_nodes` are the graph's growth ceiling; a Phase 1 run executes exactly the nodes defined above, so these only start to matter once a later release adds node-driven expansion.
+`contract` is prepended to every node's system prompt — put cross-cutting rules here instead of repeating them per node.
+
+`max_depth` and `max_nodes` are the run's growth ceiling, and they bind because a node can propose new nodes while the run is executing — see Templates and expansion, below. `max_nodes` (default `24`) counts every node the run has materialised regardless of how it ended: a failed or skipped child does not hand its budget back, so a node cannot fan out forever by failing. `max_depth` (default `3`) counts *generations of expansion*, not graph layers — every node written in the document is depth 0, a child proposed by one of them is depth 1, so `max_depth = 3` permits three generations. The run's tier narrows both further; see Tiers and growth ceilings, below.
+
+`default_tier` (`auto`, `max`, `high`, `medium`, or `low`; default `high`) is the tier runs of this workflow start at when `kvx workflow run start` is given no `--tier`. It is a document-level key like `name` and `contract`, so changing it means authoring a new version.
 
 Each `[[arg]]` declares one entry in the run-argument namespace, filled at run time with `--arg name=value`. Every `{{name}}` placeholder in a `prompt_template` must resolve to either a declared arg or an inbound edge `port` — `workflow.create` rejects a document with an unresolved placeholder before it is ever run, and starting a run separately rejects a missing required arg that has no default.
 
@@ -86,6 +90,95 @@ To hand-edit a saved workflow, run `kvx workflow update` with a new definition f
 | `command` | the node's own `command` argv, run as a plain process | none — the pane is just a process that started | delivered as raw pane text | self-report only |
 
 A `command` node needs `command = ["...", ...]` — an argv list, never a shell string. It gets the same `KARVEX_WORKFLOW_*` environment as an `agent` node, so it can call `kvx workflow node complete` the same way, but it has no turn-end hook and no screen detection: the only thing that finishes it is the node reporting itself.
+
+## Templates and expansion
+
+Some work only reveals its shape once it starts: you know you want one node per shard, but not how many shards there are until something has looked. A node can therefore ask for new nodes while it runs. It cannot create them — **it proposes, and Karvex decides** — which is what keeps the graph's growth ceiling a ceiling rather than a suggestion.
+
+Expansion has two halves in the definition. A **template** is a node marked `is_template = true`: it is never scheduled directly and does not appear in a run until something instantiates it. A node that may instantiate templates declares which ones, and how many children it may create in total:
+
+```toml
+[[node]]
+key = "fanout"
+label = "Fan out"
+prompt_template = "Split this into shards: {{goal}}"
+output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
+expand_allow = ["worker"]   # which templates this node may instantiate
+expand_max = 8              # how many children it may create in this run, in total
+
+[[node]]
+key = "worker"
+label = "Worker"
+is_template = true
+prompt_template = "Work one shard of: {{goal}}"
+output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }
+
+[[node]]
+key = "collect"
+label = "Collect"
+prompt_template = "Collect the shard reports:\n{{shard}}"
+output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }
+
+# The fan-in edge is drawn from `fanout`, not from `worker`.
+[[edge]]
+from = "fanout"
+to = "collect"
+kind = "data"
+payload = "summary"
+port = "shard"
+```
+
+`expand_max` defaults to `0`, so expansion is opt-in per node, and it counts cumulatively across every proposal that node makes in the run rather than per proposal. `expand_allow` is checked at authoring time: a key naming a node that does not exist, or one that is not a template, is rejected by `workflow.create`.
+
+Draw the fan-in edge **from the proposing node**, as above. A template's own edges are dropped when the run graph is built, so a node reachable only through a template is rejected at authoring time as unreachable. What connects the children instead is inheritance: every accepted child gets a copy of its parent's outbound edges, so each `worker` also gets an edge into `collect`, and `collect` waits for the whole generation rather than for `fanout` alone. A template's `{{slot}}`s therefore have to resolve to declared run args, since it has no inbound edge ports of its own.
+
+A node proposes from inside its own pane, before it completes:
+
+```bash
+kvx workflow node expand <run_id> <path> --template worker --label "Shard" --count 4
+kvx workflow node expand <run_id> <path> --template worker --label "Shard" --input goal="just src/ui" --json
+```
+
+Like `node complete`, it reads `KARVEX_WORKFLOW_NODE_TOKEN` from the node's own environment, so a node can only propose on its own behalf. `--count` defaults to 1. `--input KEY=VALUE` overrides one `{{slot}}` in the template's `prompt_template`; a key naming no declared slot is refused rather than quietly ignored, so the dynamic channel stays strictly narrower than the authored one. Each child gets the instance path `<parent>/<template>/<n>` — `fanout/worker/1`, `fanout/worker/2` — numbered from 1 per parent and template, and starts only once its parent has settled.
+
+A proposal is judged against four guardrails, in order: the proposing node's `expand_allow`, its `expand_max`, the run's `max_depth`, and the run's `max_nodes`.
+
+:::note[A refusal is never silent]
+If a proposal for four children only has room for two, **two are created and the shortfall is reported**. Accepting all four would break the ceiling; refusing all four would waste the room that was there. Partial acceptance is only legitimate because the truncation is reported, so it is reported on every surface that describes the run:
+
+| Surface | What it carries |
+| --- | --- |
+| `workflow.growth.limited` on the JSON API event stream | the proposing node, the template, which guardrail, that guardrail's value, and the requested/accepted counts |
+| `kvx workflow run show` and `kvx workflow node show` | the run's and the node's most recent growth limit |
+| The DAG view | a banner across the run, and a notice on the node that proposed |
+| A notice toast | the same message, if notices are enabled in `config.toml` |
+:::
+
+The response to `kvx workflow node expand` carries the same verdict back to the node that asked, so it learns exactly what it got. A refused proposal is a **successful** command, not an error: only a bad run, path, or token — or a run that has already closed — exits non-zero. A node that has already finished cannot propose, since its children would hang off an edge from a node that has already settled.
+
+## Tiers and growth ceilings
+
+A run's **tier** is the one dial for how expensive it is allowed to be. It picks each node's model and reasoning effort, together with that node's `demand`, and it narrows how far the graph may grow. There are two places to set it, most specific first:
+
+```bash
+kvx workflow run start ship-feature --tier low   # this run only
+```
+
+```toml
+default_tier = "medium"                          # every run of this workflow
+```
+
+`auto`, `max`, and `high` leave the document's ceilings alone; `medium` and `low` narrow them:
+
+| Tier | Effective `max_nodes` | Effective `max_depth` | Models |
+| --- | --- | --- | --- |
+| `max` | as authored | as authored | the strongest model at `peak` demand, opus otherwise, at `max` effort throughout |
+| `high` (default) | as authored | as authored | opus, dropping to sonnet at `light` demand |
+| `auto` | as authored | as authored | chosen per node from that node's own history, starting from the `high` row |
+| `medium` | at most 24 | as authored | opus at `peak`/`critical`, sonnet otherwise |
+| `low` | at most 12 | as authored | sonnet at every demand, `low` effort throughout |
+
+The narrowing only ever tightens: a tier cannot raise a ceiling the document set lower, and running the same workflow at `low` twice gives the same limits both times. What the run enforces is what `kvx workflow run show` and the JSON API report, so a run's growth ceiling never contradicts its own record.
 
 ## The node contract
 
@@ -142,9 +235,11 @@ kvx workflow run show <run_id> [--json]
 kvx workflow run cancel <run_id>
 ```
 
-`run` is a namespace, not a workflow selector: `start`, `list`, `show`, and `cancel` each take their own arguments, so a workflow can be named `list` without colliding with the subcommand. `--tier` defaults to the workflow's own default tier; repeat `--arg` for every declared run argument — an `--arg` key the workflow never declared is rejected before the run starts, naming every key that *is* declared, rather than being silently dropped. `run cancel` cancels the run's remaining nodes and closes their panes.
+From the Karvex TUI, `prefix+f` opens the **workflow launcher** instead: a modal listing the saved workflows, one input line per required argument of the selected one, and a tier row seeded from that workflow's own `default_tier`. `Enter` starts the run, `Esc` closes it, and every row is clickable. Rebind it with `keys.open_workflow_launcher`.
 
-The human default for `run show` names the node responsible when the run is `paused` or a node is stuck: the `status` line reads `paused (node "lint": needs_attention)`, followed by that node's blocker reason and resume condition, and then every node's path and status.
+`run` is a namespace, not a workflow selector: `start`, `list`, `show`, and `cancel` each take their own arguments, so a workflow can be named `list` without colliding with the subcommand. `--tier` defaults to the workflow's own `default_tier`; repeat `--arg` for every declared run argument — an `--arg` key the workflow never declared is rejected before the run starts, naming every key that *is* declared, rather than being silently dropped. `run cancel` cancels the run's remaining nodes and closes their panes.
+
+The human default for `run show` names the node responsible when the run is `paused` or a node is stuck: the `status` line reads `paused (node "lint": needs_attention)`, followed by that node's blocker reason and resume condition, and then every node's path and status. When a proposal has been refused or truncated it also prints a `growth_limited:` line naming the guardrail, its value, and the requested/accepted counts.
 
 ```bash
 kvx workflow node show <run_id> <path> [--json]
@@ -152,9 +247,10 @@ kvx workflow node steer <run_id> <path> <text>
 kvx workflow node interrupt <run_id> <path>
 kvx workflow node restart <run_id> <path>
 kvx workflow node complete [--result-file <path>]
+kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]
 ```
 
-`<path>` is the node's instance path, such as `plan` or `research/2/verify` — shown by `run show` and `workflow show`, and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` is the one command a node runs on itself; see The node contract, above. The human default for `node show` includes the node's blocker — reason and resume condition — when one is recorded, alongside `path`/`status`/`model`/`effort`/`pane_id`.
+`<path>` is the node's instance path, such as `plan` or `fanout/worker/2` — shown by `run show` and `workflow show`, and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` and `node expand` are the two commands a node runs on itself, both authenticated by the node token already in its environment; see The node contract and Templates and expansion, above. The human default for `node show` includes the node's blocker — reason and resume condition — and its most recent growth limit when one is recorded, alongside `path`/`status`/`model`/`effort`/`pane_id`.
 
 ## The DAG view
 
@@ -171,5 +267,7 @@ Open it with `prefix+shift+F`, or from the global menu — the launcher at the b
 | `Esc` (with the steer line open) | close the steer line without sending |
 | `Esc` (otherwise) | leave the DAG view |
 | Move the mouse | selection follows the pointer |
+
+Nodes created by an accepted expand proposal appear in the graph as they are created, laid out by the edges they inherited rather than by their generation number. When a proposal is refused or truncated, a banner across the top of the view names the guardrail and the requested/accepted counts, and the node that proposed carries the same notice in its box — so the run says what it was not allowed to do, not only what it did.
 
 The view is a read-only projection of the run: node status, position, and edges all come from the same run graph the CLI and JSON API report. Focusing a node's pane goes through the same path as focusing any other pane in Karvex, so leaving the DAG view leaves you looking at the teammate you selected.

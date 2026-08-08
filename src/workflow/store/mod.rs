@@ -37,16 +37,18 @@ pub use error::StoreError;
 #[allow(unused_imports)]
 pub use queries::{
     CheckpointRecord, RunEdgeRecord, RunEventRecord, RunNodeRecord, RunRecord, RunSummaryRecord,
-    VersionRecord, WorkflowSummary,
+    VersionRecord, WorkflowSummary, DEFAULT_NODE_HISTORY_RUNS,
 };
 use surrealdb::engine::local::{Db, Mem, SurrealKv};
 use surrealdb::Surreal;
 
 use crate::workflow::model::{
-    CheckpointKind, Demand, EdgeKind, EdgePayload, Evidence, GrowthLimits, Isolation, Kvdag,
-    KvdagEdge, KvdagNode, KvdagSpec, KvdagVersionId, NodeBinding, NodeKey, NodeKind, NodeStatus,
-    NodeUsage, OutputSchema, RunEventKind, RunId, RunStatus, StoreWrite, Succession, WorkflowId,
+    CheckpointKind, Demand, EdgeKind, EdgePayload, Evidence, GrowthLimits, InstancePath, Isolation,
+    Kvdag, KvdagEdge, KvdagNode, KvdagSpec, KvdagVersionId, NodeAssignment, NodeBinding, NodeKey,
+    NodeKind, NodeStatus, NodeUsage, OutputSchema, RunEventKind, RunId, RunStatus, StoreWrite,
+    Succession, WorkflowId,
 };
+use crate::workflow::tier::Assignment;
 use crate::workflow::tier::Tier;
 use records::{
     parse_record_id, record_id_to_string, KvdagEdgeRow, KvdagNodeRow, KvdagVersionRow,
@@ -92,7 +94,13 @@ const SUMMARY_BUDGET_CHARS: usize = 1_200;
 /// Every embedded migration, applied in order and recorded in `schema_meta`.
 /// The version string is both the `schema_meta.version` value and this
 /// module's audit trail of what has ever shipped.
-const MIGRATIONS: &[(&str, &str)] = &[("0001_init", include_str!("migrations/0001_init.surql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("migrations/0001_init.surql")),
+    (
+        "0002_growth_and_history",
+        include_str!("migrations/0002_growth_and_history.surql"),
+    ),
+];
 
 /// Where a store's data lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +146,22 @@ impl VersionOrigin {
     }
 }
 
+/// Definition metadata that lives on the mutable `workflow` row rather than on
+/// the immutable version, passed to
+/// [`WorkflowStore::create_version_with_metadata`] so the row tracks its head
+/// (`06-phase2-plan.md` H5 / §4 D16).
+///
+/// `kvdag_version` has no `description` column and deliberately gains none: it
+/// is the immutable graph revision, and a second copy of the description would
+/// be a second authority behind one `workflow.get`. `default_tier` is the same
+/// story — Phase 1 already stores it on `workflow` (§4 D17), and the only gap
+/// was that a new version never refreshed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionMetadata {
+    pub description: String,
+    pub default_tier: Tier,
+}
+
 /// The inputs of one run, checked against the version's limits on create: a run
 /// narrows its version's growth limits and never widens them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +171,24 @@ pub struct NewRun {
     pub tier: Tier,
     pub args: BTreeMap<String, String>,
     pub growth: GrowthLimits,
+    /// When the run started, stamped **once** by the caller and bound
+    /// explicitly by [`WorkflowStore::create_run`].
+    ///
+    /// `workflow_run.started_at` lost its `DEFAULT time::now()` in migration
+    /// `0002`, so the database can no longer mint a competing clock: the run
+    /// the journal describes and the run the live projection describes start at
+    /// the same instant (`06-phase2-plan.md` H1 / §4 D15).
+    pub started_at_unix_ms: u64,
+    /// Every kvdag node's resolved `(model, effort, reason)`, **including
+    /// templates**, produced once at run start by
+    /// `crate::workflow::engine::graph::resolve_assignments`.
+    ///
+    /// [`WorkflowStore::create_run`] writes these verbatim — the store resolves
+    /// no tiers of its own, so the DB row and the DAG view cannot disagree
+    /// about which model a node ran on (`06-phase2-plan.md` §4 D9 / R-2). A
+    /// scheduled node missing from this table is
+    /// [`StoreError::Invariant`], not a silent fallback.
+    pub assignments: BTreeMap<NodeKey, NodeAssignment>,
     pub context_runs: Vec<RunId>,
     /// Where the run's panes live, as the public API workspace id
     /// (`03-storage-schema.md` §4.2). Recorded at create time because it is a
@@ -154,6 +196,27 @@ pub struct NewRun {
     /// without it a run read back from the journal has no workspace binding at
     /// all.
     pub workspace_id: Option<String>,
+}
+
+/// The destructured fields of [`StoreWrite::RunNodeCreated`], grouped so the
+/// writer that consumes them is not an eleven-argument function.
+///
+/// Deliberately not a second public shape: it exists only between `write`'s
+/// match arm and [`WorkflowStore::write_run_node_created`], and its field set
+/// is the variant's field set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunNodeCreate {
+    run: RunId,
+    key: NodeKey,
+    path: InstancePath,
+    parent: Option<InstancePath>,
+    depth: u16,
+    status: NodeStatus,
+    demand: Demand,
+    assignment: Assignment,
+    assignment_reason: String,
+    attempt: u8,
+    proposal_id: String,
 }
 
 /// The workflow database. Opened lazily on first `workflow.*` use, so a karvex
@@ -205,6 +268,26 @@ impl WorkflowStore {
             self.apply_migration(version, sql).await?;
         }
         Ok(())
+    }
+
+    /// Opens a store with only the first `count` migrations applied, so a test
+    /// can build rows the way an older karvex did and then watch `migrate()`
+    /// bring them forward. Nothing in production selects a migration subset.
+    #[cfg(test)]
+    pub(super) async fn open_with_migrations(
+        location: StoreLocation,
+        count: usize,
+    ) -> Result<Self, StoreError> {
+        let db = connect(&location).await?;
+        db.use_ns(NAMESPACE)
+            .use_db(DATABASE)
+            .await
+            .map_err(query_error)?;
+        let store = Self { location, db };
+        for (version, sql) in MIGRATIONS.iter().take(count) {
+            store.apply_migration(version, sql).await?;
+        }
+        Ok(store)
     }
 
     async fn applied_migrations(&self) -> Result<std::collections::BTreeSet<String>, StoreError> {
@@ -273,6 +356,12 @@ impl WorkflowStore {
     /// Writes a new immutable version plus its nodes and edges, and returns the
     /// validated graph. An identical graph yields the same `spec_digest` and is
     /// not written again.
+    ///
+    /// The metadata-free entry point, kept so a caller that is only revising
+    /// the graph does not have to invent a description. Callers that hold the
+    /// authored document — every `workflow.create`/`workflow.update` path —
+    /// use [`Self::create_version_with_metadata`] instead, so the `workflow`
+    /// row tracks its head (H5).
     pub async fn create_version(
         &self,
         workflow: &WorkflowId,
@@ -280,7 +369,34 @@ impl WorkflowStore {
         change_summary: &str,
         spec: KvdagSpec,
     ) -> Result<Kvdag, StoreError> {
+        self.create_version_with_metadata(workflow, origin, change_summary, spec, None)
+            .await
+    }
+
+    /// [`Self::create_version`] plus the H5 head-metadata refresh.
+    ///
+    /// `kvdag_version` stores neither `description` nor `default_tier`, so
+    /// after a `workflow.update` that changed either, `workflow.get` used to
+    /// report v1's metadata beside `head_version: 2`. The fix is to make the
+    /// mutable `workflow` row track its head rather than to add a second
+    /// authority to the immutable revision (`06-phase2-plan.md` §4 D16).
+    ///
+    /// The refresh happens **before** the no-op-revision early return on
+    /// purpose: an update that changes only the description leaves the graph
+    /// digest identical, which is exactly the case that used to go missing.
+    pub async fn create_version_with_metadata(
+        &self,
+        workflow: &WorkflowId,
+        origin: VersionOrigin,
+        change_summary: &str,
+        spec: KvdagSpec,
+        metadata: Option<&VersionMetadata>,
+    ) -> Result<Kvdag, StoreError> {
         let workflow_id = workflow_record_id(workflow)?;
+        if let Some(metadata) = metadata {
+            self.refresh_workflow_metadata(&workflow_id, metadata)
+                .await?;
+        }
         let workflow_row =
             self.select_workflow(&workflow_id)
                 .await?
@@ -489,6 +605,29 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Writes the authored document's `description` and `default_tier` onto
+    /// the `workflow` row (H5). Idempotent, and a no-op for a workflow id that
+    /// does not resolve.
+    async fn refresh_workflow_metadata(
+        &self,
+        workflow_id: &surrealdb_types::RecordId,
+        metadata: &VersionMetadata,
+    ) -> Result<(), StoreError> {
+        let response = self
+            .db
+            .query(
+                "UPDATE $workflow SET description = $description, \
+                 default_tier = $default_tier, updated_at = time::now()",
+            )
+            .bind(("workflow", workflow_id.clone()))
+            .bind(("description", metadata.description.clone()))
+            .bind(("default_tier", metadata.default_tier.as_str().to_string()))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
     /// Loads one version's full node and edge set back into a validated graph.
     pub async fn load_version(&self, version: &KvdagVersionId) -> Result<Kvdag, StoreError> {
         let version_id = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
@@ -552,6 +691,19 @@ impl WorkflowStore {
         Ok(Kvdag::try_new(spec)?)
     }
 
+    /// Creates a run and materialises its static node/edge set.
+    ///
+    /// Two invariants are enforced here rather than left to caller discipline:
+    ///
+    /// - **A run narrows, never widens** (`04-kvdag-and-execution.md` §3.4). The
+    ///   run's growth limits must be `<=` the version's on both axes, which is
+    ///   what makes `workflow_run.max_nodes <= kvdag_version.max_nodes` a true
+    ///   invariant rather than a comment. `NewRun`'s own doc has claimed this
+    ///   since Phase 1; before Phase 2 nothing checked it.
+    /// - **`started_at` has one authority** (§4 D15 / H1): it is bound
+    ///   explicitly from `NewRun.started_at_unix_ms`, and migration `0002`
+    ///   removed the column's `DEFAULT time::now()` so the database cannot mint
+    ///   a second, later clock.
     pub async fn create_run(&self, run: NewRun) -> Result<RunId, StoreError> {
         let workflow_id = workflow_record_id(&run.workflow)?;
         let version_id =
@@ -559,6 +711,20 @@ impl WorkflowStore {
                 StoreError::Decode(format!("not a kvdag_version id: {}", run.version))
             })?;
         let graph = self.load_version(&run.version).await?;
+
+        if run.growth.max_depth > graph.growth.max_depth
+            || run.growth.max_nodes > graph.growth.max_nodes
+        {
+            return Err(StoreError::Invariant(format!(
+                "run growth (max_depth {}, max_nodes {}) widens version {} \
+                 (max_depth {}, max_nodes {}); a run narrows, never widens",
+                run.growth.max_depth,
+                run.growth.max_nodes,
+                run.version,
+                graph.growth.max_depth,
+                graph.growth.max_nodes,
+            )));
+        }
 
         let args_json = serde_json::Value::Object(
             run.args
@@ -579,10 +745,12 @@ impl WorkflowStore {
                  tier = $tier, status = \"pending\", args = $args, \
                  context_runs = $context_runs, max_depth = $max_depth, \
                  max_nodes = $max_nodes, workspace_id = $workspace_id, \
+                 started_at = time::from_millis($started_at_ms), \
                  nodes_total = $nodes_total RETURN AFTER",
             )
             .bind(("workflow", workflow_id))
             .bind(("version", version_id.clone()))
+            .bind(("started_at_ms", run.started_at_unix_ms as i64))
             .bind(("tier", run.tier.as_str().to_string()))
             .bind(("args", args_json))
             .bind(("context_runs", context_runs))
@@ -602,7 +770,7 @@ impl WorkflowStore {
             .ok_or_else(|| StoreError::Query("create workflow_run returned no row".to_string()))?;
         let run_id = RunId::new(record_id_to_string(&row.id));
 
-        self.materialise_run_nodes(&row.id, &version_id, run.tier, &graph)
+        self.materialise_run_nodes(&row.id, &version_id, &run.assignments, &graph)
             .await?;
 
         Ok(run_id)
@@ -648,6 +816,54 @@ impl WorkflowStore {
                     succession,
                     started_at_unix_ms,
                     ended_at_unix_ms,
+                )
+                .await
+            }
+            StoreWrite::RunNodeCreated {
+                run,
+                key,
+                path,
+                parent,
+                depth,
+                status,
+                demand,
+                assignment,
+                assignment_reason,
+                attempt,
+                proposal_id,
+            } => {
+                self.write_run_node_created(RunNodeCreate {
+                    run,
+                    key,
+                    path,
+                    parent,
+                    depth,
+                    status,
+                    demand,
+                    assignment,
+                    assignment_reason,
+                    attempt,
+                    proposal_id,
+                })
+                .await
+            }
+            StoreWrite::RunEdgeCreated {
+                run,
+                from,
+                to,
+                kind,
+                kvdag_edge,
+                condition_result,
+                fired,
+            } => {
+                self.write_run_edge_created(
+                    run,
+                    from,
+                    to,
+                    kind,
+                    kvdag_edge,
+                    condition_result,
+                    fired,
                 )
                 .await
             }
@@ -1194,11 +1410,19 @@ impl WorkflowStore {
     /// past its own growth ceiling — so every statically materialised node is
     /// at depth 0, exactly as [`crate::workflow::model::RunGraph::materialise`]
     /// records it in memory.
+    ///
+    /// `assignments` is written **verbatim**. This method used to call
+    /// `tier::resolve` itself, which made it a second resolver beside
+    /// `engine::graph`'s and left the durable row and the DAG view agreeing
+    /// only by accident (`06-phase2-plan.md` §4 D9 / R-2). A scheduled node
+    /// with no entry in the table is [`StoreError::Invariant`]: falling back to
+    /// a locally resolved assignment is precisely the second authority this
+    /// change removes.
     async fn materialise_run_nodes(
         &self,
         run_id: &surrealdb_types::RecordId,
         version_id: &surrealdb_types::RecordId,
-        tier: Tier,
+        assignments: &BTreeMap<NodeKey, NodeAssignment>,
         graph: &Kvdag,
     ) -> Result<(), StoreError> {
         let scheduled: Vec<&KvdagNode> = graph.nodes.iter().filter(|n| !n.is_template).collect();
@@ -1217,7 +1441,13 @@ impl WorkflowStore {
             } else {
                 NodeStatus::Pending
             };
-            let assignment = crate::workflow::tier::resolve(tier, node.demand, None);
+            let assignment = assignments.get(&node.key).ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "node {} has no resolved assignment; \
+                     the run's assignment table must cover every scheduled node",
+                    node.key
+                ))
+            })?;
             let kvdag_node_id = node_record_id_by_key.get(&node.key).ok_or_else(|| {
                 StoreError::Decode(format!("node {} has no stored kvdag_node row", node.key))
             })?;
@@ -1228,7 +1458,8 @@ impl WorkflowStore {
                     "CREATE run_node SET run = $run, kvdag_node = $kvdag_node, \
                      node_key = $node_key, instance_path = $instance_path, \
                      depth = $depth, status = $status, model = $model, \
-                     effort = $effort, demand = $demand RETURN AFTER",
+                     effort = $effort, demand = $demand, \
+                     assignment_reason = $assignment_reason RETURN AFTER",
                 )
                 .bind(("run", run_id.clone()))
                 .bind(("kvdag_node", kvdag_node_id.clone()))
@@ -1239,6 +1470,7 @@ impl WorkflowStore {
                 .bind(("model", assignment.model.as_str().to_string()))
                 .bind(("effort", assignment.effort.as_str().to_string()))
                 .bind(("demand", demand_str(node.demand).to_string()))
+                .bind(("assignment_reason", assignment.reason.clone()))
                 .await
                 .map_err(query_error)?;
             let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
@@ -1442,6 +1674,8 @@ impl WorkflowStore {
                  total_tokens = $total_tokens, tool_uses = $tool_uses, \
                  duration_ms = $duration_ms, evidence = $evidence, \
                  succession = $succession, blocker = $blocker, \
+                 first_pass_succeeded = IF $settles THEN $first_pass \
+                                        ELSE first_pass_succeeded END, \
                  started_at = IF $started_at_ms = NONE THEN started_at \
                               ELSE time::from_millis($started_at_ms) END, \
                  ended_at = IF $ended_at_ms = NONE THEN ended_at \
@@ -1459,6 +1693,17 @@ impl WorkflowStore {
             ))
             .bind(("succession", succession_str.map(str::to_string)))
             .bind(("blocker", blocker_json))
+            // `first_pass_succeeded` is one of the two `NodeHistory` inputs
+            // that can be truthful today (§4 D8), and it is a property of how
+            // the node *closed*, not of any intermediate transition — so it is
+            // only rewritten on a terminal status. A restart that succeeds on
+            // attempt 2 therefore reads `false`, which is what the `auto`
+            // policy needs it to mean.
+            .bind(("settles", status.is_terminal()))
+            .bind((
+                "first_pass",
+                status == NodeStatus::Succeeded && attempt <= 1,
+            ))
             .bind(("started_at_ms", started_at_unix_ms.map(|ms| ms as i64)))
             .bind(("ended_at_ms", ended_at_unix_ms.map(|ms| ms as i64)))
             .await
@@ -1520,6 +1765,248 @@ impl WorkflowStore {
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
         Ok(())
+    }
+
+    /// Re-derives both run-level node counters from the run's own `run_node`
+    /// rows.
+    ///
+    /// `nodes_total` was a create-time constant in Phase 1 because the node set
+    /// was. Dynamic growth makes it a moving number, and a progress counter
+    /// whose denominator ignores expansion children under-reports the run —
+    /// so both halves are recomputed from the rows rather than incremented.
+    async fn refresh_run_node_counters(&self, run: &RunId) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let terminal: Vec<String> = TERMINAL_NODE_STATUSES
+            .iter()
+            .map(|status| node_status_str(*status).to_string())
+            .collect();
+        let response = self
+            .db
+            .query(
+                "UPDATE $run SET \
+                 nodes_total = array::len((SELECT VALUE id FROM run_node WHERE run = $run)), \
+                 nodes_done = array::len((SELECT VALUE id FROM run_node \
+                 WHERE run = $run AND status IN $terminal))",
+            )
+            .bind(("run", run_id))
+            .bind(("terminal", terminal))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    /// Creates a `run_node` that did not exist when the run started, together
+    /// with the `spawned` relation recording which node proposed it.
+    ///
+    /// This is the first writer the `spawned` table has ever had: before
+    /// Phase 2 its only Rust reference was the `DELETE` in
+    /// [`Self::prune_run_history`]. The `CREATE` and the `RELATE` travel in one
+    /// `.query()` — one request is one transaction — so a child can never exist
+    /// without its provenance.
+    async fn write_run_node_created(&self, create: RunNodeCreate) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, create.run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {}", create.run)))?;
+        let run_row = self
+            .select_run_row(&run_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                table: TABLE_WORKFLOW_RUN,
+                id: create.run.to_string(),
+            })?;
+        let kvdag_node_id = self
+            .find_kvdag_node_id(&run_row.kvdag_version, &create.key)
+            .await?;
+        let parent_id = match &create.parent {
+            Some(parent) => Some(self.find_run_node_id(&create.run, parent).await?),
+            None => None,
+        };
+
+        // `$child` is the array `CREATE ... RETURN AFTER` yields; the relation
+        // is drawn to its single element.
+        const CREATE_NODE: &str = "LET $child = (CREATE run_node SET run = $run, \
+             kvdag_node = $kvdag_node, node_key = $node_key, instance_path = $instance_path, \
+             parent = $parent, depth = $depth, status = $status, model = $model, \
+             effort = $effort, demand = $demand, attempt = $attempt, \
+             assignment_reason = $assignment_reason RETURN AFTER);";
+        let statement = if parent_id.is_some() {
+            // `RELATE` wants a plain record target, so the created id is
+            // hoisted into its own binding rather than indexed inline.
+            format!(
+                "{CREATE_NODE}\
+                 LET $child_id = $child[0].id;\
+                 RELATE $parent -> spawned -> $child_id SET run = $run, \
+                 template_key = $template_key, proposal_id = $proposal_id;\
+                 RETURN $child;"
+            )
+        } else {
+            format!("{CREATE_NODE}RETURN $child;")
+        };
+
+        let response = self
+            .db
+            .query(statement)
+            .bind(("run", run_id))
+            .bind(("kvdag_node", kvdag_node_id))
+            .bind(("node_key", create.key.to_string()))
+            .bind(("instance_path", create.path.to_string()))
+            .bind(("parent", parent_id))
+            .bind(("depth", i64::from(create.depth)))
+            .bind(("status", node_status_str(create.status).to_string()))
+            .bind(("model", create.assignment.model.as_str().to_string()))
+            .bind(("effort", create.assignment.effort.as_str().to_string()))
+            .bind(("demand", demand_str(create.demand).to_string()))
+            .bind(("attempt", i64::from(create.attempt)))
+            .bind(("assignment_reason", create.assignment_reason))
+            .bind(("template_key", create.key.to_string()))
+            .bind(("proposal_id", create.proposal_id))
+            .await
+            .map_err(query_error)?;
+        let mut response = response.check().map_err(query_error)?;
+        // The `RETURN` is the last statement either way; its index differs
+        // because the parented form carries the `RELATE` in between.
+        let index = if create.parent.is_some() { 3 } else { 1 };
+        let rows: Vec<records::RunNodeRow> = response.take(index).map_err(query_error)?;
+        if rows.is_empty() {
+            return Err(StoreError::Query(format!(
+                "create run_node {} returned no row",
+                create.path
+            )));
+        }
+
+        self.refresh_run_node_counters(&create.run).await
+    }
+
+    /// Creates a `run_edge` that did not exist when the run started: the
+    /// parent→child `sequence` edge an accepted proposal adds, or the child's
+    /// inherited copy of one of its parent's outbound edges (§4 D4).
+    ///
+    /// The create-shaped sibling of [`Self::write_run_edge`], which is
+    /// find-then-`UPDATE` and errors on a missing row. `kvdag_edge` stays
+    /// `NONE` for the synthetic sequence edge, which has no authored
+    /// counterpart — the column is `option<record<kvdag_edge>>` for exactly
+    /// this case.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_run_edge_created(
+        &self,
+        run: RunId,
+        from: InstancePath,
+        to: InstancePath,
+        kind: EdgeKind,
+        kvdag_edge: Option<(NodeKey, NodeKey)>,
+        condition_result: Option<bool>,
+        fired: bool,
+    ) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let from_id = self.find_run_node_id(&run, &from).await?;
+        let to_id = self.find_run_node_id(&run, &to).await?;
+
+        let kvdag_edge_id = match kvdag_edge {
+            None => None,
+            Some((source, target)) => {
+                let run_row =
+                    self.select_run_row(&run_id)
+                        .await?
+                        .ok_or_else(|| StoreError::NotFound {
+                            table: TABLE_WORKFLOW_RUN,
+                            id: run.to_string(),
+                        })?;
+                self.find_kvdag_edge_id_by_keys(&run_row.kvdag_version, &source, &target, kind)
+                    .await?
+            }
+        };
+
+        let response = self
+            .db
+            .query(
+                "RELATE $from -> run_edge -> $to SET run = $run, kind = $kind, \
+                 kvdag_edge = $kvdag_edge, condition_result = $condition_result, \
+                 fired_at = IF $fired THEN time::now() ELSE NONE END",
+            )
+            .bind(("from", from_id))
+            .bind(("to", to_id))
+            .bind(("run", run_id))
+            .bind(("kind", edge_kind_str(kind).to_string()))
+            .bind(("kvdag_edge", kvdag_edge_id))
+            .bind(("condition_result", condition_result))
+            .bind(("fired", fired))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    async fn select_run_row(
+        &self,
+        run_id: &surrealdb_types::RecordId,
+    ) -> Result<Option<records::RunRow>, StoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM $id")
+            .bind(("id", run_id.clone()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
+        Ok(rows.into_iter().next())
+    }
+
+    async fn find_kvdag_node_id(
+        &self,
+        version_id: &surrealdb_types::RecordId,
+        key: &NodeKey,
+    ) -> Result<surrealdb_types::RecordId, StoreError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM kvdag_node WHERE version = $version \
+                 AND node_key = $node_key LIMIT 1",
+            )
+            .bind(("version", version_id.clone()))
+            .bind(("node_key", key.to_string()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<KvdagNodeRow> = response.take(0).map_err(query_error)?;
+        rows.into_iter()
+            .next()
+            .map(|row| row.id)
+            .ok_or_else(|| StoreError::NotFound {
+                table: TABLE_KVDAG_NODE,
+                id: format!("{}/{key}", record_id_to_string(version_id)),
+            })
+    }
+
+    /// The `kvdag_edge` behind an inherited run edge, addressed by the authored
+    /// endpoints' node keys.
+    ///
+    /// [`Self::find_kvdag_edge_id`] resolves the same link from a live
+    /// [`KvdagEdge`] during `create_run`; an expansion child's inherited edge
+    /// arrives from the pure engine as a key pair instead, because the store
+    /// write carries no `KvdagEdge`. Missing is not an error: provenance is a
+    /// link, and an edge whose authored counterpart cannot be found is still a
+    /// real edge in the run.
+    async fn find_kvdag_edge_id_by_keys(
+        &self,
+        version_id: &surrealdb_types::RecordId,
+        from: &NodeKey,
+        to: &NodeKey,
+        kind: EdgeKind,
+    ) -> Result<Option<surrealdb_types::RecordId>, StoreError> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM kvdag_edge WHERE in.version = $version \
+                 AND in.node_key = $from AND out.node_key = $to AND kind = $kind LIMIT 1",
+            )
+            .bind(("version", version_id.clone()))
+            .bind(("from", from.to_string()))
+            .bind(("to", to.to_string()))
+            .bind(("kind", edge_kind_str(kind).to_string()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<KvdagEdgeRow> = response.take(0).map_err(query_error)?;
+        Ok(rows.into_iter().next().map(|row| row.id))
     }
 
     /// Settles one materialised edge's firing record.
@@ -1632,7 +2119,7 @@ impl WorkflowStore {
                  artifact_paths = $artifact_paths, digest = $digest",
             )
             .bind(("run", run_id))
-            .bind(("run_node", run_node_id))
+            .bind(("run_node", run_node_id.clone()))
             .bind(("node_key", node_row.node_key))
             .bind(("instance_path", path.to_string()))
             .bind(("kvdag_version", run_row.kvdag_version))
@@ -1646,6 +2133,20 @@ impl WorkflowStore {
             .await
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
+
+        // The second truthful `NodeHistory` input (§4 D8). A checkpoint is the
+        // only place the store ever learns that a result failed its schema, so
+        // the counter is derived here rather than added to `StoreWrite::RunNode`
+        // — the wire carries no such field and does not need one.
+        if !schema_valid {
+            let response = self
+                .db
+                .query("UPDATE $id SET schema_failures = schema_failures + 1")
+                .bind(("id", run_node_id))
+                .await
+                .map_err(query_error)?;
+            response.check().map_err(query_error)?;
+        }
         Ok(())
     }
 }

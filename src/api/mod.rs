@@ -83,6 +83,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::WorkflowNodeSteer(_)
             | Method::WorkflowNodeInterrupt(_)
             | Method::WorkflowNodeReport(_)
+            | Method::WorkflowNodeExpand(_)
             | Method::WorkflowNodeRestart(_)
     )
 }

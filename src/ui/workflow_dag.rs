@@ -37,6 +37,9 @@ const HEADER_HEIGHT: u16 = 1;
 /// Blocker line, status line, model/usage line, summary line.
 const DETAIL_HEIGHT: u16 = 4;
 const FOOTER_HEIGHT: u16 = 1;
+/// The run banner: one line, the run's last growth limit. Allocated only when
+/// a banner is present (`06-phase2-plan.md` §1 WS-G, §3 frozen interface 10).
+const BANNER_HEIGHT: u16 = 1;
 
 /// Which way a graph-aware navigation key moves the selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,13 +61,24 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
         return DagViewState::default();
     }
 
-    let (header_rect, graph_rect, detail_rect, footer_rect) = overlay_areas(area);
     let previous = &app.view.dag;
+    // The run's last growth limit, formatted for the banner band. `None` costs
+    // zero rows (§3 frozen interface 10). Mirrored onto
+    // `WorkflowRunPresentation` alongside the run graph, the same way a refused
+    // delivery is — and gated on there being a graph to banner, so a limit left
+    // over from a run that has since been cleared cannot head an empty overlay.
+    let banner: Option<String> = app
+        .workflow_run_graph()
+        .and(app.workflow_run_presentation().growth_banner.clone());
+    let (header_rect, banner_rect, graph_rect, detail_rect, footer_rect) =
+        overlay_areas(area, banner.as_deref());
     let mut view = DagViewState {
         header_rect,
+        banner_rect,
         graph_rect,
         detail_rect,
         footer_rect,
+        banner,
         ..DagViewState::default()
     };
 
@@ -123,23 +137,40 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Splits the full-bleed overlay into its four bands. A short terminal loses
-/// the detail strip before the graph, and the graph before the footer.
-fn overlay_areas(area: Rect) -> (Rect, Rect, Rect, Rect) {
+/// Splits the full-bleed overlay into its five bands, in priority order
+/// `footer → banner → graph → detail`: a short terminal loses the detail
+/// strip before the graph, the graph before the banner, and the banner before
+/// the footer — the escape hatch is the last thing to go.
+///
+/// The banner band is allocated only when `banner.is_some()`, so a `None`
+/// banner returns rects byte-identical to the pre-Phase-2 four-band layout —
+/// every existing pinned geometry number stays exact
+/// (`06-phase2-plan.md` §3 frozen interface 10). Only the banner's presence
+/// affects geometry; its text does not, so the parameter is `Option<&str>`
+/// rather than a bare `bool` to keep the call site self-explanatory.
+fn overlay_areas(area: Rect, banner: Option<&str>) -> (Rect, Rect, Rect, Rect, Rect) {
     let header = Rect::new(area.x, area.y, area.width, HEADER_HEIGHT.min(area.height));
     let mut remaining = area.height.saturating_sub(header.height);
 
     let footer_height = FOOTER_HEIGHT.min(remaining);
     remaining = remaining.saturating_sub(footer_height);
 
+    let banner_height = if banner.is_some() {
+        BANNER_HEIGHT.min(remaining)
+    } else {
+        0
+    };
+    remaining = remaining.saturating_sub(banner_height);
+
     // The graph keeps at least one row; the detail strip yields first.
     let detail_height = DETAIL_HEIGHT.min(remaining.saturating_sub(1));
     remaining = remaining.saturating_sub(detail_height);
 
-    let graph = Rect::new(area.x, header.bottom(), area.width, remaining);
+    let banner_rect = Rect::new(area.x, header.bottom(), area.width, banner_height);
+    let graph = Rect::new(area.x, banner_rect.bottom(), area.width, remaining);
     let detail = Rect::new(area.x, graph.bottom(), area.width, detail_height);
     let footer = Rect::new(area.x, detail.bottom(), area.width, footer_height);
-    (header, graph, detail, footer)
+    (header, banner_rect, graph, detail, footer)
 }
 
 /// Layout, then drop everything the graph band cannot show.
@@ -207,6 +238,12 @@ fn project_node(
             .delivery_failures
             .get(node.path.as_str())
             .cloned(),
+        // The last guardrail this node ran into as a *proposer*, mirrored onto
+        // `WorkflowRunPresentation` beside the delivery failures. Rendered by
+        // `render_nodes` below whenever it is `Some`.
+        growth_notice: presentation.growth_notices.get(node.path.as_str()).cloned(),
+        depth: node.depth,
+        parent: node.parent,
         blocker: match &node.succession {
             Some(Succession::Blocked {
                 reason,
@@ -372,10 +409,32 @@ pub(super) fn render_workflow_dag(app: &AppState, frame: &mut Frame, area: Rect)
     }
 
     render_header(dag, p, frame);
+    render_banner(dag, p, frame);
     render_edges(dag, p, frame);
     render_nodes(dag, p, frame);
     render_detail(dag, p, frame);
     render_footer(dag, p, frame);
+}
+
+/// The run's last growth limit, in the palette's warning slot. Zero rows —
+/// and nothing drawn — while [`DagViewState::banner`] is `None`, which is the
+/// zero-height-when-absent rule `overlay_areas` already enforces on the rect
+/// (`06-phase2-plan.md` §3 frozen interface 10).
+fn render_banner(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
+    if dag.banner_rect.height == 0 {
+        return;
+    }
+    let Some(banner) = &dag.banner else {
+        return;
+    };
+    let width = (dag.banner_rect.width as usize).saturating_sub(1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", truncate_end(banner, width)),
+            Style::default().fg(p.peach).add_modifier(Modifier::BOLD),
+        ))),
+        dag.banner_rect,
+    );
 }
 
 /// What to call this run on screen: the authored workflow name when the
@@ -658,6 +717,22 @@ fn render_nodes(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
                 Style::default().fg(p.overlay0),
             ));
         }
+        // The last growth limit this node ran into as a proposer, in the
+        // palette's warning slot — one of the three non-optional surfaces the
+        // "a rejection is always surfaced" guarantee rests on
+        // (`06-phase2-plan.md` §4 D11). `NODE_HEIGHT` (`workflow/layout.rs`)
+        // gives every box exactly one interior row, so the notice shares the
+        // status row rather than a second one that does not exist — spans,
+        // not a second `Line`, and truncated the same way the header and
+        // detail rows already truncate a span run that overflows its band.
+        if let Some(notice) = &node.growth_notice {
+            spans.push(Span::styled(" · ", Style::default().fg(p.overlay0)));
+            spans.push(Span::styled(
+                notice.clone(),
+                Style::default().fg(p.peach).add_modifier(Modifier::BOLD),
+            ));
+        }
+        let spans = truncate_spans(spans, inner.width as usize);
         frame.render_widget(Paragraph::new(Line::from(spans)), inner);
     }
 }
@@ -938,6 +1013,7 @@ mod tests {
                 model: ModelAlias::Sonnet,
                 effort: Effort::Low,
             },
+            assignment_reason: String::new(),
             attempt: 1,
             binding: None,
             result: None,
@@ -970,6 +1046,7 @@ mod tests {
             version_id: KvdagVersionId::new("v1"),
             tier: Tier::Auto,
             growth: GrowthLimits::default(),
+            assignments: std::collections::BTreeMap::new(),
             nodes: vec![
                 test_node(0, "start"),
                 test_node(1, "left"),
@@ -999,12 +1076,31 @@ mod tests {
         workflow_name: &str,
         labels: &std::collections::HashMap<String, String>,
     ) -> DagViewState {
-        let (header_rect, graph_rect, detail_rect, footer_rect) = overlay_areas(area);
+        view_of_full(graph, area, workflow_name, labels, None)
+    }
+
+    /// Like [`view_of_named`], plus the run banner. The WS-G geometry and
+    /// rendering tests construct the banner directly rather than driving a real
+    /// growth limit through the engine: this file's subject is the geometry and
+    /// the drawing, and `compute_workflow_dag_view` reads the banner off
+    /// `WorkflowRunPresentation`, whose mirroring is covered in
+    /// `src/app/workflow.rs`.
+    fn view_of_full(
+        graph: &RunGraph,
+        area: Rect,
+        workflow_name: &str,
+        labels: &std::collections::HashMap<String, String>,
+        banner: Option<&str>,
+    ) -> DagViewState {
+        let (header_rect, banner_rect, graph_rect, detail_rect, footer_rect) =
+            overlay_areas(area, banner);
         let mut view = DagViewState {
             header_rect,
+            banner_rect,
             graph_rect,
             detail_rect,
             footer_rect,
+            banner: banner.map(str::to_string),
             run_id: graph.run_id.as_str().to_string(),
             workflow_name: workflow_name.to_string(),
             run_status: Some(graph.status),
@@ -1024,6 +1120,8 @@ mod tests {
                         workflow_name: workflow_name.to_string(),
                         node_labels: labels.clone(),
                         delivery_failures: std::collections::HashMap::new(),
+                        growth_banner: None,
+                        growth_notices: std::collections::HashMap::new(),
                     },
                     0,
                 )
@@ -1464,6 +1562,8 @@ mod tests {
                 path,
                 "pane.send_text: pane_not_found: no such pane".to_string(),
             )]),
+            growth_banner: None,
+            growth_notices: std::collections::HashMap::new(),
         };
         let mut view = view_of(&graph, area);
         view.nodes = graph
@@ -1589,12 +1689,18 @@ mod tests {
         assert!(!view.register_click(RunNodeIdx(1), 4, 1, now + Duration::from_millis(5100)));
     }
 
+    /// Pinned: a `None` banner must return rects byte-identical to the
+    /// pre-Phase-2 four-band layout, so every number here is exactly what it
+    /// was before the fifth band existed (`06-phase2-plan.md` §3 frozen
+    /// interface 10) — only the destructuring grew from four to five.
     #[test]
     fn overlay_bands_partition_the_area_without_overlap() {
         let area = Rect::new(0, 0, 80, 24);
-        let (header, graph, detail, footer) = overlay_areas(area);
+        let (header, banner, graph, detail, footer) = overlay_areas(area, None);
         assert_eq!(header.y, area.y);
-        assert_eq!(header.bottom(), graph.y);
+        assert_eq!(header.bottom(), banner.y);
+        assert_eq!(banner.height, 0, "no banner costs zero rows");
+        assert_eq!(banner.bottom(), graph.y);
         assert_eq!(graph.bottom(), detail.y);
         assert_eq!(detail.bottom(), footer.y);
         assert_eq!(footer.bottom(), area.bottom());
@@ -1602,15 +1708,160 @@ mod tests {
         assert_eq!(footer.height, FOOTER_HEIGHT);
     }
 
+    /// A banner takes its row from the detail strip before it ever touches
+    /// the graph's one guaranteed row — priority `footer → banner → graph →
+    /// detail` (`06-phase2-plan.md` §1 WS-G). `height = 7` is exactly
+    /// header(1) + footer(1) + detail(4) + graph(1), so there is no slack:
+    /// the banner's extra row has to come from somewhere, and it must not
+    /// come from the graph.
+    #[test]
+    fn a_present_banner_shrinks_detail_before_the_graphs_one_guaranteed_row() {
+        let area = Rect::new(0, 0, 80, 7);
+        let (header, banner, graph, detail, footer) = overlay_areas(area, None);
+        assert_eq!(banner.height, 0);
+        assert_eq!(detail.height, DETAIL_HEIGHT);
+        assert_eq!(graph.height, 1);
+        assert_eq!(
+            header.height + graph.height + detail.height + footer.height,
+            7
+        );
+
+        let (header, banner, graph, detail, footer) = overlay_areas(area, Some("growth limited"));
+        assert_eq!(banner.height, BANNER_HEIGHT);
+        assert_eq!(header.bottom(), banner.y);
+        assert_eq!(banner.bottom(), graph.y);
+        assert_eq!(graph.bottom(), detail.y);
+        assert_eq!(detail.bottom(), footer.y);
+        assert_eq!(footer.bottom(), area.bottom());
+        // The graph keeps its one row; the detail strip is what shrank.
+        assert_eq!(graph.height, 1, "the graph keeps at least one row");
+        assert_eq!(detail.height, DETAIL_HEIGHT - BANNER_HEIGHT);
+        assert_eq!(
+            header.height + banner.height + graph.height + detail.height + footer.height,
+            7
+        );
+    }
+
     #[test]
     fn a_tiny_area_still_partitions_without_panicking() {
         for height in 0..=6u16 {
             let area = Rect::new(0, 0, 20, height);
-            let (header, graph, detail, footer) = overlay_areas(area);
+            let (header, banner, graph, detail, footer) = overlay_areas(area, None);
             assert_eq!(
-                header.height + graph.height + detail.height + footer.height,
+                header.height + banner.height + graph.height + detail.height + footer.height,
+                height
+            );
+            let (header, banner, graph, detail, footer) =
+                overlay_areas(area, Some("growth limited"));
+            assert_eq!(
+                header.height + banner.height + graph.height + detail.height + footer.height,
                 height
             );
         }
+    }
+
+    /// Hit-testing reads `view.layout`, stored inside `view.graph_rect`, so a
+    /// banner shifting the graph band down must not desync the two — this is
+    /// the WS-G "hit-test still agrees with stored geometry when a banner is
+    /// present" case.
+    #[test]
+    fn hit_test_still_agrees_with_stored_geometry_when_a_banner_is_present() {
+        let view = view_of_full(
+            &diamond(),
+            Rect::new(0, 0, 120, 40),
+            "",
+            &std::collections::HashMap::new(),
+            Some("growth limited · max_nodes 12 reached · 2 of 4 requested nodes created"),
+        );
+        assert_eq!(view.banner_rect.height, BANNER_HEIGHT);
+        assert_eq!(view.nodes.len(), 4);
+
+        for (idx, rect) in &view.layout.nodes {
+            assert!(
+                contains_rect(to_layout_rect(view.graph_rect), *rect),
+                "{rect:?} escapes {:?}",
+                view.graph_rect
+            );
+            for row in rect.y..rect.bottom() {
+                for col in rect.x..rect.right() {
+                    assert_eq!(view.node_at(col, row), Some(*idx), "({col},{row})");
+                }
+            }
+        }
+        // The banner band itself hit-tests to no node.
+        for col in view.banner_rect.x..view.banner_rect.right() {
+            assert_eq!(view.node_at(col, view.banner_rect.y), None);
+        }
+    }
+
+    /// The banner renders in the palette's warning slot and costs the row it
+    /// claims; the per-node growth notice renders inside the proposing node's
+    /// box when the box has a spare interior row.
+    #[test]
+    fn render_draws_the_banner_and_a_per_node_growth_notice() {
+        let mut view = view_of_full(
+            &diamond(),
+            Rect::new(0, 0, 100, 30),
+            "",
+            &std::collections::HashMap::new(),
+            Some("growth limited · max_nodes 12 reached · 2 of 4 requested nodes created"),
+        );
+        // `NODE_HEIGHT` (`workflow/layout.rs`) gives a box exactly one
+        // interior row shared with the status text, so this stays short
+        // enough to survive `truncate_spans` unclipped — the truncation path
+        // itself is covered by `narrow_bands_are_truncated_with_an_ellipsis_not_hard_clipped`.
+        if let Some(node) = view.nodes.first_mut() {
+            node.growth_notice = Some("cap 4".to_string());
+        }
+        let area = Rect::new(0, 0, 100, 30);
+        let screen = screen_of(&view, area);
+        assert!(
+            screen.contains("growth limited · max_nodes 12 reached"),
+            "{screen}"
+        );
+        assert!(screen.contains("cap 4"), "{screen}");
+    }
+
+    /// Selection is carried by instance path (`carried_selection`), which is
+    /// what keeps it stable when expansion appends new nodes to the graph
+    /// rather than reordering the existing ones — the WS-G "selection
+    /// survives appending five nodes to a graph" case.
+    #[test]
+    fn selection_survives_appending_expansion_nodes() {
+        let graph = diamond();
+        // Wide enough that six nodes sharing "right"'s next layer (the
+        // original "end" plus five expansion children) never need clipping —
+        // this test is about selection stability, not the graph band's width
+        // budget, which `a_short_graph_band_drops_boxes_instead_of_drawing_off_screen`
+        // already covers.
+        let area = Rect::new(0, 0, 220, 40);
+        let previous = {
+            let mut view = view_of(&graph, area);
+            view.selected = Some(RunNodeIdx(2)); // "right"
+            view
+        };
+
+        let mut grown = graph.clone();
+        for n in 1..=5u8 {
+            let child_idx = 3 + n as usize;
+            let mut child = test_node(child_idx, "right/worker");
+            child.path = InstancePath::new(format!("right/worker/{n}"));
+            child.parent = Some(RunNodeIdx(2));
+            child.depth = 1;
+            grown.nodes.push(child);
+            // The `sequence` parent→child edge every accepted expansion child
+            // gets (§4 D4), so the appended nodes stay part of the same
+            // connected graph the layout places rather than becoming stray
+            // disconnected roots.
+            grown.edges.push(test_edge(2, child_idx));
+        }
+        let next = view_of(&grown, area);
+
+        assert_eq!(next.nodes.len(), 9);
+        assert_eq!(
+            carried_selection(&previous, &next),
+            Some(RunNodeIdx(2)),
+            "the proposing node's selection must survive its own expansion"
+        );
     }
 }

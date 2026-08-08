@@ -9,14 +9,37 @@ use crate::workflow::model::{
     CheckpointKind, Demand, EdgeKind, Evidence, InstancePath, KvdagVersionId, NodeKey, NodeStatus,
     RunEventKind, RunId, RunStatus, Succession, WorkflowId,
 };
-use crate::workflow::tier::Tier;
+use crate::workflow::tier::{NodeHistory, Tier};
 
 use super::records::{self, parse_record_id, record_id_to_string};
 use super::{
-    parse_demand, parse_edge_kind, parse_evidence, parse_node_status, parse_run_status,
-    parse_succession, query_error, StoreError, VersionOrigin, WorkflowStore, TABLE_KVDAG_VERSION,
-    TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
+    node_status_str, parse_demand, parse_edge_kind, parse_evidence, parse_node_status,
+    parse_run_status, parse_succession, query_error, run_status_str, StoreError, VersionOrigin,
+    WorkflowStore, TABLE_KVDAG_VERSION, TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
 };
+
+/// How many of a workflow's most recent closed runs
+/// [`WorkflowStore::node_history`] measures by default — §7.3's "last N runs".
+/// Ten is enough for §7.3 step 3's "≥ 3 prior runs" clause to have settled and
+/// short enough that a node's recent behaviour is not diluted by a graph shape
+/// it no longer has.
+pub const DEFAULT_NODE_HISTORY_RUNS: usize = 10;
+
+/// The `workflow_run.status` values that close a run. A run still in flight is
+/// not a measurement.
+const CLOSED_RUN_STATUSES: &[RunStatus] = &[
+    RunStatus::Succeeded,
+    RunStatus::Failed,
+    RunStatus::Cancelled,
+];
+
+/// The `run_node.status` values that count as one measured execution of a node.
+///
+/// Deliberately narrower than the store's terminal set: `skipped`, `cancelled`,
+/// and `restored` close a node without the node having run, and counting them
+/// would read as first-pass failures — inventing evidence of poor performance
+/// out of a dead branch.
+const MEASURED_NODE_STATUSES: &[NodeStatus] = &[NodeStatus::Succeeded, NodeStatus::Failed];
 
 /// One `workflow` row, projected for listing.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +110,11 @@ pub struct RunNodeRecord {
     /// to consult, and reporting every node as `Standard` would misreport it.
     pub demand: Demand,
     pub attempt: u8,
+    /// Why [`Self::model`]/[`Self::effort`] read what they read — the §7.3
+    /// reason string for `auto`, empty for a fixed tier. Written verbatim from
+    /// the run's assignment table, so a finished run can still be explained
+    /// (`06-phase2-plan.md` §4 D9).
+    pub assignment_reason: String,
     pub pane_id: Option<String>,
     pub terminal_id: Option<String>,
     pub agent_session_id: Option<String>,
@@ -467,6 +495,111 @@ impl WorkflowStore {
         rows.into_iter().map(checkpoint_record).collect()
     }
 
+    /// One node key's measured record across a workflow's most recent closed
+    /// runs — the aggregation `tier::resolve`'s `auto` policy has always
+    /// described (`04-kvdag-and-execution.md` §7.3) and never had.
+    ///
+    /// Windowed to the `window` most recently *started* runs that reached a
+    /// closed status. Pruning is expected, not exceptional: `prune_run_history`
+    /// removes whole runs, so `runs` counts the observations that survive and
+    /// a fully pruned workflow reports an all-zero record — which
+    /// [`crate::workflow::tier::resolve`] already documents as behaving like no
+    /// history at all.
+    ///
+    /// Three of the five fields are honest about being dormant
+    /// (`06-phase2-plan.md` §4 D8):
+    ///
+    /// - `watchdog_interventions` reads `run_node.watchdog_interventions`, the
+    ///   column Phase 4 will write. It is `0` until then.
+    /// - `mean_tokens` reads `total_tokens`, which
+    ///   `model.rs` documents as permanently `0`. It is carried because the
+    ///   field exists and is deliberately **not** consulted by `resolve_auto`.
+    /// - `first_pass_successes`/`schema_failures` are the two that are truthful
+    ///   today, written by `write_run_node` and `write_checkpoint`.
+    pub async fn node_history(
+        &self,
+        workflow: &WorkflowId,
+        node_key: &NodeKey,
+        window: usize,
+    ) -> Result<NodeHistory, StoreError> {
+        let mut history = NodeHistory::default();
+        if window == 0 {
+            return Ok(history);
+        }
+        let workflow_id = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow id: {workflow}")))?;
+
+        let closed: Vec<String> = CLOSED_RUN_STATUSES
+            .iter()
+            .map(|status| run_status_str(*status).to_string())
+            .collect();
+        // `LIMIT` takes a literal, so the window is applied in Rust; the same
+        // shape `prune_run_history` uses. `ORDER BY` needs its sort key in the
+        // projection, hence `SELECT *`.
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM workflow_run WHERE workflow = $workflow \
+                 AND status IN $closed ORDER BY started_at DESC LIMIT 1000000",
+            )
+            .bind(("workflow", workflow_id))
+            .bind(("closed", closed))
+            .await
+            .map_err(query_error)?;
+        let run_rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
+
+        let measured: Vec<String> = MEASURED_NODE_STATUSES
+            .iter()
+            .map(|status| node_status_str(*status).to_string())
+            .collect();
+        let mut total_tokens: u64 = 0;
+        // Most recent first, so the §7.3 step 4 "last two runs" window is the
+        // head of this list rather than a second query.
+        let mut first_pass_by_recency: Vec<bool> = Vec::new();
+
+        for run_row in run_rows.into_iter().take(window) {
+            let mut response = self
+                .db
+                .query(
+                    "SELECT * FROM run_node WHERE run = $run AND node_key = $node_key \
+                     AND status IN $measured ORDER BY instance_path",
+                )
+                .bind(("run", run_row.id.clone()))
+                .bind(("node_key", node_key.to_string()))
+                .bind(("measured", measured.clone()))
+                .await
+                .map_err(query_error)?;
+            let node_rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
+            for row in node_rows {
+                history.runs = history.runs.saturating_add(1);
+                if row.first_pass_succeeded {
+                    history.first_pass_successes = history.first_pass_successes.saturating_add(1);
+                }
+                history.schema_failures = history
+                    .schema_failures
+                    .saturating_add(u32::try_from(row.schema_failures).unwrap_or(u32::MAX));
+                history.watchdog_interventions = history
+                    .watchdog_interventions
+                    .saturating_add(u32::try_from(row.watchdog_interventions).unwrap_or(u32::MAX));
+                total_tokens =
+                    total_tokens.saturating_add(u64::try_from(row.total_tokens).unwrap_or(0));
+                first_pass_by_recency.push(row.first_pass_succeeded);
+            }
+        }
+
+        history.mean_tokens = if history.runs == 0 {
+            0
+        } else {
+            total_tokens / u64::from(history.runs)
+        };
+        history.recent_first_pass_failures = first_pass_by_recency
+            .iter()
+            .take(2)
+            .filter(|succeeded| !**succeeded)
+            .count() as u8;
+        Ok(history)
+    }
+
     pub async fn get_run_summary(
         &self,
         run: &RunId,
@@ -580,6 +713,7 @@ fn run_node_record(row: records::RunNodeRow) -> Result<RunNodeRecord, StoreError
         effort: row.effort,
         demand: parse_demand(&row.demand)?,
         attempt: row.attempt as u8,
+        assignment_reason: row.assignment_reason,
         pane_id: row.pane_id,
         terminal_id: row.terminal_id,
         agent_session_id: row.agent_session_id,

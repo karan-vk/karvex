@@ -5,12 +5,15 @@
 //! node's output schema before the node may succeed, and idle with no valid
 //! result never completes a node.
 
+use std::collections::BTreeMap;
+
 use sha2::{Digest, Sha256};
 
 use crate::detect::AgentState;
+use crate::workflow::engine::expand::ExpandProposal;
 use crate::workflow::model::{
-    Evidence, InstancePath, NodeResult, NodeStatus, OutputSchema, RawJson, RunGraph, RunNodeIdx,
-    Runner, Succession,
+    Evidence, InstancePath, NodeKey, NodeResult, NodeStatus, OutputSchema, RawJson, RunGraph,
+    RunNodeIdx, Runner, Succession,
 };
 
 /// `node_checkpoint.summary` budget (`03-storage-schema.md` §7). Over-budget
@@ -28,7 +31,23 @@ pub const SUSTAINED_IDLE_TICKS: u16 = 3;
 /// The ordinal of a node's first reported result. The first invalid result
 /// earns the single corrective re-prompt; every later one goes straight to
 /// `NeedsAttention`.
-const FIRST_REPORT: u8 = 1;
+///
+/// Also the `NodeHistory` sense of "first pass" (`06-phase2-plan.md` §4 D8): a
+/// node that succeeded on this ordinal succeeded without the correction.
+pub const FIRST_REPORT: u8 = 1;
+
+/// The one top-level key a reported result may carry that is **not** part of
+/// the result (`06-phase2-plan.md` §4 D6, `04-kvdag-and-execution.md` §3.4).
+///
+/// `check` implements only `type`/`required`/`properties`/`items` and never
+/// rejects unknown top-level keys, so a result carrying `expand` would validate
+/// by accident and then flow into [`NodeResult::payload`], [`summarise`],
+/// [`digest`], and the persisted checkpoint — and the digest is what Phase 3's
+/// restore reads for cross-version compatibility. So the key is lifted out by
+/// [`strip_expand`] **before** validation and **before** [`node_result`], and
+/// the node prompt/output contract is unchanged: `expand` is an *optional
+/// additional* key that never reaches the schema, the payload, or the digest.
+pub const EXPAND_KEY: &str = "expand";
 
 /// What the completion gate decided about one reported result.
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +196,171 @@ pub fn validate(schema: &OutputSchema, result: &RawJson) -> Result<(), Vec<Schem
     }
 }
 
+/// Lifts the optional top-level [`EXPAND_KEY`] out of a reported result.
+///
+/// Returns the result the completion gate actually sees and the raw `expand`
+/// value, if there was one. A non-object result (an array, a scalar, `null`)
+/// cannot carry the key and is handed back untouched, so this is a no-op for
+/// every result shape that existed before Phase 2.
+pub fn strip_expand(result: &RawJson) -> (RawJson, Option<serde_json::Value>) {
+    let Some(fields) = result.0.as_object() else {
+        return (result.clone(), None);
+    };
+    if !fields.contains_key(EXPAND_KEY) {
+        return (result.clone(), None);
+    }
+    let mut stripped = fields.clone();
+    let lifted = stripped.remove(EXPAND_KEY);
+    (RawJson(serde_json::Value::Object(stripped)), lifted)
+}
+
+/// Parses a lifted `expand` value into proposals.
+///
+/// A malformed value is a **schema-class** violation of the result — the node
+/// said something the contract does not allow — so the violations come back in
+/// the same [`SchemaViolation`] vocabulary the output schema uses, each naming
+/// the offending field, and the caller spends the node's single corrective
+/// re-prompt on them exactly as it would on a schema failure (§4 D6).
+///
+/// The accepted shape is an array of objects: a non-empty string `template`, an
+/// optional string `label` (defaulting to the template key), an optional object
+/// `inputs` whose values are strings, and an optional integer `count` of at
+/// least 1. Unknown keys inside an entry are ignored, matching [`check`]'s own
+/// tolerance of unknown keys.
+pub fn parse_expand(
+    value: &serde_json::Value,
+) -> Result<Vec<ExpandProposal>, Vec<SchemaViolation>> {
+    let Some(entries) = value.as_array() else {
+        return Err(vec![SchemaViolation::new(
+            EXPAND_KEY,
+            format!("expected type array, found {}", type_name(value)),
+        )]);
+    };
+
+    let mut violations = Vec::new();
+    let mut proposals = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let at = index_path(EXPAND_KEY, index);
+        let Some(fields) = entry.as_object() else {
+            violations.push(SchemaViolation::new(
+                &at,
+                format!("expected type object, found {}", type_name(entry)),
+            ));
+            continue;
+        };
+
+        let template = match fields.get("template") {
+            None => {
+                violations.push(SchemaViolation::new(
+                    &at,
+                    "missing required field \"template\"",
+                ));
+                continue;
+            }
+            Some(serde_json::Value::String(key)) if !key.trim().is_empty() => {
+                NodeKey::new(key.as_str())
+            }
+            Some(serde_json::Value::String(_)) => {
+                violations.push(SchemaViolation::new(
+                    &join(&at, "template"),
+                    "expected a non-empty node key",
+                ));
+                continue;
+            }
+            Some(other) => {
+                violations.push(SchemaViolation::new(
+                    &join(&at, "template"),
+                    format!("expected type string, found {}", type_name(other)),
+                ));
+                continue;
+            }
+        };
+
+        let label = match fields.get("label") {
+            None | Some(serde_json::Value::Null) => template.as_str().to_string(),
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(other) => {
+                violations.push(SchemaViolation::new(
+                    &join(&at, "label"),
+                    format!("expected type string, found {}", type_name(other)),
+                ));
+                continue;
+            }
+        };
+
+        let mut inputs = BTreeMap::new();
+        match fields.get("inputs") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Object(map)) => {
+                for (name, supplied) in map {
+                    match supplied.as_str() {
+                        Some(text) => {
+                            inputs.insert(name.clone(), text.to_string());
+                        }
+                        None => violations.push(SchemaViolation::new(
+                            &join(&join(&at, "inputs"), name),
+                            format!("expected type string, found {}", type_name(supplied)),
+                        )),
+                    }
+                }
+            }
+            Some(other) => {
+                violations.push(SchemaViolation::new(
+                    &join(&at, "inputs"),
+                    format!("expected type object, found {}", type_name(other)),
+                ));
+                continue;
+            }
+        }
+
+        let count = match fields.get("count") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(supplied) => match supplied.as_u64().filter(|count| *count >= 1) {
+                Some(count) => match u16::try_from(count) {
+                    Ok(count) => Some(count),
+                    Err(_) => {
+                        violations.push(SchemaViolation::new(
+                            &join(&at, "count"),
+                            format!("expected an integer of at most {}", u16::MAX),
+                        ));
+                        continue;
+                    }
+                },
+                None => {
+                    violations.push(SchemaViolation::new(
+                        &join(&at, "count"),
+                        "expected an integer of at least 1",
+                    ));
+                    continue;
+                }
+            },
+        };
+
+        proposals.push(ExpandProposal {
+            template,
+            label,
+            inputs,
+            count,
+        });
+    }
+
+    if violations.is_empty() {
+        Ok(proposals)
+    } else {
+        Err(violations)
+    }
+}
+
+/// Whether a violation came from the [`EXPAND_KEY`] channel rather than from the
+/// node's output schema. The two are reported together but phrased apart, so a
+/// node told its `expand` is malformed is not also told its payload failed a
+/// schema that never saw the key.
+fn is_expand_violation(violation: &SchemaViolation) -> bool {
+    violation.at == EXPAND_KEY
+        || violation.at.starts_with(&format!("{EXPAND_KEY}["))
+        || violation.at.starts_with(&format!("{EXPAND_KEY}."))
+}
+
 /// Applies the completion contract to one reported result.
 ///
 /// `report` is the 1-based ordinal of this reported result for the node, not
@@ -189,15 +373,36 @@ pub fn accept(
     evidence: Evidence,
     report: u8,
 ) -> Completion {
-    match validate(schema, result) {
-        Ok(()) => Completion::Accepted(Box::new(node_result(result, evidence))),
-        Err(errors) if report <= FIRST_REPORT => Completion::Reprompt { errors },
-        Err(errors) => Completion::NeedsAttention {
-            reason: format!(
-                "result.json still fails output-schema validation after one corrective re-prompt: {}",
-                describe(&errors)
-            ),
-        },
+    accept_with(schema, result, evidence, report, Vec::new())
+}
+
+/// [`accept`] with the schema-class violations the output schema cannot see.
+///
+/// The one producer of `extra` is [`parse_expand`]: the schema never sees
+/// `expand`, so a malformed proposal has to be carried in beside the schema's
+/// own verdict rather than discovered by it. Both kinds settle the same way —
+/// one corrective re-prompt, then `NeedsAttention` — because both are the node
+/// failing to say what the contract requires.
+pub fn accept_with(
+    schema: &OutputSchema,
+    result: &RawJson,
+    evidence: Evidence,
+    report: u8,
+    extra: Vec<SchemaViolation>,
+) -> Completion {
+    let mut errors = validate(schema, result).err().unwrap_or_default();
+    errors.extend(extra);
+    if errors.is_empty() {
+        return Completion::Accepted(Box::new(node_result(result, evidence)));
+    }
+    if report <= FIRST_REPORT {
+        return Completion::Reprompt { errors };
+    }
+    Completion::NeedsAttention {
+        reason: format!(
+            "result.json still fails output-schema validation after one corrective re-prompt: {}",
+            describe(&errors)
+        ),
     }
 }
 
@@ -221,10 +426,23 @@ pub fn missing_result(signal: Signal) -> Completion {
 
 /// The single corrective re-prompt, quoting the violations and the schema's own
 /// required fields so the node is told exactly what to fill in.
+///
+/// A malformed `expand` is named as its own fault rather than folded into the
+/// output-schema sentence: the schema never sees the key (§4 D6), so telling a
+/// node its payload failed `./output_schema.json` when only `expand` is wrong
+/// would send it looking in the wrong file.
 pub fn corrective_prompt(schema: &OutputSchema, errors: &[SchemaViolation]) -> String {
-    let mut text = String::from(
-        "Your result.json does not validate against ./output_schema.json. Fix these and re-run `kvx workflow node complete`:\n",
-    );
+    let expand_failed = errors.iter().any(is_expand_violation);
+    let schema_failed = errors.iter().any(|error| !is_expand_violation(error));
+
+    let mut text = String::new();
+    if schema_failed {
+        text.push_str("Your result.json does not validate against ./output_schema.json. ");
+    }
+    if expand_failed {
+        text.push_str("Your result.json's `expand` field is malformed. ");
+    }
+    text.push_str("Fix these and re-run `kvx workflow node complete`:\n");
     for error in errors {
         text.push_str("- ");
         text.push_str(&error.quote());
@@ -235,6 +453,13 @@ pub fn corrective_prompt(schema: &OutputSchema, errors: &[SchemaViolation]) -> S
         text.push_str("Required fields: ");
         text.push_str(&required.join(", "));
         text.push('\n');
+    }
+    if expand_failed {
+        text.push_str(
+            "`expand` is optional. When present it must be an array of objects, each with a \
+             non-empty string \"template\", an optional string \"label\", an optional object \
+             \"inputs\" whose values are strings, and an optional integer \"count\" of at least 1.\n",
+        );
     }
     text
 }
@@ -783,6 +1008,152 @@ mod tests {
         let summary = summarise(&payload);
         assert_eq!(summary.chars().count(), SUMMARY_BUDGET);
         assert!(summary.ends_with(TRUNCATION_MARKER));
+    }
+
+    /// §4 D6: the gate must never see the key, and every result shape that
+    /// existed before Phase 2 must come through untouched.
+    #[test]
+    fn strip_expand_lifts_only_the_expand_key() {
+        let (stripped, lifted) = strip_expand(&report(r#"{"plan":"x","expand":[{"a":1}]}"#));
+        assert_eq!(stripped.0, json(r#"{"plan":"x"}"#));
+        assert_eq!(lifted, Some(json(r#"[{"a":1}]"#)));
+
+        for untouched in [
+            r#"{"plan":"x"}"#,
+            r#"{}"#,
+            r#"[1,2]"#,
+            r#""a string""#,
+            r#"null"#,
+        ] {
+            let (stripped, lifted) = strip_expand(&report(untouched));
+            assert_eq!(stripped.0, json(untouched), "unchanged for {untouched}");
+            assert_eq!(lifted, None, "nothing lifted from {untouched}");
+        }
+
+        // An explicit null still counts as the key being present: the node said
+        // something about `expand`, and what it said has to be judged.
+        let (stripped, lifted) = strip_expand(&report(r#"{"plan":"x","expand":null}"#));
+        assert_eq!(stripped.0, json(r#"{"plan":"x"}"#));
+        assert_eq!(lifted, Some(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn parse_expand_reads_the_documented_shape_with_its_defaults() {
+        let proposals = parse_expand(&json(
+            r#"[
+                {"template":"worker"},
+                {"template":"worker","label":"deep dive","inputs":{"focus":"api"},"count":3}
+            ]"#,
+        ))
+        .expect("a well-formed expand parses");
+
+        assert_eq!(proposals.len(), 2);
+        assert_eq!(proposals[0].template, NodeKey::new("worker"));
+        assert_eq!(
+            proposals[0].label, "worker",
+            "an omitted label falls back to the template key"
+        );
+        assert!(proposals[0].inputs.is_empty());
+        assert_eq!(proposals[0].count, None);
+
+        assert_eq!(proposals[1].label, "deep dive");
+        assert_eq!(
+            proposals[1].inputs.get("focus").map(String::as_str),
+            Some("api")
+        );
+        assert_eq!(proposals[1].count, Some(3));
+
+        assert_eq!(
+            parse_expand(&json("[]")).expect("an empty array is well formed"),
+            Vec::new()
+        );
+    }
+
+    /// A malformed `expand` is answered in the schema vocabulary, and every
+    /// violation names the field it is about — otherwise the node's one
+    /// corrective re-prompt is spent telling it nothing it can act on.
+    #[test]
+    fn every_malformed_expand_names_the_field_it_is_about() {
+        let cases = [
+            (r#"{"template":"w"}"#, "expand"),
+            (r#"[3]"#, "expand[0]"),
+            (r#"[{}]"#, "expand[0]"),
+            (r#"[{"template":7}]"#, "expand[0].template"),
+            (r#"[{"template":"  "}]"#, "expand[0].template"),
+            (r#"[{"template":"w","label":7}]"#, "expand[0].label"),
+            (r#"[{"template":"w","inputs":[]}]"#, "expand[0].inputs"),
+            (
+                r#"[{"template":"w","inputs":{"k":7}}]"#,
+                "expand[0].inputs.k",
+            ),
+            (r#"[{"template":"w","count":0}]"#, "expand[0].count"),
+            (r#"[{"template":"w","count":-1}]"#, "expand[0].count"),
+            (r#"[{"template":"w","count":99999}]"#, "expand[0].count"),
+            (r#"[{"template":"w"},{"label":"x"}]"#, "expand[1]"),
+        ];
+        for (raw, at) in cases {
+            let errors = parse_expand(&json(raw)).expect_err("malformed: {raw}");
+            assert!(
+                errors.iter().any(|error| error.at == at),
+                "{raw} must report a violation at {at}, got {errors:?}"
+            );
+            assert!(
+                errors.iter().all(|error| !error.message.is_empty()),
+                "{raw} must say what is wrong"
+            );
+        }
+    }
+
+    /// The schema never sees `expand`, so a node whose only fault is the
+    /// proposal must not be sent looking in `./output_schema.json`.
+    #[test]
+    fn the_corrective_prompt_blames_expand_only_when_expand_is_what_failed() {
+        let schema = schema(
+            r#"{"type":"object","required":["plan"],"properties":{"plan":{"type":"string"}}}"#,
+        );
+
+        let expand_only = parse_expand(&json(r#""nope""#)).expect_err("malformed");
+        let text = corrective_prompt(&schema, &expand_only);
+        assert!(text.contains("`expand` field is malformed"));
+        assert!(
+            !text.contains("does not validate against ./output_schema.json"),
+            "the payload did not fail a schema that never saw the key"
+        );
+        assert!(text.contains("\"template\""), "the contract is restated");
+
+        let schema_only = validate(&schema, &report(r#"{"notes":"oops"}"#)).expect_err("invalid");
+        let text = corrective_prompt(&schema, &schema_only);
+        assert!(text.contains("does not validate against ./output_schema.json"));
+        assert!(!text.contains("`expand`"));
+
+        let mut both = schema_only;
+        both.extend(expand_only);
+        let text = corrective_prompt(&schema, &both);
+        assert!(text.contains("does not validate against ./output_schema.json"));
+        assert!(text.contains("`expand` field is malformed"));
+    }
+
+    #[test]
+    fn accept_with_settles_a_non_schema_violation_exactly_like_a_schema_one() {
+        let schema = schema(r#"{"type":"object","required":["plan"]}"#);
+        let valid = report(r#"{"plan":"ship it"}"#);
+        let extra = vec![SchemaViolation::new(
+            "expand",
+            "expected type array, found string",
+        )];
+
+        assert!(matches!(
+            accept_with(&schema, &valid, Evidence::SelfReport, 1, extra.clone()),
+            Completion::Reprompt { .. }
+        ));
+        assert!(matches!(
+            accept_with(&schema, &valid, Evidence::SelfReport, 2, extra),
+            Completion::NeedsAttention { .. }
+        ));
+        assert!(matches!(
+            accept_with(&schema, &valid, Evidence::SelfReport, 1, Vec::new()),
+            Completion::Accepted(_)
+        ));
     }
 
     #[test]

@@ -170,6 +170,10 @@ pub struct RunNodeRow {
     pub blocker: Option<Json>,
     pub restored_from: Option<RecordId>,
     pub watchdog_interventions: i64,
+    // ── added by migrations/0002_growth_and_history.surql ──
+    pub assignment_reason: String,
+    pub first_pass_succeeded: bool,
+    pub schema_failures: i64,
 }
 
 /// `run_edge` is `TYPE RELATION FROM run_node TO run_node`.

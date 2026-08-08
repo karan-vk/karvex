@@ -5,11 +5,12 @@
 //! the fact and replayed identically
 //! (`docs/design/workflow-builder/04-kvdag-and-execution.md` §7).
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::workflow::model::Demand;
+use crate::workflow::model::{Demand, NodeKey};
 
 /// The run's cost/quality tier. `workflow_run.tier` persists these strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -176,8 +177,22 @@ pub struct NodeHistory {
     pub recent_first_pass_failures: u8,
 }
 
+/// Every node key's measured record for one workflow, as of run start.
+///
+/// The alias lives in this pure module rather than in the store because
+/// `graph::resolve_assignments` compiles unconditionally while
+/// `store::queries` is behind `#[cfg(feature = "workflow")]` — a type declared
+/// inside the gated store cannot appear in an unconditional signature
+/// (`06-phase2-plan.md` §3 frozen interface 5). The store owns the *query* that
+/// fills it (`queries::node_history`), not the type. An absent key behaves like
+/// an all-zero record, which is what `resolve` already documents.
+pub type HistoryIndex = BTreeMap<NodeKey, NodeHistory>;
+
 impl NodeHistory {
-    fn first_pass_success_rate(&self) -> f64 {
+    /// `pub(crate)` because the store's aggregation test asserts that what
+    /// `queries::node_history` builds reads back the rate the runs actually
+    /// describe (`06-phase2-plan.md` WS-C "Tested").
+    pub(crate) fn first_pass_success_rate(&self) -> f64 {
         if self.runs == 0 {
             return 0.0;
         }
@@ -237,6 +252,43 @@ fn effort_for(rung: Rung, demand: Demand) -> Effort {
     }
 }
 
+/// §7.3 step 3: a `Standard` node with a strong track record drops to sonnet.
+///
+/// Split out of [`resolve_auto`] so [`auto_reason`] can say *which* steps fired
+/// without restating the policy — a second copy of these predicates would be
+/// exactly the "two agreeing resolvers" `06-phase2-plan.md` §4 D9 removes.
+fn downgrades_standard(demand: Demand, history: &NodeHistory) -> bool {
+    demand == Demand::Standard && history.runs >= 3 && history.first_pass_success_rate() >= 0.8
+}
+
+/// §7.3 step 4: repeated first-pass failure or heavy watchdog use escalates one
+/// model step and one effort step.
+///
+/// `watchdog_interventions` has no writer before Phase 4 (`06-phase2-plan.md`
+/// §4 D8), so today this predicate is driven entirely by
+/// `recent_first_pass_failures`.
+fn escalates(history: &NodeHistory) -> bool {
+    history.recent_first_pass_failures >= 2 || history.watchdog_interventions_per_run() >= 2.0
+}
+
+/// The `auto` policy's reason string, persisted to `run_node.assignment_reason`
+/// so a finished run can still be explained (§7.3's closing paragraph,
+/// `06-phase2-plan.md` §4 D9).
+///
+/// Reads the same predicates [`resolve_auto`] applies, so the reason cannot
+/// describe a step the assignment did not take. The fixed tiers have no reason
+/// string at all — their table row *is* the explanation — which is why this is
+/// keyed on `demand`/`history` rather than on [`Tier`].
+pub fn auto_reason(demand: Demand, history: Option<&NodeHistory>) -> &'static str {
+    let history = history.copied().unwrap_or_default();
+    match (downgrades_standard(demand, &history), escalates(&history)) {
+        (true, true) => "auto/downgrade-standard+escalate",
+        (true, false) => "auto/downgrade-standard",
+        (false, true) => "auto/escalate",
+        (false, false) => "auto/high-row",
+    }
+}
+
 /// §7.3's deterministic `auto` policy, numbered to match the doc's steps.
 fn resolve_auto(demand: Demand, history: Option<&NodeHistory>) -> Assignment {
     // 1. Start from the high row.
@@ -250,7 +302,7 @@ fn resolve_auto(demand: Demand, history: Option<&NodeHistory>) -> Assignment {
 
     // 3. Downgrade Standard -> sonnet (effort high) on a strong sonnet track
     // record: >= 3 prior runs at >= 80% first-pass success.
-    if demand == Demand::Standard && history.runs >= 3 && history.first_pass_success_rate() >= 0.8 {
+    if downgrades_standard(demand, &history) {
         model = ModelAlias::Sonnet;
         effort = Effort::High;
     }
@@ -258,7 +310,7 @@ fn resolve_auto(demand: Demand, history: Option<&NodeHistory>) -> Assignment {
     // 4. Upgrade one model step and one effort step on repeated first-pass
     // failure or heavy watchdog use, evaluated against the current
     // (possibly already-downgraded) assignment.
-    if history.recent_first_pass_failures >= 2 || history.watchdog_interventions_per_run() >= 2.0 {
+    if escalates(&history) {
         model = model.escalate();
         effort = effort.escalate();
     }
@@ -516,6 +568,72 @@ mod tests {
                 model: ModelAlias::Fable,
                 effort: Effort::Max,
             }
+        );
+    }
+
+    #[test]
+    fn the_auto_reason_names_exactly_the_steps_that_fired() {
+        let none = NodeHistory::default();
+        assert_eq!(auto_reason(Demand::Standard, None), "auto/high-row");
+        assert_eq!(auto_reason(Demand::Standard, Some(&none)), "auto/high-row");
+
+        let strong = NodeHistory {
+            runs: 4,
+            first_pass_successes: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            auto_reason(Demand::Standard, Some(&strong)),
+            "auto/downgrade-standard"
+        );
+        assert_eq!(
+            auto_reason(Demand::Peak, Some(&strong)),
+            "auto/high-row",
+            "step 3 is Standard-only"
+        );
+
+        let failing = NodeHistory {
+            runs: 5,
+            recent_first_pass_failures: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            auto_reason(Demand::Critical, Some(&failing)),
+            "auto/escalate"
+        );
+
+        let both = NodeHistory {
+            runs: 4,
+            first_pass_successes: 4,
+            recent_first_pass_failures: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            auto_reason(Demand::Standard, Some(&both)),
+            "auto/downgrade-standard+escalate"
+        );
+    }
+
+    #[test]
+    fn the_auto_reason_never_describes_a_step_the_assignment_did_not_take() {
+        let watchdogged = NodeHistory {
+            runs: 2,
+            watchdog_interventions: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            auto_reason(Demand::Standard, Some(&watchdogged)),
+            "auto/escalate"
+        );
+        assert_eq!(
+            resolve(Tier::Auto, Demand::Standard, Some(&watchdogged)),
+            Assignment {
+                // Standard's high row is (opus, high); escalation raises both
+                // and step 6 caps the model at Standard's max row, opus.
+                model: ModelAlias::Opus,
+                effort: Effort::Xhigh,
+            },
+            "the escalation the reason claims is the one resolve applied"
         );
     }
 }

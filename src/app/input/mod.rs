@@ -47,6 +47,7 @@ mod selection;
 mod settings;
 mod sidebar;
 mod terminal;
+mod workflow_launch;
 
 pub(crate) use self::{
     lease::{ConsumedInputLease, ForwardedInputLease, InputLeaseKey, InputLeaseTable, RepeatPlan},
@@ -120,6 +121,7 @@ impl App {
                     handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
                 }
                 Mode::WorkflowDag => self.handle_workflow_dag_key(key_event),
+                Mode::WorkflowLaunch => self.handle_workflow_launch_key(key_event),
                 Mode::Terminal => unreachable!(),
             },
         }
@@ -252,6 +254,9 @@ impl App {
                 }
                 self.insert_workflow_dag_steer_text(text);
                 true
+            }
+            Mode::WorkflowLaunch => {
+                workflow_launch::insert_workflow_launch_text(&mut self.state, text)
             }
             Mode::Copy => {
                 let Some(prompt) = self
@@ -880,6 +885,10 @@ pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
         Mode::Navigator => state.navigator.search_focused,
         Mode::KeybindHelp => state.keybind_help.search_focused,
         Mode::WorkflowDag => state.view.dag.steer.is_some(),
+        Mode::WorkflowLaunch => matches!(
+            state.view.workflow_launch.focus,
+            crate::app::state::WorkflowLaunchFocus::Arg(_)
+        ),
         Mode::Copy => state
             .copy_mode
             .as_ref()
@@ -1199,6 +1208,9 @@ mod tests {
             usage: crate::workflow::model::NodeUsage::default(),
             duration_ms: 0,
             delivery_failure: None,
+            growth_notice: None,
+            depth: 0,
+            parent: None,
             summary: None,
             blocker: None,
             // A `Running` node has a pane by construction; the steer affordance

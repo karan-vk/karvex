@@ -4364,15 +4364,10 @@ impl HeadlessServer {
             changed = true;
         }
 
-        if self
-            .app
-            .toast_deadline
-            .is_some_and(|deadline| now >= deadline)
-        {
-            self.app.toast_deadline = None;
-            self.app.state.toast = None;
-            changed = true;
-        }
+        // Same expiry rule as `App::handle_scheduled_tasks`, including the
+        // notice-queue pop: the headless loop is the production path for a
+        // workflow run, so a queued growth rejection has to surface here too.
+        changed |= self.app.expire_toast_or_show_next(now);
 
         if self
             .app

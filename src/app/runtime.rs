@@ -296,11 +296,9 @@ impl App {
             changed = true;
         }
 
-        if self.toast_deadline.is_some_and(|deadline| now >= deadline) {
-            self.toast_deadline = None;
-            self.state.toast = None;
-            changed = true;
-        }
+        // Expiry now also drains the notice queue, so a burst of workflow
+        // notices surfaces one after another instead of the last one winning.
+        changed |= self.expire_toast_or_show_next(now);
 
         if self
             .state

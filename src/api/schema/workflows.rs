@@ -247,6 +247,102 @@ pub struct WorkflowNodeReportParams {
     pub result: serde_json::Value,
 }
 
+// ── workflow.node.expand ───────────────────────────────────────────────────
+
+/// A node proposing new nodes
+/// (`docs/design/workflow-builder/04-kvdag-and-execution.md` §3.4).
+///
+/// Token-authenticated exactly like [`WorkflowNodeReportParams`]: an expand
+/// proposal is a node speaking, not an operator. A *rejected* proposal is a
+/// successful response carrying the rejection — the run continues; only a bad
+/// run/path/token or a closed run is an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowNodeExpandParams {
+    pub run_id: String,
+    /// The proposing node's instance path.
+    pub path: String,
+    pub token: String,
+    /// The kvdag key of the template to instantiate.
+    pub template: String,
+    #[serde(default)]
+    pub label: String,
+    /// Slot overrides for the template's `prompt_template`. A key naming no
+    /// declared slot is rejected rather than ignored: this is an override
+    /// channel over the one validated renderer, never a second unvalidated one.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub inputs: HashMap<String, String>,
+    /// How many children to instantiate; defaults to 1. `u32` on the wire and
+    /// `u16` internally, so the handler narrows with `u16::try_from` and
+    /// rejects an out-of-range value rather than truncating it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+}
+
+/// Which growth guardrail was reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowGrowthLimitKind {
+    /// The proposing node's own `expand_max`, counted cumulatively across every
+    /// proposal it has made in this run.
+    ExpandMax,
+    /// The run's `max_depth`, guarded as `parent.depth + 1 <= max_depth`.
+    MaxDepth,
+    /// The run's `max_nodes`, counted over every materialised node regardless
+    /// of status — a failed child does not refund budget.
+    MaxNodes,
+}
+
+/// One growth guardrail being reached, in the one shape reused by
+/// [`WorkflowRunInfo`], [`WorkflowRunNodeInfo`], the `workflow.growth.limited`
+/// event, and the CLI renderers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowGrowthLimit {
+    pub kind: WorkflowGrowthLimitKind,
+    /// The ceiling's value, so a reader does not have to look it up.
+    pub limit_value: u32,
+    pub requested: u32,
+    /// How many of `requested` were created anyway. Non-zero means partial
+    /// acceptance, which is the interesting case: the shortfall is reported
+    /// rather than silently truncated.
+    pub accepted: u32,
+    pub at_unix_ms: u64,
+    pub message: String,
+}
+
+/// Why one proposal was refused, in whole or in part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowExpandRejectionReason {
+    /// The template is not in the proposing node's `expand_allow`.
+    NotAllowed,
+    /// No kvdag node carries that key.
+    UnknownTemplate,
+    /// The key names a node that is not declared `is_template`.
+    NotATemplate,
+    ExpandMaxReached,
+    MaxDepthReached,
+    MaxNodesReached,
+    /// Partial acceptance: some children were created and the rest did not fit.
+    Truncated,
+    /// An `inputs` key naming no declared slot in the template.
+    UnknownInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowExpandRejection {
+    pub template: String,
+    pub reason: WorkflowExpandRejectionReason,
+    /// The guardrail hit, when the rejection is a limit rather than a
+    /// validation failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<WorkflowGrowthLimit>,
+    #[serde(default)]
+    pub requested: u32,
+    #[serde(default)]
+    pub accepted: u32,
+    pub message: String,
+}
+
 // ── read-model types shared by results and events ──────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -380,6 +476,20 @@ pub struct WorkflowRunInfo {
     pub nodes_done: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<serde_json::Value>,
+    /// The run's **effective** growth ceilings — the version's, narrowed by the
+    /// tier. One authority: what the run graph enforces is what the run row
+    /// persists and what this reports.
+    #[serde(default)]
+    pub max_depth: u32,
+    #[serde(default)]
+    pub max_nodes: u32,
+    /// Nodes materialised so far, counted against `max_nodes` regardless of
+    /// status.
+    #[serde(default)]
+    pub nodes_live: u32,
+    /// The run's most recent growth limit, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub growth_limited: Option<WorkflowGrowthLimit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -424,6 +534,18 @@ pub struct WorkflowRunNodeInfo {
     pub blocker: Option<serde_json::Value>,
     #[serde(default)]
     pub watchdog_interventions: u32,
+    /// Why `model`/`effort` read what they read — the `auto` tier's reason
+    /// string, empty for a fixed tier whose table row is the explanation.
+    #[serde(default)]
+    pub assignment_reason: String,
+    /// The last pane delivery the runtime refused for this node, e.g. a steer
+    /// whose keystrokes never reached the process. A shared runtime fact, so it
+    /// belongs on the API and not only in TUI state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_failure: Option<String>,
+    /// The last growth limit this node ran into as a *proposer*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub growth_limited: Option<WorkflowGrowthLimit>,
 }
 
 fn default_attempt() -> u32 {
@@ -447,10 +569,47 @@ pub struct WorkflowRunGraph {
     pub edges: Vec<WorkflowRunEdgeInfo>,
 }
 
+/// One projection of a workflow and its head document, read by **both**
+/// `workflow.get`'s human renderer and its `--json` path so the two cannot
+/// describe different field sets.
+///
+/// It arrives as a new sibling field on `ResponseResult::WorkflowGet` rather
+/// than replacing that response's existing `workflow: WorkflowSummary`:
+/// re-typing a published response field is the one change in this phase that
+/// would be wire-incompatible, and every other addition is additive
+/// self-describing JSON, which is what keeps `PROTOCOL_VERSION` where it is.
+///
+/// `description` comes from the `workflow` row, which `create_version` keeps
+/// equal to the head document — `kvdag_version` has no `description` column, so
+/// "read it from the head version" is not implementable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowDetail {
+    pub workflow: WorkflowSummary,
+    #[serde(default)]
+    pub nodes: Vec<KvdagNodeInfo>,
+    #[serde(default)]
+    pub edges: Vec<KvdagEdgeInfo>,
+    #[serde(default)]
+    pub args: Vec<WorkflowArgSpec>,
+    #[serde(default)]
+    pub versions: Vec<KvdagVersionSummary>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::schema::{Method, Request, ResponseResult, SuccessResponse};
+
+    fn growth_limit() -> WorkflowGrowthLimit {
+        WorkflowGrowthLimit {
+            kind: WorkflowGrowthLimitKind::MaxNodes,
+            limit_value: 12,
+            requested: 4,
+            accepted: 2,
+            at_unix_ms: 1_700_000_000_000,
+            message: "max_nodes 12 reached; 2 of 4 requested nodes created".into(),
+        }
+    }
 
     fn definition_document() -> WorkflowDefinitionDocument {
         WorkflowDefinitionDocument {
@@ -560,6 +719,18 @@ mod tests {
                     path: "plan".into(),
                 }),
                 "workflow.node.restart",
+            ),
+            (
+                Method::WorkflowNodeExpand(WorkflowNodeExpandParams {
+                    run_id: "workflow_run:1".into(),
+                    path: "fanout".into(),
+                    token: "node-token".into(),
+                    template: "worker".into(),
+                    label: "worker".into(),
+                    inputs: HashMap::from([("slice".to_string(), "auth".to_string())]),
+                    count: Some(4),
+                }),
+                "workflow.node.expand",
             ),
         ];
 
@@ -681,6 +852,9 @@ mod tests {
             succession,
             blocker: None,
             watchdog_interventions: 0,
+            assignment_reason: "auto: 4 prior runs at 100% first pass".into(),
+            delivery_failure: None,
+            growth_limited: None,
         }
     }
 
@@ -734,6 +908,10 @@ mod tests {
                     nodes_total: 3,
                     nodes_done: 1,
                     failure: None,
+                    max_depth: 3,
+                    max_nodes: 24,
+                    nodes_live: 3,
+                    growth_limited: None,
                 },
                 graph,
             },
@@ -782,6 +960,18 @@ mod tests {
                 result: ResponseResult::WorkflowGet {
                     workflow: workflow.clone(),
                     versions: vec![version_summary.clone()],
+                    detail: Some(WorkflowDetail {
+                        workflow: workflow.clone(),
+                        nodes: vec![sample_node_info()],
+                        edges: vec![sample_edge_info()],
+                        args: vec![WorkflowArgSpec {
+                            name: "goal".into(),
+                            required: true,
+                            default: None,
+                            description: "what to build".into(),
+                        }],
+                        versions: vec![version_summary.clone()],
+                    }),
                 },
             },
             SuccessResponse {
@@ -823,6 +1013,10 @@ mod tests {
             nodes_total: 1,
             nodes_done: 0,
             failure: Some(serde_json::json!({"reason": "cancelled by user"})),
+            max_depth: 3,
+            max_nodes: 12,
+            nodes_live: 1,
+            growth_limited: Some(growth_limit()),
         };
         let node = sample_run_node_info("plan", None);
 
@@ -868,6 +1062,122 @@ mod tests {
         }
     }
 
+    /// Every Phase 2 addition round-trips, including the partial-acceptance
+    /// case: `accepted` and `rejected` both non-empty, which is the shape a
+    /// truncated proposal produces and the one a client must not treat as an
+    /// error.
+    #[test]
+    fn workflow_node_expanded_result_round_trips_with_partial_acceptance() {
+        let response = SuccessResponse {
+            id: "req_node_expand".into(),
+            result: ResponseResult::WorkflowNodeExpanded {
+                accepted: vec!["fanout/worker/1".into(), "fanout/worker/2".into()],
+                rejected: vec![
+                    WorkflowExpandRejection {
+                        template: "worker".into(),
+                        reason: WorkflowExpandRejectionReason::Truncated,
+                        limit: Some(growth_limit()),
+                        requested: 4,
+                        accepted: 2,
+                        message: "max_nodes 12 reached; 2 of 4 requested nodes created".into(),
+                    },
+                    WorkflowExpandRejection {
+                        template: "auditor".into(),
+                        reason: WorkflowExpandRejectionReason::NotAllowed,
+                        limit: None,
+                        requested: 1,
+                        accepted: 0,
+                        message: "auditor is not in fanout's expand_allow".into(),
+                    },
+                ],
+            },
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"workflow_node_expanded\""));
+        let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, response);
+    }
+
+    /// Every rejection reason and every limit kind has a wire spelling, and
+    /// each one survives a round trip.
+    #[test]
+    fn every_expand_rejection_reason_and_growth_limit_kind_round_trips() {
+        let reasons = [
+            (WorkflowExpandRejectionReason::NotAllowed, "not_allowed"),
+            (
+                WorkflowExpandRejectionReason::UnknownTemplate,
+                "unknown_template",
+            ),
+            (
+                WorkflowExpandRejectionReason::NotATemplate,
+                "not_a_template",
+            ),
+            (
+                WorkflowExpandRejectionReason::ExpandMaxReached,
+                "expand_max_reached",
+            ),
+            (
+                WorkflowExpandRejectionReason::MaxDepthReached,
+                "max_depth_reached",
+            ),
+            (
+                WorkflowExpandRejectionReason::MaxNodesReached,
+                "max_nodes_reached",
+            ),
+            (WorkflowExpandRejectionReason::Truncated, "truncated"),
+            (WorkflowExpandRejectionReason::UnknownInput, "unknown_input"),
+        ];
+        for (reason, wire) in reasons {
+            let json = serde_json::to_value(reason).unwrap();
+            assert_eq!(json, serde_json::Value::String(wire.to_string()));
+            let restored: WorkflowExpandRejectionReason = serde_json::from_value(json).unwrap();
+            assert_eq!(restored, reason);
+        }
+
+        let kinds = [
+            (WorkflowGrowthLimitKind::ExpandMax, "expand_max"),
+            (WorkflowGrowthLimitKind::MaxDepth, "max_depth"),
+            (WorkflowGrowthLimitKind::MaxNodes, "max_nodes"),
+        ];
+        for (kind, wire) in kinds {
+            let json = serde_json::to_value(kind).unwrap();
+            assert_eq!(json, serde_json::Value::String(wire.to_string()));
+            let restored: WorkflowGrowthLimitKind = serde_json::from_value(json).unwrap();
+            assert_eq!(restored, kind);
+        }
+    }
+
+    /// `WorkflowGet.detail` is additive: a payload written before Phase 2 —
+    /// one with no `detail` key at all — still deserialises, which is the
+    /// property that lets `PROTOCOL_VERSION` stay where it is.
+    #[test]
+    fn workflow_get_detail_is_additive() {
+        let json = serde_json::json!({
+            "id": "req_get",
+            "result": {
+                "type": "workflow_get",
+                "workflow": {
+                    "workflow_id": "workflow:1",
+                    "name": "ship-feature",
+                    "description": "",
+                    "default_tier": "high",
+                    "archived": false,
+                    "created_at_unix_ms": 1,
+                    "updated_at_unix_ms": 2
+                },
+                "versions": []
+            }
+        });
+        let restored: SuccessResponse = serde_json::from_value(json).unwrap();
+        match restored.result {
+            ResponseResult::WorkflowGet { detail, .. } => {
+                assert!(detail.is_none(), "a pre-Phase-2 payload carries no detail");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     /// Every identifier this task adds to the JSON API (dot-method names,
     /// Rust type/variant/field names) — checked against
     /// `docs/design/workflow-builder/05-phase-plan.md` W3's ban on
@@ -876,7 +1186,13 @@ mod tests {
     /// `narrow` never false-positive on `row`.
     #[test]
     fn no_new_workflow_api_identifier_uses_banned_ui_surface_words() {
-        const BANNED: &[&str] = &["sidebar", "card", "widget", "row", "panel"];
+        // `badge`, `banner`, `toast`, and `modal` are not UI-surface words the
+        // Phase 1 list happened to name, but they are UI-surface words by the
+        // same rule — hence `growth_limited`, not `growth_banner`
+        // (`06-phase2-plan.md` WS-D "Naming guard").
+        const BANNED: &[&str] = &[
+            "sidebar", "card", "widget", "row", "panel", "badge", "banner", "toast", "modal",
+        ];
 
         fn words(identifier: &str) -> Vec<String> {
             let mut words = Vec::new();
@@ -915,6 +1231,7 @@ mod tests {
             "workflow.node.interrupt",
             "workflow.node.report",
             "workflow.node.restart",
+            "workflow.node.expand",
             // event dot names
             "workflow.run.started",
             "workflow.run.updated",
@@ -922,6 +1239,7 @@ mod tests {
             "workflow.node.created",
             "workflow.node.updated",
             "workflow.node.output_checkpoint",
+            "workflow.growth.limited",
             // vocab enums + variants
             "WorkflowTier",
             "auto",
@@ -1081,6 +1399,43 @@ mod tests {
             "condition_result",
             "fired",
             "WorkflowRunGraph",
+            // Phase 2 additions
+            "WorkflowNodeExpandParams",
+            "template",
+            "inputs",
+            "count",
+            "WorkflowGrowthLimitKind",
+            "expand_max",
+            "max_depth",
+            "max_nodes",
+            "WorkflowGrowthLimit",
+            "limit",
+            "limit_value",
+            "requested",
+            "accepted",
+            "at_unix_ms",
+            "message",
+            "WorkflowExpandRejectionReason",
+            "not_allowed",
+            "unknown_template",
+            "not_a_template",
+            "expand_max_reached",
+            "max_depth_reached",
+            "max_nodes_reached",
+            "truncated",
+            "unknown_input",
+            "WorkflowExpandRejection",
+            "reason",
+            "WorkflowDetail",
+            "detail",
+            "versions",
+            "workflow",
+            "nodes_live",
+            "growth_limited",
+            "assignment_reason",
+            "delivery_failure",
+            "WorkflowNodeExpanded",
+            "rejected",
         ];
 
         let offenders: Vec<&str> = identifiers

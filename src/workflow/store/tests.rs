@@ -142,6 +142,53 @@ async fn create_run(store: &WorkflowStore, workflow: &WorkflowId, kvdag: &Kvdag)
     create_run_in_workspace(store, workflow, kvdag, None).await
 }
 
+/// Stands in for `graph::resolve_assignments`: every node in the graph,
+/// templates included, gets an entry, because `materialise_run_nodes` writes
+/// the table verbatim and rejects a scheduled node that is missing from it.
+fn assignments_for(kvdag: &Kvdag, tier: Tier) -> BTreeMap<NodeKey, NodeAssignment> {
+    kvdag
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.key.clone(),
+                NodeAssignment::from_assignment(
+                    crate::workflow::tier::resolve(tier, node.demand, None),
+                    format!("tier/{}", tier.as_str()),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn new_run(workflow: &WorkflowId, kvdag: &Kvdag) -> NewRun {
+    NewRun {
+        workflow: workflow.clone(),
+        version: kvdag.version_id.clone(),
+        tier: Tier::Auto,
+        args: BTreeMap::new(),
+        growth: GrowthLimits::default(),
+        started_at_unix_ms: next_run_start_unix_ms(),
+        assignments: assignments_for(kvdag, Tier::Auto),
+        context_runs: Vec::new(),
+        workspace_id: None,
+    }
+}
+
+/// A stamp with sub-second precision, so a round-trip that silently fell back
+/// to `time::now()` cannot coincidentally match.
+const FIRST_RUN_START_UNIX_MS: u64 = 1_700_000_123_456;
+
+/// `create_run` binds `started_at` verbatim now, so two runs created in the
+/// same millisecond would tie — and `prune_run_history` orders by exactly that
+/// column. The fixture advances the clock a second per run so "most recent"
+/// stays well defined without depending on wall time.
+fn next_run_start_unix_ms() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(FIRST_RUN_START_UNIX_MS);
+    NEXT.fetch_add(1_000, std::sync::atomic::Ordering::Relaxed)
+}
+
 async fn create_run_in_workspace(
     store: &WorkflowStore,
     workflow: &WorkflowId,
@@ -150,13 +197,8 @@ async fn create_run_in_workspace(
 ) -> RunId {
     store
         .create_run(NewRun {
-            workflow: workflow.clone(),
-            version: kvdag.version_id.clone(),
-            tier: Tier::Auto,
-            args: BTreeMap::new(),
-            growth: GrowthLimits::default(),
-            context_runs: Vec::new(),
             workspace_id: workspace_id.map(str::to_string),
+            ..new_run(workflow, kvdag)
         })
         .await
         .expect("create_run")
@@ -284,7 +326,10 @@ async fn migrations_apply_cleanly_and_reapplying_is_a_noop() {
     let first = store.applied_migrations().await.expect("read schema_meta");
     assert_eq!(
         first,
-        std::collections::BTreeSet::from(["0001_init".to_string()])
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+        ])
     );
 
     store.migrate().await.expect("re-migrate is a no-op");
@@ -1364,4 +1409,765 @@ async fn on_disk_round_trip_survives_close_and_reopen() {
 
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── 14: Phase 2 — growth, create paths, assignments, node history ────────
+//
+// `06-phase2-plan.md` WS-C. Each case pins one of the four things the store
+// gained: a create path that is not `create_run`, the invariants `NewRun`'s
+// own doc has claimed since Phase 1, the single tier authority, and the
+// `NodeHistory` aggregation `auto` has always described and never had.
+
+/// The `spawned` relation, read back raw. `records.rs` has no row for it
+/// because until Phase 2 the table had no writer at all — only the `DELETE`
+/// in `prune_run_history`.
+#[derive(Debug, Clone, SurrealValue)]
+struct SpawnedRow {
+    r#in: surrealdb_types::RecordId,
+    out: surrealdb_types::RecordId,
+    run: surrealdb_types::RecordId,
+    template_key: String,
+    proposal_id: String,
+}
+
+/// `root` fans out into the `worker` template; `report` is the fan-in point an
+/// expansion child inherits (§4 D4).
+fn expandable_spec() -> KvdagSpec {
+    let mut template = node("worker", "Work on {{goal}}");
+    template.is_template = true;
+    let mut root = node("root", "Plan for: {{goal}}");
+    root.expand_allow = vec![NodeKey::new("worker")];
+    root.expand_max = 4;
+    base_spec(
+        vec![root, node("report", "Report on {{work}}"), template],
+        vec![edge("root", "report", Some("work"))],
+    )
+}
+
+async fn setup_expandable_run(store: &WorkflowStore, name: &str) -> (WorkflowId, Kvdag, RunId) {
+    let workflow = store
+        .create_workflow(name, "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let kvdag = store
+        .create_version(
+            &workflow,
+            VersionOrigin::Authored,
+            "expandable",
+            expandable_spec(),
+        )
+        .await
+        .expect("create_version");
+    let run = create_run(store, &workflow, &kvdag).await;
+    (workflow, kvdag, run)
+}
+
+fn node_created_write(run: &RunId, key: &str, path: &str, parent: Option<&str>) -> StoreWrite {
+    StoreWrite::RunNodeCreated {
+        run: run.clone(),
+        key: NodeKey::new(key),
+        path: InstancePath::new(path),
+        parent: parent.map(InstancePath::new),
+        depth: 1,
+        status: NodeStatus::Ready,
+        demand: Demand::Standard,
+        assignment: crate::workflow::tier::Assignment {
+            model: crate::workflow::tier::ModelAlias::Sonnet,
+            effort: crate::workflow::tier::Effort::Xhigh,
+        },
+        assignment_reason: "auto/downgrade-standard".to_string(),
+        attempt: 1,
+        proposal_id: "proposal-1".to_string(),
+    }
+}
+
+// H1 / §4 D15 — one authority for `started_at`.
+
+#[tokio::test]
+async fn create_run_binds_started_at_verbatim_so_a_reload_reports_the_apps_stamp() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+
+    let stamp = 1_699_000_000_777;
+    let run = store
+        .create_run(NewRun {
+            started_at_unix_ms: stamp,
+            ..new_run(&workflow, &kvdag)
+        })
+        .await
+        .expect("create_run");
+
+    // Reading the run back goes through the stored row, which is the only
+    // thing a restarted server has. Before migration `0002` this reported
+    // `time::now()` at queue-drain time instead — a second clock, 2-3 ms
+    // later than the one `ActiveRun` carries.
+    let reloaded = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("the run exists");
+    assert_eq!(reloaded.started_at_unix_ms, stamp);
+
+    let listed = store
+        .list_runs(&workflow, 10)
+        .await
+        .expect("list_runs")
+        .into_iter()
+        .find(|record| record.id == run)
+        .expect("the run is listed");
+    assert_eq!(
+        listed.started_at_unix_ms, stamp,
+        "every projection of the run reports the one stamp it was created with"
+    );
+}
+
+// §4 D14/D3 narrowing — `workflow_run.max_nodes <= kvdag_version.max_nodes`.
+
+#[tokio::test]
+async fn create_run_rejects_growth_wider_than_its_version_on_either_axis() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let version_growth = kvdag.growth;
+
+    for widened in [
+        GrowthLimits {
+            max_depth: version_growth.max_depth + 1,
+            max_nodes: version_growth.max_nodes,
+        },
+        GrowthLimits {
+            max_depth: version_growth.max_depth,
+            max_nodes: version_growth.max_nodes + 1,
+        },
+    ] {
+        let error = store
+            .create_run(NewRun {
+                growth: widened,
+                ..new_run(&workflow, &kvdag)
+            })
+            .await
+            .expect_err("a run may narrow its version's limits, never widen them");
+        assert!(
+            matches!(error, StoreError::Invariant(_)),
+            "expected an invariant violation, got {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_run_accepts_growth_equal_to_or_narrower_than_its_version() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let version_growth = kvdag.growth;
+
+    for accepted in [
+        version_growth,
+        GrowthLimits {
+            max_depth: version_growth.max_depth.saturating_sub(1),
+            max_nodes: version_growth.max_nodes.saturating_sub(6),
+        },
+    ] {
+        let run = store
+            .create_run(NewRun {
+                growth: accepted,
+                ..new_run(&workflow, &kvdag)
+            })
+            .await
+            .expect("narrowing is the whole point of the run-level limits");
+        let record = store
+            .get_run(&run)
+            .await
+            .expect("get_run")
+            .expect("the run exists");
+        assert_eq!(record.max_depth, accepted.max_depth);
+        assert_eq!(record.max_nodes, accepted.max_nodes);
+    }
+}
+
+// §4 D9 — one resolver. The store writes the run's table verbatim.
+
+#[tokio::test]
+async fn materialise_run_nodes_writes_the_runs_assignment_table_verbatim() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+
+    // Deliberately not what `tier::resolve(Auto, Standard, None)` would
+    // produce: if the store still resolved tiers of its own, it would
+    // overwrite these and the assertion below would read the policy's answer
+    // instead of the run's.
+    let mut assignments = BTreeMap::new();
+    assignments.insert(
+        NodeKey::new("solo"),
+        NodeAssignment {
+            model: crate::workflow::tier::ModelAlias::Fable,
+            effort: crate::workflow::tier::Effort::Low,
+            reason: "auto/escalate-recent-failures".to_string(),
+        },
+    );
+
+    let run = store
+        .create_run(NewRun {
+            assignments,
+            ..new_run(&workflow, &kvdag)
+        })
+        .await
+        .expect("create_run");
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    let solo = nodes.first().expect("the run has one node");
+    assert_eq!(solo.model, "fable");
+    assert_eq!(solo.effort, "low");
+    assert_eq!(solo.assignment_reason, "auto/escalate-recent-failures");
+}
+
+#[tokio::test]
+async fn create_run_rejects_a_scheduled_node_with_no_resolved_assignment() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+
+    let error = store
+        .create_run(NewRun {
+            assignments: BTreeMap::new(),
+            ..new_run(&workflow, &kvdag)
+        })
+        .await
+        .expect_err("a missing assignment is an invariant violation, not a fallback");
+    assert!(
+        matches!(error, StoreError::Invariant(_)),
+        "expected an invariant violation, got {error:?}"
+    );
+}
+
+// §4 D7 — the create paths.
+
+#[tokio::test]
+async fn a_created_run_node_round_trips_with_its_parent_depth_and_spawned_relation() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_expandable_run(&store, "created-node").await;
+
+    let before = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(
+        before.len(),
+        2,
+        "the template is not materialised until a proposal instantiates it"
+    );
+
+    store
+        .write(node_created_write(
+            &run,
+            "worker",
+            "root/worker/1",
+            Some("root"),
+        ))
+        .await
+        .expect("the create path exists now");
+
+    let after = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    let child = after
+        .iter()
+        .find(|record| record.instance_path.as_str() == "root/worker/1")
+        .expect("the child is in the run");
+    assert_eq!(child.node_key.as_str(), "worker");
+    assert_eq!(child.depth, 1, "first-generation children are depth 1");
+    assert_eq!(child.status, NodeStatus::Ready);
+    assert_eq!(child.model, "sonnet");
+    assert_eq!(child.effort, "xhigh");
+    assert_eq!(child.assignment_reason, "auto/downgrade-standard");
+
+    // The run's denominator moves with the graph; a progress counter that
+    // ignored expansion children would under-report every growing run.
+    let record = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("the run exists");
+    assert_eq!(record.nodes_total, 3);
+
+    let mut response = store
+        .db
+        .query("SELECT * FROM spawned")
+        .await
+        .expect("select spawned");
+    let rows: Vec<SpawnedRow> = response.take(0).expect("decode spawned");
+    let relation = rows.first().expect("the child carries its provenance");
+    assert_eq!(relation.template_key, "worker");
+    assert_eq!(relation.proposal_id, "proposal-1");
+    assert_eq!(record_id_to_string(&relation.run), run.to_string());
+
+    let mut ids = BTreeMap::new();
+    for record in &after {
+        let id = store
+            .find_run_node_id(&run, &record.instance_path)
+            .await
+            .expect("every listed node resolves");
+        ids.insert(record.instance_path.to_string(), record_id_to_string(&id));
+    }
+    assert_eq!(
+        record_id_to_string(&relation.r#in),
+        ids["root"],
+        "the relation runs from the proposing parent"
+    );
+    assert_eq!(record_id_to_string(&relation.out), ids["root/worker/1"]);
+}
+
+/// R-4: `commit` emits the create before any update for the same path, and the
+/// queue drains FIFO. The update must therefore land on the created row rather
+/// than error against a row that does not exist yet.
+#[tokio::test]
+async fn a_create_then_update_for_the_same_path_lands_the_update() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_expandable_run(&store, "create-then-update").await;
+
+    for write in [
+        node_created_write(&run, "worker", "root/worker/1", Some("root")),
+        node_status_write(&run, "root/worker/1", NodeStatus::Running),
+        node_status_write(&run, "root/worker/1", NodeStatus::Succeeded),
+    ] {
+        store.write(write).await.expect("drained in order");
+    }
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    let child = nodes
+        .iter()
+        .find(|record| record.instance_path.as_str() == "root/worker/1")
+        .expect("the child survived both writes");
+    assert_eq!(child.status, NodeStatus::Succeeded);
+    assert_eq!(
+        store
+            .get_run(&run)
+            .await
+            .expect("get_run")
+            .expect("the run exists")
+            .nodes_done,
+        1
+    );
+}
+
+#[tokio::test]
+async fn created_run_edges_carry_authored_provenance_only_when_there_is_any() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_expandable_run(&store, "created-edges").await;
+
+    store
+        .write(node_created_write(
+            &run,
+            "worker",
+            "root/worker/1",
+            Some("root"),
+        ))
+        .await
+        .expect("create the child");
+
+    // (a) the synthetic parent -> child sequence edge, which has no authored
+    // counterpart, and (b) the child's inherited copy of its parent's
+    // outbound data edge, which does.
+    store
+        .write(StoreWrite::RunEdgeCreated {
+            run: run.clone(),
+            from: InstancePath::new("root"),
+            to: InstancePath::new("root/worker/1"),
+            kind: EdgeKind::Sequence,
+            kvdag_edge: None,
+            condition_result: None,
+            fired: false,
+        })
+        .await
+        .expect("synthetic sequence edge");
+    store
+        .write(StoreWrite::RunEdgeCreated {
+            run: run.clone(),
+            from: InstancePath::new("root/worker/1"),
+            to: InstancePath::new("report"),
+            kind: EdgeKind::Data,
+            kvdag_edge: Some((NodeKey::new("root"), NodeKey::new("report"))),
+            condition_result: Some(true),
+            fired: true,
+        })
+        .await
+        .expect("inherited outbound edge");
+
+    let edges = store.list_run_edges(&run).await.expect("list_run_edges");
+    let inherited = edges
+        .iter()
+        .find(|edge| edge.from.as_str() == "root/worker/1")
+        .expect("the fan-in point survives expansion");
+    assert_eq!(inherited.to.as_str(), "report");
+    assert_eq!(inherited.kind, EdgeKind::Data);
+    assert_eq!(inherited.condition_result, Some(true));
+    assert!(inherited.fired);
+
+    let mut response = store
+        .db
+        .query("SELECT * FROM run_edge WHERE run = $run")
+        .bind((
+            "run",
+            parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id"),
+        ))
+        .await
+        .expect("select run_edge");
+    let rows: Vec<records::RunEdgeRow> = response.take(0).expect("decode run_edge");
+    let synthetic = rows
+        .iter()
+        .find(|row| row.kind == "sequence")
+        .expect("the sequence edge exists");
+    assert!(
+        synthetic.kvdag_edge.is_none(),
+        "the parent -> child sequence edge has no authored counterpart"
+    );
+    let inherited_row = rows
+        .iter()
+        .find(|row| row.kind == "data" && row.condition_result == Some(true))
+        .expect("the inherited edge exists");
+    assert!(
+        inherited_row.kvdag_edge.is_some(),
+        "an inherited edge keeps the authored edge it copies"
+    );
+}
+
+// H5 — the workflow row tracks its head.
+
+#[tokio::test]
+async fn create_version_with_metadata_refreshes_the_workflow_row_even_for_a_no_op_graph() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("head-metadata", "the original description", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let first = store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", diamond_spec())
+        .await
+        .expect("create_version");
+    store
+        .set_head_version(&workflow, &first.version_id)
+        .await
+        .expect("set_head_version");
+
+    // The graph is byte-identical, so this is the no-op-revision path — which
+    // is exactly the update that used to leave the description stale, because
+    // `kvdag_version` has no description column to read instead.
+    let metadata = VersionMetadata {
+        description: "the updated description".to_string(),
+        default_tier: Tier::Low,
+    };
+    let second = store
+        .create_version_with_metadata(
+            &workflow,
+            VersionOrigin::Authored,
+            "v1 again",
+            diamond_spec(),
+            Some(&metadata),
+        )
+        .await
+        .expect("create_version_with_metadata");
+    assert_eq!(
+        second.version_id, first.version_id,
+        "an identical graph must still not write a new version"
+    );
+
+    let summary = store
+        .get_workflow(&workflow)
+        .await
+        .expect("get_workflow")
+        .expect("the workflow exists");
+    assert_eq!(summary.description, "the updated description");
+    assert_eq!(summary.default_tier, Tier::Low);
+}
+
+#[tokio::test]
+async fn create_version_without_metadata_leaves_the_workflow_row_alone() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("no-metadata", "the original description", Tier::High)
+        .await
+        .expect("create_workflow");
+    store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", diamond_spec())
+        .await
+        .expect("create_version");
+
+    let summary = store
+        .get_workflow(&workflow)
+        .await
+        .expect("get_workflow")
+        .expect("the workflow exists");
+    assert_eq!(summary.description, "the original description");
+    assert_eq!(summary.default_tier, Tier::High);
+}
+
+// §4 D8 — `NodeHistory` gets a producer.
+
+/// Closes `solo` in one run and closes the run, so `node_history` has a
+/// measurement to find. `attempt > 1` is how a restart reads: the node
+/// succeeded, but not on its first pass.
+async fn record_solo_run(
+    store: &WorkflowStore,
+    workflow: &WorkflowId,
+    kvdag: &Kvdag,
+    status: NodeStatus,
+    attempt: u8,
+    schema_failures: u32,
+) -> RunId {
+    let run = create_run(store, workflow, kvdag).await;
+    for seq in 0..schema_failures {
+        store
+            .write(StoreWrite::Checkpoint {
+                run: run.clone(),
+                path: InstancePath::new("solo"),
+                seq: u64::from(seq) + 1,
+                kind: CheckpointKind::Result,
+                schema_valid: false,
+                payload: serde_json::json!({"report": "malformed"}),
+                summary: "did not match the schema".to_string(),
+                artifact_paths: Vec::new(),
+                digest: format!("digest-{seq}"),
+            })
+            .await
+            .expect("checkpoint");
+    }
+    store
+        .write(StoreWrite::RunNode {
+            run: run.clone(),
+            path: InstancePath::new("solo"),
+            status,
+            attempt,
+            binding: None,
+            usage: NodeUsage::default(),
+            evidence: None,
+            succession: None,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+        })
+        .await
+        .expect("close the node");
+    store
+        .write(StoreWrite::RunStatus {
+            run: run.clone(),
+            status: if status == NodeStatus::Succeeded {
+                RunStatus::Succeeded
+            } else {
+                RunStatus::Failed
+            },
+            ended_at_unix_ms: None,
+        })
+        .await
+        .expect("close the run");
+    run
+}
+
+#[tokio::test]
+async fn node_history_aggregates_the_workflows_closed_runs() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+
+    // Oldest first: a clean first pass, then a restart that only succeeded on
+    // its second attempt after one schema failure, then an outright failure.
+    record_solo_run(&store, &workflow, &kvdag, NodeStatus::Succeeded, 1, 0).await;
+    record_solo_run(&store, &workflow, &kvdag, NodeStatus::Succeeded, 2, 1).await;
+    record_solo_run(&store, &workflow, &kvdag, NodeStatus::Failed, 1, 0).await;
+
+    let history = store
+        .node_history(&workflow, &NodeKey::new("solo"), 10)
+        .await
+        .expect("node_history");
+    assert_eq!(history.runs, 3);
+    assert_eq!(history.first_pass_successes, 1);
+    assert_eq!(history.schema_failures, 1);
+    assert_eq!(
+        history.recent_first_pass_failures, 2,
+        "the two most recent runs both missed on the first pass"
+    );
+    assert!(
+        (history.first_pass_success_rate() - 1.0 / 3.0).abs() < f64::EPSILON,
+        "{} is not what the runs say",
+        history.first_pass_success_rate()
+    );
+    assert_eq!(
+        history.watchdog_interventions, 0,
+        "the column exists but Phase 4 owns its writer; 0 is documented, not fabricated"
+    );
+    assert_eq!(
+        history.mean_tokens, 0,
+        "run_node.total_tokens is permanently 0, which is why resolve_auto never reads it"
+    );
+}
+
+#[tokio::test]
+async fn node_history_windows_to_the_most_recent_runs_and_ignores_open_ones() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+
+    record_solo_run(&store, &workflow, &kvdag, NodeStatus::Failed, 1, 0).await;
+    record_solo_run(&store, &workflow, &kvdag, NodeStatus::Succeeded, 1, 0).await;
+    // Still running, so not a measurement.
+    create_run(&store, &workflow, &kvdag).await;
+
+    let windowed = store
+        .node_history(&workflow, &NodeKey::new("solo"), 1)
+        .await
+        .expect("node_history");
+    assert_eq!(windowed.runs, 1, "one run's worth of window");
+    assert_eq!(
+        windowed.first_pass_successes, 1,
+        "the window takes the most recent closed run, not the oldest"
+    );
+
+    let whole = store
+        .node_history(&workflow, &NodeKey::new("solo"), 10)
+        .await
+        .expect("node_history");
+    assert_eq!(whole.runs, 2, "the still-open run is not a measurement");
+}
+
+#[tokio::test]
+async fn node_history_reports_no_runs_once_every_run_has_been_pruned() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    record_solo_run(&store, &workflow, &kvdag, NodeStatus::Succeeded, 1, 0).await;
+    record_solo_run(&store, &workflow, &kvdag, NodeStatus::Succeeded, 1, 0).await;
+
+    let pruned = store
+        .prune_run_history(&workflow, 0)
+        .await
+        .expect("prune_run_history");
+    assert_eq!(pruned, 2);
+
+    let history = store
+        .node_history(&workflow, &NodeKey::new("solo"), 10)
+        .await
+        .expect("node_history tolerates a fully pruned workflow");
+    assert_eq!(history, crate::workflow::tier::NodeHistory::default());
+}
+
+#[tokio::test]
+async fn node_history_is_empty_for_an_unknown_node_or_a_zero_window() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    record_solo_run(&store, &workflow, &kvdag, NodeStatus::Succeeded, 1, 0).await;
+
+    let unknown = store
+        .node_history(&workflow, &NodeKey::new("never-existed"), 10)
+        .await
+        .expect("node_history");
+    assert_eq!(unknown.runs, 0);
+
+    let no_window = store
+        .node_history(&workflow, &NodeKey::new("solo"), 0)
+        .await
+        .expect("node_history");
+    assert_eq!(no_window.runs, 0);
+}
+
+// Migration 0002 on top of a 0001-only database.
+
+#[tokio::test]
+async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_columns() {
+    let store = WorkflowStore::open_with_migrations(StoreLocation::Memory, 1)
+        .await
+        .expect("a 0001-only database opens");
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from(["0001_init".to_string()])
+    );
+
+    // Rows written the way a pre-Phase-2 karvex wrote them: no
+    // `assignment_reason`, no `first_pass_succeeded`, no `schema_failures`.
+    // `workflow`/`kvdag_version`/`kvdag_node` are untouched by `0002`, so
+    // their normal writers are fine here.
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let version_id =
+        parse_record_id(TABLE_KVDAG_VERSION, kvdag.version_id.as_str()).expect("version id");
+    let mut response = store
+        .db
+        .query("SELECT * FROM kvdag_node WHERE version = $version LIMIT 1")
+        .bind(("version", version_id.clone()))
+        .await
+        .expect("select kvdag_node");
+    let node_rows: Vec<records::KvdagNodeRow> = response.take(0).expect("decode kvdag_node");
+    let kvdag_node_id = node_rows.into_iter().next().expect("the node exists").id;
+
+    let mut response = store
+        .db
+        .query(
+            "CREATE workflow_run SET workflow = $workflow, kvdag_version = $version, \
+             tier = \"auto\", status = \"succeeded\", max_depth = 3, max_nodes = 24, \
+             nodes_total = 1 RETURN AFTER",
+        )
+        .bind((
+            "workflow",
+            parse_record_id(TABLE_WORKFLOW, workflow.as_str()).expect("workflow id"),
+        ))
+        .bind(("version", version_id))
+        .await
+        .expect("create workflow_run");
+    let run_rows: Vec<IdOnly> = response.take(0).expect("decode workflow_run");
+    let run_row_id = run_rows.into_iter().next().expect("the run row").id;
+    let run = RunId::new(record_id_to_string(&run_row_id));
+
+    let response = store
+        .db
+        .query(
+            "CREATE run_node SET run = $run, kvdag_node = $kvdag_node, node_key = \"solo\", \
+             instance_path = \"solo\", depth = 0, status = \"succeeded\", model = \"opus\", \
+             effort = \"high\", demand = \"standard\"",
+        )
+        .bind(("run", run_row_id))
+        .bind(("kvdag_node", kvdag_node_id))
+        .await
+        .expect("create run_node");
+    response.check().expect("the 0001 row is valid");
+
+    store.migrate().await.expect("0002 applies on top of 0001");
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+        ])
+    );
+
+    // The read path decodes the pre-migration row, which is only true because
+    // `0002` backfills: a `DEFAULT` is applied at write time, not at read time.
+    let nodes = store
+        .list_run_nodes(&run)
+        .await
+        .expect("a pre-migration run_node still decodes");
+    let solo = nodes.first().expect("the node survived the migration");
+    assert_eq!(solo.assignment_reason, "");
+    assert_eq!(solo.model, "opus");
+
+    let history = store
+        .node_history(&workflow, &NodeKey::new("solo"), 10)
+        .await
+        .expect("node_history");
+    assert_eq!(history.runs, 1);
+    assert_eq!(
+        history.first_pass_successes, 0,
+        "a row that predates the column has no first-pass evidence to report"
+    );
+}
+
+/// The variant allows a create with no provenance. It is not what expansion
+/// produces, but it is a different SQL shape — no `RELATE`, one fewer
+/// statement in the batch — so it gets its own case rather than being assumed.
+#[tokio::test]
+async fn a_created_run_node_without_a_parent_writes_no_spawned_relation() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_expandable_run(&store, "created-node-orphan").await;
+
+    store
+        .write(node_created_write(&run, "worker", "worker/1", None))
+        .await
+        .expect("a create with no provenance is still a create");
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert!(nodes
+        .iter()
+        .any(|record| record.instance_path.as_str() == "worker/1"));
+
+    let mut response = store
+        .db
+        .query("SELECT * FROM spawned")
+        .await
+        .expect("select spawned");
+    let rows: Vec<SpawnedRow> = response.take(0).expect("decode spawned");
+    assert!(rows.is_empty(), "no parent, no provenance edge");
 }
