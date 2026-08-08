@@ -1,0 +1,273 @@
+---
+title: 工作流
+description: 定义多智能体 kvdag,将每个节点作为 Karvex 托管的队友运行,并在 DAG 视图中实时查看执行过程。
+---
+
+工作流是一个已保存、有版本管理的 **kvdag**:一个由节点(任务)组成的有向无环图,节点之间通过边传递结果。运行一个工作流会把每个节点都启动为一个真实的终端窗格 ── 通常是一个 `claude` 队友 ── 并协调它们,直到每条分支都得出结果。
+
+工作流适合那种你想定义一次、反复运行的多步骤、多智能体任务,比如计划 → 实现 → 审查。如果只是想让已经在运行的智能体之间做一次性的脚本化协作,请改用 [智能体自动化](/zh-cn/docs/agent-automation/)。
+
+## 什么是工作流
+
+**工作流** 是一个或多个 **kvdag 版本** ── 不可变的图定义 ── 的命名容器。`kvx workflow create` 创建第一个版本;`kvx workflow update` 在其基础上创建新版本。编辑操作从不就地修改某个版本,总是产生一个新版本,因此过去的运行始终可以对照它实际运行时所用的版本进行复现。
+
+**运行 (run)** 取一个 kvdag 版本,填入声明的运行参数,然后执行该图。每个节点都会成为一个 **运行节点 (run node)** ── 一个拥有自己的状态、模型/努力等级分配、窗格绑定和结果的实例。一旦某个节点的所有入边都已解析,它就会开始;彼此独立的节点会在配置的并发上限内并行运行。条件边的条件求值为 false 时该边即为死边;所有入边都是死边的节点会变为 `skipped`,而不会阻塞图的其余部分 ── 这就是工作流无需脚本语言即可分支的方式。
+
+一次运行只有在每个节点都已解析完毕、并记录下接下来会发生什么之后才算结束,而不是仅仅因为已经没有可调度的节点了。如果某个节点结束时既没有解析出后继边、也没有记录阻塞原因、也没有明确证据表明后面不会再有动作,运行就会暂停,并指出具体是哪个节点导致的,而不是默默地报告成功。
+
+## 定义格式
+
+`kvx workflow create` 和 `kvx workflow update` 会读取一个 TOML 或 JSON 格式的定义文档 ── 由文件扩展名决定格式。TOML 更便于手动编辑:
+
+```toml
+name = "ship-feature"
+description = "plan → implement → review"
+contract = """
+Reply only through result.json. Never edit files outside your node dir unless the task says so.
+"""
+max_depth = 3
+max_nodes = 24
+
+# Declared run-argument namespace. Without this, `{{goal}}` below has no inbound
+# edge port to resolve against and workflow.create rejects the document.
+[[arg]]
+name = "goal"
+required = true
+description = "what to build"
+
+[[node]]
+key = "plan"
+label = "Plan"
+kind = "agent"
+runner = "agent"          # `claude` teammate; "command" runs `command` as a plain process
+demand = "critical"
+prompt_template = "Produce an implementation plan for: {{goal}}"
+output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
+
+[[node]]
+key = "implement"
+label = "Implement"
+kind = "agent"
+demand = "peak"
+prompt_template = "Implement this plan:\n{{plan}}"
+output_schema = { type = "object", required = ["changed_files","report"], properties = { changed_files = { type = "array" }, report = { type = "string" } } }
+
+[[edge]]
+from = "plan"
+to = "implement"
+kind = "data"
+payload = "summary"
+port = "plan"
+```
+
+`contract` 会被添加到每个节点系统提示词的开头 ── 把跨节点的通用规则写在这里,而不是在每个节点里重复。
+
+`max_depth` 和 `max_nodes` 是这次运行的增长上限,而且是真正生效的:节点可以在运行过程中提出新的节点 ── 参见下文的「模板与动态扩展」。`max_nodes`(默认 `24`)会统计这次运行已经具现出来的每一个节点,无论它以什么状态结束:失败或被跳过的子节点不会把预算还回去,所以一个节点无法靠不断失败来无限扩张。`max_depth`(默认 `3`)统计的是 *扩展的代数*,而不是图的层数 ── 文档里写出来的节点全都是深度 0,由它们提出的子节点是深度 1,所以 `max_depth = 3` 允许三代。运行的等级还会进一步收紧这两个上限;参见下文的「等级与增长上限」。
+
+`default_tier`(`auto`、`max`、`high`、`medium` 或 `low`,默认 `high`)是在 `kvx workflow run start` 没有给出 `--tier` 时,该工作流的运行所使用的等级。它和 `name`、`contract` 一样是文档级的键,因此修改它意味着创建一个新版本。
+
+每个 `[[arg]]` 在运行参数命名空间中声明一个条目,在运行时通过 `--arg name=value` 填入。`prompt_template` 中的每个 `{{name}}` 占位符都必须能解析到某个已声明的参数或某条入边的 `port` ── `workflow.create` 会在文档被运行之前就拒绝含有未解析占位符的文档,而启动运行时则会单独拒绝缺少默认值的必填参数。
+
+每个 `[[node]]` 都需要唯一的 `key`、`label`、`prompt_template`,以及 `output_schema`。`output_schema` 是一个 JSON Schema,节点的结果必须先通过它的校验才能被判定为成功。省略 `output_schema` 不会导致文档被拒绝,而是使用空 schema `{}`(接受任意对象);一旦确定了想要校验的形状,再显式声明它。`kind` 默认是 `"agent"`;其他种类(`internal`、`gate`、`monitor`)目前可以被接受,但它们的调度行为会在后续版本中提供。`runner` 决定节点的进程如何被启动 ── 参见下文的节点运行方式。`demand`(`peak`、`critical`、`standard` 或 `light`,默认 `standard`)会把运行的等级映射到每个节点的模型和努力等级分配上。
+
+每个 `[[edge]]` 连接一个 `from` 节点和一个 `to` 节点,并且需要 `kind`:`sequence`(要求源节点成功)、`data`(要求源节点成功且其结果通过校验)或 `conditional`(对源节点的结果求值 `condition`;为 false 时该边即为死边)。省略 `kind` 时默认为 `sequence`。`conditional` 边必须声明 `condition`;没有 `condition` 的 `conditional` 边会在创建时被拒绝,而不是被接受后静默地永远无法解析。`payload` 控制目标节点能拿到源节点检查点的多少内容:`none`、`summary`(默认)或 `full`。`port` 指定该边的负载要填入目标节点 `prompt_template` 中的哪个 `{{slot}}`;如果 `port` 指向的 `{{slot}}` 并未出现在目标节点的 `prompt_template` 中,也会在创建时被拒绝,因为那样会产生一个数据无处可去的工作流。
+
+带上声明的参数运行它:
+
+```bash
+kvx workflow run start ship-feature --arg goal="add dark mode"
+```
+
+要手动编辑已保存的工作流,用新的定义文件运行 `kvx workflow update`。这会创建一个新的 kvdag 版本,而不是就地修改你所基于的那个版本,因此过去的每次运行都仍然可以对照它实际运行时所用的版本进行复现。
+
+## 节点运行方式
+
+`runner` 独立于 `kind`,决定节点的进程如何被启动:
+
+| `runner` | 进程 | 启动确认 | 引导输入 | 完成方式 |
+| --- | --- | --- | --- | --- |
+| `agent`(默认) | 窗格内的 `claude`,以运行解析出的模型和努力等级启动 | 必须在启动时限内以已检测到的智能体身份出现,否则启动本身即被判定为失败 | 通过与 `agent.prompt` 相同的已验证路径投递 | 下文节点契约中三种信号之一 |
+| `command` | 节点自己的 `command` argv,作为普通进程运行 | 无 ── 窗格只是一个已启动的进程 | 以原始窗格文本投递 | 仅自我上报 |
+
+`command` 节点需要 `command = ["...", ...]` ── 一个 argv 列表,绝不能是 shell 字符串。它会得到和 `agent` 节点相同的 `KARVEX_WORKFLOW_*` 环境变量,因此也能以同样的方式调用 `kvx workflow node complete`,但它没有回合结束钩子,也没有屏幕检测:唯一能让它完成的,是节点自己上报。
+
+## 模板与动态扩展
+
+有些工作的形状要开始做了才知道:你知道想给每个分片安排一个节点,但在有人真的看过之前,并不知道会有几个分片。因此节点可以在运行过程中要求新的节点。但它不能创建 ── **节点只负责提议,由 Karvex 来决定** ── 这正是让图的增长上限成为真正的上限、而不是一句建议的原因。
+
+动态扩展在定义里分成两半。**模板** 是标记了 `is_template = true` 的节点:它永远不会被直接调度,在有东西把它实例化之前也不会出现在运行里。允许实例化模板的节点则要声明它可以实例化哪些模板,以及总共可以创建多少个子节点:
+
+```toml
+[[node]]
+key = "fanout"
+label = "Fan out"
+prompt_template = "Split this into shards: {{goal}}"
+output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
+expand_allow = ["worker"]   # 该节点可以实例化的模板
+expand_max = 8              # 它在这次运行中总共可以创建的子节点数
+
+[[node]]
+key = "worker"
+label = "Worker"
+is_template = true
+prompt_template = "Work one shard of: {{goal}}"
+output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }
+
+[[node]]
+key = "collect"
+label = "Collect"
+prompt_template = "Collect the shard reports:\n{{shard}}"
+output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }
+
+# 汇聚边要从 `fanout` 画出,而不是从 `worker`。
+[[edge]]
+from = "fanout"
+to = "collect"
+kind = "data"
+payload = "summary"
+port = "shard"
+```
+
+`expand_max` 默认为 `0`,所以动态扩展是逐节点选择开启的;而且它是按该节点在这次运行中提出的所有提议累计计数,而不是每个提议单独计数。`expand_allow` 会在创建时被校验:指向不存在的节点、或指向并非模板的节点的键,都会被 `workflow.create` 拒绝。
+
+如上所示,汇聚边要 **从提议的那个节点** 画出。模板自身的边在构建运行图时会被丢弃,因此只能经由模板到达的节点会在创建时被判定为不可达而拒绝。真正把子节点连起来的是继承:每个被接受的子节点都会得到一份父节点出边的副本,所以每个 `worker` 也会有一条通向 `collect` 的边,`collect` 等待的是整整一代,而不只是 `fanout`。也因此,模板的 `{{slot}}` 必须能解析到已声明的运行参数,因为它自己没有入边端口。
+
+节点在自己的窗格里、在完成之前提出提议:
+
+```bash
+kvx workflow node expand <run_id> <path> --template worker --label "Shard" --count 4
+kvx workflow node expand <run_id> <path> --template worker --label "Shard" --input goal="just src/ui" --json
+```
+
+和 `node complete` 一样,它从节点自己的环境变量里读取 `KARVEX_WORKFLOW_NODE_TOKEN`,所以一个节点只能以自己的名义提议。`--count` 默认为 1。`--input KEY=VALUE` 会覆盖模板 `prompt_template` 中的一个 `{{slot}}`;指向未声明插槽的键会被拒绝,而不是被悄悄忽略,因此这条动态通道始终比创建时的通道更窄。每个子节点会得到 `<parent>/<template>/<n>` 形式的实例路径 ── `fanout/worker/1`、`fanout/worker/2` ── 按父节点和模板从 1 开始编号,并且只有在父节点结束之后才会启动。
+
+提议会依次接受四道护栏的判定:提议节点的 `expand_allow`、它的 `expand_max`、运行的 `max_depth`,以及运行的 `max_nodes`。
+
+:::note[拒绝永远不会静默发生]
+如果一个要求四个子节点的提议只剩下两个的余量,**就会创建两个,并把缺口报告出来**。全部接受会突破上限;全部拒绝则浪费了本来就有的余量。部分接受之所以成立,正是因为截断会被报告出来,所以它会出现在每一个描述这次运行的界面上:
+
+| 界面 | 承载的信息 |
+| --- | --- |
+| JSON API 事件流上的 `workflow.growth.limited` | 提议节点、模板、命中的是哪道护栏、该护栏的值,以及请求数与接受数 |
+| `kvx workflow run show` 和 `kvx workflow node show` | 该运行以及该节点最近一次的增长上限 |
+| DAG 视图 | 横跨整个运行的横幅,以及提议节点上的提示 |
+| 通知提示 | 如果在 `config.toml` 中启用了通知,则是同样的消息 |
+:::
+
+`kvx workflow node expand` 的响应会把同样的判定结果返回给提出提议的那个节点,所以它清楚地知道自己得到了什么。被拒绝的提议是一条 **成功** 的命令,而不是错误:只有运行 ID、路径或令牌不正确,或者运行已经关闭时,退出码才非零。已经结束的节点不能提议,因为它的子节点会挂在一条来自已结束节点的边上。
+
+## 等级与增长上限
+
+运行的 **等级(tier)** 是决定这次运行可以有多昂贵的唯一旋钮。它和每个节点的 `demand` 一起决定该节点的模型与推理努力等级,并收紧图可以增长到多大。可以设置它的地方有两处,由具体到一般:
+
+```bash
+kvx workflow run start ship-feature --tier low   # 仅这一次运行
+```
+
+```toml
+default_tier = "medium"                          # 该工作流的每一次运行
+```
+
+`auto`、`max` 和 `high` 不改动文档里的上限;`medium` 和 `low` 会收紧它们:
+
+| 等级 | 生效的 `max_nodes` | 生效的 `max_depth` | 模型 |
+| --- | --- | --- | --- |
+| `max` | 与文档一致 | 与文档一致 | `peak` demand 用最强模型,其余用 opus,努力等级全程 `max` |
+| `high`(默认) | 与文档一致 | 与文档一致 | opus,在 `light` demand 下降为 sonnet |
+| `auto` | 与文档一致 | 与文档一致 | 以 `high` 那一行为起点,按节点自身的历史逐个选择 |
+| `medium` | 至多 24 | 与文档一致 | `peak`/`critical` 用 opus,其余用 sonnet |
+| `low` | 至多 12 | 与文档一致 | 所有 demand 都用 sonnet,努力等级全程 `low` |
+
+收紧是单向的:等级不会把文档设得更低的上限再抬上去,同一个工作流用 `low` 跑两次,得到的上限也完全相同。运行实际执行的值,就是 `kvx workflow run show` 和 JSON API 报告的值,所以一次运行的增长上限永远不会和它自己的记录相互矛盾。
+
+## 节点契约
+
+每个节点都在自己专属的目录 `<run dir>/<instance path>/` 中运行:
+
+| 文件 | 由谁写入 | 内容 |
+| --- | --- | --- |
+| `task.md` | Karvex | 渲染好的提示词:工作流契约、节点角色、任务,以及 `inputs/` 下各文件的路径 |
+| `inputs/<port>.json` | Karvex | 每个入边端口对应的上游检查点负载,一个端口一个文件 |
+| `output_schema.json` | Karvex | `result.json` 必须满足的 JSON Schema |
+| `result.json` | 节点自身 | 其结构化结果 |
+| `artifacts/` | 节点自身 | 被 `result.json` 的 `artifacts` 数组引用的文件 |
+
+写入 `result.json` 后运行以下命令来完成节点:
+
+```bash
+kvx workflow node complete
+kvx workflow node complete --result-file <path>   # defaults to ./result.json in the node directory
+```
+
+该命令会从节点窗格上已经设置好的环境变量 `KARVEX_WORKFLOW_RUN_ID`、`KARVEX_WORKFLOW_NODE_PATH`、`KARVEX_WORKFLOW_NODE_DIR`、`KARVEX_WORKFLOW_NODE_TOKEN` 中读取信息,因此该命令不需要任何位置参数。请在 `result.json` 中包含一个 `summary` 字符串 ── 下游节点和运行历史看到的正是这个字符串 ── 并把任何内联不下的内容放进 `artifacts` 数组,指向 `./artifacts/` 下的路径。
+
+这种自我上报是三种完成信号中优先级最高的,按优先级排序如下:
+
+| 优先级 | 信号 | 适用对象 | 记录为 |
+| --- | --- | --- | --- |
+| 1 | 自我上报 ── 节点调用 `kvx workflow node complete` | `agent` 和 `command` 节点 | `self_report` |
+| 2 | 回合结束 ── 内置的 Claude 钩子报告窗格的回合已结束,随后 Karvex 读取 `result.json` | 仅 `agent` 节点 | `hook` |
+| 3 | 检测 ── 窗格连续多次被判定为 idle,且存在有效的 `result.json` | 仅 `agent` 节点 | `detection` |
+
+:::caution[仅凭 idle 永远不够]
+如果一个节点的窗格进入 idle 之前,从未生成过能通过 `output_schema.json` 校验的 `result.json`,它就不会完成。它会转为 `needs_attention`,并且只要它停留在这个状态,运行就不会报告成功。请始终通过 `kvx workflow node complete` 来完成节点,或者确保你的智能体做的最后一件事就是写出一个有效的结果。
+:::
+
+无效的结果会得到一次自动的纠正性再提示,其中会引用具体的 schema 错误;如果仍然无效,节点会以同样的方式转为 `needs_attention`。
+
+## 命令
+
+`kvx workflow` 也会出现在 `kvx --help` 的命令列表中。`show`、`create`、`update`、`run start`、`run show`、`node show` 默认都会输出人类可读文本;传入 `--json` 可改为输出机器可读的信封结构。
+
+```bash
+kvx workflow list
+kvx workflow show <name|id> [--json]
+kvx workflow create --file <definition.toml|json> [--name <name>] [--json]
+kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
+```
+
+`create` 和 `update` 都会从 `--file` 读取前面介绍过的定义文档;扩展名决定是 TOML 还是 JSON。`update` 会创建一个新的 kvdag 版本,而不是编辑当前版本 ── 除非该定义与当前头版本逐字节相同,这种情况下不会创建任何新内容,人类可读输出会显示 `(unchanged — this definition matches the current version; no new version was created)`,而不是声称创建了新版本。不带 `--json` 的 `show` 会渲染工作流摘要、带格式化时间戳的版本历史,以及头版本的节点(key、label、runner、demand)、边(from/to/kind/port)和已声明参数 ── 无需回到原始定义文件即可找到 `node show`/`steer`/`restart` 所需的节点 `<path>`,或 `run start` 所需的 `--arg` 名称。
+
+```bash
+kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
+kvx workflow run list <name|id> [--limit N]
+kvx workflow run show <run_id> [--json]
+kvx workflow run cancel <run_id>
+```
+
+在 Karvex 的 TUI 里,`prefix+f` 打开的则是 **工作流启动器**:一个浮层,列出已保存的工作流、当前选中工作流每个必填参数的输入行,以及一行以该工作流自己的 `default_tier` 为初值的等级选择。`Enter` 开始运行,`Esc` 关闭,每一行都可以点击。可通过 `keys.open_workflow_launcher` 重新绑定。
+
+`run` 是一个命名空间,不是用来选择工作流的参数:`start`、`list`、`show`、`cancel` 各自带有自己的参数,所以工作流即使叫 `list` 也不会和子命令冲突。`--tier` 默认使用该工作流自己的 `default_tier`;为每个已声明的运行参数重复使用 `--arg` ── 工作流未声明的 `--arg` 键不会被静默丢弃,而是在运行开始前被拒绝,并列出所有已声明的键。`run cancel` 会取消运行中剩余的节点并关闭它们的窗格。
+
+不带 `--json` 的 `run show` 会在运行处于 `paused` 或某个节点卡住时指出负责的节点:`status` 行会显示为 `paused (node "lint": needs_attention)`,随后是该节点的 blocker 原因和恢复条件,以及每个节点的路径和状态。当某个提议被拒绝或被截断时,它还会打印一行 `growth_limited:`,写明命中的护栏、该护栏的值,以及请求数与接受数。
+
+```bash
+kvx workflow node show <run_id> <path> [--json]
+kvx workflow node steer <run_id> <path> <text>
+kvx workflow node interrupt <run_id> <path>
+kvx workflow node restart <run_id> <path>
+kvx workflow node complete [--result-file <path>]
+kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]
+```
+
+`<path>` 是节点的实例路径,例如 `plan` 或 `fanout/worker/2` ── 会显示在 `run show`、`workflow show` 和 DAG 视图中。`steer` 会以和下文 DAG 视图中的引导输入相同的方式,向正在运行的节点注入文本。`interrupt` 发送一个转义键,在不结束节点的情况下停止其当前回合。`restart` 会关闭节点的窗格,增加其尝试次数,并从 `task.md` 重新启动。`node complete` 和 `node expand` 是节点对自己运行的两条命令,都由环境变量里已有的节点令牌来认证 ── 参见前文的节点契约与模板与动态扩展。不带 `--json` 的 `node show` 会在记录了相应信息时,在 `path`/`status`/`model`/`effort`/`pane_id` 之外显示该节点的 blocker(原因和恢复条件)以及最近一次的增长上限。
+
+## DAG 视图
+
+从 Karvex 的 TUI 打开某次运行的 DAG 视图,即可实时观察其执行:节点框按图的层级排布,边绘制在节点之间,详情条会显示当前选中节点的状态、模型、用量、最近一次检查点的摘要以及任何阻塞信息。
+
+用 `prefix+shift+F` 打开,或从全局菜单 — 侧边栏底部的启动器 — 中选择 **workflow dag**。菜单项仅在本服务器正在执行某次运行时出现,因为此外没有可绘制的图;按键在没有运行时也会如实告知,而不会打开一个空的浮层。可通过 `keys.open_workflow_dag` 重新绑定。
+
+| 输入 | 动作 |
+| --- | --- |
+| `h` / `j` / `k` / `l` 或方向键 | 将选中项移动到该方向上相邻的节点 |
+| 点击某个节点 | 选中该节点,不离开视图 |
+| `Enter`,或双击某个节点 | 聚焦该节点的窗格,离开 DAG 视图 |
+| `s` | 为选中节点打开一行引导输入;输入内容后按 `Enter` 以 `kvx workflow node steer` 发送 |
+| `Esc`(引导输入行处于打开状态时) | 不发送,直接关闭引导输入行 |
+| `Esc`(其他情况下) | 离开 DAG 视图 |
+| 移动鼠标 | 选中项跟随指针移动 |
+
+由被接受的扩展提议创建的节点会随着创建实时出现在图里,并按它们继承到的边、而不是按代数来排布。当某个提议被拒绝或被截断时,视图顶部会横跨一条横幅,写明命中的护栏以及请求数/接受数,提出提议的那个节点框里也会带上同样的提示 ── 这样运行说出来的不只是它做了什么,还有它没有被允许做什么。
+
+该视图是这次运行的只读投影:节点状态、位置和边全部来自 CLI 和 JSON API 所报告的同一张运行图。聚焦某个节点窗格所走的路径,和在 Karvex 中聚焦任何其他窗格完全相同,因此离开 DAG 视图之后,你看到的仍然是刚才选中的那个队友。
