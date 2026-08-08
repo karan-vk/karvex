@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.10.1] - 2026-08-08
+
 ### Fixed
 - `kvx workflow node expand --input KEY=VALUE` is no longer validated and then discarded: the override now reaches the child's rendered `task.md`, matching what `workflows.mdx` and the v0.10.0 changelog already claimed.
 - `kvx workflow node expand --label <text>` — a required flag — is no longer discarded either. An expansion child is now named by the label its proposing node gave it on every surface that names a node: its `task.md` title, its pane title, its `claude --name`, and its box in the DAG view. The label was resolved per kvdag key instead, so every child cut from one template wore that template's own label (a fan-out of `Worker`, `Worker`, `Worker`, …) and a node could not tell its own children apart.
