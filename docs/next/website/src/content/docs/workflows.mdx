@@ -160,12 +160,13 @@ kvx workflow node complete [--result-file <path>]
 
 Open a run's DAG view from the Karvex TUI to watch it execute live: node boxes laid out by graph layer, edges drawn between them, and a detail strip for whichever node is selected showing its status, model, usage, last checkpoint summary, and any blocker.
 
-Open it from the global menu — the launcher at the bottom of the sidebar — and pick **workflow dag**. The entry appears only while this server is executing a run, since there is otherwise no graph to draw.
+Open it with `prefix+shift+F`, or from the global menu — the launcher at the bottom of the sidebar — and pick **workflow dag**. The menu entry appears only while this server is executing a run, since there is otherwise no graph to draw; the key reports the same thing rather than opening an empty overlay. Rebind it with `keys.open_workflow_dag`.
 
 | Input | Action |
 | --- | --- |
 | `h` / `j` / `k` / `l` or the arrow keys | move the selection to the adjacent node in that direction |
-| `Enter`, or click a node | focus that node's pane, leaving the DAG view |
+| Click a node | select it, without leaving the view |
+| `Enter`, or double-click a node | focus that node's pane, leaving the DAG view |
 | `s` | open a steer line for the selected node; type, then `Enter` to send it as `kvx workflow node steer` |
 | `Esc` (with the steer line open) | close the steer line without sending |
 | `Esc` (otherwise) | leave the DAG view |
