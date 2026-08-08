@@ -147,7 +147,9 @@ pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuA
             leave_modal(state);
         }
         GlobalMenuAction::Settings => super::settings::open_settings(state),
-        GlobalMenuAction::WorkflowDag => open_workflow_dag(state),
+        GlobalMenuAction::WorkflowDag => {
+            open_workflow_dag(state);
+        }
     }
 }
 
@@ -155,11 +157,17 @@ pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuA
 /// exists while a run graph is mirrored into `AppState`, so the overlay is
 /// never opened onto nothing; `Esc` closes it through `leave_modal` like every
 /// other overlay.
-pub(super) fn open_workflow_dag(state: &mut AppState) {
+///
+/// Returns whether it opened. The menu entry is only offered when a run exists,
+/// but `keys.open_workflow_dag` can be pressed at any time, and a bound key
+/// that does nothing at all is indistinguishable from a broken one — the caller
+/// that has the runtime turns `false` into a notice.
+pub(super) fn open_workflow_dag(state: &mut AppState) -> bool {
     if state.workflow_run_graph().is_none() {
-        return;
+        return false;
     }
     state.mode = Mode::WorkflowDag;
+    true
 }
 
 pub(crate) fn handle_global_menu_key(state: &mut AppState, key: KeyEvent) {

@@ -455,6 +455,25 @@ fn root_help_advertises_api_schema_command_group() {
 }
 
 #[test]
+fn root_help_advertises_workflow_command_group() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kvx"))
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("kvx workflow <subcommand>"),
+        "root help usage should advertise the workflow command group: {stdout}"
+    );
+    assert!(
+        stdout.contains("Author and run multi-node agent workflows"),
+        "root help common commands should describe the workflow command group: {stdout}"
+    );
+}
+
+#[test]
 fn api_schema_default_output_is_a_short_summary() {
     let output = Command::new(env!("CARGO_BIN_EXE_kvx"))
         .args(["api", "schema"])

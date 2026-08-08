@@ -345,6 +345,41 @@ pub fn fill_slots(template: &str, slots: &BTreeMap<String, String>) -> String {
     out
 }
 
+// ── pane presentation ───────────────────────────────────────────────────────
+
+/// How wide a node pane's title is allowed to get. A run fans out over several
+/// splits, so a title that does not fit the pane header is worse than a shorter
+/// one that does.
+const PANE_TITLE_BUDGET: usize = 40;
+
+/// The pane title a node's split carries.
+///
+/// A `Runner::Command` node never emits an OSC title, so without this its pane
+/// is a blank rectangle indistinguishable from any bare process — and `enter
+/// focus` from the DAG view lands the user in exactly these panes. The title is
+/// the two facts that identify a node to a human: the workflow it belongs to
+/// and what the node is called.
+///
+/// `node_label` is the authored kvdag `label` when there is one; the caller
+/// falls back to the node key, which is why this only ever trims and joins.
+pub fn node_pane_title(workflow_name: &str, node_label: &str) -> String {
+    let workflow = workflow_name.trim();
+    let node = node_label.trim();
+    let title = match (workflow.is_empty(), node.is_empty()) {
+        (_, true) => workflow.to_string(),
+        (true, false) => node.to_string(),
+        (false, false) => format!("{workflow} · {node}"),
+    };
+    if title.chars().count() <= PANE_TITLE_BUDGET {
+        return title;
+    }
+    title
+        .chars()
+        .take(PANE_TITLE_BUDGET - 1)
+        .collect::<String>()
+        + "…"
+}
+
 // ── argv and env (§4.2) ─────────────────────────────────────────────────────
 
 /// `begin_managed_agent` is called only when the resolved argv maps to a known
@@ -707,6 +742,34 @@ mod tests {
 
     use crate::workflow::model::{InstancePath, Isolation, NodeToken, RunId, SpawnSpec};
     use crate::workflow::tier::{Assignment, Effort, ModelAlias};
+
+    /// 2.20: a command node's pane emits no OSC title, so without this it is a
+    /// blank rectangle — and `enter focus` from the DAG view lands in exactly
+    /// these panes.
+    #[test]
+    fn a_node_pane_is_titled_with_its_workflow_and_its_node() {
+        assert_eq!(
+            node_pane_title("ux-dag-probe", "Typecheck"),
+            "ux-dag-probe · Typecheck"
+        );
+    }
+
+    #[test]
+    fn a_node_pane_title_falls_back_to_whichever_name_it_has() {
+        assert_eq!(node_pane_title("", "typecheck"), "typecheck");
+        assert_eq!(node_pane_title("  ", " typecheck "), "typecheck");
+        assert_eq!(node_pane_title("ux-dag-probe", "   "), "ux-dag-probe");
+        assert_eq!(node_pane_title("", ""), "");
+    }
+
+    /// A run fans out over several splits, so a title that does not fit the
+    /// pane header is worse than a shorter one that does.
+    #[test]
+    fn a_long_node_pane_title_is_trimmed_to_the_budget() {
+        let title = node_pane_title(&"w".repeat(40), &"n".repeat(40));
+        assert_eq!(title.chars().count(), PANE_TITLE_BUDGET);
+        assert!(title.ends_with('…'), "{title}");
+    }
 
     fn agent_spec() -> SpawnSpec {
         SpawnSpec {

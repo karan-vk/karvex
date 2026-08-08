@@ -25,14 +25,16 @@ use ratatui::{
 };
 
 use super::line_cells::{line_cell_symbol, LineCell};
-use super::text::truncate_end;
+use super::text::{display_width, truncate_end};
 use super::widgets::panel_contrast_fg;
-use crate::app::state::{AppState, DagNodeView, DagViewState, Mode, Palette};
+use crate::app::state::{
+    AppState, DagNodeView, DagRunCounts, DagViewState, Mode, Palette, WorkflowRunPresentation,
+};
 use crate::workflow::layout::{layout, DagLayout, EdgeBits, LayoutRect};
 use crate::workflow::model::{NodeStatus, RunGraph, RunNode, RunNodeIdx, RunStatus, Succession};
 
 const HEADER_HEIGHT: u16 = 1;
-/// Status line, model/usage line, summary line, blocker line.
+/// Blocker line, status line, model/usage line, summary line.
 const DETAIL_HEIGHT: u16 = 4;
 const FOOTER_HEIGHT: u16 = 1;
 
@@ -69,15 +71,21 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
     let Some(graph) = app.workflow_run_graph() else {
         return view;
     };
+    let presentation = app.workflow_run_presentation();
 
     view.run_id = graph.run_id.as_str().to_string();
+    view.workflow_name = presentation.workflow_name.clone();
     view.run_status = Some(graph.status);
+    // Counted over the whole graph, before clipping: a resize must never
+    // change the answer the header gives about the run.
+    view.counts = run_counts(graph);
     view.layout = clipped_layout(graph, graph_rect);
+    let now_unix_ms = current_unix_ms();
     view.nodes = graph
         .nodes
         .iter()
         .filter(|node| view.layout.rect_of(node.idx).is_some())
-        .map(|node| project_node(graph, node))
+        .map(|node| project_node(graph, node, presentation, now_unix_ms))
         .collect();
     view.selected = carried_selection(previous, &view);
     // The steer line only survives while it still has a node to steer.
@@ -86,7 +94,33 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
     } else {
         None
     };
+    view.last_click = previous.last_click;
     view
+}
+
+/// Whole-graph status tallies. Deliberately taken from `graph`, never from the
+/// clipped projection.
+fn run_counts(graph: &RunGraph) -> DagRunCounts {
+    let mut counts = DagRunCounts {
+        total: graph.nodes.len(),
+        ..DagRunCounts::default()
+    };
+    for node in &graph.nodes {
+        match node.status {
+            NodeStatus::Running => counts.running += 1,
+            NodeStatus::Failed => counts.failed += 1,
+            NodeStatus::NeedsAttention => counts.needs_attention += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 /// Splits the full-bleed overlay into its four bands. A short terminal loses
@@ -117,7 +151,9 @@ fn clipped_layout(graph: &RunGraph, graph_rect: Rect) -> DagLayout {
     let bounds = to_layout_rect(graph_rect);
     let mut dag = layout(graph, bounds);
     dag.nodes.retain(|(_, rect)| contains_rect(bounds, *rect));
-    dag.edge_cells.retain(|(x, y), _| bounds.contains(*x, *y));
+    // Endpoint survival, not just bounds: an edge whose box was clipped away
+    // would otherwise leave a stub pointing at nothing.
+    dag.retain_visible_edges(bounds);
     dag
 }
 
@@ -129,7 +165,13 @@ fn contains_rect(bounds: LayoutRect, rect: LayoutRect) -> bool {
         && rect.bottom() <= bounds.bottom()
 }
 
-fn project_node(graph: &RunGraph, node: &RunNode) -> DagNodeView {
+fn project_node(
+    graph: &RunGraph,
+    node: &RunNode,
+    presentation: &WorkflowRunPresentation,
+    now_unix_ms: u64,
+) -> DagNodeView {
+    let node_labels = &presentation.node_labels;
     let successors = graph
         .outbound(node.idx)
         .filter_map(|edge_index| graph.edges.get(edge_index))
@@ -144,17 +186,27 @@ fn project_node(graph: &RunGraph, node: &RunNode) -> DagNodeView {
     DagNodeView {
         idx: node.idx,
         path: node.path.as_str().to_string(),
-        label: node.key.as_str().to_string(),
+        label: node_labels
+            .get(node.key.as_str())
+            .map(|label| label.trim())
+            .filter(|label| !label.is_empty())
+            .unwrap_or(node.key.as_str())
+            .to_string(),
         status: node.status,
         model: node.assignment.model.as_str().to_string(),
         effort: node.assignment.effort.as_str().to_string(),
         attempt: node.attempt,
         usage: node.usage,
+        duration_ms: display_duration_ms(node, now_unix_ms),
         summary: node
             .result
             .as_ref()
             .map(|result| result.summary.clone())
             .filter(|summary| !summary.trim().is_empty()),
+        delivery_failure: presentation
+            .delivery_failures
+            .get(node.path.as_str())
+            .cloned(),
         blocker: match &node.succession {
             Some(Succession::Blocked {
                 reason,
@@ -168,6 +220,25 @@ fn project_node(graph: &RunGraph, node: &RunNode) -> DagNodeView {
             .map(|binding| binding.pane_id.as_str().to_string()),
         successors,
         predecessors,
+    }
+}
+
+/// How long the node has been at work, as the detail strip should show it.
+///
+/// `usage.duration_ms` is only written when a node reaches a terminal status,
+/// so a live node would otherwise read `0s` forever no matter how long it has
+/// been stuck. A node that has started but not finished counts from
+/// `started_at_unix_ms`; a clock that moved backwards falls back to the
+/// recorded duration rather than underflowing.
+fn display_duration_ms(node: &RunNode, now_unix_ms: u64) -> u64 {
+    if node.status != NodeStatus::Running || node.ended_at_unix_ms.is_some() {
+        return node.usage.duration_ms;
+    }
+    match node.started_at_unix_ms {
+        Some(started) => now_unix_ms
+            .checked_sub(started)
+            .unwrap_or(node.usage.duration_ms),
+        None => node.usage.duration_ms,
     }
 }
 
@@ -293,63 +364,179 @@ pub(super) fn render_workflow_dag(app: &AppState, frame: &mut Frame, area: Rect)
         area,
     );
 
-    render_header(dag, p, frame);
+    // Nothing was drawn: say so once, on the whole overlay, instead of a header
+    // and a navigation footer arguing with an empty body.
     if dag.is_empty() {
-        render_empty_state(dag, p, frame);
-    } else {
-        render_edges(dag, p, frame);
-        render_nodes(dag, p, frame);
-        render_detail(dag, p, frame);
+        render_single_message(dag, p, frame, area);
+        return;
     }
+
+    render_header(dag, p, frame);
+    render_edges(dag, p, frame);
+    render_nodes(dag, p, frame);
+    render_detail(dag, p, frame);
     render_footer(dag, p, frame);
 }
 
+/// What to call this run on screen: the authored workflow name when the
+/// runtime mirrored one, and only otherwise the raw record id.
+fn run_title(dag: &DagViewState) -> String {
+    let name = dag.workflow_name.trim();
+    if name.is_empty() {
+        dag.run_id.clone()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Truncates a styled line to `width` cells, cutting inside the span that
+/// crosses the boundary and marking the cut with an ellipsis. The renderer,
+/// not the terminal, decides where a line ends — a hard clip turns a run id
+/// into a different, plausible, wrong run id.
+fn truncate_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|span| display_width(&span.content)).sum();
+    if total <= width || width == 0 {
+        return if width == 0 { Vec::new() } else { spans };
+    }
+    let mut used = 0usize;
+    let mut kept: Vec<Span<'static>> = Vec::new();
+    for span in spans {
+        let span_width = display_width(&span.content);
+        // Every kept span must leave room for the ellipsis that follows it.
+        if used + span_width < width {
+            used += span_width;
+            kept.push(span);
+            continue;
+        }
+        // One cell is reserved for the ellipsis, which is always emitted:
+        // whatever follows this span was dropped, so the line has to say so
+        // even when this span itself happened to fit.
+        let remaining = width.saturating_sub(used).saturating_sub(1);
+        let cut = truncate_end(&span.content, remaining);
+        let cut = cut.trim_end_matches('…');
+        let style = span.style;
+        if !cut.is_empty() {
+            kept.push(Span::styled(cut.to_string(), style));
+        }
+        kept.push(Span::styled("…", style));
+        return kept;
+    }
+    kept
+}
+
+/// The header names the run the way the author does, and reports the graph as
+/// it is — total nodes always, plus what is offscreen and what is wrong.
 fn render_header(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
     if dag.header_rect.height == 0 {
         return;
     }
-    let mut spans = vec![Span::styled(
-        " workflow run",
+    let dim = Style::default().fg(p.overlay0);
+    let mut spans = Vec::new();
+    let title = match run_title(dag) {
+        title if title.is_empty() => "workflow run".to_string(),
+        title => title,
+    };
+    spans.push(Span::styled(
+        format!(" {title}"),
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-    )];
-    if !dag.run_id.is_empty() {
-        spans.push(Span::styled(
-            format!(" {}", dag.run_id),
-            Style::default().fg(p.subtext0),
-        ));
-    }
+    ));
     if let Some(status) = dag.run_status {
-        spans.push(Span::styled(" · ", Style::default().fg(p.overlay0)));
+        spans.push(Span::styled(" · ", dim));
         spans.push(Span::styled(
             run_status_label(status),
             Style::default().fg(run_status_color(status, p)),
         ));
     }
-    if !dag.is_empty() {
+    spans.push(Span::styled(" · ", dim));
+    spans.push(Span::styled(
+        format!("{} nodes", dag.counts.total),
+        Style::default().fg(p.subtext0),
+    ));
+    let offscreen = dag.offscreen_nodes();
+    if offscreen > 0 {
         spans.push(Span::styled(
-            format!(
-                " · {} nodes · {} running",
-                dag.nodes.len(),
-                dag.nodes
-                    .iter()
-                    .filter(|node| node.status == NodeStatus::Running)
-                    .count()
-            ),
-            Style::default().fg(p.overlay0),
+            format!(" ({offscreen} offscreen)"),
+            Style::default().fg(p.peach),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), dag.header_rect);
+    if dag.counts.running > 0 {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            format!("{} running", dag.counts.running),
+            Style::default().fg(p.yellow),
+        ));
+    }
+    if dag.counts.failed > 0 {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            format!("{} failed", dag.counts.failed),
+            Style::default().fg(p.red),
+        ));
+    }
+    if dag.counts.needs_attention > 0 {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(
+            format!("{} needs attention", dag.counts.needs_attention),
+            Style::default().fg(p.peach),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(truncate_spans(
+            spans,
+            dag.header_rect.width as usize,
+        ))),
+        dag.header_rect,
+    );
 }
 
-fn render_empty_state(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
-    if dag.graph_rect.height == 0 {
+/// The one screen the overlay shows when it drew no nodes at all.
+///
+/// Two distinct situations reach it and they get different copy: there is no
+/// run to show, or there is a run and the terminal is too small to draw it.
+/// Nothing else is rendered — no run header over an empty body, no navigation
+/// hints for a graph that is not there.
+fn render_single_message(dag: &DagViewState, p: &Palette, frame: &mut Frame, area: Rect) {
+    if area.height == 0 || area.width == 0 {
         return;
     }
-    let line = Line::from(Span::styled(
-        " no workflow run to show",
-        Style::default().fg(p.overlay0),
-    ));
-    frame.render_widget(Paragraph::new(line), dag.graph_rect);
+    let width = area.width.saturating_sub(1) as usize;
+    let mut lines = Vec::new();
+    if dag.too_small_to_draw() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {}",
+                truncate_end(
+                    &format!(
+                        "terminal too small to draw {} nodes — resize the window",
+                        dag.counts.total
+                    ),
+                    width,
+                )
+            ),
+            Style::default().fg(p.peach).add_modifier(Modifier::BOLD),
+        )));
+        let target = run_title(dag);
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {}",
+                truncate_end(&format!("or run: kvx workflow run show {target}"), width)
+            ),
+            Style::default().fg(p.subtext0),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", truncate_end("no workflow run to show", width)),
+            Style::default().fg(p.overlay0),
+        )));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            " esc",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" close", Style::default().fg(p.overlay0)),
+    ]));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Direction bits → box-drawing glyphs, with a `▾` arrowhead in the cell that
@@ -365,9 +552,10 @@ fn render_edges(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
         .filter_map(|(_, rect)| rect.y.checked_sub(1).map(|y| (centre_x(*rect), y)))
         .collect();
 
+    let edge_cells = dag.layout.edge_cells();
     let buf = frame.buffer_mut();
     let bounds = buf.area;
-    for (&(x, y), &bits) in &dag.layout.edge_cells {
+    for (&(x, y), &bits) in &edge_cells {
         if x < bounds.x
             || x >= bounds.x.saturating_add(bounds.width)
             || y < bounds.y
@@ -408,13 +596,28 @@ fn render_nodes(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
             continue;
         }
         let selected = dag.selected == Some(*idx);
+        let blocking = dag.is_blocking(*idx);
         let status_color = node_status_color(node.status, p);
-        let border_color = if selected { p.accent } else { p.surface1 };
+        // A node the run is stuck behind is never quieter than the cursor:
+        // both get an emphasised border, the blocking one in its status color.
+        let border_style = if selected {
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+        } else if blocking {
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.surface1)
+        };
 
         let title_style = if selected {
             Style::default()
                 .fg(panel_contrast_fg(p))
                 .bg(p.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if blocking {
+            Style::default()
+                .fg(status_color)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.text)
@@ -422,13 +625,18 @@ fn render_nodes(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
         let label_width = rect.width.saturating_sub(4) as usize;
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
+            .border_style(border_style)
             .title(Span::styled(
                 format!(" {} ", truncate_end(&node.label, label_width)),
                 title_style,
             ))
             .style(Style::default().bg(p.panel_bg));
         let inner = block.inner(rect);
+        // Edges are routed without regard for the boxes they cross, so the box
+        // interior is wiped before it is drawn: a `│` left inside a node body
+        // reads as a table rule and corrupts the one fact the box exists to
+        // carry. `Block` only sets style, never symbols, so it cannot do this.
+        frame.render_widget(Clear, rect);
         frame.render_widget(block, rect);
 
         if inner.height == 0 {
@@ -461,13 +669,46 @@ fn render_detail(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
     let Some(node) = dag.selected_node() else {
         return;
     };
-    let width = dag.detail_rect.width.saturating_sub(1) as usize;
+    let width = dag.detail_rect.width as usize;
     let dim = Style::default().fg(p.overlay0);
-    let mut lines = vec![
-        Line::from(vec![
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // A delivery the runtime refused leads even the blocker: it is the one
+    // fact that contradicts what the user just did. Without it a steer that
+    // never reached the process looks exactly like one that landed.
+    if let Some(failure) = &node.delivery_failure {
+        lines.push(Line::from(truncate_spans(
+            vec![
+                Span::styled(
+                    " not delivered: ",
+                    Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(failure.clone(), Style::default().fg(p.red)),
+            ],
+            width,
+        )));
+    }
+    // The blocker is the only line that asks the user to do something, so it
+    // leads — labelled, not left to be mistaken for a summary.
+    if let Some(blocker) = &node.blocker {
+        lines.push(Line::from(truncate_spans(
+            vec![
+                Span::styled(
+                    " blocked: ",
+                    Style::default()
+                        .fg(node_status_color(node.status, p))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(blocker.clone(), Style::default().fg(p.red)),
+            ],
+            width,
+        )));
+    }
+    lines.push(Line::from(truncate_spans(
+        vec![
             Span::styled(" ", dim),
             Span::styled(
-                truncate_end(&node.path, width),
+                node.path.clone(),
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", dim),
@@ -475,8 +716,11 @@ fn render_detail(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
                 node_status_label(node.status),
                 Style::default().fg(node_status_color(node.status, p)),
             ),
-        ]),
-        Line::from(vec![
+        ],
+        width,
+    )));
+    lines.push(Line::from(truncate_spans(
+        vec![
             Span::styled(" ", dim),
             Span::styled(
                 format!("{} · {}", node.model, node.effort),
@@ -487,7 +731,7 @@ fn render_detail(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
                     "  {} tokens · {} tools · {}s",
                     node.usage.total_tokens,
                     node.usage.tool_uses,
-                    node.usage.duration_ms / 1000
+                    node.duration_ms / 1000
                 ),
                 dim,
             ),
@@ -498,22 +742,68 @@ fn render_detail(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
                     .unwrap_or_default(),
                 dim,
             ),
-        ]),
-    ];
+        ],
+        width,
+    )));
     lines.push(match &node.summary {
         Some(summary) => Line::from(Span::styled(
-            format!(" {}", truncate_end(summary, width)),
+            format!(" {}", truncate_end(summary, width.saturating_sub(1))),
             Style::default().fg(p.subtext0),
         )),
         None => Line::from(Span::styled(" no checkpoint yet", dim)),
     });
-    if let Some(blocker) = &node.blocker {
-        lines.push(Line::from(Span::styled(
-            format!(" {}", truncate_end(blocker, width)),
-            Style::default().fg(p.red),
-        )));
-    }
     frame.render_widget(Paragraph::new(lines), dag.detail_rect);
+}
+
+/// Every hint the overlay offers, in display order.
+const FOOTER_HINTS: [(&str, &str); 4] = [
+    ("enter", " focus"),
+    ("hjkl/↑↓←→", " move"),
+    ("s", " steer"),
+    ("esc", " close"),
+];
+
+/// Which hints fit in `width`, in display order.
+///
+/// A hint that does not fit is dropped whole rather than sliced mid-word, and
+/// they go least-useful first: `esc close` is the last thing to leave, because
+/// it is the only way out of a full-bleed overlay.
+fn footer_hints(width: usize) -> Vec<(&'static str, &'static str)> {
+    /// Indices into [`FOOTER_HINTS`], least useful first.
+    const DROP_ORDER: [usize; 4] = [2, 1, 0, 3];
+
+    let mut keep = [true; FOOTER_HINTS.len()];
+    for index in DROP_ORDER {
+        if footer_hints_width(&keep) <= width {
+            break;
+        }
+        keep[index] = false;
+    }
+    // Even the last hint can be wider than the band; a partial word is worse
+    // than nothing, so the row goes empty instead.
+    if footer_hints_width(&keep) > width {
+        return Vec::new();
+    }
+    FOOTER_HINTS
+        .iter()
+        .zip(keep)
+        .filter(|(_, kept)| *kept)
+        .map(|(hint, _)| *hint)
+        .collect()
+}
+
+fn footer_hints_width(keep: &[bool; FOOTER_HINTS.len()]) -> usize {
+    let mut used = 0usize;
+    let mut first = true;
+    for (hint, kept) in FOOTER_HINTS.iter().zip(keep) {
+        if !kept {
+            continue;
+        }
+        used += if first { 1 } else { 2 };
+        first = false;
+        used += display_width(hint.0) + display_width(hint.1);
+    }
+    used
 }
 
 fn render_footer(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
@@ -522,28 +812,33 @@ fn render_footer(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
     }
     let key = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(p.overlay0);
+    let width = dag.footer_rect.width as usize;
 
     let line = if let Some(text) = &dag.steer {
+        // The caret is what tells the user the line is live, so the text
+        // yields to it rather than the other way round.
+        let prefix = " steer › ";
+        let budget = width
+            .saturating_sub(display_width(prefix))
+            .saturating_sub(1);
         Line::from(vec![
             Span::styled(" steer", key),
             Span::styled(" › ", dim),
-            Span::styled(
-                truncate_end(text, dag.footer_rect.width.saturating_sub(12) as usize),
-                Style::default().fg(p.text),
-            ),
+            Span::styled(truncate_end(text, budget), Style::default().fg(p.text)),
             Span::styled("▏", Style::default().fg(p.accent)),
         ])
     } else {
-        Line::from(vec![
-            Span::styled(" enter", key),
-            Span::styled(" focus  ", dim),
-            Span::styled("hjkl/↑↓←→", key),
-            Span::styled(" move  ", dim),
-            Span::styled("s", key),
-            Span::styled(" steer  ", dim),
-            Span::styled("esc", key),
-            Span::styled(" close", dim),
-        ])
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (chord, label) in footer_hints(width) {
+            let chord = if spans.is_empty() {
+                format!(" {chord}")
+            } else {
+                format!("  {chord}")
+            };
+            spans.push(Span::styled(chord, key));
+            spans.push(Span::styled(label.to_string(), dim));
+        }
+        Line::from(spans)
     };
     frame.render_widget(Paragraph::new(line), dag.footer_rect);
 }
@@ -556,7 +851,13 @@ fn render_footer(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
 fn node_status_color(status: NodeStatus, p: &Palette) -> Color {
     match status {
         NodeStatus::Running => p.yellow,
-        NodeStatus::NeedsAttention | NodeStatus::Blocked | NodeStatus::Failed => p.red,
+        // `needs_attention` is recoverable and is asking for the user;
+        // `failed` is dead. They provoke opposite responses, so they must not
+        // share a color. Amber here is the same slot the header already uses
+        // for a paused run, which is exactly what a needs-attention node
+        // causes.
+        NodeStatus::NeedsAttention => p.peach,
+        NodeStatus::Blocked | NodeStatus::Failed => p.red,
         NodeStatus::Succeeded => p.green,
         NodeStatus::Pending | NodeStatus::Ready => p.subtext0,
         NodeStatus::Skipped | NodeStatus::Cancelled => p.overlay0,
@@ -689,6 +990,15 @@ mod tests {
     /// The projection the overlay would hold for `graph` in `area`, without
     /// needing an `AppState` wired to a live run.
     fn view_of(graph: &RunGraph, area: Rect) -> DagViewState {
+        view_of_named(graph, area, "", &std::collections::HashMap::new())
+    }
+
+    fn view_of_named(
+        graph: &RunGraph,
+        area: Rect,
+        workflow_name: &str,
+        labels: &std::collections::HashMap<String, String>,
+    ) -> DagViewState {
         let (header_rect, graph_rect, detail_rect, footer_rect) = overlay_areas(area);
         let mut view = DagViewState {
             header_rect,
@@ -696,7 +1006,9 @@ mod tests {
             detail_rect,
             footer_rect,
             run_id: graph.run_id.as_str().to_string(),
+            workflow_name: workflow_name.to_string(),
             run_status: Some(graph.status),
+            counts: run_counts(graph),
             ..DagViewState::default()
         };
         view.layout = clipped_layout(graph, graph_rect);
@@ -704,10 +1016,43 @@ mod tests {
             .nodes
             .iter()
             .filter(|node| view.layout.rect_of(node.idx).is_some())
-            .map(|node| project_node(graph, node))
+            .map(|node| {
+                project_node(
+                    graph,
+                    node,
+                    &WorkflowRunPresentation {
+                        workflow_name: workflow_name.to_string(),
+                        node_labels: labels.clone(),
+                        delivery_failures: std::collections::HashMap::new(),
+                    },
+                    0,
+                )
+            })
             .collect();
         view.selected = carried_selection(&DagViewState::default(), &view);
         view
+    }
+
+    fn screen_of(view: &DagViewState, area: Rect) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = AppState::test_new();
+        app.mode = Mode::WorkflowDag;
+        app.view.dag = view.clone();
+        let app = &app;
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).expect("term");
+        terminal
+            .draw(|frame| render_workflow_dag(app, frame, area))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -737,7 +1082,7 @@ mod tests {
                 view.graph_rect
             );
         }
-        for (x, y) in view.layout.edge_cells.keys() {
+        for (x, y) in view.layout.edge_cells().keys() {
             assert!(to_layout_rect(view.graph_rect).contains(*x, *y));
         }
     }
@@ -846,8 +1191,6 @@ mod tests {
 
     #[test]
     fn render_draws_boxes_edges_and_the_selected_node_detail() {
-        use ratatui::{backend::TestBackend, Terminal};
-
         let mut graph = diamond();
         graph.nodes[0].status = NodeStatus::Running;
         graph.nodes[0].succession = Some(crate::workflow::model::Succession::Blocked {
@@ -856,30 +1199,13 @@ mod tests {
         });
 
         let area = Rect::new(0, 0, 100, 30);
-        let mut app = AppState::test_new();
-        app.mode = Mode::WorkflowDag;
-        app.view.dag = view_of(&graph, area);
-        assert_eq!(app.view.dag.selected, Some(RunNodeIdx(0)));
-
-        // Shared borrow: `render_workflow_dag` cannot mutate what it draws.
-        let app = &app;
-        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).expect("term");
-        terminal
-            .draw(|frame| render_workflow_dag(app, frame, area))
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        let screen = (0..area.height)
-            .map(|row| {
-                (0..area.width)
-                    .map(|column| buffer[(column, row)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let view = view_of(&graph, area);
+        assert_eq!(view.selected, Some(RunNodeIdx(0)));
+        let screen = screen_of(&view, area);
 
         // Header, every node box, the edge glyphs, the arrowheads, the detail
         // strip for the selected node, and the hint bar.
-        assert!(screen.contains("workflow run workflow_run:1"), "{screen}");
+        assert!(screen.contains("workflow_run:1"), "{screen}");
         for label in ["start", "left", "right", "end"] {
             assert!(screen.contains(label), "missing {label}\n{screen}");
         }
@@ -889,6 +1215,378 @@ mod tests {
         assert!(screen.contains("sonnet · low"), "{screen}");
         assert!(screen.contains("waiting on review"), "{screen}");
         assert!(screen.contains("esc"), "{screen}");
+    }
+
+    /// 2.4: `render_edges` runs before `render_nodes`, and a `Block` only sets
+    /// style — so without an explicit clear a skip-layer edge routed straight
+    /// down through a box body survives inside it.
+    #[test]
+    fn no_edge_glyph_survives_inside_a_node_box() {
+        // `a → b → c` plus the skip-layer `a → c`, which routes straight down
+        // the shared centre column — directly through `b`'s box body.
+        let graph = RunGraph {
+            nodes: vec![test_node(0, "a"), test_node(1, "b"), test_node(2, "c")],
+            edges: vec![test_edge(0, 1), test_edge(1, 2), test_edge(0, 2)],
+            ..diamond()
+        };
+
+        let area = Rect::new(0, 0, 60, 20);
+        let view = view_of(&graph, area);
+        let mut app = AppState::test_new();
+        app.mode = Mode::WorkflowDag;
+        app.view.dag = view.clone();
+        let app = &app;
+
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).expect("term");
+        terminal
+            .draw(|frame| render_workflow_dag(app, frame, area))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+
+        for (_, rect) in &view.layout.nodes {
+            for row in (rect.y + 1)..(rect.bottom() - 1) {
+                for column in (rect.x + 1)..(rect.right() - 1) {
+                    let symbol = buffer[(column, row)].symbol();
+                    assert!(
+                        !"│─┌┐└┘├┤┬┴┼▾".contains(symbol),
+                        "edge glyph {symbol:?} bled into a box at ({column},{row})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 2.7: clipping a box must take its edges with it, or the frame draws a
+    /// rail and an arrowhead pointing at nothing.
+    #[test]
+    fn clipping_a_node_drops_the_edge_cells_that_pointed_at_it() {
+        let graph = diamond();
+        let view = view_of(&graph, Rect::new(0, 0, 120, 9));
+        assert!(
+            view.layout.nodes.len() < graph.nodes.len(),
+            "nothing clipped"
+        );
+
+        let surviving: Vec<RunNodeIdx> = view.layout.nodes.iter().map(|(idx, _)| *idx).collect();
+        for route in &view.layout.edges {
+            assert!(surviving.contains(&route.from), "{route:?}");
+            assert!(surviving.contains(&route.to), "{route:?}");
+        }
+        // Only the first layer survives here, so every edge went with its box
+        // and no orphan stub is left under it.
+        assert_eq!(surviving.len(), 1);
+        assert!(
+            view.layout.edge_cells().is_empty(),
+            "{:?}",
+            view.layout.edges
+        );
+    }
+
+    /// 2.5: the header counts the run, not the frame.
+    #[test]
+    fn the_header_counts_every_node_and_names_what_is_offscreen() {
+        let mut graph = diamond();
+        graph.nodes[1].status = NodeStatus::Failed;
+        graph.nodes[2].status = NodeStatus::NeedsAttention;
+
+        let area = Rect::new(0, 0, 120, 40);
+        let full = view_of(&graph, area);
+        assert_eq!(full.counts.total, 4);
+        assert_eq!(full.offscreen_nodes(), 0);
+        let screen = screen_of(&full, area);
+        assert!(screen.contains("4 nodes"), "{screen}");
+        assert!(screen.contains("1 failed"), "{screen}");
+        assert!(screen.contains("1 needs attention"), "{screen}");
+        assert!(!screen.contains("offscreen"), "{screen}");
+
+        // The same run in a band that only fits the first layer still reports
+        // four nodes, and says how many it could not draw.
+        let clipped_area = Rect::new(0, 0, 120, 9);
+        let clipped = view_of(&graph, clipped_area);
+        assert!(clipped.nodes.len() < 4);
+        assert_eq!(clipped.counts.total, 4);
+        let screen = screen_of(&clipped, clipped_area);
+        assert!(screen.contains("4 nodes"), "{screen}");
+        assert!(
+            screen.contains(&format!("({} offscreen)", clipped.offscreen_nodes())),
+            "{screen}"
+        );
+    }
+
+    /// 2.25 / 2.30: authored names win over record ids and node keys.
+    #[test]
+    fn the_overlay_shows_authored_names_before_ids_and_keys() {
+        let graph = diamond();
+        let labels: std::collections::HashMap<String, String> =
+            [("start".to_string(), "Kick Off".to_string())]
+                .into_iter()
+                .collect();
+        let area = Rect::new(0, 0, 120, 40);
+        let view = view_of_named(&graph, area, "ux-dag-probe", &labels);
+
+        assert_eq!(
+            view.node(RunNodeIdx(0)).map(|node| node.label.as_str()),
+            Some("Kick Off")
+        );
+        // A node the definition did not label still shows its key.
+        assert_eq!(
+            view.node(RunNodeIdx(1)).map(|node| node.label.as_str()),
+            Some("left")
+        );
+
+        let screen = screen_of(&view, area);
+        assert!(screen.contains("ux-dag-probe"), "{screen}");
+        assert!(screen.contains("Kick Off"), "{screen}");
+        assert!(!screen.contains("workflow_run:1"), "{screen}");
+    }
+
+    /// 2.6: a run that does not fit must not be reported as a run that does not
+    /// exist, and nothing navigable may be advertised.
+    #[test]
+    fn a_run_too_small_to_draw_says_so_once() {
+        let graph = diamond();
+        let area = Rect::new(0, 0, 24, 8);
+        let view = view_of(&graph, area);
+        assert!(view.is_empty());
+        assert!(view.too_small_to_draw());
+
+        let screen = screen_of(&view, area);
+        assert!(screen.contains("too small"), "{screen}");
+        assert!(!screen.contains("no workflow run to show"), "{screen}");
+        // No navigation hints for a graph that is not on screen.
+        assert!(!screen.contains("move"), "{screen}");
+        assert!(!screen.contains("steer"), "{screen}");
+        assert!(screen.contains("esc"), "{screen}");
+    }
+
+    #[test]
+    fn no_run_at_all_still_reads_as_no_run() {
+        let graph = RunGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            ..diamond()
+        };
+        let area = Rect::new(0, 0, 80, 24);
+        let view = view_of(&graph, area);
+        assert!(!view.too_small_to_draw());
+
+        let screen = screen_of(&view, area);
+        assert!(screen.contains("no workflow run to show"), "{screen}");
+        assert!(!screen.contains("too small"), "{screen}");
+    }
+
+    /// 2.27: the renderer decides where a line ends, so a narrow terminal never
+    /// leaves a plausible-but-wrong run id on screen.
+    #[test]
+    fn narrow_bands_are_truncated_with_an_ellipsis_not_hard_clipped() {
+        let mut graph = diamond();
+        graph.nodes[0].status = NodeStatus::Running;
+
+        let area = Rect::new(0, 0, 40, 20);
+        let view = view_of(&graph, area);
+        let screen = screen_of(&view, area);
+        for line in screen.lines() {
+            assert!(
+                line.chars().count() <= area.width as usize,
+                "line escapes the overlay: {line:?}"
+            );
+        }
+        // The run id is longer than the header band, so it ends in an ellipsis
+        // rather than in a different id.
+        let header = screen.lines().next().unwrap_or_default();
+        assert!(header.contains('…'), "{header:?}");
+    }
+
+    /// 2.28: `usage.duration_ms` is only written at completion.
+    #[test]
+    fn a_running_node_reports_elapsed_time_from_its_start() {
+        let mut node = test_node(0, "start");
+        node.status = NodeStatus::Running;
+        node.started_at_unix_ms = Some(1_000);
+        assert_eq!(display_duration_ms(&node, 8_000), 7_000);
+
+        // A finished node keeps the recorded duration.
+        node.status = NodeStatus::Succeeded;
+        node.usage.duration_ms = 42;
+        assert_eq!(display_duration_ms(&node, 8_000), 42);
+
+        // A backwards clock never underflows into a nonsense duration.
+        node.status = NodeStatus::Running;
+        assert_eq!(display_duration_ms(&node, 0), 42);
+    }
+
+    /// 2.22: the blocker is the actionable line, so it leads and it is labelled.
+    #[test]
+    fn the_detail_strip_leads_with_the_blocker() {
+        let mut graph = diamond();
+        graph.nodes[0].status = NodeStatus::NeedsAttention;
+        graph.nodes[0].succession = Some(crate::workflow::model::Succession::Blocked {
+            reason: "the node's pane exited".into(),
+            resume_when: "the node is restarted".into(),
+        });
+
+        let area = Rect::new(0, 0, 120, 40);
+        let view = view_of(&graph, area);
+        let screen = screen_of(&view, area);
+        let detail: Vec<&str> = screen
+            .lines()
+            .skip(view.detail_rect.y as usize)
+            .take(view.detail_rect.height as usize)
+            .collect();
+        assert!(
+            detail.first().is_some_and(|line| line.contains("blocked:")),
+            "{detail:?}"
+        );
+        assert!(
+            detail
+                .first()
+                .is_some_and(|line| line.contains("pane exited")),
+            "{detail:?}"
+        );
+    }
+
+    /// 2.15: a steer the runtime refused used to leave no trace on any surface
+    /// — the user was left believing it was delivered. The marker leads the
+    /// strip, above even the blocker, because it contradicts what the user just
+    /// did.
+    #[test]
+    fn a_refused_delivery_is_shown_on_the_node_it_was_meant_for() {
+        let mut graph = diamond();
+        graph.nodes[0].status = NodeStatus::Failed;
+        let path = graph.nodes[0].path.to_string();
+
+        let area = Rect::new(0, 0, 120, 40);
+        let presentation = WorkflowRunPresentation {
+            workflow_name: String::new(),
+            node_labels: std::collections::HashMap::new(),
+            delivery_failures: std::collections::HashMap::from([(
+                path,
+                "pane.send_text: pane_not_found: no such pane".to_string(),
+            )]),
+        };
+        let mut view = view_of(&graph, area);
+        view.nodes = graph
+            .nodes
+            .iter()
+            .filter(|node| view.layout.rect_of(node.idx).is_some())
+            .map(|node| project_node(&graph, node, &presentation, 0))
+            .collect();
+
+        let screen = screen_of(&view, area);
+        let detail: Vec<&str> = screen
+            .lines()
+            .skip(view.detail_rect.y as usize)
+            .take(view.detail_rect.height as usize)
+            .collect();
+        assert!(
+            detail
+                .first()
+                .is_some_and(|line| line.contains("not delivered:")),
+            "{detail:?}"
+        );
+        assert!(
+            detail
+                .first()
+                .is_some_and(|line| line.contains("pane_not_found")),
+            "{detail:?}"
+        );
+    }
+
+    /// 2.8: the two states with opposite remedies must not share a color, and
+    /// the node the run is stuck behind is never quieter than the cursor.
+    #[test]
+    fn needs_attention_is_amber_and_a_blocking_node_is_emphasised() {
+        let palette = Palette::catppuccin();
+        assert_ne!(
+            node_status_color(NodeStatus::NeedsAttention, &palette),
+            node_status_color(NodeStatus::Failed, &palette)
+        );
+        assert_eq!(
+            node_status_color(NodeStatus::NeedsAttention, &palette),
+            palette.peach
+        );
+
+        let mut graph = diamond();
+        graph.status = RunStatus::Paused;
+        graph.nodes[1].status = NodeStatus::NeedsAttention;
+        let view = view_of(&graph, Rect::new(0, 0, 120, 40));
+        assert!(view.is_blocking(RunNodeIdx(1)));
+        assert!(!view.is_blocking(RunNodeIdx(2)));
+
+        // A running run has no blocking node, however a node is doing.
+        let mut running = diamond();
+        running.nodes[1].status = NodeStatus::NeedsAttention;
+        let view = view_of(&running, Rect::new(0, 0, 120, 40));
+        assert!(!view.is_blocking(RunNodeIdx(1)));
+    }
+
+    #[test]
+    fn truncate_spans_never_exceeds_the_band_and_always_marks_the_cut() {
+        let line = || {
+            vec![
+                Span::raw("workflow_run:ue3nqrnztwlifx4a2m3g".to_string()),
+                Span::raw(" · ".to_string()),
+                Span::raw("running".to_string()),
+            ]
+        };
+        let full: usize = line().iter().map(|span| display_width(&span.content)).sum();
+
+        // A band that fits keeps the line untouched.
+        assert_eq!(truncate_spans(line(), full), line());
+
+        for width in 0..=full {
+            let cut = truncate_spans(line(), width);
+            let rendered: String = cut.iter().map(|span| span.content.to_string()).collect();
+            assert!(display_width(&rendered) <= width, "{width}: {rendered:?}");
+            if width < full && width > 0 {
+                assert!(rendered.ends_with('…'), "{width}: {rendered:?}");
+                // Never a plausible-but-wrong id: the cut is always marked.
+                assert!(!rendered.contains("ue3nqrnztwlifx4a2m3g ·") || rendered.ends_with('…'));
+            }
+        }
+    }
+
+    /// 2.27: the footer drops hints whole, and never the way out.
+    #[test]
+    fn footer_hints_degrade_without_ever_losing_escape() {
+        let full = footer_hints(200);
+        assert_eq!(full.len(), FOOTER_HINTS.len());
+
+        let mut previous = full.len();
+        for width in (0..=60).rev() {
+            let hints = footer_hints(width);
+            assert!(hints.len() <= previous, "width {width} gained a hint");
+            previous = hints.len();
+            let rendered: String = hints
+                .iter()
+                .enumerate()
+                .map(|(index, (chord, label))| {
+                    format!("{}{chord}{label}", if index == 0 { " " } else { "  " })
+                })
+                .collect();
+            assert!(display_width(&rendered) <= width, "{width}: {rendered:?}");
+            if !hints.is_empty() {
+                assert_eq!(hints.last(), Some(&("esc", " close")), "width {width}");
+            }
+        }
+    }
+
+    /// 2.21: one click selects, two focus.
+    #[test]
+    fn a_second_click_on_the_same_box_is_a_double_click() {
+        use std::time::{Duration, Instant};
+
+        let mut view = view_of(&diamond(), Rect::new(0, 0, 120, 40));
+        let now = Instant::now();
+        assert!(!view.register_click(RunNodeIdx(0), 4, 1, now));
+        assert!(view.register_click(RunNodeIdx(0), 4, 1, now + Duration::from_millis(120)));
+        // The double click is consumed, so a third click starts over.
+        assert!(!view.register_click(RunNodeIdx(0), 4, 1, now + Duration::from_millis(200)));
+
+        // Too slow, a different box, or too far away is a fresh single click.
+        assert!(!view.register_click(RunNodeIdx(0), 4, 1, now + Duration::from_secs(5)));
+        assert!(!view.register_click(RunNodeIdx(1), 4, 1, now + Duration::from_millis(5100)));
     }
 
     #[test]

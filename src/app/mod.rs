@@ -697,6 +697,7 @@ impl App {
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
             run_graph: None,
+            run_presentation: state::WorkflowRunPresentation::default(),
         };
 
         state.terminals = restored_terminals;

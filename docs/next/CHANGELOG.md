@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+- `kvx workflow` now appears in `kvx --help`'s Usage and Common commands, and in `cli-reference.mdx` (all three locales), so the feature is discoverable without already knowing `workflows.mdx` exists.
+- `kvx workflow show` now renders a workflow's summary, version history (with formatted timestamps instead of raw epoch milliseconds), and — for the head version — its nodes (key, label, runner, demand), edges (from, to, kind, port), and declared args, in human-readable text by default. Pass `--json` for the previous machine-readable envelope.
+- `kvx workflow create` and `kvx workflow update` now print human-readable output by default (including local definition errors like an invalid TOML/JSON document, rendered with real newlines instead of `\n`-escaped text inside a JSON envelope); pass `--json` for the previous machine-readable envelope.
+- `kvx workflow run show`'s default output now names the node responsible when a run is `paused` or a node needs attention, alongside that node's blocker reason and resume condition, and lists every node's path and status.
+- `kvx workflow node show`'s default output now includes the node's blocker (reason and resume condition) when one is recorded.
+
+### Fixed
+- A workflow definition document that omits `output_schema` on a node or `kind` on an edge — both of which `workflows.mdx` never documented as required — now gets a sensible default (`output_schema` defaults to `{}`, `kind` defaults to `sequence`) instead of a raw serde "missing field" error that masked every other authoring validator (cycle, dangling edge, duplicate key, missing command). Both fields are now documented in `workflows.mdx` as defaulting when omitted.
+- An edge declaring `kind = "conditional"` with no `condition`, or a `port` that names no matching `{{slot}}` in the target node's `prompt_template`, is now rejected at authoring time instead of being accepted and silently producing a workflow that never resolves or whose data goes nowhere.
+- `kvx workflow run start` now rejects an undeclared `--arg` key before starting the run, listing the workflow's declared args, instead of silently dropping the typo'd argument.
+- `kvx workflow update` now reports `(unchanged — this definition matches the current version; no new version was created)` in its human output when a resubmitted definition deduplicates against the workflow's current head version, instead of describing it as a newly created version.
+- A duplicate workflow name on `kvx workflow create` now reports a clean "a workflow named ... already exists" message instead of leaking the store's internal `Database index` / record-id error text.
+- A socket path too long for the platform's unix domain socket address (the `sun_path` limit) now fails with an actionable message naming the path, its length, and the `KARVEX_SOCKET_PATH` override, instead of the raw `io::Error` Debug output (`Error: Custom { kind: InvalidInput, ... }`).
+
 ## [0.9.3] - 2026-08-08
 
 ### Fixed

@@ -4,13 +4,13 @@
 //! and thin leaf functions that perform the file/env reads and the network
 //! call, matching the convention already used by `src/cli/pane.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::api::schema::{
     Method, Request, WorkflowCreateParams, WorkflowDefinitionDocument, WorkflowDefinitionFormat,
     WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRunListParams,
     WorkflowRunParams, WorkflowRunTarget, WorkflowTarget, WorkflowTier,
-    WorkflowVersionCreateParams,
+    WorkflowVersionCreateParams, WorkflowVersionTarget,
 };
 
 /// Env karvex injects into a node's pane
@@ -134,29 +134,83 @@ fn parse_workflow_list_args(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `workflow.get` alone only carries the workflow's summary and a version
+/// history (`KvdagVersionSummary`, no nodes/edges/args) — §2.18: "`kvx
+/// workflow show` never shows the workflow ... a user cannot discover which
+/// node paths exist ... or which `--arg` names to pass". The full graph
+/// (`KvdagNodeInfo`/`KvdagEdgeInfo`/`WorkflowArgSpec`) only exists on
+/// `workflow.version.get`, so the human view chains a second request for the
+/// head version. `--json` skips the second call and prints the raw
+/// `workflow.get` result exactly as before, for scripts that already parse it.
 fn workflow_show(args: &[String]) -> std::io::Result<i32> {
-    match parse_workflow_show_args(args) {
-        Ok(target) => super::runtime::workflow_get(target.workflow_id),
+    let (target, json) = match parse_workflow_show_args(args) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
-            Ok(2)
+            return Ok(2);
         }
+    };
+
+    if json {
+        return super::runtime::workflow_get(target.workflow_id);
     }
+
+    let response = super::send_request(&Request {
+        id: "cli:workflow:show".into(),
+        method: Method::WorkflowGet(target),
+    })?;
+    if response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+
+    let head_version_id = response["result"]["workflow"]["head_version_id"]
+        .as_str()
+        .map(str::to_string);
+    let version = match head_version_id {
+        Some(version_id) => {
+            let version_response = super::send_request(&Request {
+                id: "cli:workflow:show:version".into(),
+                method: Method::WorkflowVersionGet(WorkflowVersionTarget { version_id }),
+            })?;
+            (version_response.get("error").is_none()).then_some(version_response)
+        }
+        None => None,
+    };
+
+    print_workflow_show(&response, version.as_ref());
+    Ok(0)
 }
 
-fn parse_workflow_show_args(args: &[String]) -> Result<WorkflowTarget, String> {
+fn parse_workflow_show_args(args: &[String]) -> Result<(WorkflowTarget, bool), String> {
+    let usage = "usage: kvx workflow show <name|id> [--json]";
     match args {
-        [target] => Ok(WorkflowTarget {
-            workflow_id: target.clone(),
-        }),
-        _ => Err("usage: kvx workflow show <name|id>".into()),
+        [target] => Ok((
+            WorkflowTarget {
+                workflow_id: target.clone(),
+            },
+            false,
+        )),
+        [target, flag] if flag == "--json" => Ok((
+            WorkflowTarget {
+                workflow_id: target.clone(),
+            },
+            true,
+        )),
+        _ => Err(usage.into()),
     }
 }
 
 // ── workflow create / update ────────────────────────────────────────────
 
+/// §2.16.3: `create`/`update` had no human/`--json` split at all, so the
+/// carefully formatted TOML caret diagnostic from a parse error arrived as
+/// `\n`-escaped literal text inside a JSON envelope. Default output is now
+/// human-readable (the local definition error prints with real newlines via
+/// [`print_workflow_local_error`]; the server response renders through
+/// [`print_workflow_create_response`]); `--json` preserves the exact
+/// previous machine-readable envelope for scripts.
 fn workflow_create(args: &[String]) -> std::io::Result<i32> {
-    let (file, name) = match parse_workflow_create_args(args) {
+    let (file, name, json) = match parse_workflow_create_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
@@ -167,18 +221,26 @@ fn workflow_create(args: &[String]) -> std::io::Result<i32> {
     let definition = match load_definition_document(&file, name) {
         Ok(definition) => definition,
         Err(message) => {
-            print_workflow_cli_error("invalid_definition", &message);
-            return Ok(1);
+            return Ok(print_workflow_local_error(
+                "invalid_definition",
+                &message,
+                json,
+            ));
         }
     };
 
-    super::runtime::workflow_create(WorkflowCreateParams { definition })
+    let response = super::send_request(&Request {
+        id: "cli:workflow:create".into(),
+        method: Method::WorkflowCreate(WorkflowCreateParams { definition }),
+    })?;
+    print_workflow_create_response(&response, json)
 }
 
-fn parse_workflow_create_args(args: &[String]) -> Result<(String, Option<String>), String> {
-    let usage = "usage: kvx workflow create --file <definition.toml|json> [--name <name>]";
+fn parse_workflow_create_args(args: &[String]) -> Result<(String, Option<String>, bool), String> {
+    let usage = "usage: kvx workflow create --file <definition.toml|json> [--name <name>] [--json]";
     let mut file = None;
     let mut name = None;
+    let mut json = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -197,6 +259,10 @@ fn parse_workflow_create_args(args: &[String]) -> Result<(String, Option<String>
                 name = Some(value.clone());
                 index += 2;
             }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
@@ -204,11 +270,22 @@ fn parse_workflow_create_args(args: &[String]) -> Result<(String, Option<String>
     let Some(file) = file else {
         return Err(usage.into());
     };
-    Ok((file, name))
+    Ok((file, name, json))
 }
 
+/// §2.19's "`update` drops fields and misreports no-ops": resubmitting a
+/// definition whose spec digest already matches the workflow's head version
+/// deduplicates server-side, but the response still carries type
+/// `workflow_version_created` with no wire-level way to tell the two cases
+/// apart (see the notes returned alongside this task for the server-side
+/// fix). The human view closes that gap client-side by reading the
+/// workflow's head version *before* the update and comparing it to the
+/// version the update actually returns: a match means nothing new was
+/// created, so this prints "unchanged" and says so plainly instead of
+/// letting the response's own claim stand uncorrected. `--json` is left
+/// exactly as the server returned it.
 fn workflow_update(args: &[String]) -> std::io::Result<i32> {
-    let (workflow_id, file, change_summary) = match parse_workflow_update_args(args) {
+    let (workflow_id, file, change_summary, json) = match parse_workflow_update_args(args) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("{message}");
@@ -219,20 +296,35 @@ fn workflow_update(args: &[String]) -> std::io::Result<i32> {
     let definition = match load_definition_document(&file, None) {
         Ok(definition) => definition,
         Err(message) => {
-            print_workflow_cli_error("invalid_definition", &message);
-            return Ok(1);
+            return Ok(print_workflow_local_error(
+                "invalid_definition",
+                &message,
+                json,
+            ));
         }
     };
 
-    super::runtime::workflow_version_create(WorkflowVersionCreateParams {
-        workflow_id,
-        definition,
-        change_summary: change_summary.unwrap_or_default(),
-    })
+    let previous_head_version = if json {
+        None
+    } else {
+        fetch_head_version(&workflow_id)?
+    };
+
+    let response = super::send_request(&Request {
+        id: "cli:workflow:update".into(),
+        method: Method::WorkflowVersionCreate(WorkflowVersionCreateParams {
+            workflow_id,
+            definition,
+            change_summary: change_summary.clone().unwrap_or_default(),
+        }),
+    })?;
+    print_workflow_update_response(&response, json, previous_head_version)
 }
 
-fn parse_workflow_update_args(args: &[String]) -> Result<(String, String, Option<String>), String> {
-    let usage = "usage: kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>]";
+fn parse_workflow_update_args(
+    args: &[String],
+) -> Result<(String, String, Option<String>, bool), String> {
+    let usage = "usage: kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]";
     let Some(workflow_id) = args.first() else {
         return Err(usage.into());
     };
@@ -240,6 +332,7 @@ fn parse_workflow_update_args(args: &[String]) -> Result<(String, String, Option
 
     let mut file = None;
     let mut change_summary = None;
+    let mut json = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -249,6 +342,10 @@ fn parse_workflow_update_args(args: &[String]) -> Result<(String, String, Option
                 };
                 file = Some(value.clone());
                 index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
             }
             "--change-summary" => {
                 let Some(value) = args.get(index + 1) else {
@@ -264,7 +361,25 @@ fn parse_workflow_update_args(args: &[String]) -> Result<(String, String, Option
     let Some(file) = file else {
         return Err(usage.into());
     };
-    Ok((workflow_id, file, change_summary))
+    Ok((workflow_id, file, change_summary, json))
+}
+
+/// Reads the workflow's current head version number (before an update), so
+/// the update response can be compared against it to detect a deduplicated
+/// no-op. `None` on any lookup failure (unresolvable target, no version yet,
+/// transport hiccup): `workflow.version.create` itself is the authority on
+/// whether the update succeeds, so a failed precheck falls back to trusting
+/// the update response's own claim rather than blocking the update.
+fn fetch_head_version(workflow_id: &str) -> std::io::Result<Option<u32>> {
+    let response = super::send_request(&Request {
+        id: "cli:workflow:update:precheck".into(),
+        method: Method::WorkflowGet(WorkflowTarget {
+            workflow_id: workflow_id.to_string(),
+        }),
+    })?;
+    Ok(response["result"]["workflow"]["head_version"]
+        .as_u64()
+        .map(|version| version as u32))
 }
 
 /// `WorkflowCreateParams`/`WorkflowVersionCreateParams` carry the definition
@@ -334,6 +449,13 @@ fn override_definition_name(
 
 // ── workflow run start / list / show / cancel ───────────────────────────
 
+/// §2.19's "undeclared `--arg` ignored": `run start demo --arg goal=x --arg
+/// bogus=y` used to succeed with `bogus` silently dropped — a typo'd argument
+/// name is a silent no-op with no signal that anything went wrong. Before
+/// sending the run, this fetches the target's declared `[[arg]]` names (from
+/// its head version, the same version `workflow.run` defaults to since the
+/// CLI never sends an explicit `version`) and rejects any `--arg` key that
+/// was never declared, naming what *was* declared so the fix is obvious.
 fn workflow_run_start(args: &[String]) -> std::io::Result<i32> {
     let (params, json) = match parse_workflow_run_start_args(args) {
         Ok(parsed) => parsed,
@@ -343,11 +465,107 @@ fn workflow_run_start(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
+    if let Some(message) = validate_declared_run_args(&params.workflow_id, &params.args)? {
+        eprintln!("{message}");
+        return Ok(1);
+    }
+
     let response = super::send_request(&Request {
         id: "cli:workflow:run:start".into(),
         method: Method::WorkflowRun(params),
     })?;
     print_workflow_run_response(&response, json)
+}
+
+/// `None` when every supplied `--arg` key is declared (or none were
+/// supplied); `Some(message)` naming the unknown keys and the full declared
+/// list otherwise. Fails open (returns `None`, letting `workflow.run` itself
+/// report whatever is wrong) when the target or its args cannot be resolved,
+/// so a lookup hiccup never blocks a run the server would have accepted.
+fn validate_declared_run_args(
+    workflow_id: &str,
+    supplied: &HashMap<String, String>,
+) -> std::io::Result<Option<String>> {
+    if supplied.is_empty() {
+        return Ok(None);
+    }
+    let Some(declared) = fetch_declared_arg_names(workflow_id)? else {
+        return Ok(None);
+    };
+    Ok(unknown_arg_message(workflow_id, supplied, &declared))
+}
+
+/// Pure message-building half of [`validate_declared_run_args`], split out so
+/// it is unit-testable without a live server: `None` when every supplied key
+/// is declared, `Some(message)` naming the unknown keys and the full declared
+/// list (sorted, for a deterministic message) otherwise.
+fn unknown_arg_message(
+    workflow_id: &str,
+    supplied: &HashMap<String, String>,
+    declared: &HashSet<String>,
+) -> Option<String> {
+    let mut unknown: Vec<&str> = supplied
+        .keys()
+        .filter(|key| !declared.contains(key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    unknown.sort_unstable();
+
+    let mut declared_names: Vec<&str> = declared.iter().map(String::as_str).collect();
+    declared_names.sort_unstable();
+    let declared_list = if declared_names.is_empty() {
+        "(none declared)".to_string()
+    } else {
+        declared_names.join(", ")
+    };
+
+    Some(format!(
+        "unknown --arg key(s): {} (declared args for {workflow_id}: {declared_list})",
+        unknown.join(", ")
+    ))
+}
+
+/// Resolves `workflow_id` to its head version and reads that version's
+/// declared `[[arg]]` names. `None` on any unresolvable step (workflow
+/// lookup fails, no head version yet, version lookup fails) rather than an
+/// error, since the caller treats that as "cannot validate, don't block".
+fn fetch_declared_arg_names(workflow_id: &str) -> std::io::Result<Option<HashSet<String>>> {
+    let get_response = super::send_request(&Request {
+        id: "cli:workflow:run:start:precheck".into(),
+        method: Method::WorkflowGet(WorkflowTarget {
+            workflow_id: workflow_id.to_string(),
+        }),
+    })?;
+    if get_response.get("error").is_some() {
+        return Ok(None);
+    }
+    let Some(version_id) = get_response["result"]["workflow"]["head_version_id"]
+        .as_str()
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+
+    let version_response = super::send_request(&Request {
+        id: "cli:workflow:run:start:precheck:version".into(),
+        method: Method::WorkflowVersionGet(WorkflowVersionTarget { version_id }),
+    })?;
+    if version_response.get("error").is_some() {
+        return Ok(None);
+    }
+
+    let names = version_response["result"]["version"]["args"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg["name"].as_str().map(str::to_string))
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Some(names))
 }
 
 fn parse_workflow_run_start_args(args: &[String]) -> Result<(WorkflowRunParams, bool), String> {
@@ -471,9 +689,34 @@ fn parse_workflow_run_show_args(args: &[String]) -> Result<(WorkflowRunTarget, b
     ))
 }
 
+/// The mutating run/node verbs (`run cancel`, `node steer`, `node interrupt`,
+/// `node restart`) print their success envelope exactly as before, but render a
+/// refusal the way every other workflow error the user reads is rendered.
+///
+/// Without this the carefully worded refusals — `workflow_run_closed` naming
+/// the run's status and the remedy, `workflow_node_delivery_failed` naming the
+/// pane — arrive as a raw JSON envelope while `run show` and `node show` next
+/// to them print prose. Only the terminal rendering changes; the wire envelope
+/// these commands emit on success, and the `code` on failure, are untouched.
+fn send_workflow_mutation(id: &'static str, method: Method) -> std::io::Result<i32> {
+    let response = super::send_request(&Request {
+        id: id.into(),
+        method,
+    })?;
+    if let Some(code) = print_workflow_error(&response) {
+        return Ok(code);
+    }
+    super::print_response(&response)
+}
+
 fn workflow_run_cancel(args: &[String]) -> std::io::Result<i32> {
     match parse_workflow_run_cancel_args(args) {
-        Ok(target) => super::runtime::workflow_run_cancel(target.run_id),
+        Ok(target) => send_workflow_mutation(
+            "cli:workflow:run:cancel",
+            Method::WorkflowRunCancel(WorkflowRunTarget {
+                run_id: target.run_id,
+            }),
+        ),
         Err(message) => {
             eprintln!("{message}");
             Ok(2)
@@ -529,7 +772,9 @@ fn parse_workflow_node_show_args(args: &[String]) -> Result<(WorkflowNodeTarget,
 
 fn workflow_node_steer(args: &[String]) -> std::io::Result<i32> {
     match parse_workflow_node_steer_args(args) {
-        Ok(params) => super::runtime::workflow_node_steer(params),
+        Ok(params) => {
+            send_workflow_mutation("cli:workflow:node:steer", Method::WorkflowNodeSteer(params))
+        }
         Err(message) => {
             eprintln!("{message}");
             Ok(2)
@@ -552,7 +797,10 @@ fn parse_workflow_node_steer_args(args: &[String]) -> Result<WorkflowNodeSteerPa
 fn workflow_node_interrupt(args: &[String]) -> std::io::Result<i32> {
     match parse_workflow_node_pair_args(args, "usage: kvx workflow node interrupt <run_id> <path>")
     {
-        Ok(target) => super::runtime::workflow_node_interrupt(target.run_id, target.path),
+        Ok(target) => send_workflow_mutation(
+            "cli:workflow:node:interrupt",
+            Method::WorkflowNodeInterrupt(target),
+        ),
         Err(message) => {
             eprintln!("{message}");
             Ok(2)
@@ -562,7 +810,10 @@ fn workflow_node_interrupt(args: &[String]) -> std::io::Result<i32> {
 
 fn workflow_node_restart(args: &[String]) -> std::io::Result<i32> {
     match parse_workflow_node_pair_args(args, "usage: kvx workflow node restart <run_id> <path>") {
-        Ok(target) => super::runtime::workflow_node_restart(target.run_id, target.path),
+        Ok(target) => send_workflow_mutation(
+            "cli:workflow:node:restart",
+            Method::WorkflowNodeRestart(target),
+        ),
         Err(message) => {
             eprintln!("{message}");
             Ok(2)
@@ -613,7 +864,18 @@ fn workflow_node_complete(args: &[String]) -> std::io::Result<i32> {
         eprintln!("warning: {warning}");
     }
 
-    super::runtime::workflow_node_report(params.params)
+    let response = super::send_request(&Request {
+        id: "cli:workflow:node:complete".into(),
+        method: Method::WorkflowNodeReport(params.params),
+    })?;
+    // The server owns schema validation, so a result that does not validate
+    // comes back as an error envelope. Printing it plainly and exiting non-zero
+    // is the only correction channel a `runner = "command"` node has: its
+    // script is what has to rewrite result.json and call this again.
+    if let Some(code) = print_workflow_error(&response) {
+        return Ok(code);
+    }
+    super::print_response(&response)
 }
 
 fn parse_workflow_node_complete_args(args: &[String]) -> Result<Option<String>, String> {
@@ -720,25 +982,107 @@ fn parse_arg_assignment(raw: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
+/// §2.10: with a node blocked and the run paused, the entire human output
+/// used to be `run_id`/`status`/`tier`/`nodes` — never naming the node the
+/// docs promise `run show` "names the exact node responsible" for. `graph`
+/// only exists on `workflow.run.get` (not on `run start`'s
+/// `WorkflowRunStarted` or `run cancel`'s `WorkflowRunCancelled`, which carry
+/// no graph), so this reads it defensively and simply prints nothing extra
+/// when it is absent instead of assuming every caller has one.
 fn print_workflow_run_response(response: &serde_json::Value, json: bool) -> std::io::Result<i32> {
-    if json || response.get("error").is_some() {
+    if json {
         return super::print_response(response);
     }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
+    }
     let run = &response["result"]["run"];
+    let nodes = response["result"]["graph"]["nodes"].as_array();
+    let blocking = nodes
+        .map(|nodes| blocking_run_nodes(nodes))
+        .unwrap_or_default();
+
     println!("run_id:  {}", run["run_id"].as_str().unwrap_or(""));
-    println!("status:  {}", run["status"].as_str().unwrap_or(""));
+    print!("status:  {}", run["status"].as_str().unwrap_or(""));
+    if let Some(first) = blocking.first() {
+        println!(" (node \"{}\": {})", first.path, first.status);
+    } else {
+        println!();
+    }
     println!("tier:    {}", run["tier"].as_str().unwrap_or(""));
     println!(
         "nodes:   {}/{}",
         run["nodes_done"].as_u64().unwrap_or(0),
         run["nodes_total"].as_u64().unwrap_or(0)
     );
+
+    for node in &blocking {
+        println!("blocked: {} ({})", node.path, node.status);
+        if let Some(reason) = node.reason {
+            println!("reason:  {reason}");
+        }
+        if let Some(resume_when) = node.resume_when {
+            println!("resume:  {resume_when}");
+        }
+    }
+
+    if let Some(nodes) = nodes {
+        if !nodes.is_empty() {
+            println!();
+            println!("nodes:");
+            for node in nodes {
+                let path = node["path"].as_str().unwrap_or("");
+                let status = node["status"].as_str().unwrap_or("");
+                println!("  {path:<28} {status}");
+            }
+        }
+    }
+
     Ok(0)
 }
 
+/// One graph node in `needs_attention`/`blocked`/`failed` — the statuses
+/// that can be "the node responsible" for a paused or stuck run — plus
+/// whatever `blocker` detail the wire carried for it. `blocker` is not
+/// populated for every failure mode yet (a spawn failure currently leaves it
+/// `null` — see the notes returned alongside this task), so `reason`/
+/// `resume_when` are best-effort, not guaranteed.
+struct BlockingRunNode<'a> {
+    path: &'a str,
+    status: &'a str,
+    reason: Option<&'a str>,
+    resume_when: Option<&'a str>,
+}
+
+fn blocking_run_nodes(nodes: &[serde_json::Value]) -> Vec<BlockingRunNode<'_>> {
+    nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node["status"].as_str(),
+                Some("needs_attention" | "blocked" | "failed")
+            )
+        })
+        .map(|node| BlockingRunNode {
+            path: node["path"].as_str().unwrap_or(""),
+            status: node["status"].as_str().unwrap_or(""),
+            reason: node["blocker"]["reason"].as_str(),
+            resume_when: node["blocker"]["resume_when"].as_str(),
+        })
+        .collect()
+}
+
+/// §2.10: `node show`'s human output printed `path`/`status`/`model`/
+/// `effort`/`pane_id` but silently dropped `blocker` — the one field that
+/// says *why* a `needs_attention` or `failed` node is stuck and what would
+/// unblock it, even though the docs quote exactly this wording as the
+/// product's best-designed string.
 fn print_workflow_node_response(response: &serde_json::Value, json: bool) -> std::io::Result<i32> {
-    if json || response.get("error").is_some() {
+    if json {
         return super::print_response(response);
+    }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
     }
     let node = &response["result"]["node"];
     println!("path:    {}", node["path"].as_str().unwrap_or(""));
@@ -748,9 +1092,87 @@ fn print_workflow_node_response(response: &serde_json::Value, json: bool) -> std
     if let Some(pane_id) = node["pane_id"].as_str() {
         println!("pane_id: {pane_id}");
     }
+    if let Some(reason) = node["blocker"]["reason"].as_str() {
+        println!("blocker: {reason}");
+    }
+    if let Some(resume_when) = node["blocker"]["resume_when"].as_str() {
+        println!("resume:  {resume_when}");
+    }
     Ok(0)
 }
 
+/// Renders a `workflow.*` error envelope the way a person reads it rather than
+/// as one long JSON line. The server's best messages are multi-line — the kvdag
+/// validators, the TOML caret diagram, the schema-violation list — and a raw
+/// envelope turns every one of them into `\n` escapes at the terminal.
+/// Returns `None` when the response is not an error, so callers fall through to
+/// their normal rendering.
+fn format_workflow_error(response: &serde_json::Value) -> Option<String> {
+    let error = response.get("error")?;
+    let code = error.get("code").and_then(serde_json::Value::as_str)?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let message = humanize_workflow_error_message(code, message);
+    let mut rendered = format!("error: {code}");
+    for line in message.lines() {
+        rendered.push_str("\n  ");
+        rendered.push_str(line);
+    }
+    Some(rendered)
+}
+
+/// §2.16.2: a duplicate workflow name leaked store internals straight to the
+/// terminal — `` workflow store query failed: Database index `workflow_name`
+/// already contains 'demo', with record `workflow:6v4g4nctlshyixd756r8` `` —
+/// under the same `workflow_store_error` code a genuine graph-validation
+/// failure also uses. A real fix needs the store to return a distinct code
+/// (cross-need — this only rewrites the message actually shown at the
+/// terminal; the wire-level `code` is untouched, so `--json` and scripted
+/// callers still see the raw envelope unchanged). Falls through to the raw
+/// message when the narrow duplicate-name shape isn't recognized, so an
+/// unrelated `workflow_store_error` is never silently reworded into
+/// something it isn't.
+fn humanize_workflow_error_message<'a>(code: &str, message: &'a str) -> std::borrow::Cow<'a, str> {
+    if code == "workflow_store_error" {
+        if let Some(name) = duplicate_workflow_name(message) {
+            return std::borrow::Cow::Owned(format!(
+                "a workflow named \"{name}\" already exists; choose a different name, or run `kvx workflow update {name} --file <definition>` to add a new version to the existing one"
+            ));
+        }
+    }
+    std::borrow::Cow::Borrowed(message)
+}
+
+/// Extracts the offending name from the store's `workflow_name` unique-index
+/// violation message. Narrowly matched on both the index name and the
+/// `already contains '...'` marker so this never fires on an unrelated store
+/// error that merely happens to share the `workflow_store_error` code.
+fn duplicate_workflow_name(message: &str) -> Option<&str> {
+    if !message.contains("workflow_name") {
+        return None;
+    }
+    let marker = "already contains '";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('\'')?;
+    Some(&rest[..end])
+}
+
+/// Prints [`format_workflow_error`] to stderr. `Some(1)` is the exit code the
+/// caller should return; `None` means the response carried no error.
+fn print_workflow_error(response: &serde_json::Value) -> Option<i32> {
+    let rendered = format_workflow_error(response)?;
+    eprintln!("{rendered}");
+    Some(1)
+}
+
+/// The `--json` form of a local (pre-network) definition/environment error —
+/// unchanged from before this task, and still what `kvx workflow node
+/// complete` uses for its `missing_node_environment` error, since that
+/// command is normally invoked by a node's own script rather than a human at
+/// a terminal.
 fn print_workflow_cli_error(code: &str, message: &str) {
     let envelope = serde_json::json!({
         "error": { "code": code, "message": message }
@@ -764,13 +1186,262 @@ fn print_workflow_cli_error(code: &str, message: &str) {
     }
 }
 
+/// §2.16.3's local-error half: `create`/`update` can fail before any network
+/// call (a bad `--file` path, invalid TOML/JSON, an unresolvable
+/// `--name` rewrite). `--json` keeps the exact previous envelope
+/// ([`print_workflow_cli_error`]); the human default prints the message with
+/// its real newlines intact instead of JSON-escaping the TOML parser's caret
+/// diagram into one unreadable line. Returns the exit code so call sites stay
+/// a one-line `return Ok(print_workflow_local_error(...))`.
+fn print_workflow_local_error(code: &str, message: &str, json: bool) -> i32 {
+    if json {
+        print_workflow_cli_error(code, message);
+    } else {
+        eprintln!("error: {code}");
+        for line in message.lines() {
+            eprintln!("  {line}");
+        }
+    }
+    1
+}
+
+/// §2.16.3's success half, and §2.19's "`update` ... misreports no-ops" for
+/// `create` specifically: the wire only has one response shape, so this adds
+/// the human summary formatting that shape never had.
+fn print_workflow_create_response(
+    response: &serde_json::Value,
+    json: bool,
+) -> std::io::Result<i32> {
+    if json {
+        return super::print_response(response);
+    }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
+    }
+    let workflow = &response["result"]["workflow"];
+    let version = &response["result"]["version"];
+    println!(
+        "workflow_id: {}",
+        workflow["workflow_id"].as_str().unwrap_or("")
+    );
+    println!("name:        {}", workflow["name"].as_str().unwrap_or(""));
+    println!(
+        "version:     {}",
+        version["version"].as_u64().unwrap_or_default()
+    );
+    let change_summary = version["change_summary"].as_str().unwrap_or("");
+    if !change_summary.is_empty() {
+        println!("change:      {change_summary}");
+    }
+    Ok(0)
+}
+
+/// See [`workflow_update`] for why `previous_head_version` exists: it is the
+/// workflow's head version number read *before* this update, compared here
+/// against the version the update actually returns to tell "a new version
+/// was created" from "this content already matched the head version, so
+/// nothing new was created" — a distinction the wire's single
+/// `workflow_version_created` response type cannot make on its own.
+///
+/// `previous`/`new` disagree in width (`u32`/`u64`) because that's what the
+/// two call sites actually hold — a decoded `head_version` field and a raw
+/// `as_u64()` JSON read — so the comparison widens rather than making a
+/// caller narrow first.
+fn update_was_deduplicated(previous: Option<u32>, new: Option<u64>) -> bool {
+    matches!(
+        (previous, new),
+        (Some(previous), Some(new)) if u64::from(previous) == new
+    )
+}
+
+fn print_workflow_update_response(
+    response: &serde_json::Value,
+    json: bool,
+    previous_head_version: Option<u32>,
+) -> std::io::Result<i32> {
+    if json {
+        return super::print_response(response);
+    }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
+    }
+    let workflow = &response["result"]["workflow"];
+    let version = &response["result"]["version"];
+    let new_version = version["version"].as_u64();
+    let unchanged = update_was_deduplicated(previous_head_version, new_version);
+
+    println!(
+        "workflow_id: {}",
+        workflow["workflow_id"].as_str().unwrap_or("")
+    );
+    println!("name:        {}", workflow["name"].as_str().unwrap_or(""));
+    if unchanged {
+        println!(
+            "version:     {} (unchanged — this definition matches the current version; no new version was created)",
+            new_version.unwrap_or(0)
+        );
+    } else {
+        println!("version:     {}", new_version.unwrap_or(0));
+        let change_summary = version["change_summary"].as_str().unwrap_or("");
+        if !change_summary.is_empty() {
+            println!("change:      {change_summary}");
+        }
+    }
+    Ok(0)
+}
+
+/// §2.18: `workflow show` used to print `workflow.get`'s raw JSON — metadata
+/// plus a version history and nothing else, no nodes, no edges, no args, for
+/// any version, plus unreadable epoch-millisecond timestamps. This renders
+/// the workflow summary, a version history with formatted timestamps, and —
+/// when the head version's detail was fetched successfully — the head
+/// version's nodes (key/label/runner/demand), edges (from/to/kind/port), and
+/// declared args, so a user can discover node paths (for `node show`/
+/// `steer`/`restart`) and `--arg` names without going back to the original
+/// definition file.
+fn print_workflow_show(
+    get_response: &serde_json::Value,
+    version_response: Option<&serde_json::Value>,
+) {
+    let workflow = &get_response["result"]["workflow"];
+    println!(
+        "workflow_id: {}",
+        workflow["workflow_id"].as_str().unwrap_or("")
+    );
+    println!("name:        {}", workflow["name"].as_str().unwrap_or(""));
+    let description = workflow["description"].as_str().unwrap_or("");
+    if !description.is_empty() {
+        println!("description: {description}");
+    }
+    println!(
+        "default_tier: {}",
+        workflow["default_tier"].as_str().unwrap_or("")
+    );
+    if let Some(head_version) = workflow["head_version"].as_u64() {
+        println!("head_version: {head_version}");
+    }
+
+    if let Some(versions) = get_response["result"]["versions"].as_array() {
+        println!();
+        println!("versions:");
+        for version in versions {
+            let number = version["version"].as_u64().unwrap_or(0);
+            let created = version["created_at_unix_ms"]
+                .as_u64()
+                .map(format_unix_ms)
+                .unwrap_or_default();
+            let change_summary = version["change_summary"].as_str().unwrap_or("");
+            print!("  v{number}  {created}");
+            if !change_summary.is_empty() {
+                print!("  {change_summary}");
+            }
+            println!();
+        }
+    }
+
+    let Some(version_response) = version_response else {
+        println!();
+        println!("(head version detail unavailable; nodes/edges/args not shown)");
+        return;
+    };
+    let version = &version_response["result"]["version"];
+
+    if let Some(args) = version["args"].as_array() {
+        if !args.is_empty() {
+            println!();
+            println!("args:");
+            for arg in args {
+                let name = arg["name"].as_str().unwrap_or("");
+                let required = arg["required"].as_bool().unwrap_or(false);
+                let default = arg["default"].as_str();
+                let description = arg["description"].as_str().unwrap_or("");
+                print!(
+                    "  {name:<20} {}",
+                    if required { "required" } else { "optional" }
+                );
+                if let Some(default) = default {
+                    print!("  default={default}");
+                }
+                if !description.is_empty() {
+                    print!("  {description}");
+                }
+                println!();
+            }
+        }
+    }
+
+    if let Some(nodes) = version["nodes"].as_array() {
+        println!();
+        println!("nodes:");
+        for node in nodes {
+            let key = node["node_key"].as_str().unwrap_or("");
+            let label = node["label"].as_str().unwrap_or("");
+            let runner = node["runner"].as_str().unwrap_or("");
+            let demand = node["demand"].as_str().unwrap_or("");
+            println!("  {key:<20} {label:<24} runner={runner:<8} demand={demand}");
+        }
+    }
+
+    if let Some(edges) = version["edges"].as_array() {
+        if !edges.is_empty() {
+            println!();
+            println!("edges:");
+            for edge in edges {
+                let from = edge["from"].as_str().unwrap_or("");
+                let to = edge["to"].as_str().unwrap_or("");
+                let kind = edge["kind"].as_str().unwrap_or("");
+                let port = edge["port"].as_str();
+                print!("  {from} -> {to}  kind={kind}");
+                if let Some(port) = port {
+                    print!("  port={port}");
+                }
+                println!();
+            }
+        }
+    }
+}
+
+/// Formats an epoch-millisecond timestamp as `YYYY-MM-DD HH:MM:SS UTC` —
+/// §2.18: "version history ... prints raw JSON, with epoch-millisecond
+/// timestamps ... effectively unreadable". Uses the standard
+/// days-since-epoch civil calendar conversion (Howard Hinnant's
+/// `civil_from_days`, public domain) rather than adding a date/time
+/// dependency for one CLI formatting call.
+fn format_unix_ms(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let days = (total_secs / 86400) as i64;
+    let secs_of_day = total_secs % 86400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    let second = secs_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// Days-since-1970-01-01 to (year, month, day), proleptic Gregorian
+/// calendar. Public-domain algorithm by Howard Hinnant
+/// (`https://howardhinnant.github.io/date_algorithms.html#civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d)
+}
+
 fn print_workflow_help() {
     eprintln!("kvx workflow commands:");
     eprintln!("  kvx workflow list");
-    eprintln!("  kvx workflow show <name|id>");
-    eprintln!("  kvx workflow create --file <definition.toml|json> [--name <name>]");
+    eprintln!("  kvx workflow show <name|id> [--json]");
+    eprintln!("  kvx workflow create --file <definition.toml|json> [--name <name>] [--json]");
     eprintln!(
-        "  kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>]"
+        "  kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]"
     );
     eprintln!("  kvx workflow run <subcommand> ...");
     eprintln!("  kvx workflow node <subcommand> ...");
@@ -811,6 +1482,42 @@ mod tests {
         dir
     }
 
+    /// 2.16: the server's best messages are multi-line — the schema-violation
+    /// list a rejected `node complete` gets back, the kvdag validators, the TOML
+    /// caret diagram — and the raw envelope turned every newline into a literal
+    /// `\n` on one unreadable line.
+    #[test]
+    fn a_workflow_error_envelope_renders_as_readable_lines() {
+        let response = serde_json::json!({
+            "error": {
+                "code": "workflow_node_result_invalid",
+                "message": "result.json does not validate against the node's output_schema:\n  - missing required field \"summary\"\nfix result.json and run `kvx workflow node complete` again",
+            }
+        });
+        let rendered = format_workflow_error(&response).expect("an error envelope renders");
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "error: workflow_node_result_invalid",
+                "  result.json does not validate against the node's output_schema:",
+                "    - missing required field \"summary\"",
+                "  fix result.json and run `kvx workflow node complete` again",
+            ],
+            "every message line is indented under the code, never escaped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("\\n"),
+            "no escaped newlines survive: {rendered}"
+        );
+
+        assert_eq!(
+            format_workflow_error(&serde_json::json!({ "result": { "type": "ok" } })),
+            None,
+            "a success response is left to the caller's own rendering"
+        );
+    }
+
     #[test]
     fn workflow_list_accepts_no_arguments_and_rejects_extras() {
         assert!(parse_workflow_list_args(&args(&[])).is_ok());
@@ -819,13 +1526,21 @@ mod tests {
 
     #[test]
     fn workflow_show_builds_workflow_get() {
-        let target = parse_workflow_show_args(&args(&["ship-feature"])).unwrap();
+        let (target, json) = parse_workflow_show_args(&args(&["ship-feature"])).unwrap();
+        assert!(!json);
         assert_eq!(
             Method::WorkflowGet(target),
             Method::WorkflowGet(WorkflowTarget {
                 workflow_id: "ship-feature".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn workflow_show_json_flag_parses() {
+        let (target, json) = parse_workflow_show_args(&args(&["ship-feature", "--json"])).unwrap();
+        assert!(json);
+        assert_eq!(target.workflow_id, "ship-feature");
     }
 
     #[test]
@@ -836,14 +1551,25 @@ mod tests {
 
     #[test]
     fn workflow_create_flags_parse_file_and_optional_name() {
-        let (file, name) =
+        let (file, name, json) =
             parse_workflow_create_args(&args(&["--file", "def.toml", "--name", "ship"])).unwrap();
         assert_eq!(file, "def.toml");
         assert_eq!(name.as_deref(), Some("ship"));
+        assert!(!json);
 
-        let (file, name) = parse_workflow_create_args(&args(&["--file", "def.json"])).unwrap();
+        let (file, name, json) =
+            parse_workflow_create_args(&args(&["--file", "def.json"])).unwrap();
         assert_eq!(file, "def.json");
         assert_eq!(name, None);
+        assert!(!json);
+    }
+
+    #[test]
+    fn workflow_create_json_flag_parses() {
+        let (file, _name, json) =
+            parse_workflow_create_args(&args(&["--file", "def.toml", "--json"])).unwrap();
+        assert_eq!(file, "def.toml");
+        assert!(json);
     }
 
     #[test]
@@ -860,10 +1586,10 @@ mod tests {
     #[test]
     fn name_and_id_selectors_reach_the_wire_unchanged_for_show_update_and_run_start() {
         for selector in ["ship-feature", "workflow:abc123"] {
-            let target = parse_workflow_show_args(&args(&[selector])).unwrap();
+            let (target, _json) = parse_workflow_show_args(&args(&[selector])).unwrap();
             assert_eq!(target.workflow_id, selector);
 
-            let (workflow_id, _file, _change_summary) =
+            let (workflow_id, _file, _change_summary, _json) =
                 parse_workflow_update_args(&args(&[selector, "--file", "def.toml"])).unwrap();
             assert_eq!(workflow_id, selector);
 
@@ -874,7 +1600,7 @@ mod tests {
 
     #[test]
     fn workflow_update_flags_parse_target_file_and_change_summary() {
-        let (workflow_id, file, change_summary) = parse_workflow_update_args(&args(&[
+        let (workflow_id, file, change_summary, json) = parse_workflow_update_args(&args(&[
             "ship-feature",
             "--file",
             "def.toml",
@@ -885,6 +1611,15 @@ mod tests {
         assert_eq!(workflow_id, "ship-feature");
         assert_eq!(file, "def.toml");
         assert_eq!(change_summary.as_deref(), Some("widen retries"));
+        assert!(!json);
+    }
+
+    #[test]
+    fn workflow_update_json_flag_parses() {
+        let (_workflow_id, _file, _change_summary, json) =
+            parse_workflow_update_args(&args(&["ship-feature", "--file", "def.toml", "--json"]))
+                .unwrap();
+        assert!(json);
     }
 
     #[test]
@@ -1228,7 +1963,7 @@ mod tests {
         let params = parse_workflow_run_list_args(&args(&["list"])).unwrap();
         assert_eq!(params.workflow_id, "list");
 
-        let target = parse_workflow_show_args(&args(&["list"])).unwrap();
+        let (target, _json) = parse_workflow_show_args(&args(&["list"])).unwrap();
         assert_eq!(target.workflow_id, "list");
     }
 
@@ -1252,5 +1987,241 @@ mod tests {
                 other => panic!("unexpected verb path shape: {other:?}"),
             }
         }
+    }
+
+    // ── §2.19 undeclared --arg ───────────────────────────────────────────
+
+    /// §2.19: `run start demo --arg goal=x --arg bogus=y` used to succeed
+    /// with `bogus` silently dropped. Fails before the fix (there was no
+    /// message-building path at all — every `--arg` reached the wire
+    /// unchecked); now the unknown key is named alongside every key that
+    /// *was* declared.
+    #[test]
+    fn unknown_arg_message_names_the_unknown_key_and_the_declared_list() {
+        let supplied = HashMap::from([
+            ("goal".to_string(), "x".to_string()),
+            ("bogus".to_string(), "y".to_string()),
+        ]);
+        let declared = HashSet::from(["goal".to_string(), "tier_hint".to_string()]);
+        let message = unknown_arg_message("ship-feature", &supplied, &declared)
+            .expect("an undeclared key should produce a message");
+        assert!(message.contains("bogus"), "message: {message}");
+        assert!(
+            !message.contains("unknown --arg key(s): goal"),
+            "goal is declared and must not be listed as unknown: {message}"
+        );
+        assert!(
+            message.contains("goal"),
+            "declared list should still name goal: {message}"
+        );
+        assert!(
+            message.contains("tier_hint"),
+            "declared list should name every declared arg: {message}"
+        );
+        assert!(message.contains("ship-feature"), "message: {message}");
+    }
+
+    #[test]
+    fn unknown_arg_message_is_none_when_every_supplied_key_is_declared() {
+        let supplied = HashMap::from([("goal".to_string(), "x".to_string())]);
+        let declared = HashSet::from(["goal".to_string()]);
+        assert_eq!(
+            unknown_arg_message("ship-feature", &supplied, &declared),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_arg_message_names_no_declared_args_when_there_are_none() {
+        let supplied = HashMap::from([("goal".to_string(), "x".to_string())]);
+        let declared = HashSet::new();
+        let message = unknown_arg_message("ship-feature", &supplied, &declared).unwrap();
+        assert!(message.contains("(none declared)"), "message: {message}");
+    }
+
+    // ── §2.10 run/node show naming the responsible node ─────────────────
+
+    /// Fails before the fix: `blocking_run_nodes` did not exist, and
+    /// `print_workflow_run_response` never looked past `run_id`/`status`/
+    /// `tier`/`nodes_done`/`nodes_total`.
+    #[test]
+    fn blocking_run_nodes_finds_needs_attention_blocked_and_failed_only() {
+        let nodes = serde_json::json!([
+            { "path": "plan", "status": "succeeded" },
+            { "path": "lint", "status": "needs_attention", "blocker": { "reason": "no workspace to host the node's pane", "resume_when": "a workspace is available" } },
+            { "path": "gate", "status": "pending" },
+            { "path": "deploy", "status": "failed" },
+        ]);
+        let nodes = nodes.as_array().unwrap();
+        let blocking = blocking_run_nodes(nodes);
+        let paths: Vec<&str> = blocking.iter().map(|node| node.path).collect();
+        assert_eq!(paths, vec!["lint", "deploy"]);
+
+        let lint = &blocking[0];
+        assert_eq!(lint.status, "needs_attention");
+        assert_eq!(lint.reason, Some("no workspace to host the node's pane"));
+        assert_eq!(lint.resume_when, Some("a workspace is available"));
+
+        // §2.11: blocker is not populated for every failure mode — the
+        // `failed` node here carries none, and that must not panic or
+        // fabricate a reason.
+        let deploy = &blocking[1];
+        assert_eq!(deploy.reason, None);
+        assert_eq!(deploy.resume_when, None);
+    }
+
+    #[test]
+    fn blocking_run_nodes_is_empty_when_nothing_is_stuck() {
+        let nodes = serde_json::json!([
+            { "path": "plan", "status": "succeeded" },
+            { "path": "implement", "status": "running" },
+        ]);
+        assert!(blocking_run_nodes(nodes.as_array().unwrap()).is_empty());
+    }
+
+    // ── §2.19 update unchanged detection ─────────────────────────────────
+
+    /// Fails before the fix: `update_was_deduplicated` did not exist, and
+    /// `workflow_update`'s human output always described the response as a
+    /// new version regardless of whether the store deduplicated it.
+    #[test]
+    fn update_was_deduplicated_matches_when_the_new_version_equals_the_previous_head() {
+        assert!(update_was_deduplicated(Some(3), Some(3)));
+        assert!(!update_was_deduplicated(Some(3), Some(4)));
+        assert!(!update_was_deduplicated(None, Some(3)));
+        assert!(!update_was_deduplicated(Some(3), None));
+    }
+
+    // ── §2.16 error-message quality ──────────────────────────────────────
+
+    /// §2.16.2: fails before the fix — `humanize_workflow_error_message` did
+    /// not exist, so the DB internals in the store's uniqueness-violation
+    /// message reached the terminal verbatim.
+    #[test]
+    fn duplicate_workflow_name_error_is_reworded_without_db_internals() {
+        let message = "workflow store query failed: Database index `workflow_name` already contains 'demo', with record `workflow:6v4g4nctlshyixd756r8`";
+        let humanized = humanize_workflow_error_message("workflow_store_error", message);
+        assert!(humanized.contains("\"demo\""), "humanized: {humanized}");
+        assert!(
+            humanized.contains("already exists"),
+            "humanized: {humanized}"
+        );
+        assert!(
+            !humanized.contains("Database index"),
+            "DB internals must not survive: {humanized}"
+        );
+        assert!(
+            !humanized.contains("workflow:6v4g4nctlshyixd756r8"),
+            "the raw record id must not survive: {humanized}"
+        );
+    }
+
+    /// An unrelated `workflow_store_error` (or any other code) must pass
+    /// through unchanged rather than being guessed at.
+    #[test]
+    fn unrelated_store_errors_are_left_alone() {
+        let message = "workflow store query failed: connection reset";
+        assert_eq!(
+            humanize_workflow_error_message("workflow_store_error", message),
+            message
+        );
+        let kvdag_message = "invalid kvdag: graph is cyclic through: a, b";
+        assert_eq!(
+            humanize_workflow_error_message("invalid_kvdag", kvdag_message),
+            kvdag_message
+        );
+    }
+
+    #[test]
+    fn duplicate_workflow_name_extracts_the_offending_name() {
+        let message = "Database index `workflow_name` already contains 'ship-feature', with record `workflow:abc`";
+        assert_eq!(duplicate_workflow_name(message), Some("ship-feature"));
+        assert_eq!(duplicate_workflow_name("totally unrelated message"), None);
+    }
+
+    // ── §2.16 sun_path/local-error rendering ─────────────────────────────
+
+    /// §2.16.3: fails before the fix — there was no human/`--json` split at
+    /// all, so a local `invalid_definition` error (a TOML parse failure with
+    /// a caret diagram) always went through the JSON-only
+    /// `print_workflow_cli_error`, escaping every newline.
+    #[test]
+    fn print_workflow_local_error_returns_a_nonzero_exit_code() {
+        assert_eq!(
+            print_workflow_local_error("invalid_definition", "line one\nline two", false),
+            1
+        );
+        assert_eq!(
+            print_workflow_local_error("invalid_definition", "line one\nline two", true),
+            1
+        );
+    }
+
+    /// The mutating verbs answer a refusal the same way the read verbs do.
+    ///
+    /// Fails before the fix: `run cancel`, `node steer`, `node interrupt`, and
+    /// `node restart` called `runtime::print_method_response`, so the refusals
+    /// a human is most likely to hit — `workflow_run_closed` naming the run's
+    /// status and the remedy, `workflow_node_delivery_failed` naming the pane —
+    /// arrived as a raw JSON envelope while `run show` and `node show` next to
+    /// them printed prose. Scanned from source because the difference is which
+    /// helper the leaf calls, and the leaf itself needs a live server.
+    #[test]
+    fn every_mutating_workflow_verb_renders_its_refusal_for_a_human() {
+        let source = include_str!("workflow.rs");
+        /// From the `fn` header to the closing brace of that item, so a match
+        /// can never leak in from the next function.
+        fn body_of<'a>(source: &'a str, header: &str) -> &'a str {
+            let start = source
+                .find(header)
+                .unwrap_or_else(|| panic!("{header} still exists"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+        }
+
+        for leaf in [
+            "fn workflow_run_cancel(",
+            "fn workflow_node_steer(",
+            "fn workflow_node_interrupt(",
+            "fn workflow_node_restart(",
+        ] {
+            let body = body_of(source, leaf);
+            assert!(
+                body.contains("send_workflow_mutation"),
+                "{leaf} must render its refusal for a human: {body}"
+            );
+            assert!(
+                !body.contains("runtime::"),
+                "{leaf} must not go back to the JSON-only path: {body}"
+            );
+        }
+        // `send_workflow_mutation` is the thing that makes that true.
+        assert!(
+            body_of(source, "fn send_workflow_mutation(").contains("print_workflow_error"),
+            "the helper is what routes a refusal through the human renderer"
+        );
+    }
+
+    // ── §2.18 timestamp formatting ────────────────────────────────────────
+
+    /// Fails before the fix: `format_unix_ms` did not exist, and
+    /// `workflow show`'s version history printed the raw
+    /// `created_at_unix_ms` integer.
+    #[test]
+    fn format_unix_ms_renders_known_epoch_instants() {
+        assert_eq!(format_unix_ms(0), "1970-01-01 00:00:00 UTC");
+        // 2024-01-01T00:00:00Z
+        assert_eq!(format_unix_ms(1_704_067_200_000), "2024-01-01 00:00:00 UTC");
+        // 2000-02-29T12:34:56Z (leap day, exercises the leap-year path)
+        assert_eq!(format_unix_ms(951_827_696_000), "2000-02-29 12:34:56 UTC");
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_calendar_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        // 1_704_067_200 / 86_400 = 19_723, and format_unix_ms_renders_known_epoch_instants
+        // independently confirms 1_704_067_200_000ms is 2024-01-01.
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
     }
 }

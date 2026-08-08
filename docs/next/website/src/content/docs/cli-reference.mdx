@@ -350,6 +350,28 @@ Use `pane wait-output` for normal commands and servers. Use `agent wait` for cod
 
 `pane wait-output`, `agent wait`, and `agent prompt --wait` wait indefinitely when `--timeout` is omitted. A timeout or server error is emitted as JSON on stderr with exit status 1. CLI usage errors exit with status 2.
 
+## Workflows
+
+Author and run multi-node agent workflows — a saved, versioned graph of tasks that spawns every node as a real terminal pane and coordinates them until every branch resolves. See [Workflows](/docs/workflows/) for the definition format, the node contract, and the DAG view.
+
+```bash
+herdr workflow list
+herdr workflow show <name|id> [--json]
+herdr workflow create --file <definition.toml|json> [--name <name>] [--json]
+herdr workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
+herdr workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
+herdr workflow run list <name|id> [--limit N]
+herdr workflow run show <run_id> [--json]
+herdr workflow run cancel <run_id>
+herdr workflow node show <run_id> <path> [--json]
+herdr workflow node steer <run_id> <path> <text>
+herdr workflow node interrupt <run_id> <path>
+herdr workflow node restart <run_id> <path>
+herdr workflow node complete [--result-file <path>]
+```
+
+`show`, `create`, `update`, `run start`, `run show`, and `node show` print human-readable text by default; pass `--json` for the machine-readable envelope. `show` without `--json` renders the workflow summary, version history, and the head version's nodes/edges/declared args. `run show` without `--json` names the node responsible when the run is paused or a node needs attention, alongside that node's blocker reason and resume condition. `run start` rejects an `--arg` key the workflow never declared instead of silently dropping it.
+
 ## Integrations
 
 ```bash

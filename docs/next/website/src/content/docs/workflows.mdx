@@ -64,9 +64,9 @@ port = "plan"
 
 Each `[[arg]]` declares one entry in the run-argument namespace, filled at run time with `--arg name=value`. Every `{{name}}` placeholder in a `prompt_template` must resolve to either a declared arg or an inbound edge `port` — `workflow.create` rejects a document with an unresolved placeholder before it is ever run, and starting a run separately rejects a missing required arg that has no default.
 
-Each `[[node]]` needs a unique `key`, a `label`, and a `prompt_template`. `output_schema` is a JSON Schema the node's result must validate against before it can succeed. `kind` defaults to `"agent"`; the other kinds (`internal`, `gate`, `monitor`) are accepted today but their scheduling behavior ships in a later release. `runner` selects how the node's process is bound — see Node runners, below. `demand` (`peak`, `critical`, `standard`, or `light`, default `standard`) feeds the run's tier into a per-node model and effort assignment.
+Each `[[node]]` needs a unique `key`, a `label`, a `prompt_template`, and an `output_schema` — a JSON Schema the node's result must validate against before it can succeed. Omit `output_schema` and the node gets the empty schema `{}` (accepts any object) rather than a rejected document; declare it explicitly once you know the shape you want validated. `kind` defaults to `"agent"`; the other kinds (`internal`, `gate`, `monitor`) are accepted today but their scheduling behavior ships in a later release. `runner` selects how the node's process is bound — see Node runners, below. `demand` (`peak`, `critical`, `standard`, or `light`, default `standard`) feeds the run's tier into a per-node model and effort assignment.
 
-Each `[[edge]]` connects a `from` node to a `to` node. `kind` is `sequence` (source must succeed), `data` (source must succeed *and* its result validate), or `conditional` (evaluates a `condition` against the source's result; false makes the edge dead). `payload` controls how much of the source's checkpoint the target receives: `none`, `summary` (default), or `full`. `port` names the `{{slot}}` in the target's `prompt_template` that the edge's payload fills.
+Each `[[edge]]` connects a `from` node to a `to` node and needs a `kind`: `sequence` (source must succeed), `data` (source must succeed *and* its result validate), or `conditional` (evaluates a `condition` against the source's result; false makes the edge dead). Omit `kind` and the edge defaults to `sequence`. A `conditional` edge must declare a `condition` — one with none is rejected at authoring time rather than accepted and silently never resolving. `payload` controls how much of the source's checkpoint the target receives: `none`, `summary` (default), or `full`. `port` names the `{{slot}}` in the target's `prompt_template` that the edge's payload fills; a `port` that names no `{{slot}}` actually present in the target's `prompt_template` is also rejected at authoring time, since it would otherwise produce a workflow whose data silently goes nowhere.
 
 Run it with the declared args:
 
@@ -124,14 +124,16 @@ An invalid result gets one automatic corrective re-prompt quoting the schema err
 
 ## Commands
 
+`kvx workflow` also appears in `kvx --help`'s command list. All of `show`, `create`, `update`, `run start`, `run show`, and `node show` print human-readable text by default; pass `--json` on any of them for the machine-readable envelope instead.
+
 ```bash
 kvx workflow list
-kvx workflow show <name|id>
-kvx workflow create --file <definition.toml|json> [--name <name>]
-kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>]
+kvx workflow show <name|id> [--json]
+kvx workflow create --file <definition.toml|json> [--name <name>] [--json]
+kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
 ```
 
-`create` and `update` read the definition document described above from `--file`; the extension selects TOML or JSON. `update` authors a new kvdag version rather than editing the current one.
+`create` and `update` read the definition document described above from `--file`; the extension selects TOML or JSON. `update` authors a new kvdag version rather than editing the current one — unless the definition is byte-for-byte equivalent to the current head version, in which case nothing new is created and the human output says `(unchanged — this definition matches the current version; no new version was created)` instead of claiming a version was created. The human default for `show` renders the workflow summary, its version history with formatted timestamps, and the head version's nodes (key, label, runner, demand), edges (from/to/kind/port), and declared args — everything you need to find a node's `<path>` for `node show`/`steer`/`restart` or an `--arg` name for `run start`, without going back to the original definition file.
 
 ```bash
 kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
@@ -140,7 +142,9 @@ kvx workflow run show <run_id> [--json]
 kvx workflow run cancel <run_id>
 ```
 
-`run` is a namespace, not a workflow selector: `start`, `list`, `show`, and `cancel` each take their own arguments, so a workflow can be named `list` without colliding with the subcommand. `--tier` defaults to the workflow's own default tier; repeat `--arg` for every declared run argument. `run cancel` cancels the run's remaining nodes and closes their panes.
+`run` is a namespace, not a workflow selector: `start`, `list`, `show`, and `cancel` each take their own arguments, so a workflow can be named `list` without colliding with the subcommand. `--tier` defaults to the workflow's own default tier; repeat `--arg` for every declared run argument — an `--arg` key the workflow never declared is rejected before the run starts, naming every key that *is* declared, rather than being silently dropped. `run cancel` cancels the run's remaining nodes and closes their panes.
+
+The human default for `run show` names the node responsible when the run is `paused` or a node is stuck: the `status` line reads `paused (node "lint": needs_attention)`, followed by that node's blocker reason and resume condition, and then every node's path and status.
 
 ```bash
 kvx workflow node show <run_id> <path> [--json]
@@ -150,7 +154,7 @@ kvx workflow node restart <run_id> <path>
 kvx workflow node complete [--result-file <path>]
 ```
 
-`<path>` is the node's instance path, such as `plan` or `research/2/verify` — shown by `run show` and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` is the one command a node runs on itself; see The node contract, above.
+`<path>` is the node's instance path, such as `plan` or `research/2/verify` — shown by `run show` and `workflow show`, and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` is the one command a node runs on itself; see The node contract, above. The human default for `node show` includes the node's blocker — reason and resume condition — when one is recorded, alongside `path`/`status`/`model`/`effort`/`pane_id`.
 
 ## The DAG view
 

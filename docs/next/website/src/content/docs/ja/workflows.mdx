@@ -64,9 +64,9 @@ port = "plan"
 
 各 `[[arg]]` は実行引数の名前空間に1エントリを宣言し、実行時に `--arg name=value` で埋められます。`prompt_template` 内のすべての `{{name}}` プレースホルダーは、宣言済みの引数か入力エッジの `port` のいずれかに解決できなければなりません ── `workflow.create` は、実行される前に未解決のプレースホルダーを含むドキュメントを拒否し、実行の開始時には、デフォルト値のない必須引数が欠けている場合を別途拒否します。
 
-各 `[[node]]` には一意な `key`、`label`、`prompt_template` が必要です。`output_schema` は、ノードの結果が成功と見なされる前に検証対象となる JSON Schema です。`kind` はデフォルトで `"agent"` です。他の種類 (`internal`、`gate`、`monitor`) は現在受け付けられていますが、そのスケジューリング動作は後のリリースで提供されます。`runner` はノードのプロセスがどう起動されるかを選びます ── 後述のノードランナーを参照してください。`demand` (`peak`、`critical`、`standard`、`light`。デフォルトは `standard`) は、実行のティアをノードごとのモデル/エフォート割り当てに反映します。
+各 `[[node]]` には一意な `key`、`label`、`prompt_template`、そして `output_schema` が必要です。`output_schema` は、ノードの結果が成功と見なされる前に検証対象となる JSON Schema です。`output_schema` を省略すると、ドキュメントが拒否されるのではなく、空のスキーマ `{}` (任意のオブジェクトを許可) が使われます。検証したい形が決まったら明示的に宣言してください。`kind` はデフォルトで `"agent"` です。他の種類 (`internal`、`gate`、`monitor`) は現在受け付けられていますが、そのスケジューリング動作は後のリリースで提供されます。`runner` はノードのプロセスがどう起動されるかを選びます ── 後述のノードランナーを参照してください。`demand` (`peak`、`critical`、`standard`、`light`。デフォルトは `standard`) は、実行のティアをノードごとのモデル/エフォート割り当てに反映します。
 
-各 `[[edge]]` は `from` ノードと `to` ノードを接続します。`kind` は `sequence` (ソースが成功していること)、`data` (ソースが成功し、かつ結果が検証されていること)、`conditional` (ソースの結果に対して `condition` を評価し、false ならエッジが無効になる) のいずれかです。`payload` は、ソースのチェックポイントのどれだけをターゲットへ渡すかを制御します: `none`、`summary` (デフォルト)、`full` のいずれかです。`port` は、エッジのペイロードが埋めるターゲットの `prompt_template` 内の `{{slot}}` の名前です。
+各 `[[edge]]` は `from` ノードと `to` ノードを接続し、`kind` が必要です: `sequence` (ソースが成功していること)、`data` (ソースが成功し、かつ結果が検証されていること)、`conditional` (ソースの結果に対して `condition` を評価し、false ならエッジが無効になる) のいずれかです。`kind` を省略すると `sequence` になります。`conditional` エッジは `condition` を宣言する必要があります ── `condition` のない `conditional` エッジは、後で解決されないまま黙って残るのではなく、作成時に拒否されます。`payload` は、ソースのチェックポイントのどれだけをターゲットへ渡すかを制御します: `none`、`summary` (デフォルト)、`full` のいずれかです。`port` は、エッジのペイロードが埋めるターゲットの `prompt_template` 内の `{{slot}}` の名前です。ターゲットの `prompt_template` に存在しない `{{slot}}` を指す `port` も、データが渡される先のないワークフローになってしまうため、作成時に拒否されます。
 
 宣言済みの引数を指定して実行します:
 
@@ -124,14 +124,16 @@ kvx workflow node complete --result-file <path>   # defaults to ./result.json in
 
 ## コマンド
 
+`kvx workflow` は `kvx --help` のコマンド一覧にも表示されます。`show`、`create`、`update`、`run start`、`run show`、`node show` はすべてデフォルトで人間が読めるテキストを出力します。機械可読なエンベロープが必要な場合は `--json` を付けてください。
+
 ```bash
 kvx workflow list
-kvx workflow show <name|id>
-kvx workflow create --file <definition.toml|json> [--name <name>]
-kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>]
+kvx workflow show <name|id> [--json]
+kvx workflow create --file <definition.toml|json> [--name <name>] [--json]
+kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
 ```
 
-`create` と `update` は、前述の定義ドキュメントを `--file` から読み込みます。拡張子で TOML か JSON かが決まります。`update` は現在のバージョンを編集するのではなく、新しい kvdag バージョンを作成します。
+`create` と `update` は、前述の定義ドキュメントを `--file` から読み込みます。拡張子で TOML か JSON かが決まります。`update` は現在のバージョンを編集するのではなく、新しい kvdag バージョンを作成します ── ただし、定義が現在のヘッドバージョンとバイト単位で一致する場合は何も新しく作成されず、人間向け出力にはバージョンが作成されたという表示の代わりに `(unchanged — this definition matches the current version; no new version was created)` と表示されます。`--json` なしの `show` は、ワークフローの概要、フォーマット済みタイムスタンプ付きのバージョン履歴、そしてヘッドバージョンのノード (key、label、runner、demand)、エッジ (from/to/kind/port)、宣言済み引数を表示します ── `node show`/`steer`/`restart` 用のノード `<path>` や `run start` 用の `--arg` 名を、元の定義ファイルに戻らずに見つけられます。
 
 ```bash
 kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
@@ -140,7 +142,9 @@ kvx workflow run show <run_id> [--json]
 kvx workflow run cancel <run_id>
 ```
 
-`run` はワークフローを選ぶ引数ではなく、名前空間です。`start`、`list`、`show`、`cancel` はそれぞれ独自の引数を取るため、ワークフローに `list` という名前を付けてもサブコマンドと衝突しません。`--tier` はワークフロー自身のデフォルトティアを使います。宣言済みの実行引数ごとに `--arg` を繰り返してください。`run cancel` は実行に残っているノードをキャンセルし、そのペインを閉じます。
+`run` はワークフローを選ぶ引数ではなく、名前空間です。`start`、`list`、`show`、`cancel` はそれぞれ独自の引数を取るため、ワークフローに `list` という名前を付けてもサブコマンドと衝突しません。`--tier` はワークフロー自身のデフォルトティアを使います。宣言済みの実行引数ごとに `--arg` を繰り返してください ── ワークフローが宣言していない `--arg` キーは、黙って無視されるのではなく、実行開始前に、宣言済みのキー一覧とともに拒否されます。`run cancel` は実行に残っているノードをキャンセルし、そのペインを閉じます。
+
+`--json` なしの `run show` は、実行が `paused` であるか、あるノードが停止しているときに責任のあるノードを名指しします: `status` 行は `paused (node "lint": needs_attention)` のように表示され、続けてそのノードの blocker の理由と再開条件、そしてすべてのノードのパスとステータスが表示されます。
 
 ```bash
 kvx workflow node show <run_id> <path> [--json]
@@ -150,7 +154,7 @@ kvx workflow node restart <run_id> <path>
 kvx workflow node complete [--result-file <path>]
 ```
 
-`<path>` は、`plan` や `research/2/verify` のような、ノードのインスタンスパスです ── `run show` と DAG ビューの両方に表示されます。`steer` は、後述する DAG ビューでのステアリングと同じ方法で、実行中のノードにテキストを注入します。`interrupt` はエスケープを送り、ノードを終了させずに現在のターンを止めます。`restart` はノードのペインを閉じ、試行回数を増やし、`task.md` から再起動します。`node complete` は、ノード自身が自分に対して実行する唯一のコマンドです ── 前述のノードの契約を参照してください。
+`<path>` は、`plan` や `research/2/verify` のような、ノードのインスタンスパスです ── `run show`、`workflow show`、DAG ビューに表示されます。`steer` は、後述する DAG ビューでのステアリングと同じ方法で、実行中のノードにテキストを注入します。`interrupt` はエスケープを送り、ノードを終了させずに現在のターンを止めます。`restart` はノードのペインを閉じ、試行回数を増やし、`task.md` から再起動します。`node complete` は、ノード自身が自分に対して実行する唯一のコマンドです ── 前述のノードの契約を参照してください。`--json` なしの `node show` は、記録されている場合、`path`/`status`/`model`/`effort`/`pane_id` に加えてノードの blocker (理由と再開条件) を表示します。
 
 ## DAG ビュー
 

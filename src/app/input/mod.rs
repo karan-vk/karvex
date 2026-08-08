@@ -338,7 +338,23 @@ impl App {
     }
 
     fn open_workflow_dag_steer(&mut self) {
-        if self.state.view.dag.run_id.is_empty() || self.state.view.dag.selected_node().is_none() {
+        if self.state.view.dag.run_id.is_empty() {
+            return;
+        }
+        let Some(node) = self.state.view.dag.selected_node() else {
+            return;
+        };
+        // A node with no pane has nothing to steer. Letting the line open, take
+        // the text, and swallow it is the failure mode 2.15 describes; saying so
+        // up front costs one line.
+        if node.pane_id.is_none() {
+            let path = node.path.clone();
+            self.show_workflow_notice(crate::workflow::model::UserNotice {
+                level: crate::workflow::model::NoticeLevel::Warning,
+                run: None,
+                path: Some(crate::workflow::model::InstancePath::new(path)),
+                message: "the node has no pane to steer".to_string(),
+            });
             return;
         }
         self.state.view.dag.steer = Some(String::new());
@@ -362,12 +378,28 @@ impl App {
         if text.is_empty() || run_id.is_empty() {
             return;
         }
-        self.dispatch_runtime_mutation(
+        let response = self.dispatch_runtime_mutation(
             "tui.workflow.node.steer",
             crate::api::schema::Method::WorkflowNodeSteer(
-                crate::api::schema::WorkflowNodeSteerParams { run_id, path, text },
+                crate::api::schema::WorkflowNodeSteerParams {
+                    run_id: run_id.clone(),
+                    path: path.clone(),
+                    text,
+                },
             ),
         );
+        // The API answers with the same envelope a CLI caller gets, and it
+        // already refuses a steer whose keystrokes never reached the process.
+        // Dropping that envelope is what made the overlay's steer the one write
+        // action in karvex that could fail in silence.
+        if let Some(message) = crate::app::workflow::steer_failure_message(&response) {
+            self.show_workflow_notice(crate::workflow::model::UserNotice {
+                level: crate::workflow::model::NoticeLevel::Error,
+                run: None,
+                path: Some(crate::workflow::model::InstancePath::new(path)),
+                message,
+            });
+        }
     }
 
     /// Opens the selected node's teammate. The overlay is full-bleed, so
@@ -1165,9 +1197,13 @@ mod tests {
             effort: "low".into(),
             attempt: 1,
             usage: crate::workflow::model::NodeUsage::default(),
+            duration_ms: 0,
+            delivery_failure: None,
             summary: None,
             blocker: None,
-            pane_id: None,
+            // A `Running` node has a pane by construction; the steer affordance
+            // reads exactly this field to know there is something to steer.
+            pane_id: Some(format!("w1:p{idx}")),
             successors,
             predecessors,
         }
@@ -1183,6 +1219,11 @@ mod tests {
         crate::app::state::DagViewState {
             run_id: "workflow_run:1".into(),
             run_status: Some(crate::workflow::model::RunStatus::Running),
+            counts: crate::app::state::DagRunCounts {
+                total: 2,
+                running: 2,
+                ..crate::app::state::DagRunCounts::default()
+            },
             header_rect: Rect::new(0, 0, 80, 1),
             graph_rect: Rect::new(0, 1, 80, 18),
             detail_rect: Rect::new(0, 19, 80, 4),
@@ -1192,14 +1233,14 @@ mod tests {
                     (RunNodeIdx(0), LayoutRect::new(0, 1, 22, 3)),
                     (RunNodeIdx(1), LayoutRect::new(0, 6, 22, 3)),
                 ],
-                edge_cells: std::collections::HashMap::new(),
+                edges: Vec::new(),
             },
             nodes: vec![
                 dag_node(0, "plan", vec![RunNodeIdx(1)], Vec::new()),
                 dag_node(1, "build", Vec::new(), vec![RunNodeIdx(0)]),
             ],
             selected: Some(RunNodeIdx(0)),
-            steer: None,
+            ..crate::app::state::DagViewState::default()
         }
     }
 
@@ -1257,6 +1298,26 @@ mod tests {
 
         app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.state.view.dag.steer, None);
+    }
+
+    /// 2.15: the steer line used to open on any node, take the text, and drop
+    /// it. A node with no pane has nothing to steer, and says so instead of
+    /// accepting input it cannot deliver.
+    #[test]
+    fn workflow_dag_steer_refuses_a_node_with_no_pane_and_says_why() {
+        let mut app = test_app();
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
+        app.state.mode = Mode::WorkflowDag;
+        app.state.view.dag = dag_view();
+        if let Some(node) = app.state.view.dag.nodes.first_mut() {
+            node.pane_id = None;
+        }
+
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert_eq!(app.state.view.dag.steer, None);
+        let toast = app.state.toast.as_ref().expect("the refusal is shown");
+        assert!(toast.context.contains("no pane to steer"), "{toast:?}");
     }
 
     #[test]

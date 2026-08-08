@@ -64,9 +64,9 @@ port = "plan"
 
 每个 `[[arg]]` 在运行参数命名空间中声明一个条目,在运行时通过 `--arg name=value` 填入。`prompt_template` 中的每个 `{{name}}` 占位符都必须能解析到某个已声明的参数或某条入边的 `port` ── `workflow.create` 会在文档被运行之前就拒绝含有未解析占位符的文档,而启动运行时则会单独拒绝缺少默认值的必填参数。
 
-每个 `[[node]]` 都需要唯一的 `key`、`label` 和 `prompt_template`。`output_schema` 是一个 JSON Schema,节点的结果必须先通过它的校验才能被判定为成功。`kind` 默认是 `"agent"`;其他种类(`internal`、`gate`、`monitor`)目前可以被接受,但它们的调度行为会在后续版本中提供。`runner` 决定节点的进程如何被启动 ── 参见下文的节点运行方式。`demand`(`peak`、`critical`、`standard` 或 `light`,默认 `standard`)会把运行的等级映射到每个节点的模型和努力等级分配上。
+每个 `[[node]]` 都需要唯一的 `key`、`label`、`prompt_template`,以及 `output_schema`。`output_schema` 是一个 JSON Schema,节点的结果必须先通过它的校验才能被判定为成功。省略 `output_schema` 不会导致文档被拒绝,而是使用空 schema `{}`(接受任意对象);一旦确定了想要校验的形状,再显式声明它。`kind` 默认是 `"agent"`;其他种类(`internal`、`gate`、`monitor`)目前可以被接受,但它们的调度行为会在后续版本中提供。`runner` 决定节点的进程如何被启动 ── 参见下文的节点运行方式。`demand`(`peak`、`critical`、`standard` 或 `light`,默认 `standard`)会把运行的等级映射到每个节点的模型和努力等级分配上。
 
-每个 `[[edge]]` 连接一个 `from` 节点和一个 `to` 节点。`kind` 可以是 `sequence`(要求源节点成功)、`data`(要求源节点成功且其结果通过校验)或 `conditional`(对源节点的结果求值 `condition`;为 false 时该边即为死边)。`payload` 控制目标节点能拿到源节点检查点的多少内容:`none`、`summary`(默认)或 `full`。`port` 指定该边的负载要填入目标节点 `prompt_template` 中的哪个 `{{slot}}`。
+每个 `[[edge]]` 连接一个 `from` 节点和一个 `to` 节点,并且需要 `kind`:`sequence`(要求源节点成功)、`data`(要求源节点成功且其结果通过校验)或 `conditional`(对源节点的结果求值 `condition`;为 false 时该边即为死边)。省略 `kind` 时默认为 `sequence`。`conditional` 边必须声明 `condition`;没有 `condition` 的 `conditional` 边会在创建时被拒绝,而不是被接受后静默地永远无法解析。`payload` 控制目标节点能拿到源节点检查点的多少内容:`none`、`summary`(默认)或 `full`。`port` 指定该边的负载要填入目标节点 `prompt_template` 中的哪个 `{{slot}}`;如果 `port` 指向的 `{{slot}}` 并未出现在目标节点的 `prompt_template` 中,也会在创建时被拒绝,因为那样会产生一个数据无处可去的工作流。
 
 带上声明的参数运行它:
 
@@ -124,14 +124,16 @@ kvx workflow node complete --result-file <path>   # defaults to ./result.json in
 
 ## 命令
 
+`kvx workflow` 也会出现在 `kvx --help` 的命令列表中。`show`、`create`、`update`、`run start`、`run show`、`node show` 默认都会输出人类可读文本;传入 `--json` 可改为输出机器可读的信封结构。
+
 ```bash
 kvx workflow list
-kvx workflow show <name|id>
-kvx workflow create --file <definition.toml|json> [--name <name>]
-kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>]
+kvx workflow show <name|id> [--json]
+kvx workflow create --file <definition.toml|json> [--name <name>] [--json]
+kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
 ```
 
-`create` 和 `update` 都会从 `--file` 读取前面介绍过的定义文档;扩展名决定是 TOML 还是 JSON。`update` 会创建一个新的 kvdag 版本,而不是编辑当前版本。
+`create` 和 `update` 都会从 `--file` 读取前面介绍过的定义文档;扩展名决定是 TOML 还是 JSON。`update` 会创建一个新的 kvdag 版本,而不是编辑当前版本 ── 除非该定义与当前头版本逐字节相同,这种情况下不会创建任何新内容,人类可读输出会显示 `(unchanged — this definition matches the current version; no new version was created)`,而不是声称创建了新版本。不带 `--json` 的 `show` 会渲染工作流摘要、带格式化时间戳的版本历史,以及头版本的节点(key、label、runner、demand)、边(from/to/kind/port)和已声明参数 ── 无需回到原始定义文件即可找到 `node show`/`steer`/`restart` 所需的节点 `<path>`,或 `run start` 所需的 `--arg` 名称。
 
 ```bash
 kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
@@ -140,7 +142,9 @@ kvx workflow run show <run_id> [--json]
 kvx workflow run cancel <run_id>
 ```
 
-`run` 是一个命名空间,不是用来选择工作流的参数:`start`、`list`、`show`、`cancel` 各自带有自己的参数,所以工作流即使叫 `list` 也不会和子命令冲突。`--tier` 默认使用该工作流自己的默认等级;为每个已声明的运行参数重复使用 `--arg`。`run cancel` 会取消运行中剩余的节点并关闭它们的窗格。
+`run` 是一个命名空间,不是用来选择工作流的参数:`start`、`list`、`show`、`cancel` 各自带有自己的参数,所以工作流即使叫 `list` 也不会和子命令冲突。`--tier` 默认使用该工作流自己的默认等级;为每个已声明的运行参数重复使用 `--arg` ── 工作流未声明的 `--arg` 键不会被静默丢弃,而是在运行开始前被拒绝,并列出所有已声明的键。`run cancel` 会取消运行中剩余的节点并关闭它们的窗格。
+
+不带 `--json` 的 `run show` 会在运行处于 `paused` 或某个节点卡住时指出负责的节点:`status` 行会显示为 `paused (node "lint": needs_attention)`,随后是该节点的 blocker 原因和恢复条件,以及每个节点的路径和状态。
 
 ```bash
 kvx workflow node show <run_id> <path> [--json]
@@ -150,7 +154,7 @@ kvx workflow node restart <run_id> <path>
 kvx workflow node complete [--result-file <path>]
 ```
 
-`<path>` 是节点的实例路径,例如 `plan` 或 `research/2/verify` ── 会显示在 `run show` 和 DAG 视图中。`steer` 会以和下文 DAG 视图中的引导输入相同的方式,向正在运行的节点注入文本。`interrupt` 发送一个转义键,在不结束节点的情况下停止其当前回合。`restart` 会关闭节点的窗格,增加其尝试次数,并从 `task.md` 重新启动。`node complete` 是节点对自己运行的唯一命令 ── 参见前文的节点契约。
+`<path>` 是节点的实例路径,例如 `plan` 或 `research/2/verify` ── 会显示在 `run show`、`workflow show` 和 DAG 视图中。`steer` 会以和下文 DAG 视图中的引导输入相同的方式,向正在运行的节点注入文本。`interrupt` 发送一个转义键,在不结束节点的情况下停止其当前回合。`restart` 会关闭节点的窗格,增加其尝试次数,并从 `task.md` 重新启动。`node complete` 是节点对自己运行的唯一命令 ── 参见前文的节点契约。不带 `--json` 的 `node show` 会在记录了 blocker 时,在 `path`/`status`/`model`/`effort`/`pane_id` 之外显示该节点的 blocker(原因和恢复条件)。
 
 ## DAG 视图
 

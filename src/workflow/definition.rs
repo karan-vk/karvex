@@ -12,7 +12,9 @@
 
 use serde::Deserialize;
 
-use crate::workflow::model::{ArgSpec, GrowthLimits, KvdagEdge, KvdagNode, KvdagSpec, WorkflowId};
+use crate::workflow::model::{
+    ArgSpec, EdgeKind, GrowthLimits, KvdagEdge, KvdagNode, KvdagSpec, NodeKey, WorkflowId,
+};
 use crate::workflow::tier::Tier;
 
 /// A parsed definition document, before it is bound to a workflow identity.
@@ -50,6 +52,24 @@ pub enum DefinitionError {
     /// A document that names nothing cannot be looked up by name later, and a
     /// document with no nodes has no run to schedule.
     Empty(&'static str),
+    /// `kind = "conditional"` with no `condition` — the report ("UX
+    /// validation" §2.19) found this silently accepted, producing an edge
+    /// whose fan-out never resolves to fired-or-not.
+    ConditionalEdgeMissingCondition {
+        from: NodeKey,
+        to: NodeKey,
+    },
+    /// An edge names a `port` that never appears as `{{port}}` in the
+    /// target's `prompt_template` — accepted silently before this check
+    /// (§2.19: "a typo'd port silently produces a workflow whose data goes
+    /// nowhere"). Ports that *do* resolve are still checked in the opposite
+    /// direction by the graph-level `UnresolvedPlaceholder` validator
+    /// (`workflow::model::Kvdag::try_new`); this is the missing other half.
+    UnmatchedEdgePort {
+        from: NodeKey,
+        to: NodeKey,
+        port: String,
+    },
 }
 
 impl std::fmt::Display for DefinitionError {
@@ -57,6 +77,14 @@ impl std::fmt::Display for DefinitionError {
         match self {
             Self::Parse(message) => write!(f, "invalid definition document: {message}"),
             Self::Empty(field) => write!(f, "definition document has no {field}"),
+            Self::ConditionalEdgeMissingCondition { from, to } => write!(
+                f,
+                "edge {from} -> {to} declares kind \"conditional\" but has no condition"
+            ),
+            Self::UnmatchedEdgePort { from, to, port } => write!(
+                f,
+                "edge {from} -> {to} declares port \"{port}\", which does not appear as {{{{{port}}}}} in \"{to}\"'s prompt_template"
+            ),
         }
     }
 }
@@ -65,15 +93,44 @@ impl std::error::Error for DefinitionError {}
 
 impl Definition {
     pub fn parse_toml(text: &str) -> Result<Self, DefinitionError> {
-        let parsed: Self =
-            toml::from_str(text).map_err(|error| DefinitionError::Parse(error.to_string()))?;
-        parsed.check()
+        match toml::from_str::<Self>(text) {
+            Ok(parsed) => parsed.check(),
+            Err(first_error) => match Self::parse_toml_with_authoring_defaults(text) {
+                Some(parsed) => parsed.check(),
+                None => Err(DefinitionError::Parse(first_error.to_string())),
+            },
+        }
     }
 
     pub fn parse_json(text: &str) -> Result<Self, DefinitionError> {
-        let parsed: Self = serde_json::from_str(text)
-            .map_err(|error| DefinitionError::Parse(error.to_string()))?;
-        parsed.check()
+        match serde_json::from_str::<Self>(text) {
+            Ok(parsed) => parsed.check(),
+            Err(first_error) => match Self::parse_json_with_authoring_defaults(text) {
+                Some(parsed) => parsed.check(),
+                None => Err(DefinitionError::Parse(first_error.to_string())),
+            },
+        }
+    }
+
+    /// Retries a TOML document that failed direct typed deserialization by
+    /// backfilling `output_schema`/`kind` (see [`apply_authoring_defaults`])
+    /// and reparsing. Only called on the failure path, so a document that
+    /// already deserializes cleanly keeps `toml`'s original positional
+    /// caret diagnostics untouched; only reached when *some* field was
+    /// missing does this trade that position info for a chance at reaching
+    /// [`Definition::check`] and the graph validators beyond it.
+    fn parse_toml_with_authoring_defaults(text: &str) -> Option<Self> {
+        let raw: toml::Value = toml::from_str(text).ok()?;
+        let mut value = serde_json::to_value(raw).ok()?;
+        apply_authoring_defaults(&mut value);
+        serde_json::from_value(value).ok()
+    }
+
+    /// JSON counterpart of [`Definition::parse_toml_with_authoring_defaults`].
+    fn parse_json_with_authoring_defaults(text: &str) -> Option<Self> {
+        let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+        apply_authoring_defaults(&mut value);
+        serde_json::from_value(value).ok()
     }
 
     fn check(self) -> Result<Self, DefinitionError> {
@@ -83,7 +140,49 @@ impl Definition {
         if self.node.is_empty() {
             return Err(DefinitionError::Empty("nodes"));
         }
+        self.check_conditional_edges_declare_a_condition()?;
+        self.check_edge_ports_match_a_target_placeholder()?;
         Ok(self)
+    }
+
+    fn check_conditional_edges_declare_a_condition(&self) -> Result<(), DefinitionError> {
+        for edge in &self.edge {
+            if edge.kind == EdgeKind::Conditional && edge.condition.is_none() {
+                return Err(DefinitionError::ConditionalEdgeMissingCondition {
+                    from: edge.from.clone(),
+                    to: edge.to.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_edge_ports_match_a_target_placeholder(&self) -> Result<(), DefinitionError> {
+        let templates: std::collections::HashMap<&str, &str> = self
+            .node
+            .iter()
+            .map(|node| (node.key.as_str(), node.prompt_template.as_str()))
+            .collect();
+        for edge in &self.edge {
+            let Some(port) = edge.port.as_deref() else {
+                continue;
+            };
+            let Some(template) = templates.get(edge.to.as_str()) else {
+                // An edge to an unknown node is a different, already-named
+                // validator (`KvdagError::UnknownEdgeEndpoint`,
+                // `workflow::model::Kvdag::try_new`); this check only has an
+                // opinion about ports on edges whose target it can see.
+                continue;
+            };
+            if !template_declares_placeholder(template, port) {
+                return Err(DefinitionError::UnmatchedEdgePort {
+                    from: edge.from.clone(),
+                    to: edge.to.clone(),
+                    port: port.to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn tier(&self) -> Tier {
@@ -116,10 +215,77 @@ impl Definition {
     }
 }
 
+/// Backfills the two mandatory-but-undocumented fields the kvdag model
+/// requires so a document that omits them reaches [`Definition::check`] and
+/// the graph validators beyond it (`workflow::model::Kvdag::try_new`'s
+/// cycle/dangling-edge/duplicate-key/missing-command checks) instead of
+/// failing on a raw serde "missing field" error naming a field
+/// `workflows.mdx` never told the author was required — UX validation
+/// report §2.17: "seven of eleven distinct error fixtures returned the
+/// identical message `missing field output_schema`, hiding [every other]
+/// validator entirely."
+///
+/// - `output_schema` defaults to `{}`, the empty (accept-anything) JSON
+///   Schema: `OutputSchema::validate` accepts an object with no `type`,
+///   `required`, or `properties` key.
+/// - `kind` (on an edge) defaults to `"sequence"`, the edge kind with no
+///   data-flow or condition requirements of its own.
+///
+/// Only called after a direct typed parse already failed
+/// ([`Definition::parse_toml_with_authoring_defaults`] /
+/// `parse_json_with_authoring_defaults`), so a document that already
+/// declares both fields never goes through this path.
+fn apply_authoring_defaults(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in ["node", "nodes"] {
+        if let Some(serde_json::Value::Array(nodes)) = object.get_mut(key) {
+            for node in nodes.iter_mut() {
+                if let Some(node) = node.as_object_mut() {
+                    node.entry("output_schema")
+                        .or_insert_with(|| serde_json::json!({}));
+                }
+            }
+        }
+    }
+    for key in ["edge", "edges"] {
+        if let Some(serde_json::Value::Array(edges)) = object.get_mut(key) {
+            for edge in edges.iter_mut() {
+                if let Some(edge) = edge.as_object_mut() {
+                    edge.entry("kind")
+                        .or_insert_with(|| serde_json::Value::String("sequence".to_string()));
+                }
+            }
+        }
+    }
+}
+
+/// Minimal, deliberately duplicated `{{name}}` scanner — mirrors
+/// `workflow::model::scan_placeholders`, which is private to that module and
+/// returns richer error detail this check does not need: a yes/no "does this
+/// port appear as a placeholder in this template" answer is enough to reject
+/// a typo'd port at authoring time.
+fn template_declares_placeholder(template: &str, name: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(start) = template[search_from..].find("{{") {
+        let body_start = search_from + start + 2;
+        let Some(end_offset) = template[body_start..].find("}}") else {
+            break;
+        };
+        let body = template[body_start..body_start + end_offset].trim();
+        if body == name {
+            return true;
+        }
+        search_from = body_start + end_offset + 2;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::model::{Demand, EdgeKind, Runner};
+    use crate::workflow::model::{Demand, Runner};
 
     const DOCUMENT: &str = r#"
 name = "ship-feature"
@@ -242,6 +408,185 @@ output_schema = { type = "object" }
             Definition::parse_toml(text),
             Err(DefinitionError::Parse(_))
         ));
+    }
+
+    /// §2.17: `output_schema` was mandatory but undocumented, and omitting it
+    /// masked every other validator behind a raw `missing field
+    /// output_schema` serde error. Fails before the fix (the old
+    /// `toml::from_str::<Self>(text)`-only implementation rejected this
+    /// document outright); now it parses with the empty, accept-anything
+    /// schema.
+    #[test]
+    fn a_node_missing_output_schema_defaults_to_an_empty_schema() {
+        let text = r#"
+name = "no-schema"
+[[node]]
+key = "only"
+label = "Only"
+prompt_template = "do it"
+"#;
+        let definition = Definition::parse_toml(text).expect("document parses via defaulting");
+        assert_eq!(
+            definition.node[0].output_schema.as_json(),
+            &serde_json::json!({})
+        );
+
+        // Same defaulting applies to the JSON form.
+        let json_text = r#"{
+            "name": "no-schema",
+            "node": [
+                { "key": "only", "label": "Only", "prompt_template": "do it" }
+            ]
+        }"#;
+        let definition = Definition::parse_json(json_text).expect("document parses via defaulting");
+        assert_eq!(
+            definition.node[0].output_schema.as_json(),
+            &serde_json::json!({})
+        );
+    }
+
+    /// §2.17's other undocumented mandatory field: an edge with no `kind`.
+    /// Fails before the fix for the same reason as the `output_schema` case.
+    #[test]
+    fn an_edge_missing_kind_defaults_to_sequence() {
+        let text = r#"
+name = "no-edge-kind"
+[[node]]
+key = "a"
+label = "A"
+prompt_template = "do it"
+output_schema = { type = "object" }
+
+[[node]]
+key = "b"
+label = "B"
+prompt_template = "then this"
+output_schema = { type = "object" }
+
+[[edge]]
+from = "a"
+to = "b"
+"#;
+        let definition = Definition::parse_toml(text).expect("document parses via defaulting");
+        assert_eq!(definition.edge[0].kind, EdgeKind::Sequence);
+    }
+
+    /// Defaulting must not paper over a genuinely missing required field: a
+    /// document missing `prompt_template` (which has no default) still
+    /// fails, and the error still names the actual missing field rather than
+    /// something the defaulting retry silently invented.
+    #[test]
+    fn a_node_missing_prompt_template_still_fails_with_that_fields_name() {
+        let text = r#"
+name = "missing-prompt"
+[[node]]
+key = "only"
+label = "Only"
+output_schema = { type = "object" }
+"#;
+        let error = Definition::parse_toml(text).expect_err("prompt_template is still required");
+        let DefinitionError::Parse(message) = error else {
+            panic!("expected a Parse error, got {error:?}");
+        };
+        assert!(
+            message.contains("prompt_template"),
+            "error should still name the real missing field: {message}"
+        );
+    }
+
+    /// §2.19: `kind = "conditional"` with no `condition` was accepted
+    /// silently, producing an edge whose branch never resolves.
+    #[test]
+    fn a_conditional_edge_without_a_condition_is_rejected() {
+        let text = r#"
+name = "dangling-conditional"
+[[node]]
+key = "a"
+label = "A"
+prompt_template = "do it"
+output_schema = { type = "object" }
+
+[[node]]
+key = "b"
+label = "B"
+prompt_template = "then this"
+output_schema = { type = "object" }
+
+[[edge]]
+from = "a"
+to = "b"
+kind = "conditional"
+"#;
+        assert_eq!(
+            Definition::parse_toml(text),
+            Err(DefinitionError::ConditionalEdgeMissingCondition {
+                from: NodeKey::new("a"),
+                to: NodeKey::new("b"),
+            })
+        );
+    }
+
+    /// §2.19: an edge could declare `port = "notaslot"` even when the
+    /// target's `prompt_template` has no `{{notaslot}}` — a typo that
+    /// silently produced a workflow whose data goes nowhere.
+    #[test]
+    fn an_edge_port_with_no_matching_placeholder_is_rejected() {
+        let text = r#"
+name = "bad-port"
+[[node]]
+key = "a"
+label = "A"
+prompt_template = "do it"
+output_schema = { type = "object" }
+
+[[node]]
+key = "b"
+label = "B"
+prompt_template = "then this: {{summary}}"
+output_schema = { type = "object" }
+
+[[edge]]
+from = "a"
+to = "b"
+kind = "data"
+port = "notaslot"
+"#;
+        assert_eq!(
+            Definition::parse_toml(text),
+            Err(DefinitionError::UnmatchedEdgePort {
+                from: NodeKey::new("a"),
+                to: NodeKey::new("b"),
+                port: "notaslot".to_string(),
+            })
+        );
+    }
+
+    /// A port that *does* resolve to a `{{name}}` slot in the target's
+    /// template is accepted — this is the paired positive case for the
+    /// `an_edge_port_with_no_matching_placeholder_is_rejected` rejection.
+    #[test]
+    fn an_edge_port_matching_a_placeholder_is_accepted() {
+        let text = r#"
+name = "good-port"
+[[node]]
+key = "a"
+label = "A"
+prompt_template = "do it"
+output_schema = { type = "object" }
+
+[[node]]
+key = "b"
+label = "B"
+prompt_template = "then this: {{ summary }}"
+output_schema = { type = "object" }
+
+[[edge]]
+from = "a"
+to = "b"
+kind = "data"
+port = "summary"
+"#;
+        assert!(Definition::parse_toml(text).is_ok());
     }
 
     #[test]

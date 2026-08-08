@@ -807,10 +807,23 @@ pub(super) fn server_not_running_error(err: &std::io::Error) -> bool {
     )
 }
 
+/// True when a socket connect failed because the resolved path is longer than
+/// this OS's unix domain socket address can hold. `interprocess` reports this
+/// as `io::ErrorKind::InvalidInput` with a fixed message naming the kernel
+/// struct field (`src/os/unix/ud_addr.rs::name_too_long` in the `interprocess`
+/// crate) rather than the path or a remedy — see `socket_path_too_long_reported_error`
+/// for the actionable message this classifies into.
+fn socket_path_too_long_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::InvalidInput && err.to_string().contains("sun_path")
+}
+
 /// Maps an `ApiClientError` from a socket command into the io::Error that
 /// bubbles up to `main`. A dead-server connect failure is reported as a
-/// friendly `server_not_running` JSON error plus a recognizable marker; all
-/// other errors fall through unchanged so existing handling is preserved.
+/// friendly `server_not_running` JSON error plus a recognizable marker; a
+/// socket path that is too long for this OS's unix domain socket address gets
+/// the same treatment instead of the raw `io::Error` Debug dump `main`'s
+/// default `Result` termination would otherwise print; all other errors fall
+/// through unchanged so existing handling is preserved.
 fn map_server_not_running_or_io(
     err: ApiClientError,
     request_id: &str,
@@ -823,7 +836,38 @@ fn map_server_not_running_or_io(
                 &client.socket_path(),
             ))
         }
+        ApiClientError::Io(io_err) if socket_path_too_long_error(&io_err) => {
+            server_not_running::reported_error(socket_path_too_long_response(
+                request_id,
+                &client.socket_path(),
+            ))
+        }
         err => api_client_error_to_io(err),
+    }
+}
+
+/// Builds the actionable `socket_path_too_long` error shown when the resolved
+/// API socket path cannot fit in a unix domain socket address. Reuses the
+/// `server_not_running` marker/print plumbing (`main.rs` already special-cases
+/// it to print the carried `ErrorResponse` once and exit non-zero instead of
+/// falling through to the default `Result` termination's `Debug` dump) since
+/// the payload shape and edge behavior are identical — only the code and
+/// message differ.
+fn socket_path_too_long_response(
+    request_id: &str,
+    socket_path: &std::path::Path,
+) -> crate::api::schema::ErrorResponse {
+    let path = socket_path.display().to_string();
+    let path_len = socket_path.as_os_str().len();
+    crate::api::schema::ErrorResponse {
+        id: request_id.to_string(),
+        error: crate::api::schema::ErrorBody {
+            code: "socket_path_too_long".into(),
+            message: format!(
+                "cannot connect: the karvex socket path is {path_len} bytes, longer than this OS's unix domain socket address can hold (the kernel's sun_path field typically caps out around 100-108 bytes): {path}. Set {}=<a shorter path> to override where karvex looks for the socket, or use a shorter --session name.",
+                crate::api::SOCKET_PATH_ENV_VAR
+            ),
+        },
     }
 }
 
@@ -1122,6 +1166,81 @@ mod tests {
             &client,
         );
         assert!(!super::server_not_running::was_reported(&mapped));
+    }
+
+    /// §2.16.1 of the UX report: connecting with a socket path too long for
+    /// this OS's unix domain socket address previously bubbled the raw
+    /// `interprocess`-crate `io::Error` all the way to `main`'s default
+    /// `Result` termination, which prints its `Debug` form —
+    /// `Error: Custom { kind: InvalidInput, error: "local socket name length
+    /// exceeds capacity of sun_path of sockaddr_un" }` — naming no path,
+    /// length, limit, or fix. This asserts the mapped error instead carries
+    /// an actionable `ErrorResponse` through the same "reported" plumbing
+    /// `main` already special-cases for `server_not_running`.
+    #[test]
+    fn maps_sun_path_too_long_connect_failure_to_actionable_error() {
+        use crate::api::client::{ApiClient, ApiClientError};
+
+        let client = ApiClient::local();
+        let socket = client.socket_path().display().to_string();
+        let socket_len = client.socket_path().as_os_str().len();
+
+        let sun_path_error = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "local socket name length exceeds capacity of sun_path of sockaddr_un",
+        );
+        let mapped = super::map_server_not_running_or_io(
+            ApiClientError::Io(sun_path_error),
+            "cli:session:list",
+            &client,
+        );
+
+        let response = super::server_not_running::reported_response(&mapped)
+            .expect("a sun_path-too-long connect failure should carry a reported response");
+        assert_eq!(response.id, "cli:session:list");
+        assert_eq!(response.error.code, "socket_path_too_long");
+        assert!(
+            response.error.message.contains(&socket),
+            "message should name the offending path: {}",
+            response.error.message
+        );
+        assert!(
+            response.error.message.contains(&socket_len.to_string()),
+            "message should name the actual path length: {}",
+            response.error.message
+        );
+        assert!(
+            response
+                .error
+                .message
+                .contains(crate::api::SOCKET_PATH_ENV_VAR),
+            "message should name the env var to override: {}",
+            response.error.message
+        );
+        assert!(
+            !response.error.message.contains("Custom {"),
+            "message should never leak raw io::Error Debug formatting: {}",
+            response.error.message
+        );
+
+        // The mapping is recognizable without string matching, exactly like
+        // the dead-server case.
+        assert!(super::server_not_running::was_reported(&mapped));
+    }
+
+    #[test]
+    fn sun_path_classifier_only_matches_the_specific_os_error() {
+        assert!(super::socket_path_too_long_error(&std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "local socket name length exceeds capacity of sun_path of sockaddr_un",
+        )));
+        assert!(!super::socket_path_too_long_error(&std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "some other invalid input",
+        )));
+        assert!(!super::socket_path_too_long_error(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
     }
 
     /// Part of the W5 "manual parser / spec.rs / cli.rs dispatch" parity

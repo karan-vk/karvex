@@ -869,21 +869,39 @@ fn plugin_command() -> Command {
 
 fn workflow_command() -> Command {
     Command::new("workflow")
-        .about("Manage kvdag workflow definitions and runs")
+        .about("Author and run multi-node agent workflows")
         .subcommand(Command::new("list").about("List workflows"))
-        .subcommand(id_command("show", "target", "Show a workflow"))
+        .subcommand(
+            Command::new("show")
+                .about("Show a workflow: summary, version history, and the head version's nodes/edges/args")
+                .arg(required("target", "target").help("Workflow name or workflow:<id>"))
+                .arg(json_flag()),
+        )
         .subcommand(
             Command::new("create")
                 .about("Create a workflow from a definition document")
-                .arg(path_option("file", "PATH").required(true))
-                .arg(option("name", "NAME")),
+                .arg(
+                    path_option("file", "PATH")
+                        .required(true)
+                        .help("Path to a .toml or .json kvdag definition document"),
+                )
+                .arg(option("name", "NAME").help("Override the document's top-level name"))
+                .arg(json_flag()),
         )
         .subcommand(
             Command::new("update")
                 .about("Author a new version of a workflow from a definition document")
-                .arg(required("target", "TARGET"))
-                .arg(path_option("file", "PATH").required(true))
-                .arg(option("change-summary", "TEXT")),
+                .arg(required("target", "TARGET").help("Workflow name or workflow:<id>"))
+                .arg(
+                    path_option("file", "PATH")
+                        .required(true)
+                        .help("Path to a .toml or .json kvdag definition document"),
+                )
+                .arg(
+                    option("change-summary", "TEXT")
+                        .help("Free-text note stored on the new version, if one is created"),
+                )
+                .arg(json_flag()),
         )
         .subcommand(workflow_run_command())
         .subcommand(workflow_node_command())

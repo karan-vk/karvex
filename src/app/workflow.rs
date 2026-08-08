@@ -36,7 +36,7 @@ use crate::app::state::{ToastKind, ToastNotification};
 use crate::app::App;
 use crate::events::WorkflowAppEvent;
 use crate::workflow::binding::{observe, spawn};
-use crate::workflow::engine::{Engine, EngineConfig};
+use crate::workflow::engine::{DeliveryFailureNote, Engine, EngineConfig};
 use crate::workflow::model::{
     Demand, EdgeKind, EdgePayload, EngineInput, Evidence, InstancePath, Kvdag, KvdagVersionId,
     NodeBinding, NodeStatus, NodeToken, NoticeLevel, OutputSchema, PublicPaneId, RunEffect,
@@ -159,6 +159,14 @@ pub(crate) struct WorkflowRuntimeState {
     /// reached the process is a lie about the system's state, so the API layer
     /// takes this after driving the engine and answers with the failure.
     delivery_failure: Option<DeliveryFailure>,
+    /// The run status the user has already been told about. A run that
+    /// succeeds, fails, is cancelled, or pauses is announced exactly once, and
+    /// a run that never changes status is never announced again.
+    announced_run_status: Option<RunStatus>,
+    /// Nodes already announced as needing a human. Cleared per node when it
+    /// leaves `NeedsAttention`, so a restarted node that gets stuck again is
+    /// announced again rather than silently.
+    announced_attention: HashSet<InstancePath>,
 }
 
 /// A `RunEffect` delivery into a node's pane that the in-process API refused.
@@ -195,7 +203,77 @@ impl WorkflowRuntimeState {
             node_tokens: HashMap::new(),
             next_tick_at: None,
             delivery_failure: None,
+            announced_run_status: None,
+            announced_attention: HashSet::new(),
         }
+    }
+
+    /// Everything the user has not been told yet about the run's current shape.
+    ///
+    /// The engine raises a notice for the failures it can see from inside a
+    /// transition, but it has no notice at all for a run that *finishes* — the
+    /// most common outcome — and none for a node that quietly lands in
+    /// `needs_attention`. Reading it off the settled graph after each effect
+    /// batch covers every path into those states without a second notification
+    /// model: the caller shows these exactly the way it shows the engine's own
+    /// [`UserNotice`]s.
+    ///
+    /// Ordered node-first so the run-level notice is the last one shown, which
+    /// is the one the single-slot toast keeps.
+    pub(crate) fn take_pending_announcements(&mut self) -> Vec<UserNotice> {
+        let Some(graph) = self.engine.graph() else {
+            return Vec::new();
+        };
+        let run = graph.run_id.clone();
+        let status = graph.status;
+        let mut announcements = Vec::new();
+
+        let attention: HashSet<InstancePath> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.status == NodeStatus::NeedsAttention)
+            .map(|node| node.path.clone())
+            .collect();
+        for node in &graph.nodes {
+            if node.status != NodeStatus::NeedsAttention
+                || self.announced_attention.contains(&node.path)
+            {
+                continue;
+            }
+            announcements.push(UserNotice {
+                level: NoticeLevel::Warning,
+                run: Some(run.clone()),
+                path: Some(node.path.clone()),
+                message: match &node.succession {
+                    Some(Succession::Blocked { reason, .. }) => {
+                        format!("needs attention: {reason}")
+                    }
+                    _ => "needs attention: the node is waiting for a human".to_string(),
+                },
+            });
+        }
+        // A node that recovered is forgotten, so getting stuck again is news.
+        self.announced_attention = attention;
+
+        if self.announced_run_status != Some(status) {
+            let blocking: Vec<String> = graph
+                .nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.status,
+                        NodeStatus::NeedsAttention | NodeStatus::Blocked | NodeStatus::Failed
+                    )
+                })
+                .map(|node| node.path.to_string())
+                .collect();
+            if let Some(notice) = run_status_notice(&run, status, &blocking) {
+                announcements.push(notice);
+            }
+            self.announced_run_status = Some(status);
+        }
+
+        announcements
     }
 
     pub(crate) fn record_delivery_failure(&mut self, failure: DeliveryFailure) {
@@ -210,6 +288,26 @@ impl WorkflowRuntimeState {
 
     pub(crate) fn take_delivery_failure(&mut self) -> Option<DeliveryFailure> {
         self.delivery_failure.take()
+    }
+
+    /// Hands a refused pane delivery back to the engine, which journals it as a
+    /// run event, marks the node, and raises a notice. Returns the effects for
+    /// the caller to dispatch.
+    pub(crate) fn note_delivery_failure(
+        &mut self,
+        path: &InstancePath,
+        method: &str,
+        reason: &str,
+    ) -> Vec<RunEffect> {
+        self.engine.note_delivery_failure(path, method, reason)
+    }
+
+    /// The last delivery this node's runtime refused, if one is outstanding.
+    pub(crate) fn node_delivery_failure(
+        &self,
+        path: &InstancePath,
+    ) -> Option<&DeliveryFailureNote> {
+        self.engine.delivery_failure(path)
     }
 
     pub(crate) fn config(&self) -> EngineConfig {
@@ -269,6 +367,10 @@ impl WorkflowRuntimeState {
         self.pending_writes.clear();
         self.dropped_writes = 0;
         self.persistence_degraded = false;
+        // Announcements are per run too: the previous run's terminal status
+        // must not suppress this one's.
+        self.announced_run_status = None;
+        self.announced_attention.clear();
         self.run = Some(run);
         self.engine.install_definition(definition);
         let effects = self.engine.apply(EngineInput::Start {
@@ -484,6 +586,10 @@ pub(crate) struct NodeSpawnPlan {
     pub(crate) output_schema: OutputSchema,
     pub(crate) inputs: BTreeMap<String, serde_json::Value>,
     pub(crate) transcript_path: PathBuf,
+    /// What the node's pane is called in the sidebar and the pane header.
+    /// Distinct from `spec.label`, which has to stay unique because it is the
+    /// agent name; a pane title only has to be readable.
+    pub(crate) pane_title: String,
 }
 
 /// The text a `{{slot}}` is filled with. A summary edge carries a string
@@ -727,7 +833,33 @@ impl App {
         }
         self.flush_workflow_writes();
         self.mirror_workflow_run_graph();
+        changed |= self.announce_workflow_progress();
         changed
+    }
+
+    /// Tells the user what the settled graph now says. The engine notices only
+    /// the failures it is in the middle of; a run that succeeds, is cancelled,
+    /// or pauses reaches its terminal shape through `settle` with nothing said
+    /// at all, which is why a finished run used to leave the screen
+    /// byte-identical to an idle one.
+    fn announce_workflow_progress(&mut self) -> bool {
+        let announcements = self.workflow.take_pending_announcements();
+        let announced = !announcements.is_empty();
+        for notice in announcements {
+            self.show_workflow_notice(notice);
+        }
+        announced
+    }
+
+    /// The bound `keys.open_workflow_dag` was pressed with nothing to show.
+    pub(crate) fn notify_no_workflow_run(&mut self) {
+        self.show_workflow_notice(UserNotice {
+            level: NoticeLevel::Info,
+            run: None,
+            path: None,
+            message: "no workflow run on this server — start one with kvx workflow run start"
+                .to_string(),
+        });
     }
 
     /// Copies the engine's graph into `AppState` so the DAG overlay — which is
@@ -736,7 +868,44 @@ impl App {
     /// is tens of nodes.
     fn mirror_workflow_run_graph(&mut self) {
         let graph = self.workflow.graph().cloned();
+        // The run graph carries node keys, not the labels the author wrote, so
+        // the definition's labels are mirrored alongside it — otherwise the
+        // overlay can only ever show a key the author already named better.
+        let labels = self
+            .workflow
+            .definition()
+            .map(|kvdag| {
+                kvdag
+                    .nodes
+                    .iter()
+                    .map(|node| (node.key.as_str().to_string(), node.label.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A refused delivery lives on the engine, not in the run graph, so it
+        // is mirrored the same way the labels are — otherwise the only surface
+        // that shows a node's state cannot show that its last steer was
+        // dropped.
+        let delivery_failures = self
+            .workflow
+            .graph()
+            .map(|graph| {
+                graph
+                    .nodes
+                    .iter()
+                    .filter_map(|node| {
+                        let failure = self.workflow.node_delivery_failure(&node.path)?;
+                        Some((
+                            node.path.to_string(),
+                            format!("{}: {}", failure.method, failure.reason),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.state.set_workflow_run_graph(graph);
+        self.state.set_workflow_node_labels(labels);
+        self.state.set_workflow_delivery_failures(delivery_failures);
     }
 
     /// Hands whatever `RunEffect::Persist` queued to the store. Every effect
@@ -765,7 +934,9 @@ impl App {
             RunEffect::SendKeys { pane, keys } => self.deliver_workflow_keys(&pane, keys),
             RunEffect::ClosePane { pane } => {
                 let response = self.runtime_pane_close("workflow.node.close", pane.to_string());
-                self.record_workflow_api_error("pane.close", &pane, &response);
+                // A close is not a delivery into the node's turn, so it is
+                // logged and kept but never surfaced as a delivery marker.
+                let _ = self.record_workflow_api_error("pane.close", &pane, &response);
                 true
             }
             RunEffect::Persist(write) => {
@@ -806,7 +977,7 @@ impl App {
             ),
         };
         let response = self.dispatch_api_request("workflow.node.deliver", method);
-        self.record_workflow_api_error(label, pane, &response);
+        self.surface_workflow_delivery_failure(label, pane, &response);
         true
     }
 
@@ -835,17 +1006,45 @@ impl App {
             ),
         };
         let response = self.dispatch_api_request("workflow.node.send_keys", method);
-        self.record_workflow_api_error(label, pane, &response);
+        self.surface_workflow_delivery_failure(label, pane, &response);
         true
+    }
+
+    /// A pane delivery the runtime refused, made visible instead of only
+    /// logged. The API caller that asked for it learns through
+    /// `take_delivery_failure`, but the DAG view's steer row and the engine's
+    /// own re-prompts have no such caller — before this, a steer that never
+    /// reached the process looked exactly like one that did. The engine turns
+    /// it into a journalled run event, a node-level marker, and a user notice.
+    fn surface_workflow_delivery_failure(
+        &mut self,
+        method: &str,
+        pane: &PublicPaneId,
+        response: &str,
+    ) {
+        let Some(failure) = self.record_workflow_api_error(method, pane, response) else {
+            return;
+        };
+        let Some(path) = self.workflow.node_path_for_pane(pane) else {
+            return;
+        };
+        let reason = format!("{}: {}", failure.code, failure.message);
+        let effects = self.workflow.note_delivery_failure(&path, method, &reason);
+        self.dispatch_workflow_effects(effects);
     }
 
     /// An in-process API call answers with the same envelope a client would
     /// get, so a failed delivery is logged *and* kept: the caller that asked for
     /// the delivery has to be able to tell that it did not happen.
-    fn record_workflow_api_error(&mut self, method: &str, pane: &PublicPaneId, response: &str) {
-        let Some(failure) = workflow_api_error(method, pane, response) else {
-            return;
-        };
+    /// Returns the failure it recorded, so a caller that also has to surface it
+    /// does not have to re-parse the envelope.
+    fn record_workflow_api_error(
+        &mut self,
+        method: &str,
+        pane: &PublicPaneId,
+        response: &str,
+    ) -> Option<DeliveryFailure> {
+        let failure = workflow_api_error(method, pane, response)?;
         warn!(
             method,
             pane = %pane,
@@ -853,7 +1052,8 @@ impl App {
             message = %failure.message,
             "workflow effect delivery failed"
         );
-        self.workflow.record_delivery_failure(failure);
+        self.workflow.record_delivery_failure(failure.clone());
+        Some(failure)
     }
 
     /// Puts every admitted node into a pane through `workflow::binding::spawn`,
@@ -973,6 +1173,10 @@ impl App {
 
         let mut terminal = new_pane.terminal;
         let terminal_id = terminal.id.clone();
+        // The pane's own label, set through the same mechanism `pane.rename`
+        // uses. A `Runner::Command` node emits no OSC title, so this is the
+        // only thing that ever names its pane.
+        terminal.set_manual_label(plan.pane_title.clone());
         spawn::confirm_managed_agent(&mut terminal, &plan.spec, Instant::now());
         self.terminal_runtimes
             .insert(terminal_id.clone(), new_pane.runtime);
@@ -1110,6 +1314,20 @@ impl App {
         let transcript_path = spawn::transcript_path(&cwd, &agent_session_id)
             .map_err(|err| format!("the node's transcript path is unknown: {err}"))?;
         let label = workflow_agent_name(graph, definition, node);
+        // The pane title names the workflow and the node, so a run's splits are
+        // told apart from each other and from the user's own panes. The kvdag
+        // label is what the author wrote; the key is the honest fallback.
+        let node_title = match spec_node.label.trim() {
+            "" => node.key.as_str(),
+            authored => authored,
+        };
+        let pane_title = spawn::node_pane_title(
+            self.state
+                .workflow_run_presentation()
+                .workflow_name
+                .as_str(),
+            node_title,
+        );
 
         Ok(NodeSpawnPlan {
             spec: SpawnSpec {
@@ -1132,6 +1350,7 @@ impl App {
             task_markdown,
             inputs,
             transcript_path,
+            pane_title,
         })
     }
 
@@ -1154,14 +1373,15 @@ impl App {
         });
     }
 
-    fn show_workflow_notice(&mut self, notice: UserNotice) {
-        let previous_toast = self.state.toast.clone();
-        if !matches!(
-            self.state.toast_config.delivery,
-            crate::config::ToastDelivery::Karvex
-        ) {
-            return;
-        }
+    /// Shows one workflow notice through whichever delivery the user
+    /// configured.
+    ///
+    /// This used to answer only for `ToastDelivery::Karvex` and drop the notice
+    /// on the floor for every other setting, so a user who had deliberately
+    /// asked for terminal or desktop notifications got *fewer* workflow
+    /// notifications than the default. The escalation reuses exactly the
+    /// notifier the agent-state path uses; no second notification model.
+    pub(crate) fn show_workflow_notice(&mut self, notice: UserNotice) {
         let kind = match notice.level {
             NoticeLevel::Info => ToastKind::Finished,
             NoticeLevel::Warning | NoticeLevel::Error => ToastKind::NeedsAttention,
@@ -1170,14 +1390,31 @@ impl App {
             Some(path) => format!("Workflow node {path}"),
             None => "Workflow run".to_string(),
         };
-        self.state.toast = Some(ToastNotification {
-            kind,
-            title,
-            context: notice.message,
-            position: None,
-            target: None,
-        });
-        self.sync_toast_deadline(previous_toast);
+        match self.state.toast_config.delivery {
+            crate::config::ToastDelivery::Karvex => {
+                let previous_toast = self.state.toast.clone();
+                self.state.toast = Some(ToastNotification {
+                    kind,
+                    title,
+                    context: notice.message,
+                    position: None,
+                    target: None,
+                });
+                self.sync_toast_deadline(previous_toast);
+            }
+            crate::config::ToastDelivery::Terminal | crate::config::ToastDelivery::System
+                if self.local_terminal_notifications =>
+            {
+                let notify = match self.state.toast_config.delivery {
+                    crate::config::ToastDelivery::Terminal => {
+                        crate::terminal_notify::show_notification
+                    }
+                    _ => crate::platform::show_desktop_notification,
+                };
+                let _ = notify(&title, Some(&notice.message));
+            }
+            _ => {}
+        }
     }
 
     fn emit_workflow_event(&mut self, event: WorkflowEvent) {
@@ -1360,6 +1597,56 @@ impl App {
 
 /// An in-process API call answers with the same envelope a client would get, so
 /// a failed delivery is recoverable from the response instead of being dropped.
+/// What to tell the user when a run reaches `status`, or `None` for the
+/// statuses that are simply progress.
+///
+/// A run that pauses names what it is waiting on: "paused" alone sends the user
+/// to the CLI to find out which node stopped it.
+fn run_status_notice(run: &RunId, status: RunStatus, blocking: &[String]) -> Option<UserNotice> {
+    let (level, message) = match status {
+        RunStatus::Succeeded => (
+            NoticeLevel::Info,
+            "the run finished: every node succeeded".to_string(),
+        ),
+        RunStatus::Failed => (
+            NoticeLevel::Error,
+            match blocking.first() {
+                Some(path) => format!("the run failed at node {path}"),
+                None => "the run failed".to_string(),
+            },
+        ),
+        RunStatus::Cancelled => (NoticeLevel::Warning, "the run was cancelled".to_string()),
+        RunStatus::Paused => (
+            NoticeLevel::Warning,
+            match blocking.split_first() {
+                Some((path, [])) => format!("the run is paused on node {path}"),
+                Some((path, rest)) => {
+                    format!("the run is paused on node {path} and {} more", rest.len())
+                }
+                None => "the run is paused and is waiting for a human".to_string(),
+            },
+        ),
+        RunStatus::Pending | RunStatus::Running => return None,
+    };
+    Some(UserNotice {
+        level,
+        run: Some(run.clone()),
+        path: None,
+        message,
+    })
+}
+
+/// The user-facing message in a `workflow.node.steer` response, or `None` when
+/// the steer was accepted.
+///
+/// The envelope is the only place the TUI learns that a delivery was refused —
+/// `workflow_node_delivery_failed` for a pane that would not take the text and
+/// `workflow_node_not_running` for a node with no pane at all.
+pub(crate) fn steer_failure_message(response: &str) -> Option<String> {
+    let error = serde_json::from_str::<ErrorResponse>(response).ok()?;
+    Some(format!("steer not delivered: {}", error.error.message))
+}
+
 fn workflow_api_error(
     method: &str,
     pane: &PublicPaneId,
@@ -1673,6 +1960,132 @@ mod tests {
             .expect_err("one run at a time");
         assert_eq!(error, WorkflowStartError::RunInFlight);
         assert_eq!(state.run_status(), Some(RunStatus::Running));
+    }
+
+    /// 2.1: a run that *finishes* is the most common outcome and the engine has
+    /// no notice for it at all, so the screen used to be byte-identical to an
+    /// idle one. It is announced once, and only once.
+    #[test]
+    fn a_run_that_finishes_is_announced_exactly_once() {
+        let mut state = started_state();
+        assert!(
+            state.take_pending_announcements().is_empty(),
+            "a running run is progress, not news"
+        );
+
+        for (path, result) in [
+            ("plan", r#"{"plan":"do it"}"#),
+            ("implement", r#"{"report":"shipped"}"#),
+        ] {
+            state.bind_node(&InstancePath::new(path), binding_for(path), Instant::now());
+            state.apply(
+                EngineInput::NodeSelfReport {
+                    path: InstancePath::new(path),
+                    token: NodeToken::new("token"),
+                    result: report(result),
+                },
+                Instant::now(),
+            );
+        }
+        assert_eq!(state.run_status(), Some(RunStatus::Succeeded));
+
+        let announced = state.take_pending_announcements();
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert_eq!(announced[0].level, NoticeLevel::Info);
+        assert_eq!(announced[0].path, None);
+        assert!(
+            announced[0].message.contains("finished"),
+            "{}",
+            announced[0].message
+        );
+        assert!(
+            state.take_pending_announcements().is_empty(),
+            "the same terminal status is not announced twice"
+        );
+    }
+
+    /// 2.1: a cancelled run is a terminal state the user asked for and still
+    /// has to be told about — it is the state that frees the server.
+    #[test]
+    fn a_cancelled_run_is_announced() {
+        let mut state = started_state();
+        let _ = state.take_pending_announcements();
+        state.apply(EngineInput::CancelRun, Instant::now());
+
+        let announced = state.take_pending_announcements();
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert_eq!(announced[0].level, NoticeLevel::Warning);
+        assert!(
+            announced[0].message.contains("cancelled"),
+            "{}",
+            announced[0].message
+        );
+    }
+
+    /// 2.1: the node that stops the run is named, so "paused" does not send the
+    /// user to the CLI to find out which node it is waiting on.
+    #[test]
+    fn a_node_that_needs_a_human_is_announced_and_names_the_run_it_paused() {
+        let mut state = started_state();
+        let path = InstancePath::new("plan");
+        state.bind_node(&path, binding_for("pane-1"), Instant::now());
+        let _ = state.take_pending_announcements();
+
+        // Two schema-invalid results: the first is re-prompted, the second
+        // hands the node to a human.
+        for _ in 0..2 {
+            state.apply(
+                EngineInput::NodeSelfReport {
+                    path: path.clone(),
+                    token: NodeToken::new("token"),
+                    result: report(r#"{"wrong":1}"#),
+                },
+                Instant::now(),
+            );
+        }
+        assert_eq!(status_of(&state, "plan"), NodeStatus::NeedsAttention);
+
+        let announced = state.take_pending_announcements();
+        let node_notice = announced
+            .iter()
+            .find(|notice| notice.path.as_ref() == Some(&path))
+            .expect("the node that needs a human is announced");
+        assert_eq!(node_notice.level, NoticeLevel::Warning);
+        assert!(
+            node_notice.message.contains("needs attention"),
+            "{}",
+            node_notice.message
+        );
+        assert_eq!(state.run_status(), Some(RunStatus::Paused));
+        let run_notice = announced
+            .iter()
+            .find(|notice| notice.path.is_none())
+            .expect("the paused run is announced too");
+        assert!(
+            run_notice.message.contains("plan"),
+            "the pause names the node it is waiting on: {}",
+            run_notice.message
+        );
+        assert!(
+            state
+                .take_pending_announcements()
+                .iter()
+                .all(|notice| notice.path.as_ref() != Some(&path)),
+            "the same node is not announced twice"
+        );
+    }
+
+    /// The message the DAG view's steer row shows when the API refused the
+    /// delivery. 2.15: this is the envelope that used to be discarded.
+    #[test]
+    fn a_refused_steer_response_becomes_a_message() {
+        let refused = r#"{"id":"1","error":{"code":"workflow_node_delivery_failed","message":"pane.send_text to pane w1:pD failed: pane_not_found: no such pane"}}"#;
+        let message = steer_failure_message(refused).expect("a refusal is a message");
+        assert!(message.starts_with("steer not delivered:"), "{message}");
+        assert!(message.contains("pane_not_found"), "{message}");
+
+        let accepted = r#"{"id":"1","result":{"type":"workflow_node_steered"}}"#;
+        assert_eq!(steer_failure_message(accepted), None);
     }
 
     #[test]
@@ -2276,6 +2689,56 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "{expected} is in the node env");
         }
+    }
+
+    /// 2.20: the pane a node runs in is titled from the workflow and the node,
+    /// so a run's splits are told apart from each other and from the user's own
+    /// panes. `spec.label` cannot do this job — it is the agent name and has to
+    /// stay unique.
+    #[test]
+    fn a_spawn_plan_titles_the_node_pane_after_the_workflow_and_the_node() {
+        let mut app = test_app_with_hub(EventHub::default());
+        app.state.set_workflow_run_name("ux-dag-probe");
+        let definition = definition();
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+
+        let plan = app
+            .workflow_spawn_plan(&InstancePath::new("plan"), PathBuf::from("/repo"))
+            .expect("the root node plans a spawn");
+        assert_eq!(plan.pane_title, "ux-dag-probe · plan");
+    }
+
+    /// 2.1: a run that reaches a terminal state used to leave the screen
+    /// byte-identical to an idle one, because the engine has no notice for a
+    /// run that simply finishes.
+    #[test]
+    fn a_run_that_finishes_reaches_the_user_as_a_notification() {
+        let mut app = test_app_with_hub(EventHub::default());
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
+        let definition = definition();
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+        app.state.toast = None;
+
+        for (path, result) in [
+            ("plan", r#"{"plan":"do it"}"#),
+            ("implement", r#"{"report":"shipped"}"#),
+        ] {
+            app.bind_workflow_node(&InstancePath::new(path), binding_for(path));
+            app.apply_workflow_engine_input(EngineInput::NodeSelfReport {
+                path: InstancePath::new(path),
+                token: NodeToken::new("token"),
+                result: report(result),
+            });
+        }
+
+        assert_eq!(app.workflow.run_status(), Some(RunStatus::Succeeded));
+        let toast = app.state.toast.as_ref().expect("the run's end is shown");
+        assert_eq!(toast.title, "Workflow run");
+        assert!(toast.context.contains("finished"), "{}", toast.context);
     }
 
     #[test]

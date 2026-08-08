@@ -530,6 +530,12 @@
           "description": "Toggle sidebar collapse."
         },
         {
+          "key": "keys.open_workflow_dag",
+          "type": "keybinding",
+          "default": "\"prefix+shift+f\"",
+          "description": "Open the workflow DAG view for the run this server is executing."
+        },
+        {
           "key": "keys.indexed.tabs",
           "type": "string",
           "default": "unset",

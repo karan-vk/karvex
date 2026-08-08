@@ -324,6 +324,28 @@ herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source 
 
 `pane wait-output`、`agent wait`、`agent prompt --wait` は、`--timeout` を省略すると無期限に待ちます。タイムアウトまたはサーバーエラーは JSON として stderr に出力され、終了コード 1 になります。CLI 使用法のエラーは終了コード 2 です。
 
+## ワークフロー
+
+複数ノードからなるエージェントワークフローを作成・実行します — タスクのグラフを保存・バージョン管理し、各ノードを実際のターミナルペインとして起動して、すべての分岐が解決するまで調整します。定義フォーマット、ノードの契約、DAG ビューについては[ワークフロー](/docs/workflows/)を参照してください。
+
+```bash
+herdr workflow list
+herdr workflow show <name|id> [--json]
+herdr workflow create --file <definition.toml|json> [--name <name>] [--json]
+herdr workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
+herdr workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
+herdr workflow run list <name|id> [--limit N]
+herdr workflow run show <run_id> [--json]
+herdr workflow run cancel <run_id>
+herdr workflow node show <run_id> <path> [--json]
+herdr workflow node steer <run_id> <path> <text>
+herdr workflow node interrupt <run_id> <path>
+herdr workflow node restart <run_id> <path>
+herdr workflow node complete [--result-file <path>]
+```
+
+`show`、`create`、`update`、`run start`、`run show`、`node show` はデフォルトで人間が読めるテキストを出力します。機械可読な JSON エンベロープが必要なときは `--json` を指定してください。`--json` なしの `show` は、ワークフローの概要、バージョン履歴、そしてヘッドバージョンのノード/エッジ/宣言済み引数を表示します。`--json` なしの `run show` は、実行が一時停止しているか、あるノードが対応を必要としているときに、責任のあるノードをその blocker の理由と再開条件とともに表示します。`run start` は、ワークフローで宣言されていない `--arg` キーを黙って無視せず、実行開始前に拒否します。
+
 ## インテグレーション
 
 ```bash

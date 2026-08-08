@@ -418,6 +418,12 @@ impl App {
             NavigateAction::OpenNavigator => {
                 self.state.open_navigator_from(&self.terminal_runtimes)
             }
+            NavigateAction::OpenWorkflowDag => {
+                if !super::modal::open_workflow_dag(&mut self.state) {
+                    self.notify_no_workflow_run();
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
         }
 
         finish_action_context(&mut self.state, context, previous_mode);
@@ -1376,6 +1382,7 @@ pub(crate) enum NavigateAction {
     OpenNotificationTarget,
     Detach,
     OpenNavigator,
+    OpenWorkflowDag,
 }
 
 fn copy_mode_survives_prefix_action(action: NavigateAction) -> bool {
@@ -1518,6 +1525,7 @@ fn non_indexed_action_for_key(
         ),
         (&kb.detach, NavigateAction::Detach),
         (&kb.goto, NavigateAction::OpenNavigator),
+        (&kb.open_workflow_dag, NavigateAction::OpenWorkflowDag),
     ] {
         if action_matches(bindings, key, dispatch) {
             return Some(action);
@@ -1774,6 +1782,11 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::OpenNavigator => state.open_navigator_from(terminal_runtimes),
+        NavigateAction::OpenWorkflowDag => {
+            if !super::modal::open_workflow_dag(state) {
+                leave_navigate_mode(state);
+            }
+        }
     }
 
     finish_action_context(state, context, previous_mode);
@@ -2669,6 +2682,64 @@ last_pane = "prefix+tab"
 
         assert_eq!(app.state.active, Some(1));
         assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    /// 2.1: `WorkflowDag` was reachable only from `mouse.rs`, so it was not in
+    /// the keybind action table and could not be bound in `config.toml` at all.
+    #[test]
+    fn the_workflow_dag_is_a_real_keybind_action() {
+        let mut state = state_with_workspaces(&["one"]);
+
+        let action = action_for_key(
+            &state,
+            TerminalKey::new(KeyCode::Char('f'), KeyModifiers::SHIFT),
+            BindingDispatch::Prefix,
+        );
+        assert_eq!(action, Some(NavigateAction::OpenWorkflowDag));
+
+        // With no run there is nothing to show, and the overlay must not open
+        // onto nothing.
+        execute_navigate_action(&mut state, NavigateAction::OpenWorkflowDag);
+        assert_ne!(state.mode, Mode::WorkflowDag);
+
+        state.set_workflow_run_graph(Some(crate::workflow::model::RunGraph {
+            run_id: crate::workflow::model::RunId::new("workflow_run:1"),
+            version_id: crate::workflow::model::KvdagVersionId::new("kvdag_version:1"),
+            tier: crate::workflow::tier::Tier::High,
+            growth: crate::workflow::model::GrowthLimits::default(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            status: crate::workflow::model::RunStatus::Running,
+            seq: 0,
+        }));
+        execute_navigate_action(&mut state, NavigateAction::OpenWorkflowDag);
+        assert_eq!(state.mode, Mode::WorkflowDag);
+    }
+
+    /// A user who rebinds it gets their key, and only their key.
+    #[test]
+    fn the_workflow_dag_keybind_can_be_rebound_in_config() {
+        let mut state = state_with_workspaces(&["one"]);
+        let config: Config =
+            toml::from_str("[keys]\nopen_workflow_dag = \"prefix+ctrl+d\"\n").unwrap();
+        state.keybinds = config.keybinds();
+
+        assert_eq!(
+            action_for_key(
+                &state,
+                TerminalKey::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                BindingDispatch::Prefix,
+            ),
+            Some(NavigateAction::OpenWorkflowDag)
+        );
+        assert_ne!(
+            action_for_key(
+                &state,
+                TerminalKey::new(KeyCode::Char('f'), KeyModifiers::SHIFT),
+                BindingDispatch::Prefix,
+            ),
+            Some(NavigateAction::OpenWorkflowDag)
+        );
     }
 
     #[test]

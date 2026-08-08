@@ -809,14 +809,25 @@ pub struct DagNodeView {
     /// Instance path — the node's stable identity and the `workflow.node.*`
     /// selector.
     pub path: String,
+    /// What the box shows: the authored kvdag `label` when the definition
+    /// supplied one, otherwise the node key. The author already wrote a
+    /// human-readable name; the overlay is where it should show up.
     pub label: String,
     pub status: crate::workflow::model::NodeStatus,
     pub model: String,
     pub effort: String,
     pub attempt: u8,
     pub usage: crate::workflow::model::NodeUsage,
+    /// Wall-clock duration to display. `usage.duration_ms` is only written when
+    /// a node finishes, so a live node derives this from `started_at_unix_ms`
+    /// instead — on a monitoring surface "how long has this been running" is
+    /// the number that spots a stuck node.
+    pub duration_ms: u64,
     /// Latest checkpoint summary, when the node has produced a result.
     pub summary: Option<String>,
+    /// The last pane delivery the runtime refused for this node, e.g. a steer
+    /// whose keystrokes never reached the process. `None` is the normal case.
+    pub delivery_failure: Option<String>,
     /// `reason — resume when …` for a node whose succession is blocked.
     pub blocker: Option<String>,
     /// Public pane id of the node's teammate, once it has been bound.
@@ -842,21 +853,111 @@ pub struct DagViewState {
     /// Empty when no run is being projected; also the `workflow.node.*`
     /// `run_id` for steering.
     pub run_id: String,
+    /// The authored workflow name, when the runtime knows it. The header
+    /// prefers it over `run_id`: the record id is the least actionable thing
+    /// that could occupy the line.
+    pub workflow_name: String,
     pub run_status: Option<crate::workflow::model::RunStatus>,
+    /// Counted over the **whole** run graph, before clipping. The header must
+    /// never report how many nodes happened to fit as if it were how many
+    /// exist.
+    pub counts: DagRunCounts,
     pub header_rect: Rect,
     pub graph_rect: Rect,
     pub detail_rect: Rect,
     pub footer_rect: Rect,
     pub layout: crate::workflow::layout::DagLayout,
+    /// Only the nodes this frame actually drew.
     pub nodes: Vec<DagNodeView>,
     pub selected: Option<crate::workflow::model::RunNodeIdx>,
     /// `Some` while the steer input line is open; the pending text.
     pub steer: Option<String>,
+    /// Last left click on a node, so the next one can be recognised as a
+    /// double click. Carried across frames like `selected`.
+    pub last_click: Option<DagClick>,
 }
+
+/// Whole-graph status tallies for the overlay header.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DagRunCounts {
+    pub total: usize,
+    pub running: usize,
+    pub failed: usize,
+    pub needs_attention: usize,
+}
+
+/// A left click on a node box, remembered only long enough to recognise the
+/// second half of a double click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DagClick {
+    pub idx: crate::workflow::model::RunNodeIdx,
+    pub column: u16,
+    pub row: u16,
+    pub at: std::time::Instant,
+}
+
+/// How long after a click a second click on the same box still counts as a
+/// double click. Matches the pane and sidebar windows.
+pub(crate) const DAG_DOUBLE_CLICK_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(350);
 
 impl DagViewState {
     pub(crate) fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// How many nodes the run has that this frame could not draw.
+    pub(crate) fn offscreen_nodes(&self) -> usize {
+        self.counts.total.saturating_sub(self.nodes.len())
+    }
+
+    /// True when the run exists but the graph band was too small to draw any of
+    /// it — the case that used to render as "no workflow run to show" under a
+    /// header that was still naming the run.
+    pub(crate) fn too_small_to_draw(&self) -> bool {
+        self.nodes.is_empty() && self.counts.total > 0
+    }
+
+    /// Whether `idx` is a node the run is currently stuck behind. A paused run
+    /// is paused *for* one of these, so it earns at least as much visual weight
+    /// as the selection cursor.
+    pub(crate) fn is_blocking(&self, idx: crate::workflow::model::RunNodeIdx) -> bool {
+        use crate::workflow::model::{NodeStatus, RunStatus};
+        if self.run_status != Some(RunStatus::Paused) {
+            return false;
+        }
+        self.node(idx).is_some_and(|node| {
+            matches!(
+                node.status,
+                NodeStatus::NeedsAttention | NodeStatus::Blocked | NodeStatus::Failed
+            )
+        })
+    }
+
+    /// Records a click on `idx` and answers whether it completed a double
+    /// click. A double click consumes the record, so a third click starts over
+    /// rather than firing again.
+    pub(crate) fn register_click(
+        &mut self,
+        idx: crate::workflow::model::RunNodeIdx,
+        column: u16,
+        row: u16,
+        at: std::time::Instant,
+    ) -> bool {
+        let click = DagClick {
+            idx,
+            column,
+            row,
+            at,
+        };
+        let doubled = self.last_click.is_some_and(|last| {
+            last.idx == idx
+                && at.saturating_duration_since(last.at) <= DAG_DOUBLE_CLICK_WINDOW
+                && last.column.abs_diff(column) <= 1
+                && last.row.abs_diff(row) <= 1
+        });
+        self.last_click = if doubled { None } else { Some(click) };
+        doubled
     }
 
     pub(crate) fn node(&self, idx: crate::workflow::model::RunNodeIdx) -> Option<&DagNodeView> {
@@ -1695,6 +1796,26 @@ pub struct AppState {
     /// because it is `None` for every karvex that never runs a workflow, and
     /// `AppState` is moved on handoff.
     pub(crate) run_graph: Option<Box<crate::workflow::model::RunGraph>>,
+    /// Authored, human-readable facts about the active run that the run graph
+    /// itself does not carry: the workflow's name and each node's kvdag
+    /// `label`. Mirrored alongside `run_graph` so the overlay can name what the
+    /// author named rather than a record id and a node key.
+    pub(crate) run_presentation: WorkflowRunPresentation,
+}
+
+/// Authored names for the active run, mirrored into `AppState` for the DAG
+/// overlay. Empty when nothing has been mirrored yet, which the overlay reads
+/// as "fall back to the ids".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowRunPresentation {
+    /// `workflow.name` as the author wrote it.
+    pub workflow_name: String,
+    /// kvdag node key → authored `label`.
+    pub node_labels: std::collections::HashMap<String, String>,
+    /// Node instance path → the last pane delivery the runtime refused for it.
+    /// A steer the process never received must not look identical to one it
+    /// did, and the overlay is where the user watching the run is looking.
+    pub delivery_failures: std::collections::HashMap<String, String>,
 }
 
 impl AppState {
@@ -1802,6 +1923,43 @@ impl AppState {
         graph: Option<crate::workflow::model::RunGraph>,
     ) {
         self.run_graph = graph.map(Box::new);
+    }
+
+    /// The authored names for the active run, read by the DAG overlay.
+    pub(crate) fn workflow_run_presentation(&self) -> &WorkflowRunPresentation {
+        &self.run_presentation
+    }
+
+    /// Records the workflow's authored name. Called when a run starts, so the
+    /// overlay can head the run with the name the user typed.
+    ///
+    /// The name lives on the store record rather than on `Kvdag`, so the only
+    /// production caller is the workflow-gated `workflow.run` API handler. The
+    /// slim `--no-default-features` build has no such handler and so no
+    /// production caller; the test that covers the pane title it feeds is not
+    /// feature-gated, so the method stays compiled in both builds rather than
+    /// being `#[cfg]`-ed out along with that coverage.
+    #[cfg_attr(not(feature = "workflow"), allow(dead_code))]
+    pub(crate) fn set_workflow_run_name(&mut self, name: impl Into<String>) {
+        self.run_presentation.workflow_name = name.into();
+    }
+
+    /// Records the kvdag `label` of every node in the active definition.
+    /// Mirrored with the run graph, which carries only node keys.
+    pub(crate) fn set_workflow_node_labels(
+        &mut self,
+        labels: std::collections::HashMap<String, String>,
+    ) {
+        self.run_presentation.node_labels = labels;
+    }
+
+    /// Records the outstanding pane-delivery failures, keyed by node instance
+    /// path. Mirrored with the run graph; an empty map clears the markers.
+    pub(crate) fn set_workflow_delivery_failures(
+        &mut self,
+        failures: std::collections::HashMap<String, String>,
+    ) {
+        self.run_presentation.delivery_failures = failures;
     }
 
     /// Returns true when the given (workspace, tab, pane) refers to the
@@ -2071,6 +2229,7 @@ impl AppState {
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
             run_graph: None,
+            run_presentation: WorkflowRunPresentation::default(),
         }
     }
 

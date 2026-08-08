@@ -16,10 +16,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use serde_json::json;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::detect::AgentState;
-use crate::workflow::engine::complete::{Completion, Signal, SignalLedger};
+use crate::workflow::engine::complete::{Completion, SchemaViolation, Signal, SignalLedger};
 use crate::workflow::engine::schedule::TerminalBlocker;
 use crate::workflow::model::{
     CheckpointKind, EngineInput, InstancePath, Kvdag, NodeBinding, NodeKey, NodeResult, NodeStatus,
@@ -46,6 +46,56 @@ impl Default for EngineConfig {
     }
 }
 
+/// What the completion gate did with one reported result (§4.3).
+///
+/// The gate's decision used to be visible only as a node status change, so a
+/// caller that delivered a schema-invalid result got a success envelope for a
+/// result the engine had just rejected. The verdict is recorded here so the
+/// report's own response can say what happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportVerdict {
+    /// The result validated; the node succeeded.
+    Accepted,
+    /// Schema-invalid, first strike: the node keeps its pane and was issued the
+    /// single documented corrective re-prompt.
+    Corrected,
+    /// Schema-invalid after the corrective re-prompt, or unvalidatable at all:
+    /// the node was moved to `NeedsAttention`.
+    Surfaced,
+}
+
+/// One report's verdict, kept until the node's next report replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportOutcome {
+    pub path: InstancePath,
+    pub verdict: ReportVerdict,
+    /// One rendered output-schema violation per entry. Empty when the result
+    /// validated, and empty when there was no schema to validate it against —
+    /// so "the gate rejected this result on its schema" is exactly
+    /// `!errors.is_empty()`.
+    pub errors: Vec<String>,
+    /// The line the engine journalled and surfaced for this report.
+    pub reason: String,
+}
+
+impl ReportOutcome {
+    pub fn accepted(&self) -> bool {
+        matches!(self.verdict, ReportVerdict::Accepted)
+    }
+}
+
+/// A `PromptNode`/`SendKeys` delivery the runtime refused (§5).
+///
+/// The engine does not perform deliveries, so it cannot observe the refusal
+/// itself; the caller hands it back through [`Engine::note_delivery_failure`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryFailureNote {
+    /// The API method that was attempted, e.g. `pane.send_text`.
+    pub method: String,
+    /// The runtime's own reason, already user-facing.
+    pub reason: String,
+}
+
 /// One run's state machine. The in-memory graph is authoritative during a run;
 /// the journal is the durable record.
 #[derive(Debug, Clone)]
@@ -63,6 +113,14 @@ pub struct Engine {
     /// Whether each node's seed prompt is known to have registered, and whether
     /// it has already been re-delivered. See [`Engine::redeliver_seed`].
     seeds: HashMap<InstancePath, SeedState>,
+    /// The verdict of the most recent reported result, per node. Read by the
+    /// caller that delivered the report so its response can reflect a rejection
+    /// instead of answering `ok` for a result the gate refused.
+    reported: HashMap<InstancePath, ReportOutcome>,
+    /// The last pane delivery the runtime could not make, per node. Surfaced
+    /// state rather than a log line: a steer that never landed must not look
+    /// identical to one that did.
+    delivery_failures: HashMap<InstancePath, DeliveryFailureNote>,
 }
 
 /// What the engine knows about a node's seed prompt (§4.2).
@@ -83,6 +141,8 @@ impl Engine {
             signals: HashMap::new(),
             reports: HashMap::new(),
             seeds: HashMap::new(),
+            reported: HashMap::new(),
+            delivery_failures: HashMap::new(),
         }
     }
 
@@ -90,8 +150,102 @@ impl Engine {
         self.config
     }
 
+    /// The verdict the completion gate reached on `path`'s most recent reported
+    /// result, if it has reported one.
+    pub fn report_outcome(&self, path: &InstancePath) -> Option<&ReportOutcome> {
+        self.reported.get(path)
+    }
+
+    /// The last pane delivery this node's runtime refused, if any is
+    /// outstanding. Cleared whenever the node gets a fresh pane, is restarted,
+    /// or is steered/interrupted again.
+    pub fn delivery_failure(&self, path: &InstancePath) -> Option<&DeliveryFailureNote> {
+        self.delivery_failures.get(path)
+    }
+
+    /// Records a `PromptNode`/`SendKeys` effect the runtime could not deliver.
+    ///
+    /// The engine emits deliveries but never performs them, so a refusal is only
+    /// ever known to the caller. Handing it back here is what turns a
+    /// server-side log line into a journalled run event, a node-level marker
+    /// readers can see, and a user notice — a steer the process never received
+    /// must not be indistinguishable from one it did.
+    pub fn note_delivery_failure(
+        &mut self,
+        path: &InstancePath,
+        method: &str,
+        reason: &str,
+    ) -> Vec<RunEffect> {
+        let mut effects = Vec::new();
+        let Some(idx) = self.graph.as_ref().and_then(|graph| graph.index_of(path)) else {
+            debug!(path = %path, method, "workflow delivery failure for an unknown node");
+            return effects;
+        };
+        self.delivery_failures.insert(
+            path.clone(),
+            DeliveryFailureNote {
+                method: method.to_string(),
+                reason: reason.to_string(),
+            },
+        );
+        info!(
+            path = %path,
+            method,
+            reason,
+            "workflow node delivery failed; surfacing it on the node"
+        );
+        let Some(graph) = self.graph.as_mut() else {
+            return effects;
+        };
+        let payload = json!({ "delivery_failed": true, "method": method, "reason": reason });
+        effects.push(journal(
+            graph,
+            RunEventKind::Error,
+            Some(path.clone()),
+            payload,
+        ));
+        if let Some(status) = graph.node(idx).map(|node| node.status) {
+            effects.push(RunEffect::Emit(WorkflowEvent::NodeUpdated {
+                run: graph.run_id.clone(),
+                path: path.clone(),
+                status,
+            }));
+        }
+        effects.push(RunEffect::Notify(UserNotice {
+            level: NoticeLevel::Error,
+            run: Some(graph.run_id.clone()),
+            path: Some(path.clone()),
+            message: format!("{method} to node {path} was not delivered: {reason}"),
+        }));
+        effects
+    }
+
+    /// Records one report's verdict, replacing whatever the node reported
+    /// before.
+    fn record_report(
+        &mut self,
+        path: &InstancePath,
+        verdict: ReportVerdict,
+        errors: Vec<String>,
+        reason: &str,
+    ) {
+        self.reported.insert(
+            path.clone(),
+            ReportOutcome {
+                path: path.clone(),
+                verdict,
+                errors,
+                reason: reason.to_string(),
+            },
+        );
+    }
+
     pub fn graph(&self) -> Option<&RunGraph> {
         self.graph.as_ref()
+    }
+
+    pub fn run_status(&self) -> Option<RunStatus> {
+        self.graph.as_ref().map(|graph| graph.status)
     }
 
     pub fn definition(&self) -> Option<&Kvdag> {
@@ -129,6 +283,9 @@ impl Engine {
             node.binding = Some(binding);
             node.status = NodeStatus::Running;
         }
+        // A fresh pane is a fresh delivery channel, so whatever the previous one
+        // refused is no longer outstanding.
+        self.delivery_failures.remove(path);
         let payload = json!({});
         effects.push(journal(
             graph,
@@ -166,6 +323,8 @@ impl Engine {
         self.signals.clear();
         self.reports.clear();
         self.seeds.clear();
+        self.reported.clear();
+        self.delivery_failures.clear();
 
         graph.status = RunStatus::Running;
         let changed = schedule::propagate(&mut graph);
@@ -236,7 +395,14 @@ impl Engine {
         // produce `result.json` stalls `Running` with nothing to escalate.
         if result.0.is_null() {
             return match complete::missing_result(Signal::SelfReport) {
-                Completion::NeedsAttention { reason } => self.needs_attention(idx, &reason),
+                Completion::NeedsAttention { reason } => {
+                    info!(path = %path, reason = %reason, "workflow node report carried no result artifact");
+                    // No schema violations: there was no artifact to validate,
+                    // so the report itself is not what is wrong — the node is,
+                    // and its status already says so.
+                    self.record_report(path, ReportVerdict::Surfaced, Vec::new(), &reason);
+                    self.needs_attention(idx, &reason)
+                }
                 Completion::Accepted(_) | Completion::Reprompt { .. } => Vec::new(),
             };
         }
@@ -252,19 +418,42 @@ impl Engine {
         };
 
         let Some(schema) = self.schema_for(&key) else {
-            return self.needs_attention(
-                idx,
-                "the run's kvdag definition is not installed, so result.json cannot be validated",
-            );
+            let reason =
+                "the run's kvdag definition is not installed, so result.json cannot be validated";
+            info!(path = %path, "workflow node report could not be validated: no installed definition");
+            self.record_report(path, ReportVerdict::Surfaced, Vec::new(), reason);
+            return self.needs_attention(idx, reason);
         };
 
         match complete::accept(&schema, result, evidence, report_ordinal) {
             Completion::Accepted(accepted) => {
                 self.reports.remove(path);
+                self.record_report(
+                    path,
+                    ReportVerdict::Accepted,
+                    Vec::new(),
+                    "the reported result validated against the node's output schema",
+                );
                 self.succeed(idx, *accepted)
             }
             Completion::Reprompt { errors } => {
                 let text = complete::corrective_prompt(&schema, &errors);
+                let quoted: Vec<String> = errors.iter().map(SchemaViolation::quote).collect();
+                let reason = format!(
+                    "result.json does not validate against the node's output_schema: {}",
+                    quoted.join("; ")
+                );
+                // §4.3's single corrective re-prompt applies to every runner
+                // kind. A `Runner::Command` node has no interactive turn to
+                // re-prompt, so the correction it can actually act on is the one
+                // its own `kvx workflow node complete` call gets back — which is
+                // why this verdict is recorded rather than only journalled.
+                info!(
+                    path = %path,
+                    violations = quoted.len(),
+                    "workflow node result rejected by its output schema; issuing the single corrective re-prompt"
+                );
+                self.record_report(path, ReportVerdict::Corrected, quoted, &reason);
                 let mut effects = Vec::new();
                 let Some(graph) = self.graph.as_mut() else {
                     return effects;
@@ -295,7 +484,21 @@ impl Engine {
                 }
                 effects
             }
-            Completion::NeedsAttention { reason } => self.needs_attention(idx, &reason),
+            Completion::NeedsAttention { reason } => {
+                let quoted: Vec<String> = complete::validate(&schema, result)
+                    .err()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(SchemaViolation::quote)
+                    .collect();
+                info!(
+                    path = %path,
+                    violations = quoted.len(),
+                    "workflow node result still fails its output schema after the corrective re-prompt"
+                );
+                self.record_report(path, ReportVerdict::Surfaced, quoted, &reason);
+                self.needs_attention(idx, &reason)
+            }
         }
     }
 
@@ -479,6 +682,8 @@ impl Engine {
         self.signals.remove(&path);
         self.reports.remove(&path);
         self.seeds.remove(&path);
+        self.reported.remove(&path);
+        self.delivery_failures.remove(&path);
         let mut effects = Vec::new();
         let exit = code.map_or_else(|| "no exit code".to_string(), |code| format!("code {code}"));
         let Some(graph) = self.graph.as_mut() else {
@@ -546,12 +751,16 @@ impl Engine {
 
     fn steer(&mut self, path: &InstancePath, text: &str) -> Vec<RunEffect> {
         let mut effects = Vec::new();
+        // This attempt answers for itself: a marker left by an earlier refused
+        // delivery must not be read as this steer's outcome.
+        self.delivery_failures.remove(path);
         let Some(graph) = self.graph.as_mut() else {
             return effects;
         };
         let Some(idx) = graph.index_of(path) else {
             return effects;
         };
+        let pane = pane_of(graph, idx);
         let payload = json!({ "text": text });
         effects.push(journal(
             graph,
@@ -559,17 +768,27 @@ impl Engine {
             Some(path.clone()),
             payload,
         ));
-        if let Some(pane) = pane_of(graph, idx) {
-            effects.push(RunEffect::PromptNode {
+        match pane {
+            Some(pane) => effects.push(RunEffect::PromptNode {
                 pane,
                 text: text.to_string(),
-            });
+            }),
+            // A node with no pane has nowhere to receive the steer, and nothing
+            // downstream will ever report a delivery failure for a delivery that
+            // was never attempted. Recording it here is what stops the caller
+            // believing the text landed.
+            None => effects.extend(self.note_delivery_failure(
+                path,
+                "agent.prompt",
+                "the node has no pane to deliver to",
+            )),
         }
         effects
     }
 
     fn interrupt(&mut self, path: &InstancePath) -> Vec<RunEffect> {
         let mut effects = Vec::new();
+        self.delivery_failures.remove(path);
         let Some(idx) = self.graph.as_ref().and_then(|graph| graph.index_of(path)) else {
             return effects;
         };
@@ -583,6 +802,7 @@ impl Engine {
         let Some(graph) = self.graph.as_mut() else {
             return effects;
         };
+        let pane = pane_of(graph, idx);
         let payload = json!({ "keys": keys });
         effects.push(journal(
             graph,
@@ -590,8 +810,13 @@ impl Engine {
             Some(path.clone()),
             payload,
         ));
-        if let Some(pane) = pane_of(graph, idx) {
-            effects.push(RunEffect::SendKeys { pane, keys });
+        match pane {
+            Some(pane) => effects.push(RunEffect::SendKeys { pane, keys }),
+            None => effects.extend(self.note_delivery_failure(
+                path,
+                "agent.send_keys",
+                "the node has no pane to deliver to",
+            )),
         }
         effects
     }
@@ -601,9 +826,26 @@ impl Engine {
     /// checkpoint can exist before the Phase 4 watchdog writes them.
     fn restart(&mut self, path: &InstancePath) -> Vec<RunEffect> {
         let mut effects = Vec::new();
+        // A closed run has no scheduler left to collect a result: `settle`
+        // returns immediately for any status outside `Running`/`Paused`. Handing
+        // it a `Ready` node would spawn a pane nothing will ever read, inside a
+        // run that already reported `cancelled`/`failed`/`succeeded` — a
+        // terminal run silently containing a live process. Refuse instead.
+        if let Some(status) = self.run_status() {
+            if is_closed_run(status) {
+                info!(
+                    path = %path,
+                    ?status,
+                    "workflow node restart refused: the run has already closed"
+                );
+                return effects;
+            }
+        }
         self.signals.remove(path);
         self.reports.remove(path);
         self.seeds.remove(path);
+        self.reported.remove(path);
+        self.delivery_failures.remove(path);
         let Some(graph) = self.graph.as_mut() else {
             return effects;
         };
@@ -646,10 +888,7 @@ impl Engine {
         let Some(graph) = self.graph.as_mut() else {
             return effects;
         };
-        if matches!(
-            graph.status,
-            RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
-        ) {
+        if is_closed_run(graph.status) {
             return effects;
         }
 
@@ -882,6 +1121,16 @@ impl Engine {
     }
 }
 
+/// A run that has reached a final status. It is out of the live set for good:
+/// `settle` never advances it again, so nothing will ever collect a result from
+/// a node handed back to it.
+pub fn is_closed_run(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
+    )
+}
+
 fn next_seq(graph: &mut RunGraph) -> u64 {
     graph.seq = graph.seq.saturating_add(1);
     graph.seq
@@ -1016,6 +1265,10 @@ fn finish(graph: &mut RunGraph, status: RunStatus, effects: &mut Vec<RunEffect>)
         run: graph.run_id.clone(),
         status,
     }));
+    // A run reaching its end is announced to the user by
+    // `app::workflow::run_status_notice`, which watches the run status and
+    // fires exactly once per transition. Emitting a `Notify` here as well would
+    // deliver the same completion twice.
 }
 
 /// Lifts a pause once the graph has a runnable node again. The counterpart of
@@ -2114,6 +2367,283 @@ mod tests {
         }
         assert!(journal > 0);
         assert_eq!(checkpoints.get("plan").copied(), Some(1));
+    }
+
+    /// 2.12: a `runner = "command"` node wrote a result that does not validate,
+    /// called `kvx workflow node complete`, and got a `workflow_node_reported`
+    /// success envelope back while the node sat `Running` forever. The gate's
+    /// verdict existed only as a status change, so the caller had nothing to
+    /// answer with. It is recorded now — and the errors it carries are what the
+    /// node's own process is told.
+    #[test]
+    fn the_completion_gate_records_a_verdict_the_report_can_be_answered_with() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        let path = InstancePath::new("plan");
+        assert!(
+            engine.report_outcome(&path).is_none(),
+            "a node that has not reported has no verdict"
+        );
+
+        engine.apply(EngineInput::NodeSelfReport {
+            path: path.clone(),
+            token: NodeToken::new("token"),
+            result: report(r#"{"wrong_field":123}"#),
+        });
+        let first = engine
+            .report_outcome(&path)
+            .expect("the first report leaves a verdict");
+        assert_eq!(first.verdict, ReportVerdict::Corrected);
+        assert!(!first.accepted());
+        assert_eq!(
+            first.errors,
+            vec!["missing required field \"plan\"".to_string()],
+            "the verdict carries the violations the node has to fix"
+        );
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Running);
+
+        engine.apply(EngineInput::NodeSelfReport {
+            path: path.clone(),
+            token: NodeToken::new("token"),
+            result: report(r#"{"wrong_field":456}"#),
+        });
+        let second = engine
+            .report_outcome(&path)
+            .expect("the second report replaces the verdict");
+        assert_eq!(second.verdict, ReportVerdict::Surfaced);
+        assert!(
+            !second.errors.is_empty(),
+            "the second rejection still quotes the schema violations: {second:?}"
+        );
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+
+        engine.apply(EngineInput::RestartNode { path: path.clone() });
+        engine.bind_node(&path, binding("pane-1b"));
+        engine.apply(EngineInput::NodeSelfReport {
+            path: path.clone(),
+            token: NodeToken::new("token"),
+            result: report(r#"{"plan":"do it"}"#),
+        });
+        let accepted = engine
+            .report_outcome(&path)
+            .expect("a valid result leaves a verdict too");
+        assert!(accepted.accepted());
+        assert!(
+            accepted.errors.is_empty(),
+            "an accepted result carries no violations"
+        );
+    }
+
+    /// 2.12: a self-report that carries no artifact is not a *result* the gate
+    /// refused — there was nothing to validate. The node's status already says
+    /// what is wrong, so the verdict must carry no schema violations and the
+    /// report must not be answered as an invalid result.
+    #[test]
+    fn a_report_with_no_artifact_records_no_schema_violations() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: RawJson(serde_json::Value::Null),
+        });
+        let outcome = engine
+            .report_outcome(&InstancePath::new("plan"))
+            .expect("the report leaves a verdict");
+        assert_eq!(outcome.verdict, ReportVerdict::Surfaced);
+        assert!(outcome.errors.is_empty(), "unexpected: {outcome:?}");
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+    }
+
+    /// 2.13: after `run cancel`, restarting a node succeeded — the run reported
+    /// `cancelled` while the node reported `running`, in a fresh pane nothing
+    /// would ever collect a result from. A closed run never settles again, so
+    /// the restart is refused instead.
+    #[test]
+    fn a_closed_run_never_restarts_a_node() {
+        for close in [Closer::Cancel, Closer::Succeed] {
+            let (mut engine, graph) = two_node_engine();
+            engine.apply(EngineInput::Start {
+                graph: Box::new(graph),
+            });
+            engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+            let closed_status = match close {
+                Closer::Cancel => {
+                    engine.apply(EngineInput::CancelRun);
+                    RunStatus::Cancelled
+                }
+                Closer::Succeed => {
+                    for (path, result) in [
+                        ("plan", r#"{"plan":"do it"}"#),
+                        ("implement", r#"{"report":"shipped"}"#),
+                    ] {
+                        engine.bind_node(&InstancePath::new(path), binding(path));
+                        engine.apply(EngineInput::NodeSelfReport {
+                            path: InstancePath::new(path),
+                            token: NodeToken::new("token"),
+                            result: report(result),
+                        });
+                    }
+                    RunStatus::Succeeded
+                }
+            };
+            assert_eq!(engine.run_status(), Some(closed_status));
+            let before = status_of(&engine, "plan");
+
+            let effects = engine.apply(EngineInput::RestartNode {
+                path: InstancePath::new("plan"),
+            });
+
+            assert!(
+                effects.is_empty(),
+                "a refused restart emits nothing at all — no ClosePane, no spawn, \
+                 no journal entry: {effects:?}"
+            );
+            assert_eq!(
+                status_of(&engine, "plan"),
+                before,
+                "the node keeps the status the closed run left it with"
+            );
+            assert_eq!(
+                engine.run_status(),
+                Some(closed_status),
+                "a closed run stays closed"
+            );
+            assert!(
+                engine.admissions().is_empty(),
+                "nothing is admitted back into a closed run"
+            );
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Closer {
+        Cancel,
+        Succeed,
+    }
+
+    /// 2.15: a steer the runtime refused produced a single server-side WARN and
+    /// nothing else, so the user was left believing it had been delivered. The
+    /// refusal is handed back to the engine, which journals it, marks the node,
+    /// and raises a notice a client can render.
+    #[test]
+    fn a_refused_delivery_is_journalled_marked_and_surfaced() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        let path = InstancePath::new("plan");
+
+        engine.apply(EngineInput::Steer {
+            path: path.clone(),
+            text: "please rerun".to_string(),
+        });
+        assert!(
+            engine.delivery_failure(&path).is_none(),
+            "a steer that has not failed leaves no marker"
+        );
+
+        let effects =
+            engine.note_delivery_failure(&path, "pane.send_text", "pane_not_found: no such pane");
+
+        let note = engine
+            .delivery_failure(&path)
+            .expect("the refusal is surfaced on the node, not only logged");
+        assert_eq!(note.method, "pane.send_text");
+        assert!(note.reason.contains("pane_not_found"));
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RunEffect::Persist(write)
+                    if matches!(**write, StoreWrite::RunEvent { kind: RunEventKind::Error, .. })
+            )),
+            "the refusal is a run event, so it survives in the journal: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RunEffect::Emit(WorkflowEvent::NodeUpdated { path: updated, .. })
+                    if updated == &path
+            )),
+            "clients are told to re-read the node: {effects:?}"
+        );
+        let message = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RunEffect::Notify(notice) => Some(notice.clone()),
+                _ => None,
+            })
+            .expect("the user is told the delivery did not happen");
+        assert_eq!(message.level, NoticeLevel::Error);
+        assert_eq!(message.path, Some(path.clone()));
+        assert!(
+            message.message.contains("pane.send_text") && message.message.contains("not delivered"),
+            "unexpected notice: {}",
+            message.message
+        );
+
+        // The marker answers for the latest attempt only: a fresh steer, a fresh
+        // pane, or a restart all clear it.
+        engine.apply(EngineInput::Steer {
+            path: path.clone(),
+            text: "again".to_string(),
+        });
+        assert!(engine.delivery_failure(&path).is_none());
+        engine.note_delivery_failure(&path, "pane.send_text", "pane_not_found: no such pane");
+        engine.bind_node(&path, binding("pane-2"));
+        assert!(engine.delivery_failure(&path).is_none());
+    }
+
+    /// The other half of 2.15: a node with no pane at all never produces a
+    /// delivery for the runtime to refuse, so nothing downstream could report
+    /// one. The engine records it directly instead of emitting silence.
+    #[test]
+    fn steering_a_node_with_no_pane_is_surfaced_rather_than_dropped() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        let path = InstancePath::new("plan");
+
+        let effects = engine.apply(EngineInput::Steer {
+            path: path.clone(),
+            text: "please rerun".to_string(),
+        });
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "there is no pane to prompt"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::Notify(_))),
+            "the caller is told the steer was not delivered: {effects:?}"
+        );
+        assert!(
+            engine
+                .delivery_failure(&path)
+                .is_some_and(|note| note.reason.contains("no pane")),
+            "the node carries the marker a reader can see"
+        );
+
+        let effects = engine.apply(EngineInput::Interrupt { path: path.clone() });
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::Notify(_))),
+            "an interrupt with nowhere to go is surfaced the same way: {effects:?}"
+        );
     }
 
     /// `05-phase-plan.md` W2: the engine must not reference `App`,

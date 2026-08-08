@@ -43,9 +43,11 @@ use crate::app::App;
 #[cfg(feature = "workflow")]
 use crate::workflow::definition::{Definition, DefinitionError};
 #[cfg(feature = "workflow")]
+use crate::workflow::engine::{is_closed_run, ReportOutcome, ReportVerdict};
+#[cfg(feature = "workflow")]
 use crate::workflow::model::{
     EdgePayload, EngineInput, InstancePath, Isolation, Kvdag, KvdagEdge, KvdagNode, KvdagVersionId,
-    NodeKind, RunGraph, RunId, Runner, WorkflowId,
+    NodeKind, NodeStatus, RunGraph, RunId, RunStatus, Runner, WorkflowId,
 };
 #[cfg(feature = "workflow")]
 use crate::workflow::store::{NewRun, StoreError, VersionOrigin, VersionRecord};
@@ -102,6 +104,18 @@ const NODE_NOT_RUNNING_CODE: &str = "workflow_node_not_running";
 /// never saw is worse than one that fails loudly.
 #[cfg(feature = "workflow")]
 const DELIVERY_FAILED_CODE: &str = "workflow_node_delivery_failed";
+/// A self-reported result the completion gate refused because it does not
+/// validate against the node's `output_schema` (`04-kvdag-and-execution.md`
+/// §4.3). The node's own process is the one that has to fix it, and its only
+/// channel back is this response — answering `ok` for a result the engine just
+/// rejected is what let a schema-invalid report stall a run silently.
+#[cfg(feature = "workflow")]
+const RESULT_INVALID_CODE: &str = "workflow_node_result_invalid";
+/// A node method addressed a run that has already reached a final status.
+/// Restarting a node inside a closed run resurrects a process nothing will
+/// collect a result from, so it is refused rather than performed.
+#[cfg(feature = "workflow")]
+const RUN_CLOSED_CODE: &str = "workflow_run_closed";
 
 /// Default page size for `workflow.run.list`.
 #[cfg(feature = "workflow")]
@@ -501,7 +515,8 @@ impl App {
         // `workflow_run` row that no engine will ever advance.
         if self.workflow.is_live() {
             let refused = crate::app::workflow::WorkflowStartError::RunInFlight;
-            return encode_error(id, refused.code(), refused.message());
+            let message = self.workflow_run_in_flight_message();
+            return encode_error(id, refused.code(), message);
         }
         let selector = params.workflow_id.trim().to_string();
         let requested_version = params.version;
@@ -525,9 +540,13 @@ impl App {
                 return Ok(LookupResult::NotFound);
             };
             let kvdag = cx.block_on(cx.store().load_version(&version_id))?;
-            Ok(LookupResult::Found((summary.default_tier, kvdag)))
+            Ok(LookupResult::Found((
+                summary.default_tier,
+                summary.name,
+                kvdag,
+            )))
         });
-        let (default_tier, kvdag) = match resolved {
+        let (default_tier, workflow_name, kvdag) = match resolved {
             Ok(Ok(LookupResult::Found(resolved))) => resolved,
             Ok(Ok(LookupResult::NotFound)) => {
                 return encode_error(
@@ -594,6 +613,10 @@ impl App {
             Err(unavailable) => return unavailable_response(id, &unavailable),
         };
 
+        // The DAG overlay heads the run with the name the author gave the
+        // workflow; the run graph itself only carries record ids.
+        self.state.set_workflow_run_name(workflow_name);
+
         let graph = RunGraph::materialise(&kvdag, run_id.clone(), tier);
         let active = ActiveRun::new(
             run_id.clone(),
@@ -605,7 +628,12 @@ impl App {
         .with_placement(workspace_id, None);
 
         if let Err(error) = self.start_workflow_run(active, kvdag, graph) {
-            return encode_error(id, error.code(), error.message());
+            let message = match error {
+                crate::app::workflow::WorkflowStartError::RunInFlight => {
+                    self.workflow_run_in_flight_message()
+                }
+            };
+            return encode_error(id, error.code(), message);
         }
         match self.workflow_run_info(&run_id) {
             Some(run) => encode_success(id, ResponseResult::WorkflowRunStarted { run }),
@@ -819,6 +847,20 @@ impl App {
         ) {
             return encode_error(id, rejected.code(), rejected.message());
         }
+        // The completion gate has already run. A result it refused on the node's
+        // own `output_schema` must not come back as `workflow_node_reported`:
+        // for a `Runner::Command` node the response *is* the corrective channel,
+        // and a success envelope leaves the script believing it finished while
+        // the node sits `Running` with nothing left to report.
+        let rejection = self
+            .workflow
+            .engine()
+            .report_outcome(&path)
+            .filter(|outcome| !outcome.errors.is_empty())
+            .map(describe_rejected_report);
+        if let Some(message) = rejection {
+            return encode_error(id, RESULT_INVALID_CODE, message);
+        }
         match self.workflow_node_info(&path) {
             Some(node) => encode_success(id, ResponseResult::WorkflowNodeReported { node }),
             None => node_not_found(
@@ -839,6 +881,30 @@ impl App {
         if let Some(error) = require_node_target(&id, &target) {
             return error;
         }
+        // A run that has closed will never settle again, so a node handed back
+        // to it becomes a live process inside a `cancelled`/`failed`/`succeeded`
+        // run that nothing will ever collect a result from — and whose pane
+        // leaks. `apply_node_input` would happily report that as a success.
+        let run = RunId::new(target.run_id.trim().to_string());
+        if self.workflow_run_info(&run).is_none() {
+            return not_the_active_run(id, &target.run_id);
+        }
+        if let Some(status) = self
+            .workflow
+            .run_status()
+            .filter(|status| is_closed_run(*status))
+        {
+            return encode_error(
+                id,
+                RUN_CLOSED_CODE,
+                format!(
+                    "run {run} is already {}; a closed run cannot restart node {}. \
+                     Start a new run with `kvx workflow run start <name|id>`.",
+                    run_status_label(status),
+                    target.path.trim()
+                ),
+            );
+        }
         let path = InstancePath::new(target.path.trim().to_string());
         self.apply_node_input(
             id,
@@ -848,6 +914,62 @@ impl App {
             &path,
             |node| ResponseResult::WorkflowNodeRestarted { node },
         )
+    }
+
+    /// `workflow_run_in_flight`, told truthfully. A *paused* run is not
+    /// executing: it is waiting for a human, and the old wording sent the user
+    /// looking for a busy run that does not exist. Names the blocking run, its
+    /// status, the node it is stuck on, and both ways out.
+    fn workflow_run_in_flight_message(&self) -> String {
+        let Some(run) = self.workflow.active_run().map(|run| run.run_id.to_string()) else {
+            return crate::app::workflow::WorkflowStartError::RunInFlight
+                .message()
+                .to_string();
+        };
+        let status = self
+            .workflow
+            .run_status()
+            .map_or("running", run_status_label);
+        let blocking: Vec<(String, &'static str)> = self
+            .workflow
+            .graph()
+            .map(|graph| {
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|node| {
+                        matches!(
+                            node.status,
+                            NodeStatus::NeedsAttention | NodeStatus::Blocked | NodeStatus::Failed
+                        )
+                    })
+                    .map(|node| (node.path.to_string(), node_status_label(node.status)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut message = format!("another workflow run is still in flight: run {run} is {status}");
+        if let Some((path, node_status)) = blocking.first() {
+            message.push_str(&format!(", blocked on node \"{path}\" ({node_status})"));
+            if blocking.len() > 1 {
+                message.push_str(&format!(" and {} other node(s)", blocking.len() - 1));
+            }
+        }
+        message.push('.');
+        if matches!(self.workflow.run_status(), Some(RunStatus::Paused)) {
+            message.push_str(" A paused run is not executing — it is waiting for a human.");
+        }
+        match blocking.first() {
+            Some((path, _)) => message.push_str(&format!(
+                " Resume it with `kvx workflow node restart {run} {path}` or \
+                 `kvx workflow node steer {run} {path} <text>`, or end it with \
+                 `kvx workflow run cancel {run}`."
+            )),
+            None => message.push_str(&format!(
+                " Wait for it to finish, or end it with `kvx workflow run cancel {run}`."
+            )),
+        }
+        message
     }
 
     /// The shared body of every node method that drives the engine: the run has
@@ -989,6 +1111,63 @@ fn not_the_active_run(id: String, run_id: &str) -> String {
         NO_ACTIVE_RUN_CODE,
         format!("run {run_id} is not the run this server is executing"),
     )
+}
+
+/// The rejection message a node's own process reads back from
+/// `kvx workflow node complete`. It quotes every schema violation and names the
+/// next move, which is the only correction a `Runner::Command` node can act on.
+#[cfg(feature = "workflow")]
+fn describe_rejected_report(outcome: &ReportOutcome) -> String {
+    let next = match outcome.verdict {
+        ReportVerdict::Corrected => {
+            "this was the node's one corrective re-prompt: fix result.json and run \
+             `kvx workflow node complete` again"
+        }
+        ReportVerdict::Surfaced => {
+            "the corrective re-prompt is already spent, so the node is now \
+             needs_attention: fix result.json and restart the node"
+        }
+        // Not reachable: an accepted result has no violations to report.
+        ReportVerdict::Accepted => "the node's result was accepted",
+    };
+    let mut message =
+        String::from("result.json does not validate against the node's output_schema:");
+    for violation in &outcome.errors {
+        message.push_str("\n  - ");
+        message.push_str(violation);
+    }
+    message.push('\n');
+    message.push_str(next);
+    message
+}
+
+/// Wire spelling of a run status, for messages the user reads.
+#[cfg(feature = "workflow")]
+fn run_status_label(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Pending => "pending",
+        RunStatus::Running => "running",
+        RunStatus::Paused => "paused",
+        RunStatus::Succeeded => "succeeded",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
+#[cfg(feature = "workflow")]
+fn node_status_label(status: NodeStatus) -> &'static str {
+    match status {
+        NodeStatus::Pending => "pending",
+        NodeStatus::Ready => "ready",
+        NodeStatus::Running => "running",
+        NodeStatus::NeedsAttention => "needs_attention",
+        NodeStatus::Blocked => "blocked",
+        NodeStatus::Succeeded => "succeeded",
+        NodeStatus::Failed => "failed",
+        NodeStatus::Skipped => "skipped",
+        NodeStatus::Restored => "restored",
+        NodeStatus::Cancelled => "cancelled",
+    }
 }
 
 #[cfg(feature = "workflow")]
@@ -2196,6 +2375,190 @@ output_schema = { type = "object", required = ["done"] }
         assert!(
             value["result"]["node"]["evidence"].is_null(),
             "a node with no result artifact records no completion evidence: {value}"
+        );
+    }
+
+    /// 2.12: a `runner = "command"` node wrote `{"wrong_field":123}` against a
+    /// schema requiring `done`, and `kvx workflow node complete` printed a
+    /// `workflow_node_reported` success envelope and exited 0 while the node sat
+    /// `Running`. The response is the only correction channel a command node
+    /// has, so it has to carry the refusal and the violations.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_schema_invalid_report_is_answered_with_the_rejection_not_a_success() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+
+        let response = app.handle_workflow_node_report(
+            "req".into(),
+            WorkflowNodeReportParams {
+                run_id: run_id.clone(),
+                path: "only".into(),
+                token: "node-token".into(),
+                result: serde_json::json!({ "wrong_field": 123 }),
+            },
+        );
+        assert_eq!(error_code(&response), RESULT_INVALID_CODE, "{response}");
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("output_schema")
+                && message.contains("missing required field \"done\""),
+            "the rejection quotes the schema violation the node has to fix: {message}"
+        );
+        assert!(
+            message.contains("kvx workflow node complete"),
+            "the rejection names the next move: {message}"
+        );
+        assert_eq!(
+            app.workflow_node_info(&InstancePath::new("only"))
+                .map(|node| node.status),
+            Some(crate::api::schema::WorkflowNodeStatus::Running),
+            "the first invalid result still earns the documented corrective re-prompt"
+        );
+
+        // Second strike: still refused, and now the node is surfaced rather than
+        // left `Running` with nothing to wait for.
+        let response = app.handle_workflow_node_report(
+            "req".into(),
+            WorkflowNodeReportParams {
+                run_id,
+                path: "only".into(),
+                token: "node-token".into(),
+                result: serde_json::json!({ "wrong_field": 456 }),
+            },
+        );
+        assert_eq!(error_code(&response), RESULT_INVALID_CODE, "{response}");
+        assert_eq!(
+            app.workflow_node_info(&InstancePath::new("only"))
+                .map(|node| node.status),
+            Some(crate::api::schema::WorkflowNodeStatus::NeedsAttention),
+            "a node never stays Running after its corrective re-prompt is spent"
+        );
+    }
+
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_valid_report_is_still_answered_as_a_success() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        let response = app.handle_workflow_node_report(
+            "req".into(),
+            WorkflowNodeReportParams {
+                run_id,
+                path: "only".into(),
+                token: "node-token".into(),
+                result: serde_json::json!({ "done": true }),
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["result"]["type"], "workflow_node_reported",
+            "unexpected: {value}"
+        );
+        assert_eq!(value["result"]["node"]["status"], "succeeded");
+    }
+
+    /// 2.13: after `run cancel`, `workflow.node.restart` succeeded — the run
+    /// reported `cancelled` while the node it restarted reported `running`, in a
+    /// pane nothing would ever collect a result from.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn node_restart_is_refused_once_the_run_has_been_cancelled() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        app.handle_workflow_run_cancel(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+        );
+        assert_eq!(
+            app.workflow.run_status(),
+            Some(RunStatus::Cancelled),
+            "the fixture run is cancelled before the restart"
+        );
+
+        let response = app.handle_workflow_node_restart(
+            "req".into(),
+            WorkflowNodeTarget {
+                run_id,
+                path: "only".into(),
+            },
+        );
+        assert_eq!(error_code(&response), RUN_CLOSED_CODE, "{response}");
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("cancelled") && message.contains("kvx workflow run start"),
+            "the refusal names the run's status and what to do instead: {message}"
+        );
+        assert_eq!(
+            app.workflow_node_info(&InstancePath::new("only"))
+                .map(|node| node.status),
+            Some(crate::api::schema::WorkflowNodeStatus::Cancelled),
+            "the node is not resurrected"
+        );
+    }
+
+    /// 2.14: `workflow_run_in_flight` claimed the blocking run was "still
+    /// executing" when it was in fact paused waiting for a human, and named
+    /// neither the run nor a way out.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn run_in_flight_names_the_paused_run_the_blocking_node_and_the_remedies() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        // Two invalid results spend the corrective re-prompt, surface the node,
+        // and leave the run paused with nothing runnable.
+        for _ in 0..2 {
+            app.handle_workflow_node_report(
+                "req".into(),
+                WorkflowNodeReportParams {
+                    run_id: run_id.clone(),
+                    path: "only".into(),
+                    token: "node-token".into(),
+                    result: serde_json::json!({ "wrong_field": 1 }),
+                },
+            );
+        }
+        assert_eq!(app.workflow.run_status(), Some(RunStatus::Paused));
+
+        app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: single_node_definition("second-workflow", "run it"),
+            },
+        );
+        let response = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id: "second-workflow".into(),
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+            },
+        );
+
+        assert_eq!(
+            error_code(&response),
+            "workflow_run_in_flight",
+            "{response}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&run_id),
+            "the refusal names the blocking run: {message}"
+        );
+        assert!(
+            message.contains("paused") && message.contains("waiting for a human"),
+            "the refusal says the run is not executing: {message}"
+        );
+        assert!(
+            message.contains("blocked on node \"only\""),
+            "the refusal names the node the run is stuck on: {message}"
+        );
+        assert!(
+            message.contains(&format!("kvx workflow run cancel {run_id}"))
+                && message.contains(&format!("kvx workflow node restart {run_id} only")),
+            "the refusal names both ways out: {message}"
         );
     }
 }

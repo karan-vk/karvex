@@ -201,10 +201,25 @@ impl App {
                         self.state.view.dag.selected = Some(idx);
                     }
                 }
+                // A single click selects; only a double click (or Enter)
+                // leaves the overlay for the node's pane. Focusing on the
+                // first click made the only pointer gesture in a mouse-first
+                // TUI a destructive one — it tore down the view the user was
+                // reading, with no way back but the launcher menu.
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(idx) = self.state.view.dag.node_at(mouse.column, mouse.row) {
                         self.state.view.dag.selected = Some(idx);
-                        self.focus_workflow_dag_node();
+                        let doubled = self.state.view.dag.register_click(
+                            idx,
+                            mouse.column,
+                            mouse.row,
+                            std::time::Instant::now(),
+                        );
+                        if doubled {
+                            self.focus_workflow_dag_node();
+                        }
+                    } else {
+                        self.state.view.dag.last_click = None;
                     }
                 }
                 _ => {}

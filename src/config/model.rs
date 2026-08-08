@@ -441,6 +441,8 @@ pub struct KeysConfig {
     pub resize_mode: BindingConfig,
     /// Toggle sidebar collapse. Default: "prefix+b"
     pub toggle_sidebar: BindingConfig,
+    /// Open the workflow DAG view for the run this server is executing. Default: "prefix+shift+f".
+    pub open_workflow_dag: BindingConfig,
     /// Optional indexed shortcuts expanded over number keys 1-9.
     pub indexed: IndexedKeysConfig,
     /// Prefix-mode custom command bindings.
@@ -560,6 +562,8 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     toggle_sidebar: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    open_workflow_dag: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     indexed: Option<IndexedKeysConfig>,
     #[serde(skip_serializing)]
     command: Option<Vec<CommandKeybindConfig>>,
@@ -635,6 +639,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(zoom);
         apply_field!(resize_mode);
         apply_field!(toggle_sidebar);
+        apply_field!(open_workflow_dag);
         apply_field!(indexed);
         apply_field!(command);
 
@@ -733,6 +738,7 @@ impl KeysConfig {
         copy_effective_action_field!(zoom, keybinds.zoom);
         copy_effective_action_field!(resize_mode, keybinds.resize_mode);
         copy_effective_action_field!(toggle_sidebar, keybinds.toggle_sidebar);
+        copy_effective_action_field!(open_workflow_dag, keybinds.open_workflow_dag);
         copy_user_field!(indexed);
 
         profile
@@ -1037,6 +1043,7 @@ impl Default for KeysConfig {
             zoom: BindingConfig::one("prefix+z"),
             resize_mode: BindingConfig::one("prefix+r"),
             toggle_sidebar: BindingConfig::one("prefix+b"),
+            open_workflow_dag: BindingConfig::one("prefix+shift+f"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
             user_fields: BTreeSet::new(),

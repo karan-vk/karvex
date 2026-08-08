@@ -9,7 +9,7 @@
 //! geometry, so the clickable rectangles can never disagree with what was
 //! drawn.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::workflow::model::{InstancePath, RunGraph, RunNodeIdx};
 
@@ -87,12 +87,25 @@ impl EdgeBits {
     }
 }
 
+/// One edge's route, kept per edge rather than pre-merged into a single cell
+/// map so that clipping can drop exactly the cells belonging to an edge whose
+/// endpoint box did not survive — an edge stub pointing at a box that was never
+/// drawn is worse than no edge at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeRoute {
+    pub from: RunNodeIdx,
+    pub to: RunNodeIdx,
+    /// Cells in ascending `(x, y)` order, so the same graph always produces the
+    /// same route.
+    pub cells: Vec<((u16, u16), EdgeBits)>,
+}
+
 /// The layout output stored in the view state and read by both the renderer
 /// and the hit-test.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DagLayout {
     pub nodes: Vec<(RunNodeIdx, LayoutRect)>,
-    pub edge_cells: HashMap<(u16, u16), EdgeBits>,
+    pub edges: Vec<EdgeRoute>,
 }
 
 impl DagLayout {
@@ -109,6 +122,35 @@ impl DagLayout {
             .iter()
             .find(|(_, rect)| rect.contains(col, row))
             .map(|(idx, _)| *idx)
+    }
+
+    /// Every surviving edge cell, merged across edges that share it. Derived
+    /// rather than stored so it can never disagree with [`DagLayout::edges`].
+    pub fn edge_cells(&self) -> HashMap<(u16, u16), EdgeBits> {
+        let mut merged: HashMap<(u16, u16), EdgeBits> = HashMap::new();
+        for route in &self.edges {
+            for (position, bits) in &route.cells {
+                let entry = merged.entry(*position).or_default();
+                *entry = entry.merged(*bits);
+            }
+        }
+        merged
+    }
+
+    /// Drops every edge whose source or target box is no longer part of the
+    /// layout, then every remaining cell that falls outside `bounds`.
+    ///
+    /// Both halves matter: bounds alone leaves the orphan stubs that hang under
+    /// a clipped-away node, and endpoint survival alone leaves cells drawn
+    /// outside the graph band.
+    pub fn retain_visible_edges(&mut self, bounds: LayoutRect) {
+        let surviving: HashSet<RunNodeIdx> = self.nodes.iter().map(|(idx, _)| *idx).collect();
+        self.edges
+            .retain(|route| surviving.contains(&route.from) && surviving.contains(&route.to));
+        for route in &mut self.edges {
+            route.cells.retain(|((x, y), _)| bounds.contains(*x, *y));
+        }
+        self.edges.retain(|route| !route.cells.is_empty());
     }
 }
 
@@ -160,16 +202,24 @@ pub fn layout(graph: &RunGraph, area: LayoutRect) -> DagLayout {
         .filter_map(|node| rects.get(&node.idx).map(|rect| (node.idx, *rect)))
         .collect();
 
-    let mut edge_cells: HashMap<(u16, u16), EdgeBits> = HashMap::new();
+    let mut edges: Vec<EdgeRoute> = Vec::new();
     for edge in &graph.edges {
         let (Some(&from_rect), Some(&to_rect)) = (rects.get(&edge.from), rects.get(&edge.to))
         else {
             continue;
         };
-        route_edge(from_rect, to_rect, &mut edge_cells);
+        let cells = route_edge(from_rect, to_rect);
+        if cells.is_empty() {
+            continue;
+        }
+        edges.push(EdgeRoute {
+            from: edge.from,
+            to: edge.to,
+            cells,
+        });
     }
 
-    DagLayout { nodes, edge_cells }
+    DagLayout { nodes, edges }
 }
 
 /// Layer assignment: longest path from the roots, computed with Kahn's
@@ -284,14 +334,16 @@ fn barycenter(graph: &RunGraph, rank: &HashMap<RunNodeIdx, usize>, idx: RunNodeI
     predecessor_ranks.iter().sum::<f64>() / predecessor_ranks.len() as f64
 }
 
-/// Accumulates one edge's orthogonal drop/jog/drop route into the shared cell
-/// map, merging with whatever another edge already left in a shared cell.
-fn route_edge(from: LayoutRect, to: LayoutRect, edge_cells: &mut HashMap<(u16, u16), EdgeBits>) {
+/// One edge's orthogonal drop/jog/drop route as its own cell list, in ascending
+/// `(x, y)` order. Cells the route visits twice are merged here; cells shared
+/// with *another* edge are merged later by [`DagLayout::edge_cells`].
+fn route_edge(from: LayoutRect, to: LayoutRect) -> Vec<((u16, u16), EdgeBits)> {
     let route = edge_route_points(from, to);
+    let mut cells: BTreeMap<(u16, u16), EdgeBits> = BTreeMap::new();
     if route.len() == 1 {
         let (x, y) = route[0];
         merge_edge_bit(
-            edge_cells,
+            &mut cells,
             x,
             y,
             EdgeBits {
@@ -301,17 +353,18 @@ fn route_edge(from: LayoutRect, to: LayoutRect, edge_cells: &mut HashMap<(u16, u
                 right: false,
             },
         );
-        return;
+    } else {
+        for pair in route.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            merge_edge_bit(&mut cells, a.0, a.1, direction(a, b));
+            merge_edge_bit(&mut cells, b.0, b.1, direction(b, a));
+        }
     }
-    for pair in route.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        merge_edge_bit(edge_cells, a.0, a.1, direction(a, b));
-        merge_edge_bit(edge_cells, b.0, b.1, direction(b, a));
-    }
+    cells.into_iter().collect()
 }
 
-fn merge_edge_bit(edge_cells: &mut HashMap<(u16, u16), EdgeBits>, x: u16, y: u16, bits: EdgeBits) {
-    let entry = edge_cells.entry((x, y)).or_default();
+fn merge_edge_bit(cells: &mut BTreeMap<(u16, u16), EdgeBits>, x: u16, y: u16, bits: EdgeBits) {
+    let entry = cells.entry((x, y)).or_default();
     *entry = entry.merged(bits);
 }
 
@@ -634,7 +687,7 @@ mod tests {
                 (RunNodeIdx(0), LayoutRect::new(0, 0, 10, 3)),
                 (RunNodeIdx(1), LayoutRect::new(0, 4, 10, 3)),
             ],
-            edge_cells: HashMap::new(),
+            edges: Vec::new(),
         };
         assert_eq!(layout.node_at(1, 1), Some(RunNodeIdx(0)));
         assert_eq!(layout.node_at(1, 5), Some(RunNodeIdx(1)));
@@ -643,5 +696,57 @@ mod tests {
             layout.rect_of(RunNodeIdx(1)),
             Some(LayoutRect::new(0, 4, 10, 3))
         );
+    }
+
+    #[test]
+    fn every_routed_edge_names_the_boxes_it_joins() {
+        let dag = layout(&diamond(), LayoutRect::new(0, 0, 200, 50));
+        assert_eq!(dag.edges.len(), 4);
+        for route in &dag.edges {
+            assert!(dag.rect_of(route.from).is_some());
+            assert!(dag.rect_of(route.to).is_some());
+            assert!(!route.cells.is_empty());
+        }
+        // The derived cell map is exactly the union of the per-edge routes.
+        let merged = dag.edge_cells();
+        for route in &dag.edges {
+            for (position, _) in &route.cells {
+                assert!(merged.contains_key(position), "{position:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_a_box_drops_the_edges_that_pointed_at_it() {
+        let mut dag = layout(&diamond(), LayoutRect::new(0, 0, 200, 50));
+        let bounds = LayoutRect::new(0, 0, 200, 50);
+        assert!(dag
+            .edges
+            .iter()
+            .any(|route| route.to == RunNodeIdx(3) || route.from == RunNodeIdx(3)));
+
+        // Clip `end` away, exactly as a short graph band would.
+        dag.nodes.retain(|(idx, _)| *idx != RunNodeIdx(3));
+        dag.retain_visible_edges(bounds);
+
+        assert!(
+            dag.edges
+                .iter()
+                .all(|route| route.from != RunNodeIdx(3) && route.to != RunNodeIdx(3)),
+            "an edge survived its own endpoint: {:?}",
+            dag.edges
+        );
+        // And no cell of a dropped edge is left behind in the merged map:
+        // `end` sat in the third band, so nothing below the first gap remains.
+        let merged = dag.edge_cells();
+        assert!(merged.keys().all(|(_, y)| *y < 8), "{merged:?}");
+    }
+
+    #[test]
+    fn edge_cells_outside_the_bounds_are_dropped() {
+        let mut dag = layout(&diamond(), LayoutRect::new(0, 0, 200, 50));
+        // A band that stops above the first gap keeps no edge cells at all.
+        dag.retain_visible_edges(LayoutRect::new(0, 0, 200, 3));
+        assert!(dag.edge_cells().is_empty(), "{:?}", dag.edges);
     }
 }

@@ -351,6 +351,10 @@ pub struct Keybinds {
     pub zoom: ActionKeybinds,
     pub resize_mode: ActionKeybinds,
     pub toggle_sidebar: ActionKeybinds,
+    /// Opens the workflow DAG view. A real action rather than a menu-only
+    /// entry: the overlay is the one surface that says a run needs a human, so
+    /// it has to be reachable from the keyboard and rebindable in config.toml.
+    pub open_workflow_dag: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
 }
 
@@ -513,6 +517,7 @@ impl Config {
             zoom: empty_action!(),
             resize_mode: empty_action!(),
             toggle_sidebar: empty_action!(),
+            open_workflow_dag: empty_action!(),
             custom_commands: Vec::new(),
         };
 
@@ -654,6 +659,7 @@ impl Config {
             apply_action!(keybinds.zoom, zoom, source);
             apply_action!(keybinds.resize_mode, resize_mode, source);
             apply_action!(keybinds.toggle_sidebar, toggle_sidebar, source);
+            apply_action!(keybinds.open_workflow_dag, open_workflow_dag, source);
 
             if source == field_source!(indexed) {
                 append_legacy_indexed_bindings(
@@ -1568,6 +1574,36 @@ next_tab = "prefix+n"
             vec![BindingTrigger::Prefix((
                 KeyCode::Char('g'),
                 KeyModifiers::empty()
+            ))]
+        );
+    }
+
+    /// 2.1: the DAG view used to be reachable only by clicking a sidebar
+    /// launcher — it was not in the keybind action table at all, so it could
+    /// not even be bound in config.toml.
+    #[test]
+    fn open_workflow_dag_defaults_to_prefix_shift_f_and_is_rebindable() {
+        let kb = Config::default().keybinds();
+        assert_eq!(
+            binding_triggers(&kb.open_workflow_dag),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('f'),
+                KeyModifiers::SHIFT
+            ))]
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+open_workflow_dag = "prefix+ctrl+d"
+"#,
+        )
+        .expect("the key parses");
+        assert_eq!(
+            binding_triggers(&config.keybinds().open_workflow_dag),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL
             ))]
         );
     }

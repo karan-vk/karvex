@@ -214,6 +214,7 @@ const DEFAULT_CONFIG: &str = r##"# karvex configuration
 # zoom = "prefix+z"       # legacy alias: fullscreen
 # resize_mode = "prefix+r"
 # toggle_sidebar = "prefix+b"
+# open_workflow_dag = "prefix+shift+f" # live DAG view of the run this server is executing
 
 # Navigate-mode movement. These local shortcuts win while navigate mode is open.
 # They are independent from focus_pane_*. Do not include prefix+, esc, enter, tab, or 1..9 here.
@@ -604,6 +605,7 @@ fn main() -> io::Result<()> {
         println!("       kvx pane <subcommand> ...");
         println!("       kvx session <subcommand> ...");
         println!("       kvx integration <subcommand> ...");
+        println!("       kvx workflow <subcommand> ...");
         println!();
         println!("Common commands:");
         for (command, description) in [
@@ -666,6 +668,10 @@ fn main() -> io::Result<()> {
             (
                 "kvx integration <subcommand>",
                 "Manage built-in agent integrations",
+            ),
+            (
+                "kvx workflow <subcommand>",
+                "Author and run multi-node agent workflows",
             ),
         ] {
             println!("  {command:<32} {description}");

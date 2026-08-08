@@ -324,6 +324,28 @@ herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source 
 
 `pane wait-output`、`agent wait` 和 `agent prompt --wait` 在省略 `--timeout` 时会无限等待。超时或服务器错误以 JSON 写到 stderr,退出状态为 1。CLI 用法错误的退出状态为 2。
 
+## 工作流
+
+编写并运行多节点智能体工作流——一个已保存、有版本管理的任务图,将每个节点作为真实的终端窗格启动,并协调它们直到每条分支都得出结果。定义格式、节点约定和 DAG 视图请参见[工作流](/docs/workflows/)。
+
+```bash
+herdr workflow list
+herdr workflow show <name|id> [--json]
+herdr workflow create --file <definition.toml|json> [--name <name>] [--json]
+herdr workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
+herdr workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
+herdr workflow run list <name|id> [--limit N]
+herdr workflow run show <run_id> [--json]
+herdr workflow run cancel <run_id>
+herdr workflow node show <run_id> <path> [--json]
+herdr workflow node steer <run_id> <path> <text>
+herdr workflow node interrupt <run_id> <path>
+herdr workflow node restart <run_id> <path>
+herdr workflow node complete [--result-file <path>]
+```
+
+`show`、`create`、`update`、`run start`、`run show` 和 `node show` 默认输出人类可读文本;传入 `--json` 可改为输出机器可读的信封结构。不带 `--json` 的 `show` 会渲染工作流摘要、版本历史,以及头版本的节点/边/声明的参数。不带 `--json` 的 `run show` 会在运行暂停或某个节点需要处理时,指出负责的节点及其 blocker 原因和恢复条件。`run start` 会在运行开始前拒绝工作流未声明的 `--arg` 键,而不是默默丢弃它。
+
 ## 集成
 
 ```bash
