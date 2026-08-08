@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.10.0] - 2026-08-08
+
 ### Added
 - Workflow runs can now grow their own graph while executing. A node marked `is_template = true` is never scheduled directly; a node that declares `expand_allow = [...]` and `expand_max = N` can ask for instances of those templates with `kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]`, authenticated by the same `KARVEX_WORKFLOW_NODE_TOKEN` `kvx workflow node complete` reads, so a node can only propose on its own behalf. A node proposes and Karvex decides: every proposal is judged against the proposing node's `expand_allow` and `expand_max`, then the run's `max_depth` and `max_nodes`. Children are created as `<parent>/<template>/<n>`, numbered from 1 per parent and template, and start only once their parent has settled. `expand_max` defaults to `0`, so expansion is opt-in per node and counts cumulatively across every proposal that node makes. `--input KEY=VALUE` overrides one `{{slot}}` of the template's `prompt_template`; a key naming no declared slot is refused rather than quietly ignored. `expand_allow` is validated at authoring time, so a key naming a node that does not exist, or one that is not a template, is rejected by `workflow.create`.
 - An accepted expansion child inherits a copy of its parent's outbound edges, so the fan-in node downstream of a proposing node waits for the whole generation instead of for the parent alone. Draw the fan-in edge from the proposing node; a template's own edges are dropped when the run graph is built, and a node reachable only through a template is still rejected at authoring time as unreachable.
