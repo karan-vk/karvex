@@ -1537,6 +1537,11 @@
               ],
               "description": "The last growth limit this node ran into as a *proposer*."
             },
+            "label": {
+              "default": "",
+              "description": "The node's own name: an expansion child's accepted `--label`, or the\nauthored kvdag label for a static node. A property of the *instance*,\nnot of `node_key` — a generation cut from one template shares the key,\nso a reader that names nodes by key names them all the same\n(`04-kvdag-and-execution.md` §3.4, 2026-08-08 amendment). A shared\nruntime fact, so it belongs on the API and not only in TUI state.",
+              "type": "string"
+            },
             "model": {
               "type": "string"
             },
@@ -12237,6 +12242,11 @@
                 }
               ],
               "description": "The last growth limit this node ran into as a *proposer*."
+            },
+            "label": {
+              "default": "",
+              "description": "The node's own name: an expansion child's accepted `--label`, or the\nauthored kvdag label for a static node. A property of the *instance*,\nnot of `node_key` — a generation cut from one template shares the key,\nso a reader that names nodes by key names them all the same\n(`04-kvdag-and-execution.md` §3.4, 2026-08-08 amendment). A shared\nruntime fact, so it belongs on the API and not only in TUI state.",
+              "type": "string"
             },
             "model": {
               "type": "string"

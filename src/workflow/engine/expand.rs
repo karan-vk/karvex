@@ -557,6 +557,14 @@ pub fn commit_with_proposal_id(
             idx,
             key: accepted.template.clone(),
             path: accepted.path.clone(),
+            // The two halves of the proposal that describe *this* child rather
+            // than the template it is cut from. They ride on the node because
+            // the prompt is rendered at spawn time, long after the proposal is
+            // journalled: a child whose `RunNode` does not carry them is a
+            // child whose accepted `--label` and `--input` were validated and
+            // then discarded.
+            label: accepted.label.clone(),
+            inputs: accepted.inputs.clone(),
             parent: Some(proposer),
             depth,
             // Pending, not Ready: the parent→child sequence edge below is an
@@ -579,6 +587,8 @@ pub fn commit_with_proposal_id(
             run: run.clone(),
             key: accepted.template.clone(),
             path: accepted.path.clone(),
+            label: accepted.label.clone(),
+            inputs: accepted.inputs.clone(),
             parent: Some(parent_path.clone()),
             depth,
             status: NodeStatus::Pending,
@@ -1491,6 +1501,134 @@ mod tests {
                 .get(&NodeKey::new(TEMPLATE))
                 .map(NodeAssignment::assignment),
             "the child resolves from the run's table, never from a mid-run lookup"
+        );
+    }
+
+    /// The retest's P0 pair: `--label` is a *required* flag and `--input k=v`
+    /// is the only channel by which a proposing node can give its children
+    /// different work, and both used to reach the journal and stop there —
+    /// `commit` built a `RunNode` that carried neither, so the child's prompt
+    /// was rendered from the template alone and every sibling was named after
+    /// the template. A proposing node could then create N children it could
+    /// neither differentiate nor tell apart.
+    #[test]
+    fn a_committed_child_carries_the_proposals_label_and_inputs() {
+        let kvdag = workflow(4, growth(3, 24));
+        let mut graph = run(&kvdag);
+        let parent = idx(&graph, PARENT);
+        let mut asked = proposal(Some(1));
+        asked.label = "Shard: auth".to_string();
+        asked
+            .inputs
+            .insert("focus".to_string(), "src/auth".to_string());
+        let outcome = evaluate(&graph, &kvdag, parent, &asked);
+        let effects = commit(&mut graph, parent, &outcome);
+
+        let child = graph
+            .node(idx(&graph, "fanout/worker/1"))
+            .expect("the child is in the run graph");
+        assert_eq!(child.label, "Shard: auth");
+        assert_eq!(
+            child.inputs.get("focus").map(String::as_str),
+            Some("src/auth"),
+            "the accepted override has to reach the node the prompt is rendered from"
+        );
+
+        let created = store_writes(&effects)
+            .into_iter()
+            .find_map(|write| match write {
+                StoreWrite::RunNodeCreated { label, inputs, .. } => {
+                    Some((label.clone(), inputs.clone()))
+                }
+                _ => None,
+            })
+            .expect("the child's create write");
+        assert_eq!(
+            created.0, "Shard: auth",
+            "persisted, so a restart still knows"
+        );
+        assert_eq!(created.1.get("focus").map(String::as_str), Some("src/auth"));
+    }
+
+    /// One proposal per child is how a fan-out gives each of them different
+    /// work, so two proposals from one parent must not bleed into each other.
+    #[test]
+    fn siblings_keep_the_label_and_inputs_of_their_own_proposal() {
+        let kvdag = workflow(4, growth(3, 24));
+        let mut graph = run(&kvdag);
+        let parent = idx(&graph, PARENT);
+        for (label, focus) in [("Shard: auth", "src/auth"), ("Shard: ui", "src/ui")] {
+            let mut asked = proposal(Some(1));
+            asked.label = label.to_string();
+            asked.inputs.insert("focus".to_string(), focus.to_string());
+            let outcome = evaluate(&graph, &kvdag, parent, &asked);
+            commit(&mut graph, parent, &outcome);
+        }
+
+        let described: Vec<(String, String)> = ["fanout/worker/1", "fanout/worker/2"]
+            .into_iter()
+            .filter_map(|path| graph.node(idx(&graph, path)))
+            .map(|node| {
+                (
+                    node.label.clone(),
+                    node.inputs
+                        .get("focus")
+                        .cloned()
+                        .unwrap_or_else(|| "<none>".to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                ("Shard: auth".to_string(), "src/auth".to_string()),
+                ("Shard: ui".to_string(), "src/ui".to_string()),
+            ],
+            "two children of one parent must be nameable and taskable apart"
+        );
+    }
+
+    /// A `--count 3` proposal is one proposal, so its children share its label
+    /// and its overrides; the instance path is what distinguishes them. This is
+    /// the documented behaviour (`AcceptedExpansion::label`) and is asserted so
+    /// the per-proposal case above cannot be "fixed" by making the whole
+    /// generation share one mutable slot.
+    #[test]
+    fn one_proposal_hands_every_child_it_creates_the_same_description() {
+        let kvdag = workflow(4, growth(3, 24));
+        let mut graph = run(&kvdag);
+        let parent = idx(&graph, PARENT);
+        let mut asked = proposal(Some(2));
+        asked.label = "Shard".to_string();
+        asked.inputs.insert("focus".to_string(), "src/".to_string());
+        let outcome = evaluate(&graph, &kvdag, parent, &asked);
+        commit(&mut graph, parent, &outcome);
+
+        for path in ["fanout/worker/1", "fanout/worker/2"] {
+            let node = graph.node(idx(&graph, path)).expect("the child exists");
+            assert_eq!(node.label, "Shard");
+            assert_eq!(node.inputs.get("focus").map(String::as_str), Some("src/"));
+        }
+    }
+
+    /// A proposal that names no label falls back to the template key rather
+    /// than to nothing: an unnamed box in the DAG is worse than a generic one.
+    #[test]
+    fn a_label_less_proposal_falls_back_to_the_template_key() {
+        let kvdag = workflow(4, growth(3, 24));
+        let mut graph = run(&kvdag);
+        let parent = idx(&graph, PARENT);
+        let mut asked = proposal(Some(1));
+        asked.label = "  ".to_string();
+        let outcome = evaluate(&graph, &kvdag, parent, &asked);
+        commit(&mut graph, parent, &outcome);
+
+        assert_eq!(
+            graph
+                .node(idx(&graph, "fanout/worker/1"))
+                .map(|node| node.label.as_str()),
+            Some("  "),
+            "a whitespace label is carried verbatim; the renderers trim and fall back"
         );
     }
 

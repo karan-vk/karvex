@@ -770,7 +770,7 @@
           "key": "ui.toast.delivery",
           "type": "enum",
           "default": "\"off\"",
-          "description": "Popup notification delivery. off disables popups, karvex shows in-app toasts, terminal asks the outer terminal for a desktop notification, system asks the OS notification service directly.",
+          "description": "Popup notification delivery. off disables popups, karvex shows in-app toasts, terminal asks the outer terminal for a desktop notification, system asks the OS notification service directly. This also gates the in-app workflow growth/run notices in the DAG overlay's popup form; off does not hide them elsewhere — the run banner, the per-node notice, workflow.growth.limited, and run show/node show always report a growth limit regardless of this setting. See the Workflows guide's notices section.",
           "values": [
             "off",
             "karvex",

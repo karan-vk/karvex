@@ -101,6 +101,15 @@ pub struct RunNodeRecord {
     pub run: RunId,
     pub node_key: NodeKey,
     pub instance_path: InstancePath,
+    /// What this instance is called: the authored kvdag label for a static
+    /// node, the proposing node's `--label` for an expansion child. Read off
+    /// the row rather than joined back to the definition, which can only ever
+    /// answer with the template's name — the same name for every sibling of a
+    /// generation.
+    pub label: String,
+    /// The accepted `--input k=v` slot overrides this instance was created
+    /// with; empty for a static node.
+    pub inputs: BTreeMap<String, String>,
     pub depth: u16,
     pub status: NodeStatus,
     pub model: String,
@@ -707,6 +716,8 @@ fn run_node_record(row: records::RunNodeRow) -> Result<RunNodeRecord, StoreError
         run: RunId::new(record_id_to_string(&row.run)),
         node_key: NodeKey::new(row.node_key),
         instance_path: InstancePath::new(row.instance_path),
+        label: row.label,
+        inputs: super::string_map_from_json(&row.inputs),
         depth: row.depth as u16,
         status: parse_node_status(&row.status)?,
         model: row.model,

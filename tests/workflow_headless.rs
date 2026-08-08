@@ -575,27 +575,40 @@ const TEMPLATE: &str = "worker";
 /// A real template that is deliberately outside the proposer's `expand_allow`.
 const DISALLOWED_TEMPLATE: &str = "quarantined";
 
-/// `expand.toml` with its four placeholders resolved: both stub scripts, the
-/// template the proposing node names, and the `--count` it asks for.
+/// One proposal for `count` children under a single label — the shape a
+/// ceiling is reached by, and therefore the shape the truncation and refusal
+/// scenarios use.
+const BATCH: &str = "batch";
+/// `count` proposals of one child each, every one with its own `--label` and
+/// `--input goal=…`. §3.4's fan-out: a node proposes children *and tells each
+/// of them what to work on*.
+const SHARDS: &str = "shards";
+
+/// `expand.toml` with its placeholders resolved: the three stub scripts, the
+/// proposal mode, the template the proposing node names, and the `--count` it
+/// asks for.
 ///
-/// One fixture, three scenarios — the graph is identical and only the proposal
+/// One fixture, four scenarios — the graph is identical and only the proposal
 /// differs, so an assertion about the accepted case and one about the refused
 /// case are comparing the same run shape.
-fn expand_definition_text(template: &str, count: u16) -> String {
+fn expand_definition_text(mode: &str, template: &str, count: u16) -> String {
     let fanout_stub = fixture_dir().join("expand_stub.sh");
-    assert!(
-        fanout_stub.exists(),
-        "missing fan-out stub at {}",
-        fanout_stub.display()
-    );
+    let worker_stub = fixture_dir().join("expand_worker_stub.sh");
+    for stub in [&fanout_stub, &worker_stub] {
+        assert!(stub.exists(), "missing stub at {}", stub.display());
+    }
     let text = definition_text("expand.toml")
         .replace("@FANOUT@", &fanout_stub.to_string_lossy())
+        .replace("@WORKER@", &worker_stub.to_string_lossy())
+        .replace("@MODE@", mode)
         .replace("@TEMPLATE@", template)
         .replace("@COUNT@", &count.to_string());
-    assert!(
-        !text.contains("@FANOUT@") && !text.contains("@TEMPLATE@") && !text.contains("@COUNT@"),
-        "unresolved placeholder in expand.toml"
-    );
+    for placeholder in ["@FANOUT@", "@WORKER@", "@MODE@", "@TEMPLATE@", "@COUNT@"] {
+        assert!(
+            !text.contains(placeholder),
+            "unresolved {placeholder} in expand.toml"
+        );
+    }
     text
 }
 
@@ -607,11 +620,16 @@ fn expand_definition_text(template: &str, count: u16) -> String {
 /// so this is the only way to assert what the node was actually told. Read as
 /// the whole response envelope, exactly as `--json` printed it.
 fn expand_verdict(socket: &Path, run_id: &str) -> Value {
-    let node = node_get(socket, run_id, PROPOSER);
-    let node_dir = node["node_dir"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the proposing node has no node_dir: {node}"));
-    let verdict_path = Path::new(node_dir).join("expand.json");
+    expand_verdict_file(socket, run_id, "expand.json")
+}
+
+/// The verdict of the `n`th one-child proposal a `shards`-mode proposer made.
+fn expand_shard_verdict(socket: &Path, run_id: &str, n: u16) -> Value {
+    expand_verdict_file(socket, run_id, &format!("expand.{n}.json"))
+}
+
+fn expand_verdict_file(socket: &Path, run_id: &str, file: &str) -> Value {
+    let verdict_path = Path::new(&node_dir_of(socket, run_id, PROPOSER)).join(file);
     let text = poll_until(
         &format!("the proposal verdict at {}", verdict_path.display()),
         SETTLE,
@@ -620,6 +638,41 @@ fn expand_verdict(socket: &Path, run_id: &str) -> Value {
     );
     serde_json::from_str(&text)
         .unwrap_or_else(|err| panic!("the verdict is not JSON ({err}): {text}"))
+}
+
+/// A node's own directory (`04` §4.1), which is where the karvex-written half
+/// of its contract lives: `task.md`, `inputs/`, `output_schema.json`.
+fn node_dir_of(socket: &Path, run_id: &str, path: &str) -> String {
+    let node = node_get(socket, run_id, path);
+    node["node_dir"]
+        .as_str()
+        .unwrap_or_else(|| panic!("node {path} has no node_dir: {node}"))
+        .to_string()
+}
+
+/// The `task.md` karvex rendered for a node: the prompt a teammate actually
+/// reads, with its label as the title and every `{{slot}}` filled.
+fn task_markdown(socket: &Path, run_id: &str, path: &str) -> String {
+    let task = Path::new(&node_dir_of(socket, run_id, path)).join("task.md");
+    fs::read_to_string(&task)
+        .unwrap_or_else(|err| panic!("node {path} has no task.md at {}: {err}", task.display()))
+}
+
+/// Every pane's `label` in the run's workspace, keyed by public pane id. The
+/// pane title is where a node's label reaches the user outside the DAG view.
+fn pane_labels(socket: &Path) -> std::collections::BTreeMap<String, String> {
+    let result = request_ok(socket, &request("req_pane_list", "pane.list", json!({})));
+    result["panes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("pane.list returned no panes: {result}"))
+        .iter()
+        .filter_map(|pane| {
+            Some((
+                pane["pane_id"].as_str()?.to_string(),
+                pane["label"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
 }
 
 /// Accepted instance paths, in the order the response listed them.
@@ -1628,6 +1681,15 @@ fn run_shape(response: &Value) -> Value {
 /// has settled. Without inheritance the run would still succeed — `collect`
 /// would simply start early — so the assertion is on the edge set and the
 /// ordering, not on the status.
+///
+/// **The payload half is asserted here too**, because a topology that is right
+/// while the data underneath it is wrong is the shape the v0.10.0 retest found:
+/// `--input` was validated and discarded, the *required* `--label` was
+/// discarded, and every inherited edge kept the parent's port so one
+/// `inputs/<port>.json` held one contribution and the rest were lost silently.
+/// Each of the three now has an assertion on the surface a user or a teammate
+/// actually reads — the child's rendered `task.md`, its pane title, and the
+/// fan-in node's `inputs/` directory and prompt.
 #[test]
 fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
     let server = spawn_workflow_server("expand-accepted");
@@ -1640,7 +1702,8 @@ fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
     create_workspace(&socket, &server.base);
     let (mut reader, mut seen) = subscribe_expansion(&socket);
 
-    let workflow_id = create_workflow_from_text(&socket, &expand_definition_text(TEMPLATE, 2));
+    let workflow_id =
+        create_workflow_from_text(&socket, &expand_definition_text(SHARDS, TEMPLATE, 2));
     let run_id = start_run(&socket, &workflow_id, "ship the thing");
 
     let started = wait_for_event_matching(
@@ -1670,16 +1733,22 @@ fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
     drain_events(&mut reader, &mut seen, Duration::from_millis(500));
 
     // ── the proposing node's own channel ────────────────────────────────────
-    let verdict = expand_verdict(&socket, &run_id);
+    // Two one-child proposals, each with its own label and its own override,
+    // so the response names one child each and the numbering continues.
+    let mut accepted = Vec::new();
+    for shard in 1..=2 {
+        let verdict = expand_shard_verdict(&socket, &run_id, shard);
+        assert!(
+            rejections(&verdict).is_empty(),
+            "nothing was refused, so nothing may be reported as refused: {verdict}"
+        );
+        accepted.extend(accepted_paths(&verdict));
+    }
     assert_eq!(
-        accepted_paths(&verdict),
+        accepted,
         vec!["fanout/worker/1".to_string(), "fanout/worker/2".to_string()],
         "the response names the children it created, in `<parent>/<template>/<n>` \
-         form with `n` 1-based (§3 frozen interface 8): {verdict}"
-    );
-    assert!(
-        rejections(&verdict).is_empty(),
-        "nothing was refused, so nothing may be reported as refused: {verdict}"
+         form with `n` 1-based (§3 frozen interface 8)"
     );
 
     // ── the event stream ────────────────────────────────────────────────────
@@ -1786,6 +1855,131 @@ fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
          upstream closed at {upstream_ended}"
     );
 
+    // ── P0 1: the accepted `--input` reaches the child's rendered prompt ─────
+    let first_task = task_markdown(&socket, &run_id, "fanout/worker/1");
+    let second_task = task_markdown(&socket, &run_id, "fanout/worker/2");
+    assert!(
+        first_task.contains("Work one shard of: shard-1"),
+        "the child's `{{goal}}` slot must be filled from its proposal's \
+         `--input goal=shard-1`, not from the run argument: {first_task}"
+    );
+    assert!(
+        second_task.contains("Work one shard of: shard-2"),
+        "{second_task}"
+    );
+    for task in [&first_task, &second_task] {
+        assert!(
+            !task.contains("ship the thing"),
+            "the run argument must not survive the child's own override: {task}"
+        );
+    }
+    assert_ne!(
+        first_task, second_task,
+        "a proposing node that cannot give its children different work has no fan-out"
+    );
+
+    // ── P0 2: the required `--label` is the child's name ─────────────────────
+    assert!(
+        first_task.starts_with("# Shard 1\n"),
+        "a child's task.md is titled with its own label: {first_task}"
+    );
+    assert!(second_task.starts_with("# Shard 2\n"), "{second_task}");
+    let labels = pane_labels(&socket);
+    let pane_label_of = |path: &str| -> String {
+        let pane = node_get(&socket, &run_id, path)["pane_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("node {path} has no pane"))
+            .to_string();
+        labels
+            .get(&pane)
+            .unwrap_or_else(|| panic!("pane {pane} of {path} has no label: {labels:?}"))
+            .clone()
+    };
+    let first_pane = pane_label_of("fanout/worker/1");
+    let second_pane = pane_label_of("fanout/worker/2");
+    assert!(
+        first_pane.ends_with("Shard 1") && second_pane.ends_with("Shard 2"),
+        "each child's pane is titled with its own label, not the template's: \
+         {first_pane:?} / {second_pane:?}"
+    );
+    assert_ne!(first_pane, second_pane);
+
+    // A node's name is a shared runtime fact, so it has to be readable over
+    // the JSON API and not only through the TUI's private mirror — otherwise
+    // `run show`/`node show` name a whole generation `worker` while the DAG
+    // names them apart.
+    let named: Vec<String> = ["fanout/worker/1", "fanout/worker/2"]
+        .into_iter()
+        .map(|path| node_get(&socket, &run_id, path)["label"].to_string())
+        .collect();
+    assert_eq!(
+        named,
+        vec!["\"Shard 1\"".to_string(), "\"Shard 2\"".to_string()],
+        "workflow.node.get must carry each child's own label"
+    );
+    let run_nodes = run_get(&socket, &run_id);
+    let listed: BTreeSet<String> = run_nodes["graph"]["nodes"]
+        .as_array()
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| Some(node["label"].as_str()?.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        listed.contains("Shard 1") && listed.contains("Shard 2"),
+        "workflow.run.get lists every node's label too: {listed:?}"
+    );
+
+    // ── P0 3: every inherited edge's payload reaches the fan-in node ─────────
+    let collect_dir = PathBuf::from(node_dir_of(&socket, &run_id, "collect"));
+    let contributors: BTreeSet<String> = fs::read_dir(collect_dir.join("inputs").join("shard"))
+        .unwrap_or_else(|err| {
+            panic!(
+                "the fanned-in port has no per-contributor directory at {}: {err}",
+                collect_dir.join("inputs").join("shard").display()
+            )
+        })
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(
+        contributors,
+        BTreeSet::from([
+            "fanout.json".to_string(),
+            "fanout-worker-1.json".to_string(),
+            "fanout-worker-2.json".to_string(),
+        ]),
+        "all three upstreams fired into the one `shard` port; one file each, and \
+         no contribution may overwrite another"
+    );
+    let index: Value = serde_json::from_str(
+        &fs::read_to_string(collect_dir.join("inputs").join("shard.json"))
+            .expect("the port's own file"),
+    )
+    .expect("the port index is JSON");
+    assert_eq!(
+        index.as_array().map(Vec::len),
+        Some(3),
+        "`inputs/<port>.json` indexes the whole generation: {index}"
+    );
+
+    let collect_task = task_markdown(&socket, &run_id, "collect");
+    for expected in [
+        "fanout/worker/1 reporting on shard-1",
+        "fanout/worker/2 reporting on shard-2",
+    ] {
+        assert!(
+            collect_task.contains(expected),
+            "the fan-in prompt must carry every child's result, not the last \
+             writer's: {expected} missing from {collect_task}"
+        );
+    }
+    assert!(
+        collect_task.contains("[from fanout/worker/1 · Shard 1]"),
+        "each contribution is attributed to the node that produced it: {collect_task}"
+    );
+
     server.shutdown();
 }
 
@@ -1839,7 +2033,7 @@ fn a_truncated_expansion_is_surfaced_and_the_run_still_succeeds() {
     let (mut reader, mut seen) = subscribe_expansion(&socket);
 
     let workflow_id =
-        create_workflow_from_text(&socket, &expand_definition_text(TEMPLATE, REQUESTED));
+        create_workflow_from_text(&socket, &expand_definition_text(BATCH, TEMPLATE, REQUESTED));
     let run_id = start_run_at_tier(&socket, &workflow_id, "shard the corpus", Some("low"));
 
     // ── the one event no client can derive ──────────────────────────────────
@@ -2035,8 +2229,10 @@ fn a_disallowed_template_is_refused_and_creates_nothing() {
     create_workspace(&socket, &server.base);
     let (mut reader, mut seen) = subscribe_expansion(&socket);
 
-    let workflow_id =
-        create_workflow_from_text(&socket, &expand_definition_text(DISALLOWED_TEMPLATE, 2));
+    let workflow_id = create_workflow_from_text(
+        &socket,
+        &expand_definition_text(BATCH, DISALLOWED_TEMPLATE, 2),
+    );
     let run_id = start_run(&socket, &workflow_id, "try to escape the allowlist");
 
     let started = wait_for_event_matching(

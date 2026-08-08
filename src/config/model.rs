@@ -54,6 +54,23 @@ fn default_update_channel() -> UpdateChannelConfig {
     }
 }
 
+/// Popup delivery for background notifications, workflow growth/run notices
+/// among them.
+///
+/// `Off` is the default on purpose and stays that way — including for
+/// workflow notices — per `06-phase2-plan.md` §5 R-11: a workflow growth
+/// rejection is never carried on the toast alone (`04-kvdag-and-execution.md`
+/// §3.4, `06-phase2-plan.md` §4 D11). It is always surfaced on three
+/// non-optional surfaces regardless of this setting — the API
+/// (`workflow.growth.limited` event, `WorkflowRunInfo`/`WorkflowRunNodeInfo`),
+/// the DAG overlay (run banner + per-node notice), and the CLI (`run show` /
+/// `node show`) — so a toast-off stock config never loses the guarantee, only
+/// the popup. Giving workflow notices their own default-on delivery would
+/// split the toast subsystem's default in half; that is the cross-cutting UX
+/// decision R-11 explicitly deferred, not a workflow-specific fix. If a
+/// broader default change ever lands, it belongs to every toast producer, not
+/// this one — see `ui.toast.delivery`'s entry in `config-reference.json` and
+/// the Workflows guide's notices section for what stays visible either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ToastDelivery {

@@ -496,6 +496,14 @@ pub struct WorkflowRunInfo {
 pub struct WorkflowRunNodeInfo {
     pub path: String,
     pub node_key: String,
+    /// The node's own name: an expansion child's accepted `--label`, or the
+    /// authored kvdag label for a static node. A property of the *instance*,
+    /// not of `node_key` — a generation cut from one template shares the key,
+    /// so a reader that names nodes by key names them all the same
+    /// (`04-kvdag-and-execution.md` §3.4, 2026-08-08 amendment). A shared
+    /// runtime fact, so it belongs on the API and not only in TUI state.
+    #[serde(default)]
+    pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_path: Option<String>,
     #[serde(default)]
@@ -831,6 +839,7 @@ mod tests {
         WorkflowRunNodeInfo {
             path: path.into(),
             node_key: "plan".into(),
+            label: "Plan".into(),
             parent_path: None,
             depth: 0,
             status: WorkflowNodeStatus::Succeeded,

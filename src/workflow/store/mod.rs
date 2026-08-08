@@ -100,6 +100,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0002_growth_and_history",
         include_str!("migrations/0002_growth_and_history.surql"),
     ),
+    (
+        "0003_node_identity",
+        include_str!("migrations/0003_node_identity.surql"),
+    ),
 ];
 
 /// Where a store's data lives.
@@ -209,6 +213,8 @@ struct RunNodeCreate {
     run: RunId,
     key: NodeKey,
     path: InstancePath,
+    label: String,
+    inputs: BTreeMap<String, String>,
     parent: Option<InstancePath>,
     depth: u16,
     status: NodeStatus,
@@ -217,6 +223,39 @@ struct RunNodeCreate {
     assignment_reason: String,
     attempt: u8,
     proposal_id: String,
+}
+
+/// A flat `string -> string` map as the JSON object the column holds. The same
+/// shape `workflow_run.args` is written in, so `run_node.inputs` reads back the
+/// way every other authored map does.
+fn string_map_json(map: &BTreeMap<String, String>) -> serde_json::Value {
+    serde_json::Value::Object(
+        map.iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+            .collect(),
+    )
+}
+
+/// The inverse of [`string_map_json`]. A value that is not a string is rendered
+/// as its JSON text rather than dropped: a slot override that reached the
+/// column in an unexpected shape should still reach the prompt, because the
+/// alternative is the silent discard this column exists to end.
+fn string_map_from_json(value: &serde_json::Value) -> BTreeMap<String, String> {
+    value
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let text = match value {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    (key.clone(), text)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The workflow database. Opened lazily on first `workflow.*` use, so a karvex
@@ -823,6 +862,8 @@ impl WorkflowStore {
                 run,
                 key,
                 path,
+                label,
+                inputs,
                 parent,
                 depth,
                 status,
@@ -836,6 +877,8 @@ impl WorkflowStore {
                     run,
                     key,
                     path,
+                    label,
+                    inputs,
                     parent,
                     depth,
                     status,
@@ -1457,7 +1500,7 @@ impl WorkflowStore {
                 .query(
                     "CREATE run_node SET run = $run, kvdag_node = $kvdag_node, \
                      node_key = $node_key, instance_path = $instance_path, \
-                     depth = $depth, status = $status, model = $model, \
+                     label = $label, depth = $depth, status = $status, model = $model, \
                      effort = $effort, demand = $demand, \
                      assignment_reason = $assignment_reason RETURN AFTER",
                 )
@@ -1465,6 +1508,9 @@ impl WorkflowStore {
                 .bind(("kvdag_node", kvdag_node_id.clone()))
                 .bind(("node_key", node.key.to_string()))
                 .bind(("instance_path", node.key.to_string()))
+                // A static node's instance label is the authored one; `inputs`
+                // is left to its `{}` default, since nothing proposed it.
+                .bind(("label", node.label.clone()))
                 .bind(("depth", i64::from(STATIC_NODE_DEPTH)))
                 .bind(("status", node_status_str(status).to_string()))
                 .bind(("model", assignment.model.as_str().to_string()))
@@ -1827,6 +1873,7 @@ impl WorkflowStore {
         // is drawn to its single element.
         const CREATE_NODE: &str = "LET $child = (CREATE run_node SET run = $run, \
              kvdag_node = $kvdag_node, node_key = $node_key, instance_path = $instance_path, \
+             label = $label, inputs = $inputs, \
              parent = $parent, depth = $depth, status = $status, model = $model, \
              effort = $effort, demand = $demand, attempt = $attempt, \
              assignment_reason = $assignment_reason RETURN AFTER);";
@@ -1851,6 +1898,11 @@ impl WorkflowStore {
             .bind(("kvdag_node", kvdag_node_id))
             .bind(("node_key", create.key.to_string()))
             .bind(("instance_path", create.path.to_string()))
+            .bind(("label", create.label.clone()))
+            // Bound as JSON rather than as a typed map: the column is a flat
+            // `string -> string` object and this is the one writer, so the
+            // shape is decided here and read back the same way.
+            .bind(("inputs", string_map_json(&create.inputs)))
             .bind(("parent", parent_id))
             .bind(("depth", i64::from(create.depth)))
             .bind(("status", node_status_str(create.status).to_string()))

@@ -217,10 +217,18 @@ fn project_node(
     DagNodeView {
         idx: node.idx,
         path: node.path.as_str().to_string(),
-        label: node_labels
-            .get(node.key.as_str())
+        // Per instance first, per key second. A generation cut from one
+        // template shares that template's key, so reading the map by key drew
+        // N identical boxes for N children the proposing node had named apart;
+        // `mirror_workflow_run_graph` keys every run node by its instance path
+        // for exactly that reason. The per-key entry stays as the fallback for
+        // a node the run graph does not carry — and a static node's path *is*
+        // its key, so the two can never disagree.
+        label: [node.path.as_str(), node.key.as_str()]
+            .into_iter()
+            .filter_map(|lookup| node_labels.get(lookup))
             .map(|label| label.trim())
-            .filter(|label| !label.is_empty())
+            .find(|label| !label.is_empty())
             .unwrap_or(node.key.as_str())
             .to_string(),
         status: node.status,
@@ -310,6 +318,18 @@ fn to_rect(rect: LayoutRect) -> Rect {
 /// `Down`/`Up` follow the graph — successors and predecessors first — and fall
 /// back to the nearest box in the next/previous band so a disconnected node is
 /// still reachable. `Left`/`Right` move within a band.
+///
+/// A node's graph successors/predecessors are not all one hop away in the
+/// *rendered* layout: `layout()` layers by longest path
+/// (`src/workflow/layout.rs::assign_layers`), so a fan-in node such as
+/// `collect` sits two rows below `fanout` (one past the freshly appended
+/// `worker` row) even though the authored edge from `fanout` to `collect` is
+/// direct. Picking the graph successor nearest in `x` without first asking
+/// which one is in the *nearest row* let that far edge win over the adjacent
+/// one, stranding every node an expansion appends — `Enter`/`s` become
+/// keyboard-unreachable for exactly the nodes dynamic growth creates. Ranking
+/// by row distance first, `x` distance second, restores "the appended row is
+/// adjacent from the parent" for `hjkl`/arrow navigation.
 pub(crate) fn workflow_dag_neighbour(
     view: &DagViewState,
     direction: DagNavDirection,
@@ -323,10 +343,14 @@ pub(crate) fn workflow_dag_neighbour(
     let origin = centre_x(rect);
 
     match direction {
-        DagNavDirection::Down => nearest_by_x(view, &node.successors, origin)
-            .or_else(|| nearest_in_band(view, rect, origin, true)),
-        DagNavDirection::Up => nearest_by_x(view, &node.predecessors, origin)
-            .or_else(|| nearest_in_band(view, rect, origin, false)),
+        DagNavDirection::Down => {
+            nearest_graph_neighbour(view, &node.successors, rect, origin, true)
+                .or_else(|| nearest_in_band(view, rect, origin, true))
+        }
+        DagNavDirection::Up => {
+            nearest_graph_neighbour(view, &node.predecessors, rect, origin, false)
+                .or_else(|| nearest_in_band(view, rect, origin, false))
+        }
         DagNavDirection::Left => same_band(view, rect)
             .filter(|(_, other)| other.x < rect.x)
             .max_by_key(|(_, other)| other.x)
@@ -342,11 +366,45 @@ fn centre_x(rect: LayoutRect) -> u16 {
     rect.x.saturating_add(rect.width / 2)
 }
 
-fn nearest_by_x(view: &DagViewState, candidates: &[RunNodeIdx], origin: u16) -> Option<RunNodeIdx> {
+/// The graph successor/predecessor nearest to `rect` in row order first, `x`
+/// distance second.
+///
+/// `down` selects the direction: successors are asked for the nearest row
+/// *below* `rect` (`Down`), predecessors for the nearest row *above*
+/// (`Up`). A candidate that (defensively — layering should never produce
+/// this for an acyclic graph) sits on the wrong side or shares the row is
+/// skipped rather than treated as an equally good neighbour: it is not
+/// where a `Down`/`Up` press should land.
+fn nearest_graph_neighbour(
+    view: &DagViewState,
+    candidates: &[RunNodeIdx],
+    rect: LayoutRect,
+    origin: u16,
+    down: bool,
+) -> Option<RunNodeIdx> {
     candidates
         .iter()
-        .filter_map(|idx| view.rect_of(*idx).map(|rect| (*idx, rect)))
-        .min_by_key(|(idx, rect)| (centre_x(*rect).abs_diff(origin), rect.x, idx.0))
+        .filter_map(|idx| view.rect_of(*idx).map(|other| (*idx, other)))
+        .filter(|(_, other)| {
+            if down {
+                other.y > rect.y
+            } else {
+                other.y < rect.y
+            }
+        })
+        .min_by_key(|(idx, other)| {
+            let band_distance = if down {
+                other.y.saturating_sub(rect.y)
+            } else {
+                rect.y.saturating_sub(other.y)
+            };
+            (
+                band_distance,
+                centre_x(*other).abs_diff(origin),
+                other.x,
+                idx.0,
+            )
+        })
         .map(|(idx, _)| idx)
 }
 
@@ -779,21 +837,33 @@ fn render_detail(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
             width,
         )));
     }
-    lines.push(Line::from(truncate_spans(
-        vec![
-            Span::styled(" ", dim),
-            Span::styled(
-                node.path.clone(),
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  ", dim),
-            Span::styled(
-                node_status_label(node.status),
-                Style::default().fg(node_status_color(node.status, p)),
-            ),
-        ],
-        width,
-    )));
+    // The node box elides this to whatever fits its fixed ~20-column title
+    // row (`render_nodes` above); the detail strip is the one place selecting
+    // that node is guaranteed to show the *whole* limit, because it is the
+    // strip's own width, not a box's, that bounds `truncate_spans` here. A
+    // growth notice sharing this line rather than claiming a row of its own
+    // keeps `DETAIL_HEIGHT` a true constant — no per-node content changes how
+    // much of the overlay's fixed budget the strip needs.
+    let mut path_status = vec![
+        Span::styled(" ", dim),
+        Span::styled(
+            node.path.clone(),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", dim),
+        Span::styled(
+            node_status_label(node.status),
+            Style::default().fg(node_status_color(node.status, p)),
+        ),
+    ];
+    if let Some(notice) = &node.growth_notice {
+        path_status.push(Span::styled("  ", dim));
+        path_status.push(Span::styled(
+            notice.clone(),
+            Style::default().fg(p.peach).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(truncate_spans(path_status, width)));
     lines.push(Line::from(truncate_spans(
         vec![
             Span::styled(" ", dim),
@@ -1006,6 +1076,8 @@ mod tests {
             idx: RunNodeIdx(idx),
             key: NodeKey::new(key),
             path: InstancePath::new(key),
+            label: String::new(),
+            inputs: std::collections::BTreeMap::new(),
             parent: None,
             depth: 0,
             status: NodeStatus::Pending,
@@ -1233,6 +1305,149 @@ mod tests {
             Some(left)
         );
         assert_eq!(workflow_dag_neighbour(&view, DagNavDirection::Right), None);
+    }
+
+    /// Regression for the retest P1: `fanout` proposes `worker`, and `collect`
+    /// sits downstream of `fanout` on a direct authored data edge
+    /// (`tests/fixtures/workflow/expand.toml`, mirroring
+    /// `04-kvdag-and-execution.md` §3.4's fan-in inheritance — `collect` also
+    /// inherits an edge from `worker`). `collect` is one authored hop from
+    /// `fanout`, but two *rows* away once `worker` is materialised, because
+    /// `layout()` layers by longest path
+    /// (`src/workflow/layout.rs::assign_layers`). Before the fix, `Down` from
+    /// `fanout` picked whichever successor was nearest in `x` regardless of
+    /// row and landed on `collect`, skipping the entire appended `worker` row
+    /// — exactly the frames the retest captured (`dag-02` → `dag-03`).
+    #[test]
+    fn navigation_reaches_an_expansion_child_before_its_downstream_fan_in() {
+        let graph = RunGraph {
+            run_id: RunId::new("workflow_run:1"),
+            version_id: KvdagVersionId::new("v1"),
+            tier: Tier::Auto,
+            growth: GrowthLimits::default(),
+            assignments: std::collections::BTreeMap::new(),
+            nodes: vec![
+                test_node(0, "fanout"),
+                test_node(1, "collect"),
+                test_node(2, "worker"),
+            ],
+            edges: vec![
+                // Authored: fanout -> collect, direct.
+                test_edge(0, 1),
+                // Spawned by expansion: fanout -> worker.
+                test_edge(0, 2),
+                // Inherited fan-in: worker -> collect, so collect waits on
+                // the whole generation (§3.4).
+                test_edge(2, 1),
+            ],
+            status: RunStatus::Running,
+            seq: 0,
+        };
+        let fanout = RunNodeIdx(0);
+        let collect = RunNodeIdx(1);
+        let worker = RunNodeIdx(2);
+
+        let mut view = view_of(&graph, Rect::new(0, 0, 120, 40));
+        view.selected = Some(fanout);
+
+        // collect is a genuine graph successor of fanout, but it renders two
+        // rows down; worker renders one row down and must win.
+        assert_eq!(
+            workflow_dag_neighbour(&view, DagNavDirection::Down),
+            Some(worker),
+            "Down from fanout must reach the appended worker row, not skip to collect"
+        );
+
+        view.selected = Some(worker);
+        assert_eq!(
+            workflow_dag_neighbour(&view, DagNavDirection::Up),
+            Some(fanout),
+            "Up from worker must return to its proposing parent"
+        );
+        assert_eq!(
+            workflow_dag_neighbour(&view, DagNavDirection::Down),
+            Some(collect),
+            "Down from worker still reaches collect, one row below it"
+        );
+    }
+
+    /// The retest's `--label` P0, on the surface that names nodes: a whole
+    /// generation cut from one template shares that template's `key`, so a
+    /// label map read by key drew N identical boxes for N children the
+    /// proposing node had deliberately named apart. `mirror_workflow_run_graph`
+    /// keys per *instance path*; the projection has to read it the same way,
+    /// falling back to the per-key definition entry for a node the run graph
+    /// does not carry.
+    #[test]
+    fn siblings_cut_from_one_template_are_drawn_under_their_own_labels() {
+        let mut graph = diamond();
+        graph.nodes = vec![
+            test_node(0, "fanout"),
+            test_node(1, "worker"),
+            test_node(2, "worker"),
+        ];
+        graph.nodes[1].path = InstancePath::new("fanout/worker/1");
+        graph.nodes[2].path = InstancePath::new("fanout/worker/2");
+        graph.edges = vec![test_edge(0, 1), test_edge(0, 2)];
+
+        let presentation = WorkflowRunPresentation {
+            workflow_name: String::new(),
+            node_labels: std::collections::HashMap::from([
+                // The definition's per-key entry — the fallback, and the only
+                // thing the broken lookup ever saw.
+                ("worker".to_string(), "Worker".to_string()),
+                ("fanout".to_string(), "Fan out".to_string()),
+                // What the proposals actually named these two children.
+                ("fanout/worker/1".to_string(), "Shard: auth".to_string()),
+                ("fanout/worker/2".to_string(), "Shard: ui".to_string()),
+            ]),
+            delivery_failures: std::collections::HashMap::new(),
+            growth_banner: None,
+            growth_notices: std::collections::HashMap::new(),
+        };
+
+        let drawn: Vec<String> = graph
+            .nodes
+            .iter()
+            .map(|node| project_node(&graph, node, &presentation, 0).label)
+            .collect();
+        assert_eq!(
+            drawn,
+            vec![
+                "Fan out".to_string(),
+                "Shard: auth".to_string(),
+                "Shard: ui".to_string(),
+            ],
+            "two children of one template must not be drawn as the same box"
+        );
+    }
+
+    /// A static node's path *is* its key, so the per-key definition entry has
+    /// to keep working — and a run graph that carries no per-path label at all
+    /// (an older mirror, a node the definition alone describes) must still be
+    /// named rather than falling through to the bare key.
+    #[test]
+    fn a_static_node_still_reads_its_definition_label() {
+        let graph = diamond();
+        let presentation = WorkflowRunPresentation {
+            workflow_name: String::new(),
+            node_labels: std::collections::HashMap::from([(
+                graph.nodes[0].key.as_str().to_string(),
+                "Plan".to_string(),
+            )]),
+            delivery_failures: std::collections::HashMap::new(),
+            growth_banner: None,
+            growth_notices: std::collections::HashMap::new(),
+        };
+        assert_eq!(
+            project_node(&graph, &graph.nodes[0], &presentation, 0).label,
+            "Plan"
+        );
+        assert_eq!(
+            project_node(&graph, &graph.nodes[1], &presentation, 0).label,
+            graph.nodes[1].key.as_str(),
+            "no label anywhere still falls back to the key, not to an empty box"
+        );
     }
 
     #[test]
@@ -1820,6 +2035,37 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("cap 4"), "{screen}");
+    }
+
+    /// Regression for the retest P2: the node box has exactly one interior
+    /// row shared with the status text (`NODE_HEIGHT`,
+    /// `workflow/layout.rs`), so a growth notice longer than the box's title
+    /// width is elided there — by design, and covered above. The retest found
+    /// the detail strip did not pick up the slack: selecting the node that
+    /// hit the limit showed path/status/model/usage/result and no growth
+    /// line at all, so the limit "renders but conveys nothing"
+    /// (`06-phase2-plan.md` §4 D11's guarantee needs *one* surface to carry
+    /// the full text, not just the fact that a limit exists). The detail
+    /// strip is the overlay's one band wide enough to carry it whole.
+    #[test]
+    fn detail_strip_carries_the_full_growth_notice_the_node_box_elides() {
+        let mut view = view_of(&diamond(), Rect::new(0, 0, 100, 30));
+        let long_notice =
+            "growth limited: max_nodes 12 · 6 of 8 requested nodes created for this proposal";
+        if let Some(node) = view.nodes.first_mut() {
+            node.growth_notice = Some(long_notice.to_string());
+        }
+        assert_eq!(
+            view.selected,
+            Some(RunNodeIdx(0)),
+            "start is selected by default"
+        );
+
+        let screen = screen_of(&view, Rect::new(0, 0, 100, 30));
+        assert!(
+            screen.contains(long_notice),
+            "detail strip must render the whole growth notice, not the node box's elided form: {screen}"
+        );
     }
 
     /// Selection is carried by instance path (`carried_selection`), which is

@@ -308,6 +308,59 @@ Proposal → guardrail → commit. A node **cannot create nodes**; it proposes.
    karvex is the spawner, there is no nesting ceiling to work around — the
    ceiling is `max_depth`, which is karvex's own, configurable, and visible.
 
+**Amendment, 2026-08-08 — what an accepted proposal carries into the child.**
+Step 1 lists `label` and `inputs` on the proposal and step 3 said only that a
+`RunNode` is created. That left the payload half unstated, and the v0.10.0
+implementation reported both and then discarded both: the `--input` overrides
+reached the `expand_accepted` journal entry and nothing else, and the label was
+resolved per *kvdag key* at render time, so every sibling of a generation was
+named after the template. A node could propose N children but could neither give
+them different work nor tell them apart. The rule is therefore explicit:
+
+- The accepted `label` and `inputs` are **properties of the child instance**.
+  They are carried on its `RunNode`, persisted on its `run_node` row, and read
+  from there by every surface that names a node (DAG box, pane title,
+  `claude --name`, the `task.md` title) and by the one renderer that fills
+  `{{slot}}`s. A label resolved per key, or an override read from the journal,
+  is a bug.
+- `inputs` **overrides** the run argument of the same name for that child only,
+  and is the highest-precedence slot source: run-arg default < run argument <
+  inbound port < proposal `inputs`. It is already validated against the
+  template's declared slots at acceptance (§4 D3), so nothing else re-checks it.
+- One proposal describes one *batch*: `count: n` creates n children that share
+  the proposal's label and overrides, distinguished by instance path. A fan-out
+  that wants n differently-tasked children makes n proposals. This is what makes
+  `--label`/`--input` per-proposal rather than per-child, and it is why the
+  end-to-end fixture proposes once per shard.
+
+**Amendment, 2026-08-08 — a fan-in port carries a generation, not a node.**
+Step 3's inherited edges preserve the fan-in point by giving every child a copy
+of the parent's outbound edges, port and all. §4.1's `inputs/<port>.json` was
+written as though a port had one source, so N inherited edges wrote one file N
+times and the fan-in node saw only the last writer — silent loss of a whole
+generation minus one. A port is therefore a **list of contributions**, each
+attributed to the instance path that produced it:
+
+| Contributors on a port | `inputs/` shape |
+|---|---|
+| 1 (the ordinary authored edge) | `inputs/<port>.json` **is** the payload — unchanged |
+| ≥ 2 (a fan-in) | `inputs/<port>/<source>.json` per contributor, one payload each, plus `inputs/<port>.json` as the ordered index `[{from, label, file, payload}, …]` |
+
+`<source>` is the contributing instance path sanitised the way a directory
+segment is (`fanout/worker/1` → `fanout-worker-1`), disambiguated with a digest
+when sanitising two paths collides — two contributions may never resolve to one
+file. Contributions are ordered by **node-creation order**, which is the order a
+generation was proposed in and the order the DAG lays it out; ordering by path
+string would read `worker/10` before `worker/2`.
+
+The consuming `{{port}}` slot aggregates the same list: one contributor renders
+exactly as before, and several render as one attributed block each, joined by a
+blank line and framed `[from <instance path> · <label>]` — the frame §5.1
+already uses for cross-node text, so a teammate reads one convention. `task.md`'s
+`## Inputs` section states the contribution count and lists every per-contributor
+file, so a node cannot read one of five and report as though it had read all
+five.
+
 **Defaults and the narrowing rule.** `kvdag_version` carries the authoritative
 limits, defaulting to `max_depth = 3`, `max_nodes = 24` (`03-storage-schema.md`
 §4.1). `expand_max` defaults to **0** — expansion is opt-in per node, matching
@@ -339,7 +392,7 @@ Each `run_node` gets `<run dir>/<instance path>/` containing:
 | File | Written by | Purpose |
 |---|---|---|
 | `task.md` | karvex | rendered prompt: contract + role + filled `{{port}}` slots |
-| `inputs/*.json` | karvex | upstream checkpoint summaries (or full payloads for `payload: full` edges) |
+| `inputs/*.json` | karvex | upstream checkpoint summaries (or full payloads for `payload: full` edges); one file per inbound port, plus `inputs/<port>/<source>.json` per contributor when several upstreams fan into one port (§3.4 amendment) |
 | `output_schema.json` | karvex | the JSON Schema the result must satisfy |
 | `result.json` | the node | the node's structured result |
 | `artifacts/` | the node | anything large; indexed into the checkpoint |

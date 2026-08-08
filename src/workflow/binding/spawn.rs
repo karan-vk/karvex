@@ -206,6 +206,117 @@ impl NodeDirLayout {
     pub fn input_file(&self, port: &str) -> PathBuf {
         self.inputs.join(format!("{}.json", path_segment(port)))
     }
+
+    /// `inputs/<port>/` — where a port that several upstreams fanned into keeps
+    /// one file per contributor (§4.1, 2026-08-08 amendment).
+    ///
+    /// Never collides with [`Self::input_file`]: that path always ends in
+    /// `.json` and this one never does.
+    pub fn port_dir(&self, port: &str) -> PathBuf {
+        self.inputs.join(path_segment(port))
+    }
+
+    /// `inputs/<port>/<stem>.json`, the file one contributor's payload is
+    /// written to. `stem` comes from [`input_source_stems`], which is what keeps
+    /// two contributors from resolving to the same name.
+    pub fn input_source_file(&self, port: &str, stem: &str) -> PathBuf {
+        self.port_dir(port).join(format!("{stem}.json"))
+    }
+}
+
+/// `inputs/<port>`, relative to the node directory, in the same sanitised
+/// spelling [`NodeDirLayout::port_dir`] writes to — so `task.md` and the
+/// `inputs/<port>.json` index can only ever name files that exist.
+pub fn port_dir_relative(port: &str) -> String {
+    format!("{INPUTS_DIR}/{}", path_segment(port))
+}
+
+/// One upstream's contribution to a single inbound port.
+///
+/// A port used to be a `port -> payload` entry, which silently held only the
+/// last writer once §3.4's inherited fan-in gave one port several sources: a
+/// whole generation of children collapsed to one file. The contributing node is
+/// therefore part of the value, not a key that can be overwritten.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortContribution {
+    /// The contributing node's instance path — unique in a run, which is what
+    /// makes it the identity a per-contributor file is named after.
+    pub from: String,
+    /// The contributing node's label, for the human reading `task.md`. May be
+    /// empty; nothing is invented in its place.
+    pub label: String,
+    pub payload: serde_json::Value,
+}
+
+/// File-name stems for one port's contributors, positionally aligned with
+/// `sources`.
+///
+/// The instance path sanitised the same way a directory segment is, which maps
+/// `fanout/worker/1` to `fanout-worker-1`. Sanitising is lossy — `a/b` and `a-b`
+/// both become `a-b` — so a stem that is not unique among *this port's*
+/// contributors is disambiguated with a digest of the path it came from. Two
+/// contributions must never resolve to one file: that is the exact silent loss
+/// this shape exists to end.
+pub fn input_source_stems(sources: &[&str]) -> Vec<String> {
+    let plain: Vec<String> = sources.iter().map(|source| path_segment(source)).collect();
+    plain
+        .iter()
+        .enumerate()
+        .map(|(index, stem)| {
+            let unique = plain
+                .iter()
+                .enumerate()
+                .all(|(other, candidate)| other == index || candidate != stem);
+            if unique {
+                stem.clone()
+            } else {
+                format!("{stem}-{}", short_digest(sources[index]))
+            }
+        })
+        .collect()
+}
+
+/// The text one payload fills a `{{slot}}` with. A summary edge carries a
+/// string already; a full payload renders as the JSON the node also finds under
+/// `inputs/`.
+pub fn payload_text(payload: &serde_json::Value) -> String {
+    match payload {
+        serde_json::Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// What a `{{port}}` slot renders to, for however many upstreams fed the port
+/// (§4.1, 2026-08-08 amendment).
+///
+/// One contributor renders exactly as it always did, so a static graph's prompt
+/// is byte-identical to before. Several render as one block each, attributed
+/// with the same `[karvex · from …]`-shaped frame cross-node messages use, in
+/// the caller's order — node-creation order, so a generation reads the same way
+/// twice. Concatenating them unattributed would leave a fan-in node unable to
+/// tell whose report is whose, and taking only one would be the data loss with
+/// extra steps.
+pub fn port_slot_text(contributions: &[PortContribution]) -> String {
+    match contributions {
+        [] => String::new(),
+        [only] => payload_text(&only.payload),
+        many => many
+            .iter()
+            .map(|contribution| {
+                let attribution = if contribution.label.trim().is_empty() {
+                    format!("[from {}]", contribution.from)
+                } else {
+                    format!(
+                        "[from {} · {}]",
+                        contribution.from,
+                        contribution.label.trim()
+                    )
+                };
+                format!("{attribution}\n{}", payload_text(&contribution.payload))
+            })
+            .collect::<Vec<String>>()
+            .join("\n\n"),
+    }
 }
 
 /// Everything karvex writes into a node directory before the process starts.
@@ -214,8 +325,10 @@ pub struct NodeDirPlan<'a> {
     /// The rendered `task.md` body; see [`TaskDocument`].
     pub task_markdown: &'a str,
     pub output_schema: &'a OutputSchema,
-    /// `port -> upstream checkpoint payload`, written to `inputs/<port>.json`.
-    pub inputs: &'a BTreeMap<String, serde_json::Value>,
+    /// `port -> every upstream that fired into it`, written to
+    /// `inputs/<port>.json` and, when a port has more than one contributor, to
+    /// one `inputs/<port>/<source>.json` per contributor.
+    pub inputs: &'a BTreeMap<String, Vec<PortContribution>>,
 }
 
 /// Creates the node directory and writes the karvex-owned files of §4.1.
@@ -240,12 +353,63 @@ pub fn materialise_node_dir(layout: &NodeDirLayout, plan: &NodeDirPlan<'_>) -> i
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     std::fs::write(&layout.output_schema, format!("{schema}\n"))?;
 
-    for (port, payload) in plan.inputs {
-        let body = serde_json::to_string_pretty(payload)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        std::fs::write(layout.input_file(port), format!("{body}\n"))?;
+    for (port, contributions) in plan.inputs {
+        write_port_inputs(layout, port, contributions)?;
     }
     Ok(())
+}
+
+/// Writes one inbound port's files (§4.1, 2026-08-08 amendment).
+///
+/// A port with a single contributor keeps the original shape exactly:
+/// `inputs/<port>.json` **is** that payload. A port several upstreams fanned
+/// into gets one file per contributor under `inputs/<port>/`, and
+/// `inputs/<port>.json` becomes the ordered index of them — the port still has
+/// one file, and no contribution can overwrite another.
+fn write_port_inputs(
+    layout: &NodeDirLayout,
+    port: &str,
+    contributions: &[PortContribution],
+) -> io::Result<()> {
+    let Some((first, rest)) = contributions.split_first() else {
+        return Ok(());
+    };
+    // A restart reuses the node directory, and this attempt's contributor set
+    // may be smaller than the last one's. A leftover file would read as a
+    // contribution nobody made, so the directory is rebuilt rather than merged.
+    match std::fs::remove_dir_all(layout.port_dir(port)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    if rest.is_empty() {
+        return write_json(&layout.input_file(port), &first.payload);
+    }
+
+    std::fs::create_dir_all(layout.port_dir(port))?;
+    let sources: Vec<&str> = contributions
+        .iter()
+        .map(|contribution| contribution.from.as_str())
+        .collect();
+    let stems = input_source_stems(&sources);
+    let mut index = Vec::with_capacity(contributions.len());
+    for (contribution, stem) in contributions.iter().zip(stems.iter()) {
+        let file = layout.input_source_file(port, stem);
+        write_json(&file, &contribution.payload)?;
+        index.push(serde_json::json!({
+            "from": contribution.from,
+            "label": contribution.label,
+            "file": format!("{}/{stem}.json", port_dir_relative(port)),
+            "payload": contribution.payload,
+        }));
+    }
+    write_json(&layout.input_file(port), &serde_json::Value::Array(index))
+}
+
+fn write_json(file: &Path, value: &serde_json::Value) -> io::Result<()> {
+    let body = serde_json::to_string_pretty(value)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    std::fs::write(file, format!("{body}\n"))
 }
 
 // ── task.md ─────────────────────────────────────────────────────────────────
@@ -262,8 +426,22 @@ pub struct TaskDocument<'a> {
     pub contract: &'a str,
     /// The node's `prompt_template` with every `{{slot}}` already filled.
     pub prompt: &'a str,
-    /// Inbound edge ports that have an `inputs/<port>.json` file.
-    pub input_ports: &'a [String],
+    /// Inbound edge ports that have an `inputs/<port>.json` file, with the
+    /// per-contributor files of a fanned-in port beside them.
+    pub input_ports: &'a [TaskInputPort],
+}
+
+/// One inbound port as `task.md` describes it (§4.1, 2026-08-08 amendment).
+///
+/// `sources` is empty for the ordinary one-edge port, whose file is exactly the
+/// upstream payload. A fanned-in port lists every contributor, so a node told
+/// "here is your input" can see that there are five of them and open any one of
+/// them individually.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskInputPort {
+    pub port: String,
+    /// `(contributing instance path, path relative to the node dir)`.
+    pub sources: Vec<(String, String)>,
 }
 
 impl TaskDocument<'_> {
@@ -285,11 +463,26 @@ impl TaskDocument<'_> {
 
         if !self.input_ports.is_empty() {
             out.push_str("## Inputs\n\n");
-            for port in self.input_ports {
+            for input in self.input_ports {
+                let port = &input.port;
                 out.push_str(&format!(
-                    "- `{port}`: `./{INPUTS_DIR}/{}.json`\n",
+                    "- `{port}`: `./{INPUTS_DIR}/{}.json`",
                     path_segment(port)
                 ));
+                if input.sources.len() > 1 {
+                    // The count is stated rather than left to be counted: a
+                    // fan-in node that reads one of five contributions and
+                    // reports is the failure this section exists to prevent.
+                    out.push_str(&format!(
+                        " — {} contributions, indexed there and one file each:\n",
+                        input.sources.len()
+                    ));
+                    for (from, file) in &input.sources {
+                        out.push_str(&format!("  - `{from}`: `./{file}`\n"));
+                    }
+                } else {
+                    out.push('\n');
+                }
             }
             out.push('\n');
         }
@@ -1043,13 +1236,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn materialise_writes_the_contract_and_clears_a_stale_result() {
-        let base = std::env::temp_dir().join(format!(
+    /// A private directory per test, so the filesystem-touching cases here
+    /// never share a node directory.
+    fn temp_base() -> PathBuf {
+        std::env::temp_dir().join(format!(
             "karvex-workflow-spawn-{}-{}",
             std::process::id(),
             NEXT_TOKEN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
+        ))
+    }
+
+    #[test]
+    fn materialise_writes_the_contract_and_clears_a_stale_result() {
+        let base = temp_base();
         let layout = NodeDirLayout::new(base.join("plan"));
         std::fs::create_dir_all(&layout.root).unwrap();
         std::fs::write(&layout.result, "{\"stale\":true}").unwrap();
@@ -1061,7 +1260,10 @@ mod tests {
         }))
         .unwrap();
         let mut inputs = BTreeMap::new();
-        inputs.insert("plan".to_string(), serde_json::json!({ "summary": "ok" }));
+        inputs.insert(
+            "plan".to_string(),
+            vec![contribution("plan", serde_json::json!({ "summary": "ok" }))],
+        );
 
         materialise_node_dir(
             &layout,
@@ -1087,9 +1289,29 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    /// One contributor on a port, which is what an ordinary single-edge port
+    /// carries.
+    fn contribution(from: &str, payload: serde_json::Value) -> PortContribution {
+        PortContribution {
+            from: from.to_string(),
+            label: String::new(),
+            payload,
+        }
+    }
+
+    fn port(name: &str, sources: &[(&str, &str)]) -> TaskInputPort {
+        TaskInputPort {
+            port: name.to_string(),
+            sources: sources
+                .iter()
+                .map(|(from, file)| ((*from).to_string(), (*file).to_string()))
+                .collect(),
+        }
+    }
+
     #[test]
     fn task_document_names_the_result_contract() {
-        let ports = vec!["plan".to_string()];
+        let ports = vec![port("plan", &[])];
         let rendered = TaskDocument {
             label: "Implement",
             role: "You are the implementer.",
@@ -1109,6 +1331,187 @@ mod tests {
         // The engine's checkpoint summariser reads these two keys.
         assert!(rendered.contains("`summary`"));
         assert!(rendered.contains("`artifacts`"));
+    }
+
+    /// The retest's third P0: §3.4's inherited fan-in gives one port a whole
+    /// generation of contributors, and `inputs/<port>.json` used to be written
+    /// once per port — last writer wins, five of six results gone with nothing
+    /// said. Every contribution must land in its own file, and the port's own
+    /// file must index all of them.
+    #[test]
+    fn a_fanned_in_port_keeps_one_file_per_contributor() {
+        let base = temp_base();
+        let layout = NodeDirLayout::new(base.join("collect"));
+        let schema = OutputSchema::parse(serde_json::json!({ "type": "object" })).unwrap();
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            "shard".to_string(),
+            vec![
+                contribution("fanout/worker/1", serde_json::json!("report one")),
+                contribution("fanout/worker/2", serde_json::json!("report two")),
+                contribution("fanout", serde_json::json!("the plan")),
+            ],
+        );
+
+        materialise_node_dir(
+            &layout,
+            &NodeDirPlan {
+                task_markdown: "# Collect\n",
+                output_schema: &schema,
+                inputs: &inputs,
+            },
+        )
+        .unwrap();
+
+        let read = |path: PathBuf| -> serde_json::Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("{} is missing: {err}", path.display())),
+            )
+            .expect("valid json")
+        };
+        assert_eq!(
+            read(layout.input_source_file("shard", "fanout-worker-1")),
+            serde_json::json!("report one")
+        );
+        assert_eq!(
+            read(layout.input_source_file("shard", "fanout-worker-2")),
+            serde_json::json!("report two")
+        );
+        assert_eq!(
+            read(layout.input_source_file("shard", "fanout")),
+            serde_json::json!("the plan"),
+            "the parent contributes to the same port its children inherited"
+        );
+
+        let index = read(layout.input_file("shard"));
+        let entries = index.as_array().expect("the port file indexes its sources");
+        assert_eq!(
+            entries.len(),
+            3,
+            "no contribution may be overwritten by another: {index}"
+        );
+        assert_eq!(entries[0]["from"], "fanout/worker/1");
+        assert_eq!(entries[0]["file"], "inputs/shard/fanout-worker-1.json");
+        assert_eq!(entries[0]["payload"], serde_json::json!("report one"));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A restart reuses the node directory. A contributor that is no longer
+    /// upstream must not survive as a file the node reads as this attempt's
+    /// input.
+    #[test]
+    fn a_second_materialisation_rebuilds_a_ports_directory() {
+        let base = temp_base();
+        let layout = NodeDirLayout::new(base.join("collect"));
+        let schema = OutputSchema::parse(serde_json::json!({ "type": "object" })).unwrap();
+        let plan_with = |inputs: &BTreeMap<String, Vec<PortContribution>>| {
+            materialise_node_dir(
+                &layout,
+                &NodeDirPlan {
+                    task_markdown: "# Collect\n",
+                    output_schema: &schema,
+                    inputs,
+                },
+            )
+            .unwrap();
+        };
+
+        let mut first = BTreeMap::new();
+        first.insert(
+            "shard".to_string(),
+            vec![
+                contribution("worker/1", serde_json::json!("one")),
+                contribution("worker/2", serde_json::json!("two")),
+            ],
+        );
+        plan_with(&first);
+        assert!(layout.input_source_file("shard", "worker-2").exists());
+
+        let mut second = BTreeMap::new();
+        second.insert(
+            "shard".to_string(),
+            vec![contribution("worker/1", serde_json::json!("one"))],
+        );
+        plan_with(&second);
+        assert!(
+            !layout.input_source_file("shard", "worker-2").exists(),
+            "a stale contributor would read as an input nobody produced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.input_file("shard"))
+                .unwrap()
+                .trim(),
+            "\"one\"",
+            "a port back down to one contributor keeps the original shape"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Sanitising an instance path is lossy, and two contributions resolving to
+    /// one file is the silent loss this shape exists to end.
+    #[test]
+    fn contributor_file_names_are_unique_even_when_sanitising_collides() {
+        assert_eq!(
+            input_source_stems(&["fanout/worker/1", "fanout/worker/2"]),
+            vec!["fanout-worker-1".to_string(), "fanout-worker-2".to_string()]
+        );
+        let colliding = input_source_stems(&["a/b", "a-b"]);
+        assert_eq!(colliding.len(), 2);
+        assert_ne!(
+            colliding[0], colliding[1],
+            "two sources may never name one file: {colliding:?}"
+        );
+        assert!(colliding.iter().all(|stem| stem.starts_with("a-b")));
+    }
+
+    /// The `{{port}}` slot is the other half of the fan-in: a node whose port
+    /// carries a generation must see the whole generation, attributed.
+    #[test]
+    fn a_fanned_in_slot_renders_every_contribution_attributed() {
+        assert_eq!(
+            port_slot_text(&[contribution("plan", serde_json::json!("one step"))]),
+            "one step",
+            "a single contributor renders exactly as it always did"
+        );
+
+        let mut first = contribution("fanout/worker/1", serde_json::json!("auth done"));
+        first.label = "Shard: auth".to_string();
+        let second = contribution("fanout/worker/2", serde_json::json!("ui done"));
+        assert_eq!(
+            port_slot_text(&[first, second]),
+            "[from fanout/worker/1 · Shard: auth]\nauth done\n\n[from fanout/worker/2]\nui done"
+        );
+        assert_eq!(port_slot_text(&[]), "");
+    }
+
+    #[test]
+    fn task_document_lists_every_contributor_of_a_fanned_in_port() {
+        let ports = vec![port(
+            "shard",
+            &[
+                ("fanout/worker/1", "inputs/shard/fanout-worker-1.json"),
+                ("fanout/worker/2", "inputs/shard/fanout-worker-2.json"),
+            ],
+        )];
+        let rendered = TaskDocument {
+            label: "Collect",
+            role: "",
+            contract: "",
+            prompt: "Collect them.",
+            input_ports: &ports,
+        }
+        .render();
+
+        assert!(rendered.contains("- `shard`: `./inputs/shard.json`"));
+        assert!(
+            rendered.contains("2 contributions"),
+            "the count is stated so a node cannot read one of two and report: {rendered}"
+        );
+        assert!(rendered.contains("- `fanout/worker/1`: `./inputs/shard/fanout-worker-1.json`"));
+        assert!(rendered.contains("- `fanout/worker/2`: `./inputs/shard/fanout-worker-2.json`"));
     }
 
     #[test]

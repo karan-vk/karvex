@@ -462,6 +462,8 @@ mod tests {
             idx: RunNodeIdx(idx),
             key: NodeKey::new(key),
             path: InstancePath::new(path),
+            label: String::new(),
+            inputs: std::collections::BTreeMap::new(),
             parent: None,
             depth,
             status: NodeStatus::Pending,

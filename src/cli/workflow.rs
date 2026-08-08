@@ -1223,14 +1223,31 @@ fn print_workflow_run_response(response: &serde_json::Value, json: bool) -> std:
             println!();
             println!("nodes:");
             for node in nodes {
-                let path = node["path"].as_str().unwrap_or("");
-                let status = node["status"].as_str().unwrap_or("");
-                println!("  {path:<28} {status}");
+                println!("{}", format_run_node_line(node));
             }
         }
     }
 
     Ok(0)
+}
+
+/// One node's line under `run show`'s `nodes:` heading.
+///
+/// The label trails the status because the *path* is the identity every other
+/// command takes as an argument, and a fan-out's children differ only in their
+/// label: `fanout/worker/1..3` all read `worker` on every key-derived surface,
+/// which is what made a generation indistinguishable here
+/// (`04-kvdag-and-execution.md` §3.4, 2026-08-08 amendment). Omitted when it
+/// would only repeat the path, so a static node's line is unchanged.
+fn format_run_node_line(node: &serde_json::Value) -> String {
+    let path = node["path"].as_str().unwrap_or("");
+    let status = node["status"].as_str().unwrap_or("");
+    let label = node["label"].as_str().unwrap_or("").trim();
+    if label.is_empty() || label == path {
+        format!("  {path:<28} {status}")
+    } else {
+        format!("  {path:<28} {status:<12} {label}")
+    }
 }
 
 /// One graph node in `needs_attention`/`blocked`/`failed` — the statuses
@@ -1343,6 +1360,12 @@ fn print_workflow_node_response(response: &serde_json::Value, json: bool) -> std
     }
     let node = &response["result"]["node"];
     println!("path:    {}", node["path"].as_str().unwrap_or(""));
+    // Between path and status because it is what a human calls this node; a
+    // static node whose label is its key adds nothing, so it is skipped.
+    let label = node["label"].as_str().unwrap_or("").trim();
+    if !label.is_empty() && label != node["path"].as_str().unwrap_or("") {
+        println!("label:   {label}");
+    }
     println!("status:  {}", node["status"].as_str().unwrap_or(""));
     println!("model:   {}", node["model"].as_str().unwrap_or(""));
     println!("effort:  {}", node["effort"].as_str().unwrap_or(""));
@@ -2051,6 +2074,48 @@ mod tests {
                 run_id: "run-1".to_string(),
                 path: "plan".to_string(),
             })
+        );
+    }
+
+    /// `run show` used to print path + status only, so the three children of a
+    /// fan-out — which differ *only* by label — read as three anonymous rows.
+    /// The label is the one thing that says what each of them was sent to do.
+    #[test]
+    fn run_show_names_each_node_by_its_own_label() {
+        let lines: Vec<String> = [
+            serde_json::json!({"path": "fanout/worker/1", "status": "succeeded", "label": "Shard 1"}),
+            serde_json::json!({"path": "fanout/worker/2", "status": "succeeded", "label": "Shard 2"}),
+            serde_json::json!({"path": "fanout/worker/3", "status": "running", "label": "Shard 3"}),
+        ]
+        .iter()
+        .map(format_run_node_line)
+        .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "  fanout/worker/1              succeeded    Shard 1".to_string(),
+                "  fanout/worker/2              succeeded    Shard 2".to_string(),
+                "  fanout/worker/3              running      Shard 3".to_string(),
+            ],
+            "a generation must not read as three identical rows"
+        );
+    }
+
+    /// A node whose label says nothing the path did not already say keeps the
+    /// original two-column line — the label column is for disambiguation, not
+    /// decoration.
+    #[test]
+    fn run_show_omits_a_label_that_only_repeats_the_path() {
+        assert_eq!(
+            format_run_node_line(
+                &serde_json::json!({"path": "plan", "status": "succeeded", "label": "plan"})
+            ),
+            "  plan                         succeeded"
+        );
+        assert_eq!(
+            format_run_node_line(&serde_json::json!({"path": "plan", "status": "succeeded"})),
+            "  plan                         succeeded",
+            "a wire payload from an older server carries no label at all"
         );
     }
 

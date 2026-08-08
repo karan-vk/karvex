@@ -1180,6 +1180,25 @@ pub struct RunNode {
     pub idx: RunNodeIdx,
     pub key: NodeKey,
     pub path: InstancePath,
+    /// What this **instance** is called: the kvdag node's authored `label` for a
+    /// static node, and the proposing node's `--label` for an expansion child
+    /// (`04-kvdag-and-execution.md` §3.4 step 1).
+    ///
+    /// Per instance, never per key. A generation cut from one template shares a
+    /// key, so a label resolved from the definition names every sibling
+    /// identically — which is the one thing a fan-out must not do. Empty means
+    /// "the author named nothing"; every renderer falls back to the key or the
+    /// instance path, and none of them invents a name here.
+    pub label: String,
+    /// The `{{slot}}` overrides this instance was created with — the `--input
+    /// k=v` half of an expand proposal (§3.4 step 1, `06-phase2-plan.md` §4 D3),
+    /// empty for a static node.
+    ///
+    /// Kept on the node rather than only in the `expand_accepted` journal entry
+    /// because the prompt is rendered at **spawn** time, which is after the
+    /// parent settles: without this the accepted override is validated, audited,
+    /// and then discarded before the child's `task.md` is written.
+    pub inputs: BTreeMap<String, String>,
     pub parent: Option<RunNodeIdx>,
     pub depth: u16,
     pub status: NodeStatus,
@@ -1420,6 +1439,13 @@ pub enum StoreWrite {
         /// The kvdag key this instance is cut from; also `spawned.template_key`.
         key: NodeKey,
         path: InstancePath,
+        /// [`RunNode::label`] — the proposing node's `--label`, persisted so a
+        /// restarted server reads back the name the child actually ran under
+        /// rather than the template's.
+        label: String,
+        /// [`RunNode::inputs`] — the accepted `--input k=v` overrides, persisted
+        /// for the same reason.
+        inputs: BTreeMap<String, String>,
         /// The proposing node. `None` is not expected for an expansion child
         /// and exists only so the variant can also express a create with no
         /// provenance.

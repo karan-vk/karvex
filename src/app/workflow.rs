@@ -42,8 +42,8 @@ use crate::workflow::engine::{DeliveryFailureNote, Engine, EngineConfig};
 use crate::workflow::model::{
     Demand, EdgeKind, EdgePayload, EngineInput, Evidence, GrowthLimits, InstancePath, Kvdag,
     KvdagVersionId, NodeBinding, NodeStatus, NodeToken, NoticeLevel, OutputSchema, PublicPaneId,
-    RunEffect, RunGraph, RunId, RunNode, RunStatus, Runner, SpawnSpec, StoreWrite, Succession,
-    UserNotice, WorkflowEvent, WorkflowId,
+    RunEffect, RunGraph, RunId, RunNode, RunNodeIdx, RunStatus, Runner, SpawnSpec, StoreWrite,
+    Succession, UserNotice, WorkflowEvent, WorkflowId,
 };
 use crate::workflow::tier::Tier;
 
@@ -672,7 +672,10 @@ pub(crate) struct NodeSpawnPlan {
     pub(crate) layout: spawn::NodeDirLayout,
     pub(crate) task_markdown: String,
     pub(crate) output_schema: OutputSchema,
-    pub(crate) inputs: BTreeMap<String, serde_json::Value>,
+    /// `port -> every upstream that fired into it`, in source-path order. A
+    /// port is a list and not a payload because §3.4's inherited fan-in gives
+    /// one port a whole generation of contributors.
+    pub(crate) inputs: BTreeMap<String, Vec<spawn::PortContribution>>,
     pub(crate) transcript_path: PathBuf,
     /// What the node's pane is called in the sidebar and the pane header.
     /// Distinct from `spec.label`, which has to stay unique because it is the
@@ -680,35 +683,68 @@ pub(crate) struct NodeSpawnPlan {
     pub(crate) pane_title: String,
 }
 
-/// The text a `{{slot}}` is filled with. A summary edge carries a string
-/// already; a full payload is rendered as the JSON the node also finds in
-/// `inputs/<port>.json`.
-fn slot_text(payload: &serde_json::Value) -> String {
-    match payload {
-        serde_json::Value::String(text) => text.clone(),
-        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+/// What **this instance** is called, on every surface that names a node.
+///
+/// The run node's own label first — for an expansion child that is the `--label`
+/// the proposing node was required to supply, and it is the only thing that
+/// distinguishes one sibling of a generation from another. The definition's
+/// authored label is the fallback for a node whose instance carries none (a run
+/// graph restored by an older karvex, say), and the kvdag key is the last one.
+/// Nothing here invents a name.
+pub(crate) fn workflow_node_label<'a>(definition: &'a Kvdag, node: &'a RunNode) -> &'a str {
+    let instance = node.label.trim();
+    if !instance.is_empty() {
+        return instance;
     }
+    let authored = definition
+        .node(&node.key)
+        .map(|spec| spec.label.trim())
+        .unwrap_or_default();
+    if authored.is_empty() {
+        node.key.as_str()
+    } else {
+        authored
+    }
+}
+
+/// One port's per-contributor files as `task.md` lists them, empty for the
+/// ordinary single-edge port whose file is exactly the upstream payload.
+fn task_input_sources(
+    port: &str,
+    contributions: &[spawn::PortContribution],
+) -> Vec<(String, String)> {
+    if contributions.len() < 2 {
+        return Vec::new();
+    }
+    let sources: Vec<&str> = contributions
+        .iter()
+        .map(|contribution| contribution.from.as_str())
+        .collect();
+    spawn::input_source_stems(&sources)
+        .into_iter()
+        .zip(sources.iter())
+        .map(|(stem, from)| {
+            (
+                (*from).to_string(),
+                format!("{}/{stem}.json", spawn::port_dir_relative(port)),
+            )
+        })
+        .collect()
 }
 
 /// `SpawnSpec::label` becomes both `claude --name` and the karvex agent name, so
 /// it has to be unique among the run's live agents. Node labels are not unique
-/// by construction; the instance path always is.
+/// by construction — a proposing node may hand its whole generation one label —
+/// and the instance path always is.
 fn workflow_agent_name(graph: &RunGraph, definition: &Kvdag, node: &RunNode) -> String {
-    let label = definition
-        .node(&node.key)
-        .map(|spec| spec.label.trim())
-        .unwrap_or_default();
+    let label = workflow_node_label(definition, node);
     if label.is_empty() {
         return node.path.to_string();
     }
     let duplicated = graph
         .nodes
         .iter()
-        .filter(|other| {
-            definition
-                .node(&other.key)
-                .is_some_and(|spec| spec.label.trim() == label)
-        })
+        .filter(|other| workflow_node_label(definition, other) == label)
         .count()
         > 1;
     if duplicated {
@@ -1015,10 +1051,13 @@ impl App {
     /// is tens of nodes.
     fn mirror_workflow_run_graph(&mut self) {
         let graph = self.workflow.graph().cloned();
-        // The run graph carries node keys, not the labels the author wrote, so
-        // the definition's labels are mirrored alongside it — otherwise the
-        // overlay can only ever show a key the author already named better.
-        let labels = self
+        // Labels are mirrored **per instance**, keyed by instance path, because
+        // a generation cut from one template shares a key: keying by key drew
+        // six identically labelled boxes for six children the proposing node had
+        // deliberately named apart. The definition's labels are still mirrored
+        // under their keys, as the fallback for a node the graph does not carry
+        // — a static node's path *is* its key, so the two never disagree.
+        let mut labels: std::collections::HashMap<String, String> = self
             .workflow
             .definition()
             .map(|kvdag| {
@@ -1029,6 +1068,15 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        if let (Some(graph), Some(definition)) = (self.workflow.graph(), self.workflow.definition())
+        {
+            for node in &graph.nodes {
+                labels.insert(
+                    node.path.to_string(),
+                    workflow_node_label(definition, node).to_string(),
+                );
+            }
+        }
         // A refused delivery lives on the engine, not in the run graph, so it
         // is mirrored the same way the labels are — otherwise the only surface
         // that shows a node's state cannot show that its last steer was
@@ -1428,12 +1476,21 @@ impl App {
             .node(&node.key)
             .ok_or_else(|| format!("the definition has no node {}", node.key))?;
 
-        let mut inputs: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        // Every upstream that fired into a port, not just the last one. §3.4's
+        // inherited fan-in gives one port a whole generation of sources, and
+        // keying by port alone made each child's result overwrite its sibling's
+        // — `collect` saw one report and the other N-1 were lost with nothing
+        // said on any surface.
+        let mut inputs: BTreeMap<String, Vec<(RunNodeIdx, spawn::PortContribution)>> =
+            BTreeMap::new();
         for edge in graph.edges.iter().filter(|edge| edge.to == node.idx) {
             let (Some(port), true) = (edge.port.as_ref(), edge.fired) else {
                 continue;
             };
-            let Some(result) = graph.node(edge.from).and_then(|from| from.result.as_ref()) else {
+            let Some(from) = graph.node(edge.from) else {
+                continue;
+            };
+            let Some(result) = from.result.as_ref() else {
                 continue;
             };
             let payload = match edge.payload {
@@ -1441,8 +1498,32 @@ impl App {
                 EdgePayload::Summary => serde_json::Value::String(result.summary.clone()),
                 EdgePayload::None => continue,
             };
-            inputs.insert(port.clone(), payload);
+            inputs.entry(port.clone()).or_default().push((
+                from.idx,
+                spawn::PortContribution {
+                    from: from.path.to_string(),
+                    label: workflow_node_label(definition, from).to_string(),
+                    payload,
+                },
+            ));
         }
+        // Node-creation order — the order a generation was proposed in, and the
+        // order the DAG lays it out. Sorting by instance path would read
+        // `worker/10` before `worker/2`, and edge order alone is an
+        // implementation detail of how the graph was built.
+        let inputs: BTreeMap<String, Vec<spawn::PortContribution>> = inputs
+            .into_iter()
+            .map(|(port, mut contributions)| {
+                contributions.sort_by_key(|(idx, _)| idx.0);
+                (
+                    port,
+                    contributions
+                        .into_iter()
+                        .map(|(_, contribution)| contribution)
+                        .collect(),
+                )
+            })
+            .collect();
 
         let mut slots: BTreeMap<String, String> = BTreeMap::new();
         for arg in &definition.args {
@@ -1455,8 +1536,15 @@ impl App {
         }
         // An inbound port beats a run argument of the same name: the graph's own
         // data flow is the more specific source.
-        for (port, payload) in &inputs {
-            slots.insert(port.clone(), slot_text(payload));
+        for (port, contributions) in &inputs {
+            slots.insert(port.clone(), spawn::port_slot_text(contributions));
+        }
+        // The proposal's `--input k=v` wins over both (`06-phase2-plan.md` §4
+        // D3): it is the one channel by which a proposing node can give each of
+        // its children different work, and it was already validated against this
+        // template's declared slots when the proposal was accepted.
+        for (name, value) in &node.inputs {
+            slots.insert(name.clone(), value.clone());
         }
 
         let contract = match spec_node.system_contract.as_deref() {
@@ -1466,9 +1554,19 @@ impl App {
             _ => definition.contract.clone(),
         };
         let prompt = spawn::fill_slots(&spec_node.prompt_template, &slots);
-        let input_ports: Vec<String> = inputs.keys().cloned().collect();
+        let input_ports: Vec<spawn::TaskInputPort> = inputs
+            .iter()
+            .map(|(port, contributions)| spawn::TaskInputPort {
+                port: port.clone(),
+                sources: task_input_sources(port, contributions),
+            })
+            .collect();
+        let node_label = workflow_node_label(definition, node);
         let task_markdown = spawn::TaskDocument {
-            label: &spec_node.label,
+            // The instance's own label, not the template's: a fan-out's whole
+            // point is that its children are told apart, and `task.md`'s title
+            // is the first place a teammate reads its own name.
+            label: node_label,
             role: &spec_node.role,
             contract: &contract,
             prompt: &prompt,
@@ -1483,12 +1581,10 @@ impl App {
             .map_err(|err| format!("the node's transcript path is unknown: {err}"))?;
         let label = workflow_agent_name(graph, definition, node);
         // The pane title names the workflow and the node, so a run's splits are
-        // told apart from each other and from the user's own panes. The kvdag
-        // label is what the author wrote; the key is the honest fallback.
-        let node_title = match spec_node.label.trim() {
-            "" => node.key.as_str(),
-            authored => authored,
-        };
+        // told apart from each other and from the user's own panes. The
+        // instance's label is what the author — or the proposing node — called
+        // *this* node; the key is the honest fallback.
+        let node_title = node_label;
         let pane_title = spawn::node_pane_title(
             self.state
                 .workflow_run_presentation()
@@ -1773,6 +1869,14 @@ impl App {
         Some(WorkflowRunNodeInfo {
             path: node.path.to_string(),
             node_key: node.key.to_string(),
+            // Resolved the same way every other naming surface resolves it:
+            // instance label first, authored kvdag label second, key last.
+            label: self
+                .workflow
+                .definition()
+                .map(|definition| workflow_node_label(definition, node))
+                .unwrap_or(node.key.as_str())
+                .to_string(),
             parent_path: node
                 .parent
                 .and_then(|parent| graph.node(parent))
@@ -3104,12 +3208,264 @@ mod tests {
             .workflow_spawn_plan(&InstancePath::new("implement"), PathBuf::from("/repo"))
             .expect("the downstream node plans a spawn");
         assert_eq!(
-            plan.inputs.get("plan").and_then(|value| value.as_str()),
+            plan.inputs
+                .get("plan")
+                .and_then(|contributions| contributions.first())
+                .and_then(|contribution| contribution.payload.as_str()),
             Some("ship the api"),
             "a summary edge writes the upstream summary to inputs/<port>.json"
         );
         assert!(plan.task_markdown.contains("Implement ship the api"));
         assert!(plan.task_markdown.contains("`plan`: `./inputs/plan.json`"));
+    }
+
+    /// `fanout → collect` on a `shard` data edge, with a `worker` template
+    /// `fanout` may instantiate. The same shape as
+    /// `tests/fixtures/workflow/expand.toml`, small enough to drive a spawn
+    /// plan directly.
+    fn expandable_definition() -> Kvdag {
+        let mut fanout = definition_node("fanout", Runner::Agent, "plan");
+        fanout.label = "Fan out".to_string();
+        fanout.expand_allow = vec![NodeKey::new("worker")];
+        fanout.expand_max = 4;
+
+        let mut worker = definition_node("worker", Runner::Agent, "report");
+        worker.label = "Worker".to_string();
+        worker.is_template = true;
+        worker.prompt_template = "Work one shard of: {{goal}}".to_string();
+
+        let mut collect = definition_node("collect", Runner::Agent, "report");
+        collect.label = "Collect".to_string();
+        collect.prompt_template = "Collect the reports:\n{{shard}}".to_string();
+
+        Kvdag::try_new(KvdagSpec {
+            version_id: KvdagVersionId::new("kvdag_version:test"),
+            workflow_id: WorkflowId::new("workflow:test"),
+            version: 1,
+            parent: None,
+            contract: "Reply only through result.json.".to_string(),
+            growth: GrowthLimits::default(),
+            args: vec![ArgSpec {
+                name: "goal".to_string(),
+                required: false,
+                default: None,
+                description: String::new(),
+            }],
+            nodes: vec![fanout, worker, collect],
+            edges: vec![KvdagEdge {
+                from: NodeKey::new("fanout"),
+                to: NodeKey::new("collect"),
+                kind: EdgeKind::Data,
+                condition: None,
+                payload: EdgePayload::Summary,
+                port: Some("shard".to_string()),
+            }],
+        })
+        .expect("fixture kvdag is valid")
+    }
+
+    /// Proposes one child of `worker` with its own label and slot override,
+    /// exactly as `kvx workflow node expand --label … --input k=v` does.
+    fn expand_child(app: &mut App, label: &str, goal: &str) {
+        app.apply_workflow_engine_input(EngineInput::ExpandProposed {
+            path: InstancePath::new("fanout"),
+            token: NodeToken::new("token"),
+            proposals: vec![crate::workflow::engine::expand::ExpandProposal {
+                template: NodeKey::new("worker"),
+                label: label.to_string(),
+                inputs: BTreeMap::from([("goal".to_string(), goal.to_string())]),
+                count: Some(1),
+            }],
+        });
+    }
+
+    /// The retest's first two P0s, at the surface a teammate actually reads:
+    /// the accepted `--input` has to reach the child's rendered `task.md`, and
+    /// the required `--label` has to be the child's name in its own prompt and
+    /// on its pane. Before the fix both were validated, journalled, and then
+    /// dropped, so two children of one parent were byte-identical documents
+    /// under one name.
+    #[test]
+    fn an_expansion_childs_task_carries_its_own_label_and_input_override() {
+        let mut app = test_app_with_hub(EventHub::default());
+        app.state.set_workflow_run_name("dgprobe");
+        let definition = expandable_definition();
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+
+        expand_child(&mut app, "Shard: auth", "just src/auth");
+        expand_child(&mut app, "Shard: ui", "just src/ui");
+
+        let first = app
+            .workflow_spawn_plan(
+                &InstancePath::new("fanout/worker/1"),
+                PathBuf::from("/repo"),
+            )
+            .expect("the first child plans a spawn");
+        let second = app
+            .workflow_spawn_plan(
+                &InstancePath::new("fanout/worker/2"),
+                PathBuf::from("/repo"),
+            )
+            .expect("the second child plans a spawn");
+
+        assert!(
+            first
+                .task_markdown
+                .contains("Work one shard of: just src/auth"),
+            "the accepted --input must fill the template slot: {}",
+            first.task_markdown
+        );
+        assert!(
+            second
+                .task_markdown
+                .contains("Work one shard of: just src/ui"),
+            "{}",
+            second.task_markdown
+        );
+        assert_ne!(
+            first.task_markdown, second.task_markdown,
+            "a proposing node with no way to differentiate its children has no fan-out"
+        );
+        assert!(
+            first.task_markdown.starts_with("# Shard: auth\n"),
+            "a child's task.md is titled with its own label: {}",
+            first.task_markdown
+        );
+        assert_eq!(first.pane_title, "dgprobe · Shard: auth");
+        assert_eq!(second.pane_title, "dgprobe · Shard: ui");
+        assert_eq!(
+            first.spec.label, "Shard: auth",
+            "the agent name is the child's label, not the template's"
+        );
+    }
+
+    /// The run argument is the default and the proposal's `--input` is the
+    /// override (`06-phase2-plan.md` §4 D3). A child that renders the run's
+    /// `goal` where its parent asked for a shard is the retest's finding
+    /// exactly.
+    #[test]
+    fn an_expansion_input_overrides_the_run_argument_of_the_same_name() {
+        let mut app = test_app_with_hub(EventHub::default());
+        let definition = expandable_definition();
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+        expand_child(&mut app, "Shard", "just src/auth");
+
+        let plan = app
+            .workflow_spawn_plan(
+                &InstancePath::new("fanout/worker/1"),
+                PathBuf::from("/repo"),
+            )
+            .expect("the child plans a spawn");
+        assert!(plan.task_markdown.contains("just src/auth"));
+        assert!(
+            !plan.task_markdown.contains("ship it"),
+            "the run argument must not win over the child's own override: {}",
+            plan.task_markdown
+        );
+    }
+
+    /// The DAG's label map used to be keyed by kvdag node *key*, so a whole
+    /// generation cut from one template drew as N boxes labelled alike. It is
+    /// keyed by instance path now, and the per-key entries stay as the
+    /// fallback for anything the graph does not carry.
+    #[test]
+    fn the_mirrored_label_map_names_each_expansion_child_individually() {
+        let mut app = test_app_with_hub(EventHub::default());
+        let definition = expandable_definition();
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+        expand_child(&mut app, "Shard: auth", "just src/auth");
+        expand_child(&mut app, "Shard: ui", "just src/ui");
+
+        let labels = &app.state.workflow_run_presentation().node_labels;
+        assert_eq!(
+            labels.get("fanout/worker/1").map(String::as_str),
+            Some("Shard: auth")
+        );
+        assert_eq!(
+            labels.get("fanout/worker/2").map(String::as_str),
+            Some("Shard: ui")
+        );
+        assert_eq!(
+            labels.get("fanout").map(String::as_str),
+            Some("Fan out"),
+            "a static node's path is its key, so both lookups agree"
+        );
+        assert_eq!(
+            labels.get("worker").map(String::as_str),
+            Some("Worker"),
+            "the template's own authored label stays as the fallback"
+        );
+    }
+
+    /// The third P0: every child inherits its parent's outbound edge, so
+    /// `collect`'s one `shard` port carries the parent's result *and* the whole
+    /// generation's. Keyed by port alone the last writer won and the rest were
+    /// lost with nothing said on any surface.
+    #[test]
+    fn a_fan_in_node_receives_every_upstream_that_fired_into_one_port() {
+        let mut app = test_app_with_hub(EventHub::default());
+        let definition = expandable_definition();
+        let graph = graph_of(&definition);
+        app.start_workflow_run(active_run(), definition, graph)
+            .expect("the run starts");
+        expand_child(&mut app, "Shard: auth", "just src/auth");
+        expand_child(&mut app, "Shard: ui", "just src/ui");
+
+        for (path, summary) in [
+            ("fanout", "the plan"),
+            ("fanout/worker/1", "auth report"),
+            ("fanout/worker/2", "ui report"),
+        ] {
+            app.bind_workflow_node(&InstancePath::new(path), binding_for(path));
+            app.apply_workflow_engine_input(EngineInput::NodeSelfReport {
+                path: InstancePath::new(path),
+                token: NodeToken::new("token"),
+                result: report(&format!(
+                    r#"{{"plan":"p","report":"r","summary":"{summary}"}}"#
+                )),
+            });
+        }
+
+        let plan = app
+            .workflow_spawn_plan(&InstancePath::new("collect"), PathBuf::from("/repo"))
+            .expect("the fan-in node plans a spawn");
+        let shard = plan
+            .inputs
+            .get("shard")
+            .expect("the fan-in port carries its contributions");
+        assert_eq!(
+            shard
+                .iter()
+                .map(|contribution| contribution.from.as_str())
+                .collect::<Vec<&str>>(),
+            vec!["fanout", "fanout/worker/1", "fanout/worker/2"],
+            "all three upstreams fired into `shard`; none may overwrite another"
+        );
+        for expected in ["the plan", "auth report", "ui report"] {
+            assert!(
+                plan.task_markdown.contains(expected),
+                "the fan-in prompt must carry {expected}: {}",
+                plan.task_markdown
+            );
+        }
+        assert!(
+            plan.task_markdown
+                .contains("[from fanout/worker/1 · Shard: auth]"),
+            "each contribution is attributed to the node that produced it: {}",
+            plan.task_markdown
+        );
+        assert!(
+            plan.task_markdown
+                .contains("`fanout/worker/2`: `./inputs/shard/fanout-worker-2.json`"),
+            "and to a file it can open on its own: {}",
+            plan.task_markdown
+        );
     }
 
     #[test]

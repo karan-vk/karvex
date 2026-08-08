@@ -174,6 +174,13 @@ pub struct RunNodeRow {
     pub assignment_reason: String,
     pub first_pass_succeeded: bool,
     pub schema_failures: i64,
+    // ── added by migrations/0003_node_identity.surql ──
+    /// What this instance is called — the authored kvdag label for a static
+    /// node, the proposing node's `--label` for an expansion child.
+    pub label: String,
+    /// The accepted `--input k=v` slot overrides this instance was created
+    /// with, as a flat `string -> string` object. Empty for a static node.
+    pub inputs: Json,
 }
 
 /// `run_edge` is `TYPE RELATION FROM run_node TO run_node`.

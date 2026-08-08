@@ -1929,6 +1929,9 @@ fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> Workfl
     WorkflowRunNodeInfo {
         path: record.instance_path.to_string(),
         node_key: record.node_key.to_string(),
+        // Persisted per instance on `run_node.label`, so a run read back after
+        // a restart still names its children the way their proposals did.
+        label: record.label.clone(),
         parent_path: None,
         depth: u32::from(record.depth),
         status: wire_node_status(record.status),

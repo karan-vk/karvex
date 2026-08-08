@@ -329,6 +329,7 @@ async fn migrations_apply_cleanly_and_reapplying_is_a_noop() {
         std::collections::BTreeSet::from([
             "0001_init".to_string(),
             "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
         ])
     );
 
@@ -1463,10 +1464,29 @@ async fn setup_expandable_run(store: &WorkflowStore, name: &str) -> (WorkflowId,
 }
 
 fn node_created_write(run: &RunId, key: &str, path: &str, parent: Option<&str>) -> StoreWrite {
+    labelled_node_created_write(run, key, path, parent, "", &[])
+}
+
+/// [`node_created_write`] with the two facts that describe *this* child rather
+/// than the template it is cut from: the proposing node's `--label` and its
+/// accepted `--input k=v` overrides (`04-kvdag-and-execution.md` §3.4).
+fn labelled_node_created_write(
+    run: &RunId,
+    key: &str,
+    path: &str,
+    parent: Option<&str>,
+    label: &str,
+    inputs: &[(&str, &str)],
+) -> StoreWrite {
     StoreWrite::RunNodeCreated {
         run: run.clone(),
         key: NodeKey::new(key),
         path: InstancePath::new(path),
+        label: label.to_string(),
+        inputs: inputs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect(),
         parent: parent.map(InstancePath::new),
         depth: 1,
         status: NodeStatus::Ready,
@@ -2115,17 +2135,22 @@ async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_colu
         .expect("create run_node");
     response.check().expect("the 0001 row is valid");
 
-    store.migrate().await.expect("0002 applies on top of 0001");
+    store
+        .migrate()
+        .await
+        .expect("0002 and 0003 apply on top of 0001");
     assert_eq!(
         store.applied_migrations().await.expect("read schema_meta"),
         std::collections::BTreeSet::from([
             "0001_init".to_string(),
             "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
         ])
     );
 
     // The read path decodes the pre-migration row, which is only true because
-    // `0002` backfills: a `DEFAULT` is applied at write time, not at read time.
+    // `0002` and `0003` backfill: a `DEFAULT` is applied at write time, not at
+    // read time.
     let nodes = store
         .list_run_nodes(&run)
         .await
@@ -2133,6 +2158,11 @@ async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_colu
     let solo = nodes.first().expect("the node survived the migration");
     assert_eq!(solo.assignment_reason, "");
     assert_eq!(solo.model, "opus");
+    assert_eq!(
+        solo.label, "",
+        "a row that predates the column carries no instance label; the renderers fall back"
+    );
+    assert!(solo.inputs.is_empty());
 
     let history = store
         .node_history(&workflow, &NodeKey::new("solo"), 10)
@@ -2143,6 +2173,85 @@ async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_colu
         history.first_pass_successes, 0,
         "a row that predates the column has no first-pass evidence to report"
     );
+}
+
+/// The two facts that describe an expansion child rather than the template it
+/// is cut from have to survive the process that created them: a run read back
+/// after a restart must still know which shard `worker/1` was and what it was
+/// told to work on. Before this column pair, both lived only in the
+/// `expand_accepted` journal payload and nothing on the read path could see
+/// them.
+#[tokio::test]
+async fn a_created_run_node_persists_its_label_and_input_overrides() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_expandable_run(&store, "created-node-identity").await;
+
+    for (path, label, focus) in [
+        ("root/worker/1", "Shard: auth", "src/auth"),
+        ("root/worker/2", "Shard: ui", "src/ui"),
+    ] {
+        store
+            .write(labelled_node_created_write(
+                &run,
+                "worker",
+                path,
+                Some("root"),
+                label,
+                &[("focus", focus)],
+            ))
+            .await
+            .expect("the create carries the proposal's description");
+    }
+
+    let described: Vec<(String, String, String)> = store
+        .list_run_nodes(&run)
+        .await
+        .expect("list_run_nodes")
+        .into_iter()
+        .filter(|record| record.instance_path.as_str().starts_with("root/worker/"))
+        .map(|record| {
+            (
+                record.instance_path.to_string(),
+                record.label.clone(),
+                record
+                    .inputs
+                    .get("focus")
+                    .cloned()
+                    .unwrap_or_else(|| "<none>".to_string()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        described,
+        vec![
+            (
+                "root/worker/1".to_string(),
+                "Shard: auth".to_string(),
+                "src/auth".to_string()
+            ),
+            (
+                "root/worker/2".to_string(),
+                "Shard: ui".to_string(),
+                "src/ui".to_string()
+            ),
+        ],
+        "two siblings of one generation must read back apart"
+    );
+
+    // A static node's row carries the authored kvdag label, so one column
+    // answers for both kinds of node.
+    let root = store
+        .list_run_nodes(&run)
+        .await
+        .expect("list_run_nodes")
+        .into_iter()
+        .find(|record| record.instance_path.as_str() == "root")
+        .expect("the static proposer is in the run");
+    assert_eq!(
+        root.label, "root",
+        "the fixture's authored label; the point is that the column is written at all"
+    );
+    assert!(root.inputs.is_empty(), "nothing proposed a static node");
 }
 
 /// The variant allows a create with no provenance. It is not what expansion

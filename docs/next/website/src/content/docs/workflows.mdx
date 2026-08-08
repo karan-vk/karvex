@@ -132,6 +132,18 @@ port = "shard"
 
 Draw the fan-in edge **from the proposing node**, as above. A template's own edges are dropped when the run graph is built, so a node reachable only through a template is rejected at authoring time as unreachable. What connects the children instead is inheritance: every accepted child gets a copy of its parent's outbound edges, so each `worker` also gets an edge into `collect`, and `collect` waits for the whole generation rather than for `fanout` alone. A template's `{{slot}}`s therefore have to resolve to declared run args, since it has no inbound edge ports of its own.
 
+Inheritance means more than one child's edge can settle on the same port of the same downstream node — the fan-in case above has every `worker` landing on `collect`'s `shard` port. A port is therefore a **list of contributions**, never one payload. A port with exactly one settled edge is unchanged: `inputs/<port>.json` is that payload and the `{{slot}}` renders it exactly as it always has. Once several edges settle on one port, each contributor gets its own file at `inputs/<port>/<source>.json`, `inputs/<port>.json` becomes the ordered index of them (`[{from, label, file, payload}, …]` in child-creation order), and the `{{slot}}` renders one attributed block per contribution:
+
+```text
+[from fanout/worker/1 · Shard 1]
+auth shard reviewed, two findings
+
+[from fanout/worker/2 · Shard 2]
+ui shard reviewed, no findings
+```
+
+So `collect`'s `{{shard}}` sees every `worker`'s report and knows whose is whose, rather than the last child to finish silently overwriting the rest.
+
 A node proposes from inside its own pane, before it completes:
 
 ```bash
@@ -139,7 +151,16 @@ kvx workflow node expand <run_id> <path> --template worker --label "Shard" --cou
 kvx workflow node expand <run_id> <path> --template worker --label "Shard" --input goal="just src/ui" --json
 ```
 
-Like `node complete`, it reads `KARVEX_WORKFLOW_NODE_TOKEN` from the node's own environment, so a node can only propose on its own behalf. `--count` defaults to 1. `--input KEY=VALUE` overrides one `{{slot}}` in the template's `prompt_template`; a key naming no declared slot is refused rather than quietly ignored, so the dynamic channel stays strictly narrower than the authored one. Each child gets the instance path `<parent>/<template>/<n>` — `fanout/worker/1`, `fanout/worker/2` — numbered from 1 per parent and template, and starts only once its parent has settled.
+Like `node complete`, it reads `KARVEX_WORKFLOW_NODE_TOKEN` from the node's own environment, so a node can only propose on its own behalf. `--count` defaults to 1. `--input KEY=VALUE` overrides one `{{slot}}` in the template's `prompt_template` for the children this proposal creates; a key naming no declared slot is refused rather than quietly ignored, so the dynamic channel stays strictly narrower than the authored one. The override beats a run argument of the same name, and it is filled into the child's own `task.md` — which is what lets one parent give each child different work. `--label` names the children this proposal creates: it is the title of their `task.md`, their box in the DAG view, their pane title, and their `claude --name`. Each child gets the instance path `<parent>/<template>/<n>` — `fanout/worker/1`, `fanout/worker/2` — numbered from 1 per parent and template, and starts only once its parent has settled.
+
+One proposal describes one batch, so `--count 4` creates four children that share its label and its overrides. To fan out into differently-tasked children, make one proposal per child:
+
+```bash
+kvx workflow node expand "$KARVEX_WORKFLOW_RUN_ID" "$KARVEX_WORKFLOW_NODE_PATH" \
+  --template worker --label "Shard 1" --input goal="just src/auth"
+kvx workflow node expand "$KARVEX_WORKFLOW_RUN_ID" "$KARVEX_WORKFLOW_NODE_PATH" \
+  --template worker --label "Shard 2" --input goal="just src/ui"
+```
 
 A proposal is judged against four guardrails, in order: the proposing node's `expand_allow`, its `expand_max`, the run's `max_depth`, and the run's `max_nodes`.
 
@@ -149,8 +170,9 @@ If a proposal for four children only has room for two, **two are created and the
 | Surface | What it carries |
 | --- | --- |
 | `workflow.growth.limited` on the JSON API event stream | the proposing node, the template, which guardrail, that guardrail's value, and the requested/accepted counts |
-| `kvx workflow run show` and `kvx workflow node show` | the run's and the node's most recent growth limit |
-| The DAG view | a banner across the run, and a notice on the node that proposed |
+| `kvx workflow run show` | the run's current growth state and which guardrail was last hit, without the requested/accepted counts — see Commands, below |
+| `kvx workflow node show` | the proposing node's own last rejection: the guardrail, its value, and the requested/accepted counts |
+| The DAG view | a banner across the run, and a notice on the node that proposed, both with the requested/accepted counts |
 | A notice toast | the same message, if notices are enabled in `config.toml` |
 :::
 
@@ -187,7 +209,8 @@ Every node runs inside its own directory, `<run dir>/<instance path>/`:
 | File | Written by | Contents |
 | --- | --- | --- |
 | `task.md` | Karvex | rendered prompt: workflow contract, node role, task, and the paths of any `inputs/` files |
-| `inputs/<port>.json` | Karvex | upstream checkpoint payloads, one file per inbound edge port |
+| `inputs/<port>.json` | Karvex | upstream checkpoint payloads, one file per inbound edge port; a port with more than one settled edge (fan-in from expansion) holds the ordered index of its contributions |
+| `inputs/<port>/<source>.json` | Karvex | one file per contributor, named after the contributing node's instance path — written only for a fanned-in port |
 | `output_schema.json` | Karvex | the JSON Schema `result.json` must satisfy |
 | `result.json` | the node | its structured result |
 | `artifacts/` | the node | files referenced from `result.json`'s `artifacts` array |
@@ -237,9 +260,9 @@ kvx workflow run cancel <run_id>
 
 From the Karvex TUI, `prefix+f` opens the **workflow launcher** instead: a modal listing the saved workflows, one input line per required argument of the selected one, and a tier row seeded from that workflow's own `default_tier`. `Enter` starts the run, `Esc` closes it, and every row is clickable. Rebind it with `keys.open_workflow_launcher`.
 
-`run` is a namespace, not a workflow selector: `start`, `list`, `show`, and `cancel` each take their own arguments, so a workflow can be named `list` without colliding with the subcommand. `--tier` defaults to the workflow's own `default_tier`; repeat `--arg` for every declared run argument — an `--arg` key the workflow never declared is rejected before the run starts, naming every key that *is* declared, rather than being silently dropped. `run cancel` cancels the run's remaining nodes and closes their panes.
+`run` is a namespace, not a workflow selector: `start`, `list`, `show`, and `cancel` each take their own arguments, so a workflow can be named `list` without colliding with the subcommand. `--tier` defaults to the workflow's own `default_tier`; repeat `--arg` for every declared run argument — an `--arg` key the workflow never declared is rejected before the run starts, naming every key that *is* declared, rather than being silently dropped. `run cancel` cancels the run's remaining nodes and closes their panes; a run reaching `succeeded` does **not** close its nodes' panes on its own — they stay open so you can read a teammate's final output or keep talking to it. `run cancel` is what tears panes down, and `node restart` (below) tears down just the one node's pane before respawning it.
 
-The human default for `run show` names the node responsible when the run is `paused` or a node is stuck: the `status` line reads `paused (node "lint": needs_attention)`, followed by that node's blocker reason and resume condition, and then every node's path and status. When a proposal has been refused or truncated it also prints a `growth_limited:` line naming the guardrail, its value, and the requested/accepted counts.
+The human default for `run show` names the node responsible when the run is `paused` or a node is stuck: the `status` line reads `paused (node "lint": needs_attention)`, followed by that node's blocker reason and resume condition, and then every node's path, status, and label — an expansion child's label is its accepted `--label`, which is the only thing that tells one child of a generation from another, since they all share the template's key. When the run has ever hit a growth guardrail it also prints a `growth:` line reporting the run's current growth state and which guardrail was last hit — `growth:  3 of 12 nodes · limited: max_nodes reached at 14:22` — not the requested/accepted counts for that rejection; those are on `kvx workflow node show`, below, and in the DAG banner.
 
 ```bash
 kvx workflow node show <run_id> <path> [--json]
@@ -250,13 +273,13 @@ kvx workflow node complete [--result-file <path>]
 kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]
 ```
 
-`<path>` is the node's instance path, such as `plan` or `fanout/worker/2` — shown by `run show` and `workflow show`, and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` and `node expand` are the two commands a node runs on itself, both authenticated by the node token already in its environment; see The node contract and Templates and expansion, above. The human default for `node show` includes the node's blocker — reason and resume condition — and its most recent growth limit when one is recorded, alongside `path`/`status`/`model`/`effort`/`pane_id`.
+`<path>` is the node's instance path, such as `plan` or `fanout/worker/2` — shown by `run show` and `workflow show`, and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` and `node expand` are the two commands a node runs on itself, both authenticated by the node token already in its environment; see The node contract and Templates and expansion, above. The human default for `node show` includes the node's blocker — reason and resume condition — and, when this node has proposed into a guardrail, a `growth_limited:` line naming the guardrail, its value, and the requested/accepted counts, alongside `path`/`label`/`status`/`model`/`effort`/`pane_id`.
 
 ## The DAG view
 
 Open a run's DAG view from the Karvex TUI to watch it execute live: node boxes laid out by graph layer, edges drawn between them, and a detail strip for whichever node is selected showing its status, model, usage, last checkpoint summary, and any blocker.
 
-Open it with `prefix+shift+F`, or from the global menu — the launcher at the bottom of the sidebar — and pick **workflow dag**. The menu entry appears only while this server is executing a run, since there is otherwise no graph to draw; the key reports the same thing rather than opening an empty overlay. Rebind it with `keys.open_workflow_dag`.
+Open it with `prefix+shift+F`, or from the global menu — the launcher at the bottom of the sidebar — and pick **workflow dag**. The menu entry appears only while this server is executing a run, since there is otherwise no graph to draw. The key is more forgiving: with no run to show, `prefix+shift+F` falls through to the workflow launcher instead of dead-ending there, since starting a run is the obvious next step from "there is nothing to view yet." It only reports `no workflow run on this server — start one with kvx workflow run start` when there is nothing to launch either — no saved workflows on this server. Rebind it with `keys.open_workflow_dag`.
 
 | Input | Action |
 | --- | --- |

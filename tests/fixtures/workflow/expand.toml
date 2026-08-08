@@ -11,6 +11,10 @@
 #
 #   @STUB@      -> tests/fixtures/workflow/node_stub.sh
 #   @FANOUT@    -> tests/fixtures/workflow/expand_stub.sh
+#   @WORKER@    -> tests/fixtures/workflow/expand_worker_stub.sh
+#   @MODE@      -> `batch` (one proposal for @COUNT@ children, one label) or
+#                  `shards` (@COUNT@ proposals of one child each, each with its
+#                  own `--label` and `--input goal=…`)
 #   @TEMPLATE@  -> the kvdag key the proposal names
 #   @COUNT@     -> the proposal's `--count`
 #
@@ -54,7 +58,7 @@ key = "fanout"
 label = "Fan out"
 kind = "agent"
 runner = "command"
-command = ["/bin/sh", "@FANOUT@", "@TEMPLATE@", "@COUNT@", '{"plan":"stub fan-out plan"}']
+command = ["/bin/sh", "@FANOUT@", "@MODE@", "@TEMPLATE@", "@COUNT@", '{"plan":"stub fan-out plan","summary":"the fan-out plan"}']
 demand = "standard"
 prompt_template = "Split this into shards: {{goal}}"
 output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
@@ -73,7 +77,11 @@ label = "Worker"
 kind = "agent"
 runner = "command"
 is_template = true
-command = ["/bin/sh", "@STUB@", "report", '{"report":"stub worker report"}']
+# Every child of a template is spawned from this one authored argv, so a fixed
+# payload would make N children indistinguishable — the exact failure the
+# payload path has to make impossible. This stub reports what its *own* node
+# directory says about it: the filled `{{goal}}` slot and its instance path.
+command = ["/bin/sh", "@WORKER@"]
 demand = "standard"
 # A template has no static inbound edge, so every slot it names has to resolve
 # to a declared arg. `Kvdag::try_new` proves that at authoring time, which is

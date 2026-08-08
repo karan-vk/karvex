@@ -114,6 +114,14 @@ impl RunGraph {
                 idx,
                 key: node.key.clone(),
                 path: InstancePath::new(node.key.as_str()),
+                // The authored label, carried onto the instance so every
+                // renderer reads one field whether the node is static or was
+                // proposed mid-run. Empty stays empty: the fallback to the key
+                // belongs to the renderer, not to materialisation.
+                label: node.label.clone(),
+                // A static node is not the product of a proposal, so it has no
+                // slot overrides.
+                inputs: BTreeMap::new(),
                 parent: None,
                 depth: 0,
                 status: NodeStatus::Pending,

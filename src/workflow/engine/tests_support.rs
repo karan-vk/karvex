@@ -87,6 +87,8 @@ pub fn graph_of(nodes: &[TestNode], edges: &[TestEdge]) -> RunGraph {
                 idx: RunNodeIdx(index),
                 key: NodeKey::new(node.key.as_str()),
                 path: InstancePath::new(node.key.as_str()),
+                label: String::new(),
+                inputs: std::collections::BTreeMap::new(),
                 parent: None,
                 depth: 0,
                 status: NodeStatus::Pending,

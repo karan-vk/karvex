@@ -430,6 +430,7 @@ mod workflow_event_tests {
         WorkflowRunNodeInfo {
             path: "plan".into(),
             node_key: "plan".into(),
+            label: "Plan".into(),
             parent_path: None,
             depth: 0,
             status: WorkflowNodeStatus::Running,
