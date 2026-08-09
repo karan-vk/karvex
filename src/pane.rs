@@ -54,6 +54,11 @@ const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::
 const PANE_TERM: &str = "xterm-256color";
 const PANE_COLORTERM: &str = "truecolor";
 
+/// Opt-out for the tmux-compatible pane identity (see `apply_tmux_compat_env`).
+/// Any set value (including empty) disables the export, matching the
+/// presence-only convention used elsewhere (e.g. `DISABLE_SOUND_ENV`).
+const KARVEX_NO_TMUX_COMPAT_ENV_VAR: &str = "KARVEX_NO_TMUX_COMPAT";
+
 fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     // Each pane is rendered by karvex's own terminal layer, not the outer terminal
     // that launched the app. Advertising the inherited TERM leaks the host terminal
@@ -130,11 +135,92 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
             );
             cmd.env(crate::integration::KARVEX_TAB_ID_ENV_VAR, tab_id);
             cmd.env(crate::integration::KARVEX_PANE_ID_ENV_VAR, pane_id);
+            apply_tmux_compat_env(cmd, pane_id);
         }
         PaneLaunchIdentity::OmitPane => {
             cmd.env_remove(crate::integration::KARVEX_PANE_ID_ENV_VAR);
         }
     }
+}
+
+/// Exports a tmux-compatible identity into a `Managed` pane's environment so
+/// tools that dispatch on tmux presence (notably Claude Code's Agent Teams
+/// mode) treat the pane as tmux-backed by Karvex's own `tmux` shim.
+///
+/// Per D1 (docs/design/claude-teammates/01-port-plan.md), shim install
+/// *gates* the export: `platform::ensure_tmux_shim_dir()` is resolved first,
+/// and `TMUX`/`TMUX_PANE`/`PATH` are only touched on success. On Windows, on
+/// any install failure, and under `KARVEX_NO_TMUX_COMPAT`, the pane env is
+/// left completely unchanged and Claude falls back to its own backends
+/// instead of failing against a `tmux` Karvex does not control.
+fn apply_tmux_compat_env(cmd: &mut CommandBuilder, pane_id: &str) {
+    apply_tmux_compat_env_with_shim_dir(cmd, pane_id, crate::platform::ensure_tmux_shim_dir);
+}
+
+/// The injectable half of `apply_tmux_compat_env`: takes a *thunk* resolving
+/// the shim directory (or `None` on install failure / an unsupported
+/// platform) so it is unit-testable without a real shim install. A real
+/// install can only ever succeed from a binary whose stem is exactly `kvx`
+/// (`platform::tmux_shim::binary_owns_shim`), which nextest's own test
+/// binaries (`kvx-<hash>`) never are by design — see
+/// `tmux_compat_env_not_exported_when_shim_unavailable` below and W7's
+/// `nextest_binary_never_installs_a_tmux_shim`.
+///
+/// ⚠ The thunk is deliberately lazy and the opt-out is checked *before* it
+/// runs: `ensure_tmux_shim_dir` is not a pure query, it creates
+/// `<data_dir>/shims/tmux` (and, on macOS, the `~/.local/bin/tmux` mirror
+/// that outlives an uninstall — D6/R2). Resolving it eagerly would install a
+/// `tmux` symlink onto an opted-out user's `PATH`, which is precisely what
+/// `KARVEX_NO_TMUX_COMPAT` exists to prevent. Covered by
+/// `tmux_compat_opt_out_never_resolves_the_shim_dir`.
+fn apply_tmux_compat_env_with_shim_dir(
+    cmd: &mut CommandBuilder,
+    pane_id: &str,
+    shim_dir: impl FnOnce() -> Option<std::path::PathBuf>,
+) {
+    if std::env::var_os(KARVEX_NO_TMUX_COMPAT_ENV_VAR).is_some() {
+        return;
+    }
+    let Some(shim_dir) = shim_dir() else {
+        return;
+    };
+
+    let socket_path = crate::api::socket_path();
+    let existing_path = cmd.get_env("PATH").map(std::ffi::OsStr::to_os_string);
+
+    cmd.env(
+        "TMUX",
+        format!("{},{},0", socket_path.display(), std::process::id()),
+    );
+    cmd.env("TMUX_PANE", pane_id);
+    cmd.env(
+        "PATH",
+        prepend_path_once(&shim_dir, existing_path.as_deref()),
+    );
+}
+
+/// Prepends `dir` to a `:`-joined PATH exactly once, preserving the order of
+/// every other entry. A `PATH` that already starts with `dir` is returned
+/// unchanged rather than duplicated.
+fn prepend_path_once(dir: &Path, existing: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    if let Some(existing) = existing {
+        let already_first = existing
+            .to_str()
+            .and_then(|value| value.split(':').next())
+            .is_some_and(|first| Path::new(first) == dir);
+        if already_first {
+            return existing.to_os_string();
+        }
+    }
+
+    let mut path = dir.as_os_str().to_os_string();
+    if let Some(existing) = existing {
+        if !existing.is_empty() {
+            path.push(":");
+            path.push(existing);
+        }
+    }
+    path
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2969,6 +3055,200 @@ mod tests {
         apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
 
         assert!(cmd.get_env("CODEX_THREAD_ID").is_none());
+    }
+
+    /// R7: a Karvex pane exports `TMUX`/`TMUX_PANE` once this change lands,
+    /// so a test process launched from *inside* one (e.g. `just check` run
+    /// from a live Karvex session) inherits them ambiently. Every test below
+    /// that reads or writes `TMUX`, `TMUX_PANE`, `KARVEX_SOCKET_PATH` or
+    /// `KARVEX_NO_TMUX_COMPAT` serializes on `integration_env_lock()` and
+    /// explicitly sets-or-removes each var via this guard, rather than
+    /// assuming an ambient value.
+    struct ScrubbedTmuxEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ScrubbedTmuxEnv {
+        const VARS: [&'static str; 4] = [
+            "TMUX",
+            "TMUX_PANE",
+            crate::api::SOCKET_PATH_ENV_VAR,
+            KARVEX_NO_TMUX_COMPAT_ENV_VAR,
+        ];
+
+        fn new() -> Self {
+            let lock = crate::integration::integration_env_lock();
+            let previous = Self::VARS
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect();
+            for name in Self::VARS {
+                std::env::remove_var(name);
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+
+        fn set(&self, name: &str, value: &str) {
+            std::env::set_var(name, value);
+        }
+    }
+
+    impl Drop for ScrubbedTmuxEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tmux_compat_env_exports_socket_and_pane_id_for_managed_panes() {
+        let guard = ScrubbedTmuxEnv::new();
+        guard.set(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/karvex-test.sock");
+
+        let mut cmd = CommandBuilder::new("shell");
+        let shim_dir = std::env::temp_dir().join("karvex-tmux-compat-test-shims");
+        apply_tmux_compat_env_with_shim_dir(&mut cmd, "w1:p3", || Some(shim_dir.clone()));
+
+        assert_eq!(
+            cmd.get_env("TMUX").and_then(std::ffi::OsStr::to_str),
+            Some(format!("/tmp/karvex-test.sock,{},0", std::process::id())).as_deref()
+        );
+        assert_eq!(
+            cmd.get_env("TMUX_PANE").and_then(std::ffi::OsStr::to_str),
+            Some("w1:p3")
+        );
+        let path = cmd
+            .get_env("PATH")
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("PATH must be set once the shim install succeeds");
+        assert!(path.starts_with(shim_dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn tmux_compat_env_absent_for_inherit_identity() {
+        let _guard = ScrubbedTmuxEnv::new();
+        let mut cmd = CommandBuilder::new("shell");
+
+        apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
+
+        assert!(cmd.get_env("TMUX").is_none());
+        assert!(cmd.get_env("TMUX_PANE").is_none());
+    }
+
+    #[test]
+    fn tmux_compat_env_absent_for_omit_pane_identity() {
+        let _guard = ScrubbedTmuxEnv::new();
+        let launch_env = PaneLaunchEnv::default().without_pane_identity();
+        let mut cmd = CommandBuilder::new("shell");
+
+        apply_pane_launch_env(&mut cmd, &launch_env);
+
+        assert!(cmd.get_env("TMUX").is_none());
+        assert!(cmd.get_env("TMUX_PANE").is_none());
+    }
+
+    #[test]
+    fn tmux_compat_env_opt_out_via_karvex_no_tmux_compat() {
+        let guard = ScrubbedTmuxEnv::new();
+        guard.set(KARVEX_NO_TMUX_COMPAT_ENV_VAR, "1");
+
+        let mut cmd = CommandBuilder::new("shell");
+        // `CommandBuilder::new` seeds its env from the ambient process env
+        // (including PATH) at construction time, so capture that baseline
+        // before asserting the opt-out left it untouched.
+        let path_before = cmd.get_env("PATH").map(std::ffi::OsStr::to_os_string);
+        let shim_dir = std::env::temp_dir().join("karvex-tmux-compat-test-optout");
+
+        apply_tmux_compat_env_with_shim_dir(&mut cmd, "w1:p3", || Some(shim_dir));
+
+        assert!(cmd.get_env("TMUX").is_none());
+        assert!(cmd.get_env("TMUX_PANE").is_none());
+        assert_eq!(
+            cmd.get_env("PATH").map(std::ffi::OsStr::to_os_string),
+            path_before,
+            "opt-out must leave PATH exactly as CommandBuilder found it"
+        );
+    }
+
+    /// The opt-out must be checked *before* the shim directory is resolved.
+    /// `platform::ensure_tmux_shim_dir` is not a query — it creates
+    /// `<data_dir>/shims/tmux` and, on macOS, the `~/.local/bin/tmux` mirror
+    /// that outlives an uninstall (D6/R2). Resolving it eagerly would plant a
+    /// `tmux` symlink on an opted-out user's `PATH`, shadowing their real
+    /// tmux, which is exactly what `KARVEX_NO_TMUX_COMPAT` exists to prevent.
+    #[test]
+    fn tmux_compat_opt_out_never_resolves_the_shim_dir() {
+        let guard = ScrubbedTmuxEnv::new();
+        guard.set(KARVEX_NO_TMUX_COMPAT_ENV_VAR, "1");
+
+        let resolved = std::cell::Cell::new(false);
+        let mut cmd = CommandBuilder::new("shell");
+        apply_tmux_compat_env_with_shim_dir(&mut cmd, "w1:p3", || {
+            resolved.set(true);
+            Some(std::env::temp_dir().join("karvex-tmux-compat-test-never-resolved"))
+        });
+
+        assert!(
+            !resolved.get(),
+            "the opt-out must short-circuit before the shim install runs"
+        );
+        assert!(cmd.get_env("TMUX").is_none());
+        assert!(cmd.get_env("TMUX_PANE").is_none());
+    }
+
+    #[test]
+    fn tmux_compat_env_not_exported_when_shim_unavailable() {
+        let _guard = ScrubbedTmuxEnv::new();
+
+        // Direct contract (D1): a `None` shim dir must leave the pane env
+        // completely untouched.
+        let mut cmd = CommandBuilder::new("shell");
+        apply_tmux_compat_env_with_shim_dir(&mut cmd, "w1:p3", || None);
+        assert!(cmd.get_env("TMUX").is_none());
+        assert!(cmd.get_env("TMUX_PANE").is_none());
+
+        // End-to-end: nextest's own test binaries are never named exactly
+        // `kvx` (D6's exact-stem guard), so the real
+        // `platform::ensure_tmux_shim_dir()` call inside
+        // `apply_pane_launch_env`'s Managed arm also refuses here — the
+        // in-process half of the guarantee W7's
+        // `nextest_binary_never_installs_a_tmux_shim` verifies end to end
+        // through the real built binary.
+        let mut cmd = CommandBuilder::new("shell");
+        let launch_env = PaneLaunchEnv::default().with_identity(
+            "workspace-1".to_string(),
+            "tab-1".to_string(),
+            "w1:p3".to_string(),
+        );
+        apply_pane_launch_env(&mut cmd, &launch_env);
+        assert!(cmd.get_env("TMUX").is_none());
+        assert!(cmd.get_env("TMUX_PANE").is_none());
+    }
+
+    #[test]
+    fn tmux_compat_env_prepends_shim_dir_once_and_preserves_path_order() {
+        let shim_dir = Path::new("/opt/karvex/shims");
+
+        assert_eq!(prepend_path_once(shim_dir, None), shim_dir.as_os_str());
+
+        let existing = std::ffi::OsString::from("/usr/bin:/bin");
+        let updated = prepend_path_once(shim_dir, Some(&existing));
+        assert_eq!(
+            updated,
+            std::ffi::OsString::from("/opt/karvex/shims:/usr/bin:/bin")
+        );
+
+        let already_first = std::ffi::OsString::from("/opt/karvex/shims:/usr/bin:/bin");
+        let unchanged = prepend_path_once(shim_dir, Some(&already_first));
+        assert_eq!(unchanged, already_first);
     }
 
     #[tokio::test]

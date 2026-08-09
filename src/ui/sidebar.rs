@@ -2,13 +2,13 @@ mod tokens;
 
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 
-use self::tokens::{ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
+use self::tokens::{entry_agent_accent_color, ResolvedToken, ResolvedTokenKind, SpaceTokenContext};
 use super::scrollbar::{render_scrollbar, should_show_scrollbar};
 use super::status::{state_icon, state_label, state_label_color};
 use super::text::{display_width, display_width_u16, truncate_end};
@@ -996,6 +996,7 @@ fn resolved_token_spans(
     custom_style: Style,
     p: &Palette,
     max_width: usize,
+    agent_accent: Option<Color>,
 ) -> Vec<Span<'static>> {
     let fixed_widths = resolved
         .iter()
@@ -1125,11 +1126,24 @@ fn resolved_token_spans(
             }
             ResolvedTokenKind::Tab(text)
             | ResolvedTokenKind::Pane(text)
-            | ResolvedTokenKind::Agent(text)
             | ResolvedTokenKind::Branch(text) => {
                 spans.push(Span::styled(
                     truncate_end(text, budgets[index]),
                     apply_token_style(secondary_style, token.style),
+                ));
+            }
+            ResolvedTokenKind::Agent(text) => {
+                // Teammate accent colour (D8): a style hint only, never
+                // rendered as separate text. An explicit per-token style from
+                // the user's sidebar config (`token.style`, applied last by
+                // `apply_token_style`) still wins over the accent.
+                let base_style = match agent_accent {
+                    Some(color) => secondary_style.fg(color),
+                    None => secondary_style,
+                };
+                spans.push(Span::styled(
+                    truncate_end(text, budgets[index]),
+                    apply_token_style(base_style, token.style),
                 ));
             }
             ResolvedTokenKind::GitStatus { ahead, behind } => {
@@ -1348,6 +1362,8 @@ fn render_workspace_list(
                 card.rect
                     .width
                     .saturating_sub(prefix_width + trailing_width) as usize,
+                // Workspace/space rows have no agent token, so no accent.
+                None,
             ));
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
@@ -1496,6 +1512,7 @@ fn render_agent_detail(
         };
         let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
         let state_icon = state_icon(detail.state, detail.seen, app.status_indicators, p);
+        let agent_accent = entry_agent_accent_color(detail);
 
         for (row_index, resolved) in rows.iter().take(height as usize).enumerate() {
             let mut spans = vec![Span::raw(if row_index == 0 { " " } else { "   " })];
@@ -1509,6 +1526,7 @@ fn render_agent_detail(
                 p,
                 body.width
                     .saturating_sub(if row_index == 0 { 1 } else { 3 }) as usize,
+                agent_accent,
             ));
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(row_style),
@@ -1809,6 +1827,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             Style::default(),
             &crate::app::state::AppState::test_new().palette,
             20,
+            None,
         );
 
         assert_eq!(
@@ -1851,6 +1870,80 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(metrics.max_offset_from_bottom, 0);
         assert_eq!(row_text(buffer, body.y, body.width), " pi");
         assert_eq!(row_text(buffer, body.y + 1, body.width), " claude");
+    }
+
+    /// D8: `agent_accent` is a *style* hint, never rendered as literal text —
+    /// the row's text stays exactly the agent label, and only the token's
+    /// foreground colour changes.
+    #[test]
+    fn sidebar_agent_accent_tints_agent_token() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(Agent::Claude);
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                crate::cli::tmux_compat::AGENT_ACCENT_TOKEN_KEY.to_string(),
+                Some("cyan".to_string()),
+            )]),
+            None,
+            std::time::Instant::now(),
+        );
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let area = Rect::new(0, 0, 20, 5);
+        let mut render_terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        render_terminal
+            .draw(|frame| render_agent_detail(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = render_terminal.backend().buffer();
+        let body = agent_panel_body_rect(area, false);
+
+        assert_eq!(row_text(buffer, body.y, body.width), " claude");
+        let style = buffer[(find_symbol_x(buffer, body.y, body.width, "c"), body.y)].style();
+        assert_eq!(style.fg, tokens::agent_accent_color("cyan"));
+        assert_ne!(style.fg, Some(app.palette.overlay0));
+    }
+
+    /// An unrecognised `agent_accent` value must not leak into the UI: the
+    /// row keeps its default (unaccented) style.
+    #[test]
+    fn sidebar_unknown_accent_value_falls_back_to_the_default_style() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.ensure_test_terminals();
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(Agent::Claude);
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                crate::cli::tmux_compat::AGENT_ACCENT_TOKEN_KEY.to_string(),
+                Some("chartreuse".to_string()),
+            )]),
+            None,
+            std::time::Instant::now(),
+        );
+        app.sidebar_agents.rows = vec![vec![crate::config::AgentSidebarToken::Agent]];
+
+        let area = Rect::new(0, 0, 20, 5);
+        let mut render_terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        render_terminal
+            .draw(|frame| render_agent_detail(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = render_terminal.backend().buffer();
+        let body = agent_panel_body_rect(area, false);
+
+        assert_eq!(row_text(buffer, body.y, body.width), " claude");
+        let style = buffer[(find_symbol_x(buffer, body.y, body.width, "c"), body.y)].style();
+        assert_eq!(style.fg, Some(app.palette.overlay0));
     }
 
     #[test]
@@ -1920,6 +2013,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             Style::default(),
             &app.palette,
             8,
+            None,
         );
         let text = spans
             .iter()

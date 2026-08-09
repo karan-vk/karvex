@@ -4707,6 +4707,71 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
 // Entry point
 // ---------------------------------------------------------------------------
 
+const KARVEX_NO_AUTO_INTEGRATION_ENV_VAR: &str = "KARVEX_NO_AUTO_INTEGRATION";
+
+/// Karvex ships the Claude Code integration out of the box: on server start,
+/// install (or refresh) the Claude hook when it is missing or outdated so
+/// agent tracking works without a manual `kvx integration install claude`.
+/// Best-effort and never fatal to server start. Opt out by setting
+/// `KARVEX_NO_AUTO_INTEGRATION` (any value; `=1` is the documented form).
+fn auto_install_claude_integration() {
+    // Presence-based, matching `KARVEX_NO_TMUX_COMPAT` (`src/pane.rs`) and
+    // `KARVEX_DISABLE_SOUND` (`src/sound.rs`). An opt-out that silently did
+    // nothing for `=true`/`=yes` would be worse than one that fires for any
+    // set value.
+    let opt_out = std::env::var_os(KARVEX_NO_AUTO_INTEGRATION_ENV_VAR).is_some();
+    let statuses = crate::integration::installed_integration_statuses();
+    if !should_auto_install_claude(&statuses, opt_out) {
+        return;
+    }
+
+    // A user who has never installed Claude Code has no `~/.claude` (or
+    // `$CLAUDE_CONFIG_DIR`) directory at all, and `install_target` errors on
+    // every single server start in that case. Skip quietly rather than
+    // warning every start; only warn when the directory exists but the
+    // install itself fails for some other reason. The hook's install path is
+    // always `<claude_dir>/hooks/<hook file>`, so climbing two parents off
+    // the already-computed status path recovers `<claude_dir>` without
+    // duplicating `$CLAUDE_CONFIG_DIR`/`~/.claude` resolution here.
+    let claude_dir_exists = statuses
+        .iter()
+        .find(|status| status.target == crate::api::schema::IntegrationTarget::Claude)
+        .and_then(|status| status.path.parent())
+        .and_then(Path::parent)
+        .is_some_and(Path::is_dir);
+    if !claude_dir_exists {
+        tracing::debug!(
+            "auto integration: skipping claude install, no claude config directory found"
+        );
+        return;
+    }
+
+    match crate::integration::install_target(crate::api::schema::IntegrationTarget::Claude) {
+        Ok(messages) => {
+            for message in messages {
+                tracing::info!("auto integration: {message}");
+            }
+        }
+        Err(err) => tracing::warn!("auto claude integration install failed: {err}"),
+    }
+}
+
+/// Pure decision of whether the Claude integration should be (re)installed,
+/// split out from `auto_install_claude_integration` so it is unit-testable
+/// with injected statuses/opt-out rather than a real `~/.claude`.
+fn should_auto_install_claude(
+    statuses: &[crate::integration::IntegrationStatus],
+    opt_out: bool,
+) -> bool {
+    if opt_out {
+        return false;
+    }
+    statuses.iter().any(|status| {
+        status.target == crate::api::schema::IntegrationTarget::Claude
+            && status.state != crate::integration::IntegrationStatusKind::Current
+    })
+}
+
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
     init_logging();
@@ -4741,6 +4806,7 @@ pub fn run_server() -> io::Result<()> {
     }
 
     let loaded_config = config::Config::load();
+    auto_install_claude_integration();
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
 
@@ -10816,5 +10882,72 @@ next_tab = ""
              handle_internal_event_with_forwarding (bypass risk):\n  {}",
             bypass_lines.join("\n  ")
         );
+    }
+
+    fn claude_status(
+        state: crate::integration::IntegrationStatusKind,
+    ) -> crate::integration::IntegrationStatus {
+        crate::integration::IntegrationStatus {
+            target: crate::api::schema::IntegrationTarget::Claude,
+            path: PathBuf::from("/home/test/.claude/hooks/karvex-agent-state.sh"),
+            state,
+            installed_version: None,
+            expected_version: 8,
+        }
+    }
+
+    fn other_status(
+        state: crate::integration::IntegrationStatusKind,
+    ) -> crate::integration::IntegrationStatus {
+        crate::integration::IntegrationStatus {
+            target: crate::api::schema::IntegrationTarget::Codex,
+            path: PathBuf::from("/home/test/.codex/hooks/karvex-agent-state"),
+            state,
+            installed_version: None,
+            expected_version: 8,
+        }
+    }
+
+    #[test]
+    fn should_auto_install_claude_skips_when_current() {
+        let statuses = vec![claude_status(
+            crate::integration::IntegrationStatusKind::Current,
+        )];
+        assert!(!should_auto_install_claude(&statuses, false));
+    }
+
+    #[test]
+    fn should_auto_install_claude_installs_when_outdated_or_missing() {
+        let outdated = vec![claude_status(
+            crate::integration::IntegrationStatusKind::Outdated,
+        )];
+        assert!(should_auto_install_claude(&outdated, false));
+
+        let not_installed = vec![claude_status(
+            crate::integration::IntegrationStatusKind::NotInstalled,
+        )];
+        assert!(should_auto_install_claude(&not_installed, false));
+    }
+
+    #[test]
+    fn should_auto_install_claude_respects_opt_out() {
+        let statuses = vec![claude_status(
+            crate::integration::IntegrationStatusKind::Outdated,
+        )];
+        assert!(!should_auto_install_claude(&statuses, true));
+    }
+
+    #[test]
+    fn should_auto_install_claude_ignores_non_claude_targets() {
+        let statuses = vec![other_status(
+            crate::integration::IntegrationStatusKind::Outdated,
+        )];
+        assert!(!should_auto_install_claude(&statuses, false));
+
+        let mixed = vec![
+            claude_status(crate::integration::IntegrationStatusKind::Current),
+            other_status(crate::integration::IntegrationStatusKind::NotInstalled),
+        ];
+        assert!(!should_auto_install_claude(&mixed, false));
     }
 }

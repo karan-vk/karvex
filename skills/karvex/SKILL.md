@@ -184,6 +184,36 @@ Use `--format ansi` when colors and terminal styling are evidence. Otherwise use
 
 After that failed read, ask the agent to write its complete response as Markdown in a temporary directory and reply only with the file path, then read the file directly. Use this only as a fallback; do not request file output in the initial prompt.
 
+## Claude Code Agent Teams teammate panes
+
+When Claude Code's Agent Teams feature runs inside a Karvex pane with `teammateMode` resolving to `auto` (the default), Karvex makes itself Claude's tmux backend automatically: it exports a tmux-compatible session identity into the pane and puts a `tmux` shim on `PATH` that Claude's own code talks to. The practical effect is that each teammate Claude spawns shows up as an ordinary Karvex pane in the same tab, not as a nested terminal session — the leader pane keeps focus, and teammate panes are visible and controllable the same way any other pane is.
+
+Treat a teammate pane as a normal Claude Code pane for every read and inspect operation:
+
+```bash
+kvx pane list --workspace "$KARVEX_WORKSPACE_ID"
+kvx agent list
+kvx agent get <teammate-pane-or-name>
+kvx agent read <teammate-pane-or-name> --source recent-unwrapped --lines 120
+```
+
+Do not assume a teammate pane's existence, title, or lifecycle state — read it from `pane.list`/`agent.list` output the same way you would for any other agent pane. A teammate's pane closes on its own when Claude reaps it (the team ends, or the teammate is killed from the leader); do not close a teammate pane yourself unless the user explicitly asks, for the same reason you would not close any other agent's pane out from under it.
+
+Two environment variables control whether this integration is active for the current session; check them before assuming teammate panes will appear:
+
+```bash
+env | grep -E '^KARVEX_NO_(TMUX_COMPAT|AUTO_INTEGRATION)='
+# KARVEX_NO_TMUX_COMPAT set (any value, including empty): panes get no tmux
+#   identity and no shim install, so teammates never become Karvex panes.
+# KARVEX_NO_AUTO_INTEGRATION set (any value): the Claude Code hook is not
+#   auto-installed on server start, so teammate panes won't report lifecycle
+#   state until the hook is installed by hand.
+```
+
+Both are presence-based, so `grep`ping for the variable name is the reliable check — a `-0`/`-false` value still opts out.
+
+If `KARVEX_NO_TMUX_COMPAT` is set, Claude Code falls back to its own non-tmux backends and teammates will not appear as Karvex panes at all — do not spend time debugging a "missing" teammate pane under that condition; report the opt-out to the user instead.
+
 ## Safety and coordination rules
 
 - Use `--no-focus` for background work unless the user asked to switch context.

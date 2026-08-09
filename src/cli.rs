@@ -22,6 +22,7 @@ mod server_not_running;
 mod spec;
 mod status;
 mod tab;
+pub(crate) mod tmux_compat;
 mod workflow;
 mod workspace;
 mod worktree;

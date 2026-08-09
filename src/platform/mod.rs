@@ -148,6 +148,25 @@ pub(crate) fn restore_default_sigpipe() {
 pub(crate) fn restore_default_sigpipe() {}
 
 #[cfg(unix)]
+mod tmux_shim;
+#[cfg(unix)]
+use tmux_shim::ensure_tmux_shim_dir_platform;
+
+/// Ensures `<data_dir>/shims/tmux` exists as a symlink to Karvex's own
+/// binary and returns the shims directory on success. `None` on Windows
+/// (D10, no `cfg(unix)` implementation exists there) and on any install
+/// failure — callers must treat `None` as "do not export a tmux identity"
+/// (D1), never as an error to propagate.
+pub(crate) fn ensure_tmux_shim_dir() -> Option<std::path::PathBuf> {
+    ensure_tmux_shim_dir_platform()
+}
+
+#[cfg(not(unix))]
+fn ensure_tmux_shim_dir_platform() -> Option<std::path::PathBuf> {
+    None
+}
+
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardCommand {
     pub program: &'static str,

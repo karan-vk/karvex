@@ -494,6 +494,16 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    // Dispatch the tmux compatibility shim before any Karvex argument parsing:
+    // `session::configure_from_args` interprets `--session`, `--`, and
+    // `session attach`, all of which appear in tmux argv with different
+    // meanings, and it mutates process-global session state.
+    if let Some(program) = raw_args.first() {
+        if cli::tmux_compat::invoked_as_tmux(program) {
+            std::process::exit(cli::tmux_compat::run_shim(&raw_args[1..]));
+        }
+    }
+
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {

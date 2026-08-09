@@ -112,6 +112,35 @@ The hook reports Claude Code session identity to the local Herdr socket on sessi
 
 Herdr uses `~/.claude` by default, or `CLAUDE_CONFIG_DIR` when set. The Claude config directory must already exist. Install writes `hooks/herdr-agent-state.sh` and updates `settings.json` with Herdr hook entries. Uninstall removes the matching hook entries and deletes the hook script.
 
+## Claude Agent Teams
+
+Claude Code's Agent Teams feature spawns each teammate through a tmux backend when `teammateMode` resolves to `auto` (the default). Herdr makes itself that backend automatically: every Herdr-managed pane exports a tmux-compatible session identity, and Herdr puts a `tmux`-named executable on that pane's `PATH` that speaks to the local Herdr socket instead of a real tmux server. Claude Code detects `$TMUX` is set, treats the pane as tmux, and spawns each teammate as a native Herdr pane in the same tab — no separate terminal multiplexer, no nested session to attach to. The leader pane keeps focus, and teammate panes show up in the sidebar and report lifecycle state the same way any other detected Claude Code pane does.
+
+This requires `teammateMode` to actually resolve to `auto`. A Claude settings file that pins `teammateMode` to something else (for example `iterm2`) defeats the tmux backend, and Herdr has no way to override that from outside Claude's own configuration — if teammates are not appearing as Herdr panes, check that setting first.
+
+Two environment variables opt out, both read at the point a pane is launched or the server starts:
+
+```bash
+KARVEX_NO_TMUX_COMPAT=1   # do not export a tmux identity into new panes
+KARVEX_NO_AUTO_INTEGRATION=1   # do not auto-install the Claude Code hook on server start
+```
+
+`KARVEX_NO_TMUX_COMPAT=1` does not remove a shim Herdr already installed; it only stops exporting the identity into panes launched after it is set. A real `tmux` already on `PATH` still works normally inside a Herdr pane — Herdr's shim only intercepts the narrow command surface Claude Code's teammate backend uses and passes everything else through, including a `tmux -L <name>` invocation naming an unrelated server.
+
+On macOS, Herdr additionally mirrors the shim to `~/.local/bin/tmux` so it wins ordering fights with Homebrew's PATH setup; Herdr only creates that mirror when `~/.local/bin` already exists and never overwrites a real file or a symlink it doesn't own. There is no `herdr uninstall` command, so removing the shim is manual — and the macOS mirror in particular outlives an uninstall of Herdr and keeps shadowing a real `tmux` until it is removed. Confirm each link belongs to Herdr before removing it:
+
+```bash
+readlink ~/.config/herdr/shims/tmux   # the shim itself; sessions have their own copy
+rm ~/.config/herdr/shims/tmux
+
+readlink ~/.local/bin/tmux            # macOS only; remove only if it points into a Herdr install
+rm ~/.local/bin/tmux
+```
+
+Named sessions keep their own copy at `~/.config/herdr/sessions/<name>/shims/tmux`. Both links are recreated the next time a pane launches unless `KARVEX_NO_TMUX_COMPAT` is also set, so set the opt-out first if the removal is meant to stick.
+
+Claude Agent Teams as native panes is not supported on Windows. Herdr does not export a tmux identity there, so Claude Code falls back to its own non-tmux backends for teammates.
+
 ## Codex
 
 Install the Codex hook:

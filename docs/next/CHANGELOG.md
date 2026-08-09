@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- Managed panes now export a tmux-compatible identity (`TMUX`, `TMUX_PANE`) and get Karvex's own `tmux` shim prepended to `PATH`, so tools that detect tmux by its presence — notably Claude Code's Agent Teams mode — work inside a Karvex pane. The shim lives at `<data_dir>/shims/tmux`, symlinked to Karvex's own binary, and is mirrored into `~/.local/bin/tmux` on macOS when that directory already exists, so it wins over a Homebrew `tmux` on `PATH`; shim installation gates the export, so if it fails, or on Windows, pane env is left unchanged. Set `KARVEX_NO_TMUX_COMPAT=1` to opt out; the opt-out is checked before the install runs, so it also prevents the shim from being created in the first place. There is no `kvx uninstall`; removing the shim means deleting `<data_dir>/shims/tmux` and, on macOS, `~/.local/bin/tmux` if it points at Karvex.
+- The `tmux` shim translates the narrow command surface Claude Code's teammate backend uses onto Karvex's own pane API, so each teammate Claude spawns becomes a native Karvex pane instead of a nested tmux session: `display-message` answers `#{pane_id}`/`#{window_id}` and the `#{client_control_mode}`/`#{client_termtype}` startup probes, `list-panes` enumerates a tab's panes leader-first in creation order, `split-window` creates the pane (converting tmux's "size the new pane" percentage into Karvex's "share kept by the existing pane" ratio, and honouring `-d` by leaving focus with the leader), `respawn-pane` waits for the new pane's shell to settle and then submits the teammate command into it, `select-pane -T` renames the pane, `kill-pane` closes it, and `send-keys` types into it; `set-option`, `select-layout`, `resize-pane` and `show-options` are accepted so Claude's styling and rebalance calls succeed. Anything outside that surface — a named-socket `tmux -L` invocation, a `-S` socket that is not this session's, or plain interactive `tmux` — is passed through to a real `tmux` found later on `PATH`, so existing tmux use keeps working. The shim talks only to the socket it resolves from `KARVEX_SOCKET_PATH` or `TMUX`, never to the default session, and bounds every request at 1500ms so a stopped server surfaces as a fast, plain `no server running` rather than a hang; `tmux -V` keeps succeeding even with no server, so Claude's availability check still passes.
+- Karvex now installs, or refreshes, the Claude Code hook integration automatically on server start whenever it is missing or outdated, so agent tracking for Claude panes works out of the box without running `kvx integration install claude` by hand. Set `KARVEX_NO_AUTO_INTEGRATION=1` to opt out.
+- Claude Code Agent Teams teammate accent colours — set through tmux `set-option` (`window-style`/`pane-border-style`/`pane-active-border-style`) — are now reported through `pane.report_metadata` as an `agent_accent` token and tint the teammate's name in the sidebar's agent panel.
+
+### Fixed
+
+- Terminal passthrough sequences (`\ePtmux;…\e\\`) are now unwrapped at the top of a pane's inbound byte stream instead of being dropped, so OSC 52 clipboard writes and OSC 11/OSC 4/XTGETTCAP colour and capability queries made from inside a tmux-aware app (neovim, fzf, yazi, lazygit, tmux-aware prompts) keep working once a pane exports `TMUX`. Unrelated DCS strings still pass through byte-identical. This is a prerequisite for the tmux-compat work above, not an independent feature.
+
 ## [0.10.2] - 2026-08-09
 
 ### Fixed

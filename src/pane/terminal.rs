@@ -15,8 +15,11 @@ use unicode_width::UnicodeWidthStr;
 use crate::layout::PaneId;
 use crate::protocol::CellData;
 
+mod tmux_passthrough;
 #[cfg(windows)]
 mod windows_recent_fallback;
+
+use tmux_passthrough::TmuxPassthroughFilter;
 
 use super::cursor::{CursorPositionSettleState, DecscusrTracker, CURSOR_POSITION_SETTLE};
 use super::{
@@ -176,6 +179,8 @@ pub(crate) struct GhosttyPaneCore {
     pub osc_debug_tracker: OscDebugTracker,
     pub agent_osc_state: AgentOscStateTracker,
     pub xtgettcap_query_tracker: XtgettcapQueryTracker,
+    /// Unwraps `ESC P tmux; … ESC \` before any observer sees the stream.
+    tmux_passthrough: TmuxPassthroughFilter,
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
@@ -954,6 +959,7 @@ impl GhosttyPaneTerminal {
                 osc_debug_tracker: OscDebugTracker::default(),
                 agent_osc_state: AgentOscStateTracker::default(),
                 xtgettcap_query_tracker: XtgettcapQueryTracker::default(),
+                tmux_passthrough: TmuxPassthroughFilter::default(),
                 decscusr_tracker: DecscusrTracker::default(),
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
@@ -1123,6 +1129,13 @@ impl GhosttyPaneTerminal {
                 terminal_responses: Vec::new(),
             };
         };
+
+        // Unwrap tmux DCS passthrough first, so every observer below — and the
+        // terminal write itself — sees the payload exactly as it would have
+        // arrived without `$TMUX` set. Unwrapping later would fix clipboard but
+        // leave the OSC 11 / OSC 4 / XTGETTCAP response trackers blind.
+        let unwrapped_bytes = core.tmux_passthrough.filter(bytes);
+        let bytes = unwrapped_bytes.as_ref();
 
         let _ = core.terminal.take_pwd_changes();
         // Restored history may have exercised terminal callbacks before this live PTY write.
@@ -3462,6 +3475,107 @@ mod tests {
         assert_eq!(result.clipboard_writes, vec![b"clipboard".to_vec()]);
         assert_eq!(result.reported_cwd, None);
         assert!(result.terminal_responses.is_empty());
+    }
+
+    #[test]
+    fn tmux_passthrough_unwraps_osc52_clipboard_write() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+
+        // What an OSC-52 provider emits once `$TMUX` is set: the inner sequence
+        // wrapped in `ESC P tmux; ... ESC \` with every inner ESC doubled.
+        let result = pane.process_pty_bytes(
+            PaneId::from_raw(1),
+            0,
+            b"output\x1bPtmux;\x1b\x1b]52;c;Y2xpcGJvYXJk\x07\x1b\\",
+            &tx,
+        );
+
+        assert_eq!(result.clipboard_writes, vec![b"clipboard".to_vec()]);
+    }
+
+    #[test]
+    fn tmux_passthrough_unwraps_osc11_query_and_a_response_is_produced() {
+        let (tx, _rx) = mpsc::channel(4);
+        let pane_id = PaneId::from_raw(1);
+        let themed_pane = |tx: mpsc::Sender<Bytes>| {
+            let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+            let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+            pane.apply_host_terminal_theme(crate::terminal_theme::TerminalTheme {
+                foreground: None,
+                background: Some(crate::terminal_theme::RgbColor {
+                    r: 0xaa,
+                    g: 0xbb,
+                    b: 0xcc,
+                }),
+                ..Default::default()
+            });
+            pane
+        };
+
+        let bare = themed_pane(tx.clone());
+        let expected = bare
+            .process_pty_bytes(pane_id, 0, b"\x1b]11;?\x07", &tx)
+            .terminal_responses;
+        assert!(
+            !expected.is_empty(),
+            "the bare OSC 11 query must produce a response to compare against"
+        );
+        assert!(String::from_utf8_lossy(&expected[0]).contains("rgb:aaaa/bbbb/cccc"));
+
+        let wrapped = themed_pane(tx.clone());
+        let result =
+            wrapped.process_pty_bytes(pane_id, 0, b"\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\", &tx);
+
+        assert_eq!(
+            result.terminal_responses, expected,
+            "a tmux-wrapped OSC 11 query must answer exactly like the bare query"
+        );
+    }
+
+    #[test]
+    fn tmux_passthrough_unwraps_xtgettcap_query() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        let result = pane.process_pty_bytes(
+            pane_id,
+            0,
+            b"\x1bPtmux;\x1b\x1bP+q5463\x1b\x1b\\\x1b\\",
+            &tx,
+        );
+
+        assert_eq!(
+            result.terminal_responses,
+            vec![expected_xtgettcap_response("5463", None)]
+        );
+    }
+
+    #[test]
+    fn tmux_passthrough_unwraps_osc52_split_across_pty_reads() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        let wrapped: &[u8] = b"\x1bPtmux;\x1b\x1b]52;c;Y2xpcGJvYXJk\x07\x1b\\";
+        for split in 1..wrapped.len() {
+            let terminal = crate::ghostty::Terminal::new(80, 24, 100).unwrap();
+            let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+            let first = pane.process_pty_bytes(pane_id, 0, &wrapped[..split], &tx);
+            let second = pane.process_pty_bytes(pane_id, 0, &wrapped[split..], &tx);
+            let mut writes = first.clipboard_writes;
+            writes.extend(second.clipboard_writes);
+            assert_eq!(
+                writes,
+                vec![b"clipboard".to_vec()],
+                "split at offset {split} lost the clipboard write"
+            );
+        }
+        let _ = pane;
     }
 
     #[test]

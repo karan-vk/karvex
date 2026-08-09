@@ -1317,6 +1317,15 @@ mod tests {
         );
     }
 
+    /// ⚠ This asserts *tracker-layer* policy only, not pane-level behaviour.
+    /// Since the tmux-compat work
+    /// (`docs/design/claude-teammates/01-port-plan.md` R1/W3) a pane unwraps
+    /// `ESC P tmux ; … ESC \` in `GhosttyPaneTerminal::process_pty_bytes`
+    /// before any tracker observes the stream
+    /// (`src/pane/terminal/tmux_passthrough.rs`), so a wrapped OSC 11 query
+    /// *does* reach this tracker in production — as its unwrapped inner
+    /// bytes. This test drives the tracker directly, upstream of that filter.
+    /// Do not cite it as evidence that Karvex still drops tmux passthrough.
     #[test]
     fn default_color_event_tracker_ignores_other_osc_and_dcs_payloads() {
         let mut tracker = DefaultColorEventTracker::default();

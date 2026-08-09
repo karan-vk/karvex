@@ -1,3 +1,5 @@
+use ratatui::style::Color;
+
 use super::AgentPanelEntry;
 use crate::config::{
     AgentSidebarToken, AgentsSidebarConfig, SidebarTokenStyle, SpaceSidebarToken,
@@ -151,11 +153,82 @@ pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'
     }
 }
 
+/// Teammate accent colour (D8): a style hint derived from the
+/// `agent_accent` metadata token the tmux-compat shim writes
+/// (`src/cli/tmux_compat.rs`), never rendered as literal text. An unset or
+/// unrecognised value falls back to `None`, so the caller keeps the row's
+/// default style rather than propagating garbage into the UI.
+///
+/// These are fixed identity swatches, deliberately independent of the active
+/// theme's `Palette`: the accent's job is to let a user tell teammates apart
+/// by the colour Claude itself assigned them, not to carry status meaning
+/// (unlike `Palette::red`/`green`/`yellow`, which already mean
+/// blocked/idle/working elsewhere in this UI).
+pub(super) fn agent_accent_color(value: &str) -> Option<Color> {
+    Some(match value {
+        "red" => Color::Rgb(0xe0, 0x6c, 0x75),
+        "blue" => Color::Rgb(0x61, 0xaf, 0xef),
+        "green" => Color::Rgb(0x98, 0xc3, 0x79),
+        "yellow" => Color::Rgb(0xe5, 0xc0, 0x7b),
+        "magenta" => Color::Rgb(0xc6, 0x78, 0xdd),
+        "cyan" => Color::Rgb(0x56, 0xb6, 0xc2),
+        // colour208
+        "orange" => Color::Rgb(0xd1, 0x9a, 0x66),
+        // colour205
+        "pink" => Color::Rgb(0xff, 0x79, 0xc6),
+        _ => return None,
+    })
+}
+
+/// Reads the `agent_accent` token straight off the panel entry and resolves
+/// it to a colour. See [`agent_accent_color`].
+pub(super) fn entry_agent_accent_color(entry: &AgentPanelEntry) -> Option<Color> {
+    entry
+        .tokens
+        .get(crate::cli::tmux_compat::AGENT_ACCENT_TOKEN_KEY)
+        .and_then(|value| agent_accent_color(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{AgentSidebarToken, SpaceSidebarToken};
     use crate::detect::AgentState;
+
+    #[test]
+    fn agent_accent_color_maps_every_claude_colour_and_falls_back_for_unknown() {
+        for colour in ["red", "blue", "green", "yellow", "magenta", "cyan"] {
+            assert!(agent_accent_color(colour).is_some(), "missing {colour}");
+        }
+        // Post-normalisation names (colour208 -> orange, colour205 -> pink);
+        // the shim never hands the sidebar a raw `colourNNN` value.
+        assert!(agent_accent_color("orange").is_some());
+        assert!(agent_accent_color("pink").is_some());
+        assert_eq!(agent_accent_color("colour208"), None);
+        assert_eq!(agent_accent_color(""), None);
+        assert_eq!(agent_accent_color("mauve"), None);
+    }
+
+    #[test]
+    fn entry_agent_accent_color_reads_the_agent_accent_token() {
+        let mut with_accent = entry();
+        with_accent
+            .tokens
+            .insert("agent_accent".into(), "cyan".into());
+        assert_eq!(
+            entry_agent_accent_color(&with_accent),
+            agent_accent_color("cyan")
+        );
+
+        let without_accent = entry();
+        assert_eq!(entry_agent_accent_color(&without_accent), None);
+
+        let mut unknown_value = entry();
+        unknown_value
+            .tokens
+            .insert("agent_accent".into(), "chartreuse".into());
+        assert_eq!(entry_agent_accent_color(&unknown_value), None);
+    }
 
     fn entry() -> AgentPanelEntry {
         AgentPanelEntry {

@@ -112,6 +112,35 @@ herdr integration install claude
 
 Herdr 默认使用 `~/.claude`,设置了 `CLAUDE_CONFIG_DIR` 时使用后者。Claude 配置目录必须已经存在。安装会写入 `hooks/herdr-agent-state.sh`,并向 `settings.json` 添加 Herdr 钩子条目。卸载会移除匹配的钩子条目并删除钩子脚本。
 
+## Claude Agent Teams
+
+当 `teammateMode` 解析为 `auto`(默认值)时,Claude Code 的 Agent Teams 功能会通过 tmux 后端启动每个队友。Herdr 会自动让自己成为这个后端: 每个由 Herdr 管理的窗格都会导出一个 tmux 兼容的会话身份,并且 Herdr 会在该窗格的 `PATH` 中放置一个名为 `tmux` 的可执行文件,它与本地 Herdr socket 通信,而不是真正的 tmux 服务器。Claude Code 检测到设置了 `$TMUX`,便把该窗格当作 tmux 处理,并把每个队友作为原生 Herdr 窗格在同一个标签页中启动 — 不需要单独的终端复用器,也不需要挂接嵌套的会话。首领窗格保留焦点,队友窗格会出现在侧边栏中,并像其他被检测到的 Claude Code 窗格一样上报生命周期状态。
+
+这要求 `teammateMode` 实际解析为 `auto`。如果 Claude 的设置文件把 `teammateMode` 固定为其他值(例如 `iterm2`),tmux 后端就会失效,而 Herdr 无法从 Claude 自身配置之外覆盖这一点 — 如果队友没有以 Herdr 窗格的形式出现,请先检查这个设置。
+
+有两个环境变量可以选择退出,都会在窗格启动或服务器启动时读取:
+
+```bash
+KARVEX_NO_TMUX_COMPAT=1   # 不要向新窗格导出 tmux 身份
+KARVEX_NO_AUTO_INTEGRATION=1   # 服务器启动时不要自动安装 Claude Code 钩子
+```
+
+`KARVEX_NO_TMUX_COMPAT=1` 不会删除 Herdr 已经安装的垫片;它只会停止向设置之后启动的窗格导出该身份。Herdr 窗格内 `PATH` 上已有的真正 `tmux` 仍然可以正常工作 — Herdr 的垫片只拦截 Claude Code 队友后端使用的这一小部分命令,其余的一律原样传递,包括指向无关服务器的 `tmux -L <name>` 调用。
+
+在 macOS 上,Herdr 还会把垫片镜像到 `~/.local/bin/tmux`,以便在与 Homebrew 的 PATH 设置的顺序之争中获胜;Herdr 只在 `~/.local/bin` 已经存在时才创建这个镜像,并且从不覆盖它不拥有的真实文件或符号链接。目前没有 `herdr uninstall` 命令,因此删除垫片需要手动完成。尤其是 macOS 上的镜像会在卸载 Herdr 之后继续存在,在删除之前一直遮蔽真正的 `tmux`。删除之前先确认每个链接确实属于 Herdr:
+
+```bash
+readlink ~/.config/herdr/shims/tmux   # 垫片本体;每个会话另有自己的副本
+rm ~/.config/herdr/shims/tmux
+
+readlink ~/.local/bin/tmux            # 仅限 macOS;只有指向 Herdr 安装位置时才删除它
+rm ~/.local/bin/tmux
+```
+
+命名会话在 `~/.config/herdr/sessions/<name>/shims/tmux` 有自己的副本。除非同时设置了 `KARVEX_NO_TMUX_COMPAT`,否则这两个链接都会在下次启动窗格时被重新创建,因此如果希望删除是永久性的,请先设置该退出开关。
+
+作为原生窗格的 Claude Agent Teams 在 Windows 上不受支持。Herdr 在那里不会导出 tmux 身份,因此 Claude Code 会为队友回退到自己的非 tmux 后端。
+
 ## Codex
 
 安装 Codex 钩子:

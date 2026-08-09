@@ -112,6 +112,35 @@ herdr integration install claude
 
 Herdr はデフォルトで `~/.claude` を使い、`CLAUDE_CONFIG_DIR` が設定されていればそちらを使います。Claude の設定ディレクトリはあらかじめ存在している必要があります。インストールは `hooks/herdr-agent-state.sh` を書き込み、`settings.json` に Herdr のフックエントリを追加します。アンインストールは一致するフックエントリを削除し、フックスクリプトを削除します。
 
+## Claude Agent Teams
+
+Claude Code の Agent Teams 機能は、`teammateMode` が `auto`(デフォルト)に解決されるとき、各チームメイトを tmux バックエンド経由で起動します。Herdr は自動的にそのバックエンドになりすまします: Herdr が管理するすべてのペインは tmux 互換のセッション識別情報をエクスポートし、Herdr はそのペインの `PATH` に、実際の tmux サーバーではなくローカルの Herdr ソケットと通信する `tmux` という名前の実行ファイルを配置します。Claude Code は `$TMUX` が設定されていることを検出してそのペインを tmux とみなし、各チームメイトを同じタブ内のネイティブな Herdr ペインとして起動します — 別のターミナルマルチプレクサも、アタッチすべきネストしたセッションも不要です。リーダーペインはフォーカスを保持し、チームメイトペインはサイドバーに表示され、他の検出済み Claude Code ペインと同じ方法でライフサイクル状態を報告します。
+
+これには `teammateMode` が実際に `auto` に解決される必要があります。Claude の設定ファイルが `teammateMode` を別の値(例えば `iterm2`)に固定している場合、tmux バックエンドは無効になり、Herdr には Claude 自身の設定の外側からそれを上書きする方法がありません — チームメイトが Herdr ペインとして表示されない場合は、まずこの設定を確認してください。
+
+2 つの環境変数がオプトアウトを提供し、どちらもペインの起動時またはサーバー起動時に読み込まれます:
+
+```bash
+KARVEX_NO_TMUX_COMPAT=1   # 新しいペインに tmux 識別情報をエクスポートしない
+KARVEX_NO_AUTO_INTEGRATION=1   # サーバー起動時に Claude Code フックを自動インストールしない
+```
+
+`KARVEX_NO_TMUX_COMPAT=1` は、Herdr がすでにインストールしたシムを削除しません。設定後に起動するペインへの識別情報のエクスポートを停止するだけです。Herdr ペイン内ですでに `PATH` 上にある実際の `tmux` は通常どおり動作します — Herdr のシムは Claude Code のチームメイトバックエンドが使う狭いコマンド範囲だけを横取りし、無関係なサーバーを指す `tmux -L <name>` の呼び出しを含め、それ以外はすべて素通しします。
+
+macOS では、Herdr は Homebrew の PATH 設定との順序の争いに勝つため、シムを `~/.local/bin/tmux` にもミラーします。Herdr はこのミラーを `~/.local/bin` がすでに存在する場合にのみ作成し、自分が所有していない実ファイルやシンボリックリンクを上書きすることはありません。`herdr uninstall` コマンドは存在しないため、シムの削除は手動です。特に macOS のミラーは Herdr をアンインストールしても残り、削除するまで実際の `tmux` を隠し続けます。削除する前に、それぞれのリンクが Herdr のものであることを確認してください:
+
+```bash
+readlink ~/.config/herdr/shims/tmux   # シム本体。セッションごとに別のコピーがある
+rm ~/.config/herdr/shims/tmux
+
+readlink ~/.local/bin/tmux            # macOS のみ。Herdr のインストール先を指している場合だけ削除する
+rm ~/.local/bin/tmux
+```
+
+名前付きセッションは `~/.config/herdr/sessions/<name>/shims/tmux` に独自のコピーを持ちます。`KARVEX_NO_TMUX_COMPAT` も設定していない限り、どちらのリンクも次にペインが起動したときに再作成されるため、削除を恒久的にしたい場合は先にオプトアウトを設定してください。
+
+ネイティブペインとしての Claude Agent Teams は Windows ではサポートされていません。Herdr はそこでは tmux 識別情報をエクスポートしないため、Claude Code はチームメイトに対して独自の tmux 以外のバックエンドにフォールバックします。
+
 ## Codex
 
 Codex フックをインストールします:
