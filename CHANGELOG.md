@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.11.0] - 2026-08-09
+
 ### Added
 
 - Managed panes now export a tmux-compatible identity (`TMUX`, `TMUX_PANE`) and get Karvex's own `tmux` shim prepended to `PATH`, so tools that detect tmux by its presence — notably Claude Code's Agent Teams mode — work inside a Karvex pane. The shim lives at `<data_dir>/shims/tmux`, symlinked to Karvex's own binary, and is mirrored into `~/.local/bin/tmux` on macOS when that directory already exists, so it wins over a Homebrew `tmux` on `PATH`; shim installation gates the export, so if it fails, or on Windows, pane env is left unchanged. Set `KARVEX_NO_TMUX_COMPAT=1` to opt out; the opt-out is checked before the install runs, so it also prevents the shim from being created in the first place. There is no `kvx uninstall`; removing the shim means deleting `<data_dir>/shims/tmux` and, on macOS, `~/.local/bin/tmux` if it points at Karvex.
