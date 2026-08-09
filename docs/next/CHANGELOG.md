@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.10.2] - 2026-08-09
+
 ### Fixed
 - The `events.subscribe` stream now delivers every subscribed event for a connection in one global order instead of one event per subscribed type per 100ms poll pass. A per-type cursor previously let `workflow.run.finished` drain ahead of the `workflow.node.*` events it summarised whenever a backlog built up (an 11-event `node_created` backlog took over three seconds to catch up to a one-event `run_finished` type); a single cursor over the event hub's own sequence now walks the backlog in the order it actually happened, so a node's `created` always precedes its own `updated`/checkpoint events, and a run's `finished` always follows its nodes' events.
 - `workflow.run.updated` now fires when a run's node set grows, coalesced into one event per batch of newly materialised nodes and always ordered before that batch's `run.finished`. It previously fired only from `pause`/`resume`, so a subscriber tracking `nodes_total` had no way to see a run grow.
