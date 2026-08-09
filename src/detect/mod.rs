@@ -545,7 +545,30 @@ fn agent_name_from_known_package_path(path: &str) -> Option<String> {
             return Some(agent_label(Agent::Pi).to_string());
         }
     }
+
+    if is_claude_versioned_install(&components) {
+        return Some(agent_label(Agent::Claude).to_string());
+    }
     None
+}
+
+/// Claude Code's native installer keeps version-pinned binaries at
+/// `<data dir>/claude/versions/<version>` and puts a `claude` symlink to the
+/// active one on `PATH`. A hand-started `claude` therefore has a `claude`
+/// argv[0], but Agent-Teams *teammates* are launched by that absolute
+/// versioned path, so their argv[0] basename is a bare version string like
+/// `2.1.226` and no other rule here identifies them.
+///
+/// Deliberately narrow: the last three path components must be exactly
+/// `claude`, `versions`, and a component starting with a digit. A numeric
+/// basename anywhere else is never treated as an agent.
+fn is_claude_versioned_install(components: &[String]) -> bool {
+    let [.., claude, versions, version] = components else {
+        return false;
+    };
+    claude.as_str() == "claude"
+        && versions.as_str() == "versions"
+        && version.starts_with(|c: char| c.is_ascii_digit())
 }
 
 fn resolved_agent_name_from_path_token(token: &str) -> Option<String> {
@@ -883,6 +906,59 @@ mod tests {
             identify_agent_in_job(&job),
             Some((Agent::Claude, "claude".to_string()))
         );
+    }
+
+    /// Live gate evidence (`docs/design/claude-teammates/01-port-plan.md` §7):
+    /// a Claude Code Agent-Teams teammate is respawned as
+    /// `<data dir>/claude/versions/<version> --agent-id … --agent-name …`, so
+    /// its argv[0] basename is a bare version string and every basename-based
+    /// rule misses it. Without this the teammate pane reports no agent at all
+    /// and no manifest rule ever runs against its screen.
+    #[test]
+    fn identify_agent_in_job_detects_claude_teammate_versioned_binary() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "2.1.226",
+                &[
+                    "/home/user/.local/share/claude/versions/2.1.226",
+                    "--agent-id",
+                    "probe-mate@session-abc",
+                    "--agent-name",
+                    "probe-mate",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Claude, "claude".to_string()))
+        );
+    }
+
+    #[test]
+    fn claude_versioned_install_rule_is_narrow() {
+        let versioned = |path: &str| agent_name_from_known_package_path(path);
+
+        assert_eq!(
+            versioned("/home/user/.local/share/claude/versions/2.1.226"),
+            Some("claude".to_string())
+        );
+        // Windows-style separators resolve the same way.
+        assert_eq!(
+            versioned(r"C:\Users\user\claude\versions\2.1.226"),
+            Some("claude".to_string())
+        );
+        // The version component must be last: a deeper path is not the
+        // installed binary.
+        assert_eq!(versioned("/opt/claude/versions/2.1.226/bin/other"), None);
+        // A non-version-shaped basename under the same directory is not ours.
+        assert_eq!(versioned("/opt/claude/versions/README"), None);
+        // `versions` alone, without the `claude` parent, never matches.
+        assert_eq!(versioned("/opt/othertool/versions/2.1.226"), None);
+        // A bare numeric basename anywhere else is never an agent.
+        assert_eq!(versioned("/usr/lib/2.1.226"), None);
     }
 
     #[test]

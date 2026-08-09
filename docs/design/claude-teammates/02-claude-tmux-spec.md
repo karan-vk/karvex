@@ -1,11 +1,11 @@
 # Claude Code teammate tmux backend — Karvex spec
 
 Status: describes the code as built and merged into the working tree
-(W1–W5, W7, W8 complete; adversarially audited 2026-08-09). **The sections
-still marked TBD are gate-phase outputs** — they can only be filled in by
-`01-port-plan.md` §7's live run against a real Claude Code Agent Teams
-session, which has not happened yet. Everything not marked TBD reflects
-shipped behavior and is backed by tests.
+(W1–W5, W7, W8 complete; adversarially audited 2026-08-09). The live gate
+phase (`01-port-plan.md` §7) ran on 2026-08-09 against Claude Code
+v2.1.226 with real Agent Teams teammates; its results are recorded inline
+below in place of the former TBD markers. Everything here reflects shipped
+behavior and is backed by tests, live evidence, or both.
 
 ## Provenance
 
@@ -202,20 +202,22 @@ leader-first ordering `list-panes` must produce (see
 number properly via `workspace::decode_public_number`, keeping a decimal
 parse only as a fallback for other id shapes.
 
-⚠ **Unverified at time of writing** — flagged as gate-phase probe Q1b in
-`01-port-plan.md` §8: does anything in Claude's Agent Teams path validate the
-`%N`/`@N` sigil shape rather than treating ids as opaque? If the gate probe
-(`01-port-plan.md` §7 step 13) finds that it does, the fix is a bijective
-`w1:p3 ↔ %<ordinal>` mapping behind a single pair of pure
-`encode_pane_id`/`decode_pane_id` functions in the shim — every id must
-already route through that pair rather than being formatted inline, so the
-fix is contained if it is ever needed. **TBD: record the probe result here
-once the gate phase runs.**
+✅ **Q1b answered by the live gate (2026-08-09, Claude Code v2.1.226).**
+Claude treats the ids as opaque. Across a full teammate lifecycle — 15 shim
+invocations covering `display-message`, `list-panes`, `split-window`,
+`set-option` ×5, `select-pane -T`, `respawn-pane`, and `kill-pane` — every
+`-t` target Claude sent back was a Karvex-shaped `w1:pN`/`w1:tN` id it had
+received from us, with zero errors, zero retries, and no re-probing. The
+`w1:p3 ↔ %<ordinal>` mapping is **not** needed; the
+`encode_pane_id`/`decode_pane_id` seam stays in place as insurance only.
 
-Similarly unverified (Q1c): whether anything parses the `-V` banner more
-strictly than "exit 0". Karvex prints `tmux 3.5a (karvex-compat)`; real tmux
-prints `tmux 3.5a`. If something on a user's `PATH` chokes on the suffix, drop
-it. **TBD: record the probe result here once the gate phase runs.**
+✅ **Q1c answered: the banner is never parsed, because `-V` is never
+called.** `insideTmux` (a synchronous `process.env.TMUX` check) short-circuits
+backend selection before `isAvailable` is consulted, so a pane that exports
+`TMUX` never reaches the `tmux -V` availability probe at all. The live
+invocation log contains no `-V` call. The `(karvex-compat)` suffix is
+therefore unexercised by Claude on this path; it is kept because it is the
+honest answer for anything else on `PATH` that asks.
 
 ## Behavioral notes
 
@@ -304,11 +306,11 @@ Karvex keeps its own `karvex-agent-state.sh` hook (handles `session` **and**
 `stop`) rather than adopting bakr's `SessionStart`-only version, because the
 `stop → idle` report is consumed by the workflow engine
 (`EngineInput::TurnEnded`) and bakr's version regressed it. No hook change,
-no `CLAUDE_INTEGRATION_VERSION` bump — **unless** the gate-phase probe
-(`01-port-plan.md` §7 step 8) finds that Agent-Teams teammate hook events
-carry `agent_id`, which the hook's existing `is_subagent` guard treats as an
-in-process subagent and ignores. **TBD — record the probe's raw JSON result
-and verdict here** once the gate phase runs; see
+no `CLAUDE_INTEGRATION_VERSION` bump. The gate-phase probe
+(`01-port-plan.md` §7 step 8) confirmed this was correct rather than merely
+convenient: teammate hook events do **not** carry `agent_id`, so the
+`is_subagent` guard never fires for them and a teammate pane reports its own
+session normally. W9 did not run and the constant stays at 8. See
 [Hook probe result](#hook-probe-result) below.
 
 ### D8: teammate accent colour
@@ -414,10 +416,30 @@ must land before or together with the `TMUX` export — never after.
 **Acceptance is two-part** and both halves are hard gates
 (`01-port-plan.md` §7 step 7, §9): (a) an OSC 52 clipboard write made through
 tmux-wrapped passthrough reaches the system clipboard, and (b) a
-tmux-wrapped OSC 11 background-colour query produces a response. If either
-fails, the fallback is to invert the `TMUX` export from default-on to
-opt-in (`KARVEX_TMUX_COMPAT=1`) rather than ship the regression. **TBD:
-record which outcome shipped here** once the gate phase runs.
+tmux-wrapped colour query produces a response identical to the bare form. If
+either fails, the fallback is to invert the `TMUX` export from default-on to
+opt-in (`KARVEX_TMUX_COMPAT=1`) rather than ship the regression.
+
+✅ **Both halves passed live (2026-08-09); the default-on export shipped.**
+
+- **(a) Clipboard.** From inside a pane with `TMUX` exported,
+  `\ePtmux;\e\e]52;c;<base64>\a\e\\` landed in the real system clipboard
+  (`wl-paste` read back the exact payload). The write travels
+  pane → `ProcessBytesResult.clipboard_writes` → `AppEvent::ClipboardWrite`
+  → `ServerMessage::Clipboard` to the foreground client → the host clipboard,
+  so on a desktop with a working native clipboard it never appears as an
+  OSC 52 re-emission on the client's stdout — check the clipboard, not the
+  client's output stream, when verifying this by hand.
+- **(b) Colour/capability queries.** A tmux-wrapped `OSC 4;1;?` palette query
+  answered `\e]4;1;rgb:cccc/6666/6666\e\\` — **byte-identical** to the bare
+  query — and a wrapped `CSI 6n` answered identically to the bare form too.
+  Wrapped `OSC 11`/`OSC 10` returned empty in that harness, but so did the
+  *bare* form: Karvex only answers a default fg/bg query once it has learned
+  a host terminal theme, and the gate harness (detached tmux → `script` → a
+  pipe) had no terminal to learn one from. Identical bare/wrapped behavior in
+  every case, and
+  `tmux_passthrough_unwraps_osc11_query_and_a_response_is_produced` pins the
+  OSC 11 equality with a host theme applied.
 
 ## Residual gaps
 
@@ -436,8 +458,36 @@ of done:
   map Claude's leader-30%/teammates-stacked layout request onto its own
   split geometry; Karvex's own layout stands in instead. A real mapping
   (`main-vertical` → `layout.apply`) is a follow-up, not part of this
-  landing. **TBD: record here how bad this looks in practice** once the gate
-  phase runs (`01-port-plan.md` §8 Q3).
+  landing.
+
+  ✅ **Q3 answered for one teammate: it looks fine, because `split-window`
+  already carries the geometry.** With a single teammate Claude sends
+  `split-window -d -t <leader> -h -l 70%`, which the shim inverts to a 0.3
+  ratio for the leader — measured live at 52/174 columns for the leader
+  against 122 for the teammate, with focus staying on the leader. The
+  `select-layout main-vertical` / `resize-pane -x 30%` pair that follows is
+  then genuinely redundant. It is only at 3+ teammates, where the stacking
+  half of `main-vertical` carries information the per-split ratios do not,
+  that dropping it is expected to bite; that case was not exercised at
+  the gate and remains the reason the follow-up mapping is worth doing.
+
+- **`list-panes` treats the tab's first pane as the leader.** Claude's own
+  `.slice(1)` assumes element 0 is the leader, and the shim's leader-first
+  ordering is creation order within the tab — so a Claude started in a tab
+  that *already* contains an older pane will have that unrelated pane
+  treated as the leader (observed at the gate: `resize-pane -x 30%` was
+  aimed at a bystander pane). Every verb this affects is accept-and-drop, so
+  the observed impact was nil, but the assumption is worth knowing: the
+  intended shape is Claude owning its tab.
+
+- **A teammate that finishes its own task is not always reaped.** Reaping is
+  driven entirely by Claude issuing `kill-pane`, which it does on an explicit
+  teammate stop (verified live: `kill-pane -t w1:p3` closed the pane). At the
+  gate one teammate reported "finished" on its own and the leader's roster
+  dropped it *without* issuing `kill-pane`, leaving a live teammate `claude`
+  process in its Karvex pane. Nothing in the shim can detect this — Karvex
+  faithfully executed every command it was given — but users may see an
+  orphaned teammate pane they need to close by hand.
 - **No general tmux replacement.** tmux control mode (`DCS 1000 p`), the
   external-session path, and the `claude --tmux` entry helper are all out of
   scope; a real tmux still wins for anything the shim doesn't service or
@@ -460,24 +510,136 @@ the accept-and-succeed verbs (`set-option`, `select-layout`, `resize-pane`,
 passing through to the system tmux untouched; and the dead-server behavior
 recorded under [D3](#d3-shim-transport).
 
-Still open, and still requiring the real gate phase against a live Claude
-Code session: Q1 (hook `agent_id`, see
-[Hook probe result](#hook-probe-result) below), Q1b (pane-id sigil
-validation), Q1c (`-V` banner strictness), Q2 (`respawn-pane` reliability
-under real teammate commands), Q3 (how the accept-and-drop layout looks in
-practice), and the two-part R1 clipboard/colour-query acceptance.
+## Verified by the live gate phase (2026-08-09)
+
+`01-port-plan.md` §7 ran against Claude Code v2.1.226 with
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, driving real teammates in a
+throwaway named session. Every open question above is now answered: Q1
+(hook `agent_id` — clean), Q1b (id sigil — opaque), Q1c (`-V` — never
+called), Q2 (`respawn-pane` — reliable, see below), Q3 (layout — fine at one
+teammate), and the two-part R1 acceptance (both halves passed).
+
+The exact command sequence Claude issued to spawn one teammate, in order,
+was:
+
+```
+show -Av mouse                              → passthrough (real tmux)
+show -gv focus-events                       → passthrough (real tmux)
+display-message -p -t w1:p1 '#{session_name}:#{window_id}.#{pane_id}'
+display-message -t w1:p1 -p '#{window_id}'  → w1:t1
+list-panes -t w1:t1 -F '#{pane_id}'         → w1:p1
+split-window -d -t w1:p1 -h -l 70% -P -F '#{pane_id}' -- cat  → w1:p2
+set-option -p -t w1:p2 window-style bg=default,fg=blue
+set-option -p -t w1:p2 pane-border-style fg=blue
+set-option -p -t w1:p2 pane-active-border-style fg=blue
+select-pane -t w1:p2 -T gate-mate
+set-option -p -t w1:p2 pane-border-format '#[fg=blue,bold] #{pane_title} #[default]'
+list-panes -t w1:t1 -F '#{pane_id}'         → w1:p1, w1:p2
+set-option -w -t w1:t1 pane-border-status top
+set-option -p -t w1:p2 remain-on-exit failed
+respawn-pane -k -t w1:p2 -- '<teammate claude command>'
+```
+
+and, on an explicit teammate stop, `kill-pane -t <pane>`. `Q2` is answered by
+that `respawn-pane` line working every time it was issued: the teammate
+command reached the pane's shell and started, with no mangling from the
+readiness wait.
+
+Two surface gaps were observed and deliberately left as-is:
+
+- **Composite `-F` formats are not interpolated.** Claude's startup probe
+  `display-message -p '#{session_name}:#{window_id}.#{pane_id}'` is not one
+  of the recognized single-token formats, so the shim prints an empty line
+  and exits 0, per the unknown-format contract. Claude proceeded normally and
+  the whole teammate lifecycle worked, so this is non-fatal — but a small
+  format interpolator over the tokens the shim already answers would be
+  strictly more faithful.
+- **`show -Av mouse` and `show -gv focus-events` fall through to
+  passthrough.** Only `show-options … prefix` is serviced. Against a machine
+  with a real tmux installed these reach it and fail with tmux's own "no
+  server running", which Claude tolerates. On a machine with no tmux at all
+  the shim emulates the same failure. Neither affected teammate spawning.
+
+Also confirmed live: `tmux -L foo ls`, an unknown verb, and a mismatched
+`-S <path>` all passed through to the system `/usr/bin/tmux` (each failing
+with real tmux's own error text, never Karvex's); the
+`KARVEX_NO_TMUX_COMPAT=1` opt-out left panes with no `TMUX`, no `TMUX_PANE`,
+an unmodified `PATH`, `tmux` resolving to `/usr/bin/tmux`, and no `shims/`
+directory created at all; the shims directory contained exactly one entry,
+`tmux`, symlinked to the running binary; and with the server stopped
+`tmux -V` still exited 0 while `list-panes` failed in 14ms with exactly
+`no server running` on stderr, an empty stdout, and no JSON envelope.
 
 ## Hook probe result
 
-**TBD.** `01-port-plan.md` §7 step 8 / §8 Q1: does a live Agent-Teams
-teammate pane's hook event carry `agent_id`, which
-`karvex-agent-state.sh`'s existing `is_subagent` guard would treat as an
-in-process subagent and ignore (meaning the teammate pane never reports
-`agent_session` back to `kvx pane get`)? This decides whether W9 (hook
-reconciliation) runs and whether `CLAUDE_INTEGRATION_VERSION` moves from 8 to
-9. Record the raw hook JSON and the verdict here once the gate phase runs —
-a clean probe (teammate pane does report a session) is the evidence that "no
-hook change" was correct, not merely convenient.
+**Clean — no hook change, no version bump.** Live gate, 2026-08-09, Claude
+Code v2.1.226. A teammate pane reports its own session identity through the
+unmodified `karvex-agent-state.sh` exactly like a hand-started Claude pane:
+
+```
+$ kvx pane get w1:p2
+  "label": "gate-mate",
+  "agent": "claude",
+  "agent_status": "idle",
+  "agent_session": {
+    "agent": "claude", "kind": "id", "source": "karvex:claude",
+    "value": "68dcbedf-af8a-4766-b2be-9a3b4ee2b54d"
+  },
+  "tokens": { "agent_accent": "blue" }
+```
+
+The value differs from the leader pane's session id, so this is the
+teammate's own `SessionStart`, not the leader's leaking across. The hook's
+`is_subagent` guard (`bool(hook_input.get("agent_id"))`) is aimed at
+*in-process* subagents; an Agent-Teams teammate is a separate `claude`
+process owning its own pane and its own session, and its hook payload carries
+no `agent_id`. W9 did not run; `CLAUDE_INTEGRATION_VERSION` stays at 8.
+
+Lifecycle state was verified live end to end as well: the teammate pane
+transitions `idle → working → idle` as it receives and answers a
+`SendMessage` from the leader, and appears as a first-class entry in
+`kvx agent list` with its own session id.
+
+⚠ **One gate-phase fix was required to get there** — see
+[Teammate process identity](#teammate-process-identity) below. The hook was
+always fine; agent *identification* was not.
+
+## Teammate process identity
+
+⚠ **Found by the live gate; fixed in `src/detect/mod.rs`.** Claude's native
+installer keeps version-pinned binaries at
+`<data dir>/claude/versions/<version>` with a `claude` symlink to the active
+one on `PATH`. A hand-started Claude therefore has `claude` as its argv[0] —
+but the teammate command Claude submits through `respawn-pane` invokes the
+**absolute versioned path**:
+
+```
+cd <cwd> && env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+  /home/<user>/.local/share/claude/versions/2.1.226 \
+  --agent-id gate-mate@session-<sid> --agent-name gate-mate \
+  --team-name session-<sid> --agent-color blue \
+  --parent-session-id <sid> --permission-mode auto --effort high --model haiku
+```
+
+so the teammate process's argv[0] basename is a bare version string
+(`2.1.226`) and every basename-based rule in `identify_agent_in_job` missed
+it. The observed consequence was that a teammate pane reported `agent: null`
+and `agent_status: "unknown"`, no manifest rule ever ran against its screen,
+and it never appeared in `kvx agent list` or the sidebar's agent panel — even
+though its hook was reporting a session correctly the whole time.
+
+The fix is a narrow path-shape rule in `agent_name_from_known_package_path`:
+the last three path components must be exactly `claude`, `versions`, and a
+component starting with a digit. A numeric basename anywhere else is never
+treated as an agent, and `claude/versions/<v>/bin/<other>` does not match.
+Covered by `identify_agent_in_job_detects_claude_teammate_versioned_binary`
+and `claude_versioned_install_rule_is_narrow`.
+
+**No agent-detection manifest change was needed.** Once identity resolves,
+the teammate's screen is the ordinary Claude Code UI and the existing
+`src/detect/manifests/claude.toml` rules classify it correctly with no
+tuning: `osc_title_idle` (`^\x{2733} `) matches the teammate's idle OSC title
+and `osc_title_working` (braille spinner) matches while it works.
 
 ## Removal
 

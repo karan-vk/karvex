@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- A Claude Code Agent Teams teammate pane is now recognized as a Claude pane. Claude's native installer keeps version-pinned binaries at `<data dir>/claude/versions/<version>` and puts a `claude` symlink to the active one on `PATH`, so a hand-started Claude is identified by its `claude` argv[0] — but teammates are launched by that absolute versioned path, giving them a bare version string like `2.1.226` as their process name. Teammate panes consequently reported no agent at all: no lifecycle state, no entry in `kvx agent list`, and no row in the sidebar's agent panel, even though their hook was reporting a session correctly the whole time. Karvex now recognizes the `claude/versions/<version>` install layout specifically; a numeric process name anywhere else is still never treated as an agent.
 - Terminal passthrough sequences (`\ePtmux;…\e\\`) are now unwrapped at the top of a pane's inbound byte stream instead of being dropped, so OSC 52 clipboard writes and OSC 11/OSC 4/XTGETTCAP colour and capability queries made from inside a tmux-aware app (neovim, fzf, yazi, lazygit, tmux-aware prompts) keep working once a pane exports `TMUX`. Unrelated DCS strings still pass through byte-identical. This is a prerequisite for the tmux-compat work above, not an independent feature.
 
 ## [0.10.2] - 2026-08-09
