@@ -13,7 +13,7 @@ use std::fs;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
-use crate::api::subscriptions::ActiveSubscription;
+use crate::api::subscriptions::{ActiveSubscription, EventStreamCursor as ActiveEventStreamCursor};
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
@@ -697,12 +697,36 @@ fn stream_subscriptions(
         return Err(err);
     }
 
+    // Every event-log-backed subscription on this connection shares one cursor
+    // over the hub's global sequence, so a backlog is delivered in causal order
+    // rather than one event per subscribed type per pass. The remaining
+    // subscriptions (`pane.output_matched`, `pane.agent_status_changed`,
+    // `pane.scroll_changed`) poll the app for a snapshot and keep their own
+    // per-pass cadence.
+    let mut event_cursor = ActiveEventStreamCursor::from_subscriptions(&subscriptions);
+
     loop {
         if should_stop_connection(&mut stream, running)? {
             return Ok(());
         }
 
+        if let Some(cursor) = event_cursor.as_mut() {
+            for event in cursor.drain(event_hub) {
+                if let Err(err) = write_json_line(&mut stream, &event) {
+                    if is_connection_closed_error(&err) {
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
         for subscription in &mut subscriptions {
+            // The `Event` arm is served by the shared cursor above; polling it
+            // here as well would deliver every event twice.
+            if subscription.event_kind().is_some() {
+                continue;
+            }
             if let Some(event) = subscription.poll(api_tx, event_hub) {
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {

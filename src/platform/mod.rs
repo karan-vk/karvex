@@ -129,6 +129,24 @@ pub(crate) fn take_terminal_resize_signal() -> bool {
     false
 }
 
+/// Restores the POSIX default disposition for `SIGPIPE`, which the Rust
+/// runtime replaces with `SIG_IGN`. A CLI in a pipeline should die quietly
+/// when its reader goes away (`kvx workflow run show | head`), not panic with
+/// a backtrace into the user's terminal.
+#[cfg(unix)]
+pub(crate) fn restore_default_sigpipe() {
+    // SAFETY: `signal` only installs a disposition for the calling process;
+    // this runs once, synchronously, at CLI startup before any thread is
+    // spawned and before stdout is written to, so there is no concurrent
+    // access to signal state.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn restore_default_sigpipe() {}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardCommand {
@@ -362,6 +380,19 @@ impl PrefixInputSource for RealPrefixInputSource {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sigpipe_disposition_is_default_after_restore() {
+        restore_default_sigpipe();
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut current) };
+        assert_eq!(result, 0, "sigaction query failed");
+        assert_eq!(
+            current.sa_sigaction,
+            libc::SIG_DFL,
+            "SIGPIPE disposition should be SIG_DFL after restore_default_sigpipe()"
+        );
+    }
 
     #[test]
     fn terminal_resize_signal_is_recorded_once_per_delivery() {

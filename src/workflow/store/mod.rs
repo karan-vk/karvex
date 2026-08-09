@@ -37,7 +37,8 @@ pub use error::StoreError;
 #[allow(unused_imports)]
 pub use queries::{
     CheckpointRecord, RunEdgeRecord, RunEventRecord, RunNodeRecord, RunRecord, RunSummaryRecord,
-    VersionRecord, WorkflowSummary, DEFAULT_NODE_HISTORY_RUNS,
+    StoredGrowthLimit, StoredGrowthLimits, VersionRecord, WorkflowSummary,
+    DEFAULT_NODE_HISTORY_RUNS,
 };
 use surrealdb::engine::local::{Db, Mem, SurrealKv};
 use surrealdb::Surreal;

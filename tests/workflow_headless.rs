@@ -33,11 +33,26 @@
 //! 9. a proposal naming a template outside the proposer's `expand_allow` is
 //!    refused with no side effects at all.
 //!
-//! **On event ordering.** `events.subscribe` gives each requested `type` its own
-//! cursor and the stream loop yields at most one event per subscription per
-//! poll pass, so only events of the *same* kind arrive in a guaranteed order.
-//! Cross-kind causality is asserted from event payloads, never from stream
-//! position.
+//! Phase 2's ordering fix adds a tenth:
+//!
+//! 10. one `events.subscribe` connection carrying every `workflow.*` type
+//!     delivers a fast expansion run in **causal** order — a node's
+//!     `workflow.node.created` before that node's updates and checkpoints, and
+//!     `workflow.run.finished` after every node event of the run — plus a
+//!     `workflow.run.updated` that carries the grown `nodes_total`.
+//!
+//! **On event ordering.** `events.subscribe` gives every event-log-backed
+//! subscription on a connection **one shared cursor** over the hub's global
+//! sequence, and each poll pass drains the whole backlog in that order. So a
+//! single connection's stream position *is* causal order: a node's
+//! `workflow.node.created` precedes its updates and checkpoints, and
+//! `workflow.run.finished` follows the node events it summarises. Before this
+//! each subscribed `type` had its own cursor and the loop yielded at most one
+//! event per subscription per pass, so a run with eleven queued node events and
+//! one queued `run.finished` delivered the finish first — the P1 regression
+//! scenario 10 pins. Assertions written against *payloads* rather than stream
+//! position are still fine, and most of the older scenarios below keep doing
+//! that; scenario 10 is the one that asserts the guarantee itself.
 //!
 //! **Why almost every fixture uses `runner = "command"`.** `runner =
 //! "command"` is a declared node field and a first-class binding (`04` §4.2),
@@ -721,6 +736,45 @@ fn subscribe_expansion(socket: &Path) -> (JsonLineReader, Vec<Value>) {
         "subscribe was rejected: {ack}"
     );
     (reader, Vec::new())
+}
+
+/// One connection carrying every `workflow.*` event type, which is what a
+/// client migrating off polling actually opens — and the only shape in which
+/// the cross-type ordering guarantee is observable.
+fn subscribe_all_workflow_events(socket: &Path) -> (JsonLineReader, Vec<Value>) {
+    let mut reader = open_subscription(
+        socket,
+        &request(
+            "sub_order",
+            "events.subscribe",
+            json!({
+                "subscriptions": [
+                    { "type": "workflow.run.started" },
+                    { "type": "workflow.run.updated" },
+                    { "type": "workflow.run.finished" },
+                    { "type": "workflow.node.created" },
+                    { "type": "workflow.node.updated" },
+                    { "type": "workflow.node.output_checkpoint" },
+                    { "type": "workflow.growth.limited" },
+                ]
+            }),
+        ),
+    );
+    let ack = reader.read_json_line(Duration::from_secs(5));
+    assert_eq!(ack["id"], "sub_order", "unexpected subscribe ack: {ack}");
+    assert_eq!(
+        ack["result"]["type"], "subscription_started",
+        "subscribe was rejected: {ack}"
+    );
+    (reader, Vec::new())
+}
+
+/// The instance path an event is about, however that event spells it.
+fn event_node_path(event: &Value) -> Option<String> {
+    event["data"]["node"]["path"]
+        .as_str()
+        .or_else(|| event["data"]["path"].as_str())
+        .map(str::to_string)
 }
 
 /// Every `workflow.node.created` event announcing a child of the proposer.
@@ -2319,6 +2373,154 @@ fn a_disallowed_template_is_refused_and_creates_nothing() {
         edge_pairs(&run),
         BTreeSet::from(["fanout -> collect".to_string()]),
         "the graph is the one the author drew: {run}"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 10. The event stream's causal ordering guarantee
+// ---------------------------------------------------------------------------
+
+/// The P1 regression, end to end, over the surface it broke on.
+///
+/// A stub expansion run finishes in well under a second, so every event of the
+/// run is queued on the hub before the subscription's poll loop next wakes.
+/// That backlog is exactly the condition under which per-type cursors used to
+/// deliver `workflow.run.finished` ahead of the `workflow.node.created` events
+/// it summarises, and a node's `workflow.node.output_checkpoint` ahead of that
+/// node's own creation — an event-driven client cache saw a finished run before
+/// its children existed. `06-phase2-plan.md:229` states the write-ordering
+/// invariant ("RunNodeCreated before any RunNode update for the same path");
+/// this asserts the *delivery* order a client actually observes.
+///
+/// Written against stream position on purpose. Every other scenario in this
+/// file deliberately asserts from payloads instead, because payload assertions
+/// survive a reordering — which is precisely why none of them caught this.
+#[test]
+fn event_stream_delivers_cross_type_events_in_causal_order() {
+    let server = spawn_workflow_server("eorder");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_all_workflow_events(&socket);
+
+    let workflow_id =
+        create_workflow_from_text(&socket, &expand_definition_text(SHARDS, TEMPLATE, 3));
+    let run_id = start_run(&socket, &workflow_id, "ship the thing");
+
+    let started = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_started",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    let nodes_at_start = started["data"]["run"]["nodes_total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("run.started carries no nodes_total: {started}"));
+
+    wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_run_finished",
+        EXPANSION_SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    // Anything still queued behind the finish belongs to the same run and has
+    // to be counted, or a stream that delivered the finish first would look
+    // ordered simply because the test stopped reading.
+    drain_events(&mut reader, &mut seen, Duration::from_secs(2));
+
+    let kinds = event_kinds(&seen);
+    let created_at: std::collections::BTreeMap<String, usize> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["event"] == "workflow_node_created")
+        .filter_map(|(index, event)| Some((event_node_path(event)?, index)))
+        .fold(
+            std::collections::BTreeMap::new(),
+            |mut acc, (path, index)| {
+                acc.entry(path).or_insert(index);
+                acc
+            },
+        );
+    assert!(
+        created_at.len() >= 5,
+        "two static nodes plus three children must each be announced; saw {kinds:?}"
+    );
+
+    // ── a node is created before anything else refers to it ─────────────────
+    for (index, event) in seen.iter().enumerate() {
+        let kind = event["event"].as_str().unwrap_or_default();
+        if kind != "workflow_node_updated" && kind != "workflow_node_output_checkpoint" {
+            continue;
+        }
+        let Some(path) = event_node_path(event) else {
+            continue;
+        };
+        let created = created_at.get(&path).copied().unwrap_or_else(|| {
+            panic!("{kind} for {path} with no workflow_node_created at all; saw {kinds:?}")
+        });
+        assert!(
+            created < index,
+            "{kind} for {path} arrived at line {index}, before that node's \
+             workflow_node_created at line {created}; saw {kinds:?}"
+        );
+    }
+
+    // ── the run finishes after every node event of the run ──────────────────
+    let finished_at = seen
+        .iter()
+        .position(|event| event["event"] == "workflow_run_finished")
+        .unwrap_or_else(|| panic!("no workflow_run_finished on the stream; saw {kinds:?}"));
+    for (path, created) in &created_at {
+        assert!(
+            *created < finished_at,
+            "workflow_run_finished arrived at line {finished_at}, before \
+             workflow_node_created for {path} at line {created} — a client cache \
+             would see a finished run whose children do not exist yet; saw {kinds:?}"
+        );
+    }
+    let last_node_event = seen
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some(
+                    "workflow_node_created"
+                        | "workflow_node_updated"
+                        | "workflow_node_output_checkpoint"
+                )
+            )
+        })
+        .unwrap_or_else(|| panic!("no node events at all; saw {kinds:?}"));
+    assert!(
+        last_node_event < finished_at,
+        "workflow_run_finished must be the last word on the run, but a node event \
+         followed it at line {last_node_event}; saw {kinds:?}"
+    );
+
+    // ── the run's growth is trackable from the run stream alone ─────────────
+    let grew = seen[..finished_at]
+        .iter()
+        .filter(|event| event["event"] == "workflow_run_updated")
+        .filter_map(|event| event["data"]["run"]["nodes_total"].as_u64())
+        .max()
+        .unwrap_or_else(|| {
+            panic!(
+                "no workflow.run.updated before the run finished, so a subscriber \
+                 cannot track nodes_total growth from run events; saw {kinds:?}"
+            )
+        });
+    assert!(
+        grew > nodes_at_start,
+        "the run grew from {nodes_at_start} nodes, but no workflow.run.updated \
+         reported more than {grew}; saw {kinds:?}"
     );
 
     server.shutdown();

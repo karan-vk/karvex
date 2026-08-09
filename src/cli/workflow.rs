@@ -1199,6 +1199,9 @@ fn print_workflow_run_response(response: &serde_json::Value, json: bool) -> std:
         println!();
     }
     println!("tier:    {}", run["tier"].as_str().unwrap_or(""));
+    if let Some(line) = format_run_limits_line(run) {
+        println!("{line}");
+    }
     println!(
         "nodes:   {}/{}",
         run["nodes_done"].as_u64().unwrap_or(0),
@@ -1252,10 +1255,12 @@ fn format_run_node_line(node: &serde_json::Value) -> String {
 
 /// One graph node in `needs_attention`/`blocked`/`failed` — the statuses
 /// that can be "the node responsible" for a paused or stuck run — plus
-/// whatever `blocker` detail the wire carried for it. `blocker` is not
-/// populated for every failure mode yet (a spawn failure currently leaves it
-/// `null` — see the notes returned alongside this task), so `reason`/
-/// `resume_when` are best-effort, not guaranteed.
+/// whatever `blocker` detail the wire carried for it. Every `needs_attention`
+/// trigger now records a `Succession::Blocked` and so carries both fields
+/// (`src/workflow/engine/mod.rs::needs_attention`), but `reason`/`resume_when`
+/// stay `Option`: a node can also be `blocked`/`failed` for reasons that record
+/// a different succession, and a run read back from an older journal predates
+/// the blocker being recorded at all.
 struct BlockingRunNode<'a> {
     path: &'a str,
     status: &'a str,
@@ -1279,6 +1284,24 @@ fn blocking_run_nodes(nodes: &[serde_json::Value]) -> Vec<BlockingRunNode<'_>> {
             resume_when: node["blocker"]["resume_when"].as_str(),
         })
         .collect()
+}
+
+/// `run show`'s enforced ceilings — `max_nodes` and `max_depth` used to be
+/// `--json`-only, contradicting `workflows.mdx`'s promise that "what the run
+/// enforces is what `kvx workflow run show` and the JSON API report". `None`
+/// only when both keys are entirely absent from the JSON value (a defensive
+/// fallback for a hand-built fixture missing the run's own growth ceilings,
+/// not something `WorkflowRunInfo` itself ever omits), so `run start` /
+/// `run cancel` print nothing extra when handed a response that never carried
+/// them.
+fn format_run_limits_line(run: &serde_json::Value) -> Option<String> {
+    let max_nodes = run.get("max_nodes")?;
+    let max_depth = run.get("max_depth")?;
+    Some(format!(
+        "limits:  max_nodes={} · max_depth={}",
+        max_nodes.as_u64().unwrap_or(0),
+        max_depth.as_u64().unwrap_or(0)
+    ))
 }
 
 /// §3.4 / §4 D11's headline guarantee, CLI half: a run that ever hit a growth
@@ -1336,14 +1359,16 @@ fn format_node_delivery_failure_line(node: &serde_json::Value) -> Option<String>
     Some(format!("delivery_failure: {text}"))
 }
 
-/// `HH:MM` for a growth-limit timestamp — the plan's own example
-/// ("... reached at 14:22") is clock time, not a full date, so this is
-/// deliberately narrower than [`format_unix_ms`].
+/// `HH:MM UTC` for a growth-limit timestamp — the plan's own example
+/// ("... reached at 14:22 UTC") is clock time, not a full date, so this is
+/// deliberately narrower than [`format_unix_ms`]. Names `UTC` explicitly like
+/// its sibling `format_unix_ms` does, rather than leaving a bare clock time
+/// that reads as local time to whoever's terminal it lands in.
 fn format_unix_ms_clock(ms: u64) -> String {
     let secs_of_day = (ms / 1000) % 86_400;
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
-    format!("{hour:02}:{minute:02}")
+    format!("{hour:02}:{minute:02} UTC")
 }
 
 /// §2.10: `node show`'s human output printed `path`/`status`/`model`/
@@ -2350,6 +2375,7 @@ mod tests {
         assert!(line.starts_with("growth:"), "{line}");
         assert!(line.contains("3 of 12 nodes"), "{line}");
         assert!(line.contains("max_nodes reached at"), "{line}");
+        assert!(line.ends_with(" UTC"), "{line}");
     }
 
     #[test]
@@ -2375,6 +2401,7 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("(2 of 4 accepted)"), "{line}");
+        assert!(line.contains(" UTC "), "{line}");
     }
 
     /// §H6's sibling surface: `delivery_failure` is a shared runtime fact
@@ -2397,11 +2424,27 @@ mod tests {
     }
 
     #[test]
-    fn format_unix_ms_clock_renders_hour_and_minute() {
+    fn format_run_limits_line_reports_the_enforced_ceilings() {
+        let run = serde_json::json!({ "max_nodes": 12, "max_depth": 3 });
+        assert_eq!(
+            format_run_limits_line(&run),
+            Some("limits:  max_nodes=12 · max_depth=3".to_string())
+        );
+    }
+
+    #[test]
+    fn format_run_limits_line_is_none_without_ceilings() {
+        // `run start` / `run cancel` responses that never carried the keys.
+        let run = serde_json::json!({ "run_id": "run-1", "status": "running" });
+        assert_eq!(format_run_limits_line(&run), None);
+    }
+
+    #[test]
+    fn format_unix_ms_clock_names_utc_like_its_sibling() {
         // 1970-01-01T00:00:00Z
-        assert_eq!(format_unix_ms_clock(0), "00:00");
+        assert_eq!(format_unix_ms_clock(0), "00:00 UTC");
         // 2024-01-01T14:22:00Z
-        assert_eq!(format_unix_ms_clock(1_704_118_920_000), "14:22");
+        assert_eq!(format_unix_ms_clock(1_704_118_920_000), "14:22 UTC");
     }
 
     #[test]

@@ -180,6 +180,22 @@ pub(super) fn apply_workflow_launch_key(state: &mut AppState, key: KeyEvent) -> 
             }
             LaunchIntent::None
         }
+        // `j`/`k` navigate the workflow list, matching the DAG view's own
+        // bindings — but only while the list itself has focus. When focus is
+        // an `Arg`, these must still type `j`/`k` into the field, which is
+        // why the guard is on `launch.focus`, not a global mode check.
+        KeyCode::Char('j')
+            if launch.focus == WorkflowLaunchFocus::Workflows
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            move_selection(launch, 1)
+        }
+        KeyCode::Char('k')
+            if launch.focus == WorkflowLaunchFocus::Workflows
+                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            move_selection(launch, -1)
+        }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let WorkflowLaunchFocus::Arg(index) = launch.focus {
                 if let Some(arg) = launch.args.get_mut(index) {
@@ -581,6 +597,37 @@ mod tests {
         assert_eq!(
             state.view.workflow_launch.selected, 1,
             "the list selection does not move while an arg has focus"
+        );
+    }
+
+    #[test]
+    fn workflow_launcher_list_moves_on_j_and_k() {
+        let mut state = state_with_form();
+
+        assert_eq!(
+            apply_workflow_launch_key(&mut state, key(KeyCode::Char('j'))),
+            LaunchIntent::SelectionChanged
+        );
+        assert_eq!(state.view.workflow_launch.selected, 1);
+
+        assert_eq!(
+            apply_workflow_launch_key(&mut state, key(KeyCode::Char('k'))),
+            LaunchIntent::SelectionChanged
+        );
+        assert_eq!(state.view.workflow_launch.selected, 0);
+    }
+
+    #[test]
+    fn workflow_launcher_arg_field_still_types_j_and_k() {
+        let mut state = state_with_form();
+        state.view.workflow_launch.focus = WorkflowLaunchFocus::Arg(0);
+
+        apply_workflow_launch_key(&mut state, key(KeyCode::Char('j')));
+        apply_workflow_launch_key(&mut state, key(KeyCode::Char('k')));
+        assert_eq!(state.view.workflow_launch.args[0].value, "jk");
+        assert_eq!(
+            state.view.workflow_launch.selected, 0,
+            "typing into an arg field must not move the list selection"
         );
     }
 

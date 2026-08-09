@@ -1,4 +1,5 @@
 use regex::Regex;
+use tracing::debug;
 
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, PaneAgentStatusChangedEvent, PaneOutputMatchedEvent,
@@ -101,6 +102,93 @@ pub(super) enum ActiveSubscription {
     OutputMatched(ActiveOutputMatchedSubscription),
     AgentStatusChanged(Box<ActiveAgentStatusChangedSubscription>),
     ScrollChanged(ActiveScrollChangedSubscription),
+}
+
+/// One cursor over the hub's global sequence for every event-log-backed
+/// subscription on a connection, so cross-type causal order survives a backlog.
+///
+/// Before this existed each `Subscription::*` that reads the event log carried
+/// its own private cursor and the stream loop yielded **at most one event per
+/// subscription per poll pass**. A run whose 11 `workflow.node.created` events
+/// and single `workflow.run.finished` were all queued therefore delivered
+/// `run.finished` in the first pass and the node events over the next eleven —
+/// a client cache saw a finished run before its children existed. Per-type FIFO
+/// held; cross-type causality did not.
+///
+/// A single cursor walked in hub-sequence order restores it: the hub
+/// ([`EventHub`]) is already globally sequenced, so draining it in order and
+/// fanning each event out to the kinds that asked for it is the whole fix.
+pub(super) struct EventStreamCursor {
+    /// One entry per subscribed `Event` subscription, in the order the client
+    /// declared them, so a client that asked for the same kind twice still gets
+    /// it twice.
+    kinds: Vec<crate::api::schema::EventKind>,
+    /// The highest hub sequence already delivered on this connection. Starts at
+    /// `0`, matching the per-subscription cursors it replaces, so a new
+    /// subscriber still replays whatever the ring retains.
+    last_sequence: u64,
+}
+
+impl EventStreamCursor {
+    pub(super) fn from_subscriptions(subscriptions: &[ActiveSubscription]) -> Option<Self> {
+        let kinds: Vec<_> = subscriptions
+            .iter()
+            .filter_map(ActiveSubscription::event_kind)
+            .collect();
+        (!kinds.is_empty()).then_some(Self {
+            kinds,
+            last_sequence: 0,
+        })
+    }
+
+    /// Every subscribed event newer than the cursor, in hub-sequence order.
+    ///
+    /// One event is emitted per *matching subscription*, not per matching kind,
+    /// so a client that asked for the same type twice still gets it twice. The
+    /// whole backlog is returned in one call: the hub retains at most
+    /// `EventHub::MAX_EVENTS`, so this is bounded without a second queue.
+    pub(super) fn drain(&mut self, event_hub: &EventHub) -> Vec<serde_json::Value> {
+        let pending = event_hub.events_after(self.last_sequence);
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        if self.last_sequence > 0 {
+            if let Some((oldest, _)) = pending.first() {
+                if *oldest > self.last_sequence + 1 {
+                    // The ring dropped events this connection had not read yet.
+                    // Not a wire-visible gap marker by design — a subscriber
+                    // cannot act on it — but the server should be able to say
+                    // so when someone asks why a cache diverged.
+                    debug!(
+                        cursor = self.last_sequence,
+                        oldest_retained = *oldest,
+                        "event subscription fell behind the retained ring"
+                    );
+                }
+            }
+        }
+
+        let mut delivered = Vec::new();
+        for (sequence, event) in pending {
+            self.last_sequence = sequence;
+            let copies = self
+                .kinds
+                .iter()
+                .filter(|kind| **kind == event.event)
+                .count();
+            if copies == 0 {
+                continue;
+            }
+            let Ok(value) = serde_json::to_value(&event) else {
+                continue;
+            };
+            for _ in 1..copies {
+                delivered.push(value.clone());
+            }
+            delivered.push(value);
+        }
+        delivered
+    }
 }
 
 impl ActiveSubscription {
@@ -323,6 +411,17 @@ impl ActiveSubscription {
                     request_prefix: format!("{request_id}:sub:{index}"),
                 }))
             }
+        }
+    }
+
+    /// The event-log kind this subscription reads, or `None` for the three
+    /// subscriptions that poll the app instead of the hub. The stream loop uses
+    /// it to split the two families apart: the event-log ones are served by one
+    /// shared [`EventStreamCursor`], the rest keep polling per pass.
+    pub(super) fn event_kind(&self) -> Option<crate::api::schema::EventKind> {
+        match self {
+            Self::Event(subscription) => Some(subscription.event_kind),
+            Self::OutputMatched(_) | Self::AgentStatusChanged(_) | Self::ScrollChanged(_) => None,
         }
     }
 
@@ -680,6 +779,198 @@ mod tests {
                 state_labels: HashMap::new(),
             },
         }
+    }
+
+    fn workflow_node(path: &str) -> crate::api::schema::WorkflowRunNodeInfo {
+        crate::api::schema::WorkflowRunNodeInfo {
+            path: path.into(),
+            node_key: "worker".into(),
+            label: path.into(),
+            parent_path: None,
+            depth: 0,
+            status: crate::api::schema::WorkflowNodeStatus::Running,
+            demand: crate::api::schema::WorkflowDemand::Standard,
+            model: "sonnet".into(),
+            effort: "low".into(),
+            attempt: 1,
+            pane_id: None,
+            terminal_id: None,
+            agent_session_id: None,
+            cwd: None,
+            node_dir: None,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+            total_tokens: 0,
+            tool_uses: 0,
+            duration_ms: 0,
+            evidence: None,
+            succession: None,
+            blocker: None,
+            watchdog_interventions: 0,
+            assignment_reason: String::new(),
+            delivery_failure: None,
+            growth_limited: None,
+        }
+    }
+
+    fn node_created_event(path: &str) -> EventEnvelope {
+        EventEnvelope {
+            event: EventKind::WorkflowNodeCreated,
+            data: EventData::WorkflowNodeCreated {
+                run_id: "workflow_run:1".into(),
+                node: workflow_node(path),
+            },
+        }
+    }
+
+    fn run_finished_event() -> EventEnvelope {
+        EventEnvelope {
+            event: EventKind::WorkflowRunFinished,
+            data: EventData::WorkflowRunFinished {
+                run: crate::api::schema::WorkflowRunInfo {
+                    run_id: "workflow_run:1".into(),
+                    workflow_id: "workflow:1".into(),
+                    version_id: "kvdag_version:1".into(),
+                    tier: crate::api::schema::WorkflowTier::Auto,
+                    status: crate::api::schema::WorkflowRunStatus::Succeeded,
+                    args: HashMap::new(),
+                    workspace_id: None,
+                    tab_id: None,
+                    started_at_unix_ms: 1,
+                    ended_at_unix_ms: Some(2),
+                    total_tokens: 0,
+                    total_tool_uses: 0,
+                    nodes_total: 2,
+                    nodes_done: 2,
+                    failure: None,
+                    max_depth: 3,
+                    max_nodes: 24,
+                    nodes_live: 2,
+                    growth_limited: None,
+                },
+            },
+        }
+    }
+
+    fn event_subscription(kind: Subscription) -> ActiveSubscription {
+        let event_hub = EventHub::default();
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        ActiveSubscription::new(kind, "test", 0, &api_tx, &event_hub).expect("event subscription")
+    }
+
+    /// The delivered `event` field of each line the stream loop would write.
+    fn delivered_kinds(values: &[serde_json::Value]) -> Vec<String> {
+        values
+            .iter()
+            .map(|value| {
+                let kind = value["event"].as_str().unwrap_or_default().to_string();
+                match value["data"]["node"]["path"].as_str() {
+                    Some(path) => format!("{kind}({path})"),
+                    None => kind,
+                }
+            })
+            .collect()
+    }
+
+    /// The P1 regression, at the layer that caused it. `EventHub` is already a
+    /// single globally-sequenced ring; it was the *delivery* layer that gave
+    /// every subscribed type its own cursor and drained one event per type per
+    /// poll pass, so a run's `workflow.run.finished` overtook the node events it
+    /// summarises.
+    #[test]
+    fn event_subscriptions_deliver_cross_type_events_in_hub_order() {
+        let event_hub = EventHub::default();
+        let subscriptions = vec![
+            event_subscription(Subscription::WorkflowNodeCreated {}),
+            event_subscription(Subscription::WorkflowRunFinished {}),
+        ];
+        let mut cursor =
+            EventStreamCursor::from_subscriptions(&subscriptions).expect("an event cursor");
+
+        event_hub.push(node_created_event("fanout/worker/1"));
+        event_hub.push(run_finished_event());
+        event_hub.push(node_created_event("fanout/worker/2"));
+
+        let first_pass = delivered_kinds(&cursor.drain(&event_hub));
+
+        assert_eq!(
+            first_pass,
+            vec![
+                "workflow_node_created(fanout/worker/1)".to_string(),
+                "workflow_run_finished".to_string(),
+                "workflow_node_created(fanout/worker/2)".to_string(),
+            ],
+            "one poll pass must deliver the whole backlog in hub order, not one event per type"
+        );
+        assert!(
+            cursor.drain(&event_hub).is_empty(),
+            "a drained backlog is not redelivered"
+        );
+    }
+
+    /// The merged cursor must not collapse a client that asked for the same
+    /// type twice into one delivery.
+    #[test]
+    fn a_duplicate_event_subscription_still_receives_every_event_once_each() {
+        let event_hub = EventHub::default();
+        let subscriptions = vec![
+            event_subscription(Subscription::WorkflowNodeCreated {}),
+            event_subscription(Subscription::WorkflowNodeCreated {}),
+        ];
+        let mut cursor =
+            EventStreamCursor::from_subscriptions(&subscriptions).expect("an event cursor");
+
+        event_hub.push(node_created_event("plan"));
+
+        assert_eq!(
+            delivered_kinds(&cursor.drain(&event_hub)),
+            vec![
+                "workflow_node_created(plan)".to_string(),
+                "workflow_node_created(plan)".to_string(),
+            ]
+        );
+    }
+
+    /// The cursor starts at `0`, not at the hub's current sequence, so a
+    /// subscriber that connects after the events were pushed still sees
+    /// whatever the ring retained — exactly what the per-subscription cursors
+    /// it replaces did.
+    #[test]
+    fn a_new_subscriber_still_replays_the_retained_ring() {
+        let event_hub = EventHub::default();
+        event_hub.push(node_created_event("plan"));
+        event_hub.push(run_finished_event());
+
+        let subscriptions = vec![
+            event_subscription(Subscription::WorkflowNodeCreated {}),
+            event_subscription(Subscription::WorkflowRunFinished {}),
+        ];
+        let mut cursor =
+            EventStreamCursor::from_subscriptions(&subscriptions).expect("an event cursor");
+
+        assert_eq!(
+            delivered_kinds(&cursor.drain(&event_hub)),
+            vec![
+                "workflow_node_created(plan)".to_string(),
+                "workflow_run_finished".to_string(),
+            ]
+        );
+    }
+
+    /// A connection with no event-log subscription keeps the old shape: no
+    /// cursor at all, and the poll loop is unchanged.
+    #[test]
+    fn a_connection_without_event_subscriptions_has_no_cursor() {
+        let subscriptions = vec![ActiveSubscription::ScrollChanged(
+            ActiveScrollChangedSubscription {
+                pane_id: "pane_1".into(),
+                last_scroll: None,
+                request_prefix: "test".into(),
+            },
+        )];
+
+        assert!(EventStreamCursor::from_subscriptions(&subscriptions).is_none());
+        assert!(subscriptions[0].event_kind().is_none());
     }
 
     fn pane_info_with_scroll(scroll: Option<PaneScrollInfo>) -> PaneInfo {

@@ -58,7 +58,13 @@ pub enum Completion {
     /// errors, then no more.
     Reprompt { errors: Vec<SchemaViolation> },
     /// Still invalid after the corrective re-prompt, or no result at all.
-    NeedsAttention { reason: String },
+    ///
+    /// `resume_when` is not decoration: a `NeedsAttention` node stalls the run
+    /// until a human acts, so the completion gate that decides a node is stuck
+    /// also has to say what would unstick it. It travels beside `reason` rather
+    /// than being defaulted at the call site so the code that knows *why* a node
+    /// is blocked is the code that names the way out.
+    NeedsAttention { reason: String, resume_when: String },
 }
 
 /// One output-schema violation, phrased so it can be quoted straight back to
@@ -403,6 +409,7 @@ pub fn accept_with(
             "result.json still fails output-schema validation after one corrective re-prompt: {}",
             describe(&errors)
         ),
+        resume_when: RESUME_BY_CORRECTING_THE_RESULT.to_string(),
     }
 }
 
@@ -421,8 +428,21 @@ pub fn missing_result(signal: Signal) -> Completion {
                 Signal::SustainedIdle => "sustained idle",
             }
         ),
+        resume_when: RESUME_BY_CORRECTING_THE_RESULT.to_string(),
     }
 }
+
+/// Both completion-gate blockers — no artifact at all, and an artifact that
+/// still fails its schema — resume the same way, because the node is still
+/// alive and holding its pane: tell it what to write, or start the attempt over.
+///
+/// `kvx workflow node complete` is deliberately **not** named here: it reads its
+/// credential from the node's own environment, so it is the node's command, not
+/// the watching human's. A resume condition that names a command the reader
+/// cannot run is worse than none.
+const RESUME_BY_CORRECTING_THE_RESULT: &str = "the node writes a result.json that satisfies its \
+     output_schema; steer it with `kvx workflow node steer <run_id> <path> <text>`, or start the \
+     attempt over with `kvx workflow node restart <run_id> <path>`";
 
 /// The single corrective re-prompt, quoting the violations and the schema's own
 /// required fields so the node is told exactly what to fill in.
@@ -786,12 +806,18 @@ mod tests {
         assert!(prompt.contains("missing required field \"plan\""));
         assert!(prompt.contains("Required fields: plan"));
 
-        let Completion::NeedsAttention { reason } =
-            accept(&schema, &result, Evidence::SelfReport, 2)
+        let Completion::NeedsAttention {
+            reason,
+            resume_when,
+        } = accept(&schema, &result, Evidence::SelfReport, 2)
         else {
             panic!("the second invalid result must not earn another re-prompt");
         };
         assert!(reason.contains("missing required field \"plan\""));
+        assert!(
+            resume_when.contains("kvx workflow node restart"),
+            "giving up on a result names how the user resumes: {resume_when}"
+        );
     }
 
     #[test]
@@ -845,10 +871,24 @@ mod tests {
     #[test]
     fn a_signal_with_no_result_never_completes_a_node() {
         for signal in [Signal::SelfReport, Signal::TurnEnd, Signal::SustainedIdle] {
-            let Completion::NeedsAttention { reason } = missing_result(signal) else {
+            let Completion::NeedsAttention {
+                reason,
+                resume_when,
+            } = missing_result(signal)
+            else {
                 panic!("no artifact can ever be a completion");
             };
             assert!(reason.contains("no result.json"));
+            assert!(
+                resume_when.contains("kvx workflow node steer")
+                    && resume_when.contains("kvx workflow node restart"),
+                "the blocker names commands the watching human can actually run: {resume_when}"
+            );
+            assert!(
+                !resume_when.contains("kvx workflow node complete"),
+                "`node complete` reads the node's own env credential, so it is not the \
+                 human's command: {resume_when}"
+            );
         }
     }
 

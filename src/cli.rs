@@ -70,10 +70,78 @@ pub(super) fn print_read_response(response: &serde_json::Value) -> std::io::Resu
     Ok(0)
 }
 
+/// Whether this invocation is a print-and-exit CLI that should die quietly on
+/// `SIGPIPE` — `kvx workflow run show <id> | head` — instead of panicking with
+/// Rust's broken-pipe backtrace.
+///
+/// Deliberately an **allowlist**, not "everything except `kvx server`". Two
+/// families must keep the Rust runtime's `SIG_IGN`, so that a write to a gone
+/// reader comes back as an `io::Error` the caller can handle:
+///
+/// - Anything `maybe_run` does not recognise falls through to `main`, which
+///   runs the TUI, the client runloop (`kvx client`), the remote bridge, or the
+///   updater. Those own a terminal and a PTY/socket; dying mid-write would
+///   leave the user's terminal in raw mode. `kvx server` is the daemon.
+/// - The interactive attaches, which live inside otherwise print-and-exit
+///   namespaces (`kvx agent attach`, `kvx terminal attach`,
+///   `kvx terminal session …`) and take the terminal over through
+///   `crate::client`.
+fn restores_default_sigpipe(command: &str, subcommand: Option<&str>) -> bool {
+    const PRINT_AND_EXIT: &[&str] = &[
+        "api",
+        "status",
+        "completion",
+        "completions",
+        "config",
+        "channel",
+        "workspace",
+        "worktree",
+        "tab",
+        "notification",
+        "agent",
+        "terminal",
+        "pane",
+        "plugin",
+        "integration",
+        "session",
+        "workflow",
+    ];
+    // The top-level print-and-exit flags are handled by `main` after
+    // `maybe_run` declines, and only when they are the *whole* invocation:
+    // `kvx client --help` runs the client, so a flag anywhere in the arguments
+    // proves nothing.
+    const PRINT_AND_EXIT_FLAGS: &[&str] = &[
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+        "--default-config",
+        "--skill",
+    ];
+    if subcommand.is_none() && PRINT_AND_EXIT_FLAGS.contains(&command) {
+        return true;
+    }
+    if !PRINT_AND_EXIT.contains(&command) {
+        return false;
+    }
+    !matches!(
+        (command, subcommand),
+        ("agent", Some("attach")) | ("terminal", Some("attach" | "session"))
+    )
+}
+
 pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let Some(command) = args.get(1).map(|arg| arg.as_str()) else {
         return Ok(CommandOutcome::NotCli);
     };
+
+    // Before any printing happens (including `--help`), so a piped
+    // `kvx <command> --help | head` dies quietly too, like the command's own
+    // output does. Only the print-and-exit verbs — see
+    // `restores_default_sigpipe`.
+    if restores_default_sigpipe(command, args.get(2).map(|arg| arg.as_str())) {
+        crate::platform::restore_default_sigpipe();
+    }
 
     if spec::print_requested_help(args)? {
         return Ok(CommandOutcome::Handled(0));
@@ -1052,6 +1120,79 @@ fn _print_json<T: Serialize>(value: &T) {
 
 #[cfg(test)]
 mod tests {
+    /// `SIG_DFL` for `SIGPIPE` turns a write to a closed reader into process
+    /// death, which is right for a print-and-exit CLI and wrong for anything
+    /// that owns a terminal or a long-lived socket: those need `EPIPE` back as
+    /// an `io::Error` so they can restore the terminal and report. So the
+    /// policy has to be an allowlist. An exclusion list of one (`"server"`)
+    /// silently covered every argument `maybe_run` does *not* recognise —
+    /// `kvx client`, `kvx remote-client-bridge`, `kvx --session <name>`, and a
+    /// bare `kvx --help` all fall through `maybe_run` to the TUI and the client
+    /// runloop in `main`.
+    #[test]
+    fn restores_default_sigpipe_only_for_print_and_exit_commands() {
+        for (command, subcommand) in [
+            ("workflow", Some("run")),
+            ("pane", Some("list")),
+            ("agent", Some("read")),
+            ("status", None),
+            ("api", Some("methods")),
+            ("tab", Some("list")),
+            ("completion", Some("bash")),
+            ("workspace", Some("list")),
+            ("terminal", Some("title")),
+            // Handled by `main` after `maybe_run` declines, but still just a
+            // print and an exit.
+            ("--help", None),
+            ("--version", None),
+            ("--skill", None),
+            ("--default-config", None),
+        ] {
+            assert!(
+                super::restores_default_sigpipe(command, subcommand),
+                "{command} {subcommand:?} prints and exits"
+            );
+        }
+
+        // `kvx client --help` runs the client runloop; the flag being present
+        // somewhere is not proof the process prints and exits.
+        assert!(!super::restores_default_sigpipe("client", Some("--help")));
+        assert!(!super::restores_default_sigpipe(
+            "--help",
+            Some("--session")
+        ));
+
+        // The daemon, and every path that falls through `maybe_run` into the
+        // TUI or the client runloop in `main`.
+        for command in [
+            "server",
+            "client",
+            "remote-client-bridge",
+            "update",
+            "--session",
+            "--remote",
+            "my-session-name",
+        ] {
+            assert!(
+                !super::restores_default_sigpipe(command, None),
+                "{command} does not print and exit"
+            );
+        }
+
+        // Interactive attaches live inside otherwise print-and-exit
+        // namespaces: both take over the terminal through `crate::client`.
+        for (command, subcommand) in [
+            ("agent", Some("attach")),
+            ("terminal", Some("attach")),
+            ("terminal", Some("session")),
+        ] {
+            assert!(
+                !super::restores_default_sigpipe(command, subcommand),
+                "{command} {subcommand:?} takes over the terminal"
+            );
+        }
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(

@@ -452,13 +452,16 @@ impl Engine {
         // produce `result.json` stalls `Running` with nothing to escalate.
         if result.0.is_null() {
             return match complete::missing_result(Signal::SelfReport) {
-                Completion::NeedsAttention { reason } => {
+                Completion::NeedsAttention {
+                    reason,
+                    resume_when,
+                } => {
                     info!(path = %path, reason = %reason, "workflow node report carried no result artifact");
                     // No schema violations: there was no artifact to validate,
                     // so the report itself is not what is wrong — the node is,
                     // and its status already says so.
                     self.record_report(path, ReportVerdict::Surfaced, Vec::new(), &reason);
-                    self.needs_attention(idx, &reason)
+                    self.needs_attention(idx, &reason, &resume_when)
                 }
                 Completion::Accepted(_) | Completion::Reprompt { .. } => Vec::new(),
             };
@@ -494,7 +497,17 @@ impl Engine {
                 "the run's kvdag definition is not installed, so result.json cannot be validated";
             info!(path = %path, "workflow node report could not be validated: no installed definition");
             self.record_report(path, ReportVerdict::Surfaced, Vec::new(), reason);
-            return self.needs_attention(idx, reason);
+            // Unlike the other blockers, nothing the node does next can clear
+            // this one: without the definition there is no output_schema to
+            // validate against, so the resume condition is a new run, not a
+            // retry of this one.
+            return self.needs_attention(
+                idx,
+                reason,
+                "this run cannot validate any further results; cancel it with \
+                 `kvx workflow run cancel <run_id>` and start a new run from the saved workflow \
+                 with `kvx workflow run start <name|id>`",
+            );
         };
 
         let completion = complete::accept_with(
@@ -597,7 +610,10 @@ impl Engine {
                 }
                 effects
             }
-            Completion::NeedsAttention { reason } => {
+            Completion::NeedsAttention {
+                reason,
+                resume_when,
+            } => {
                 self.note_schema_failure(path);
                 let mut quoted: Vec<String> = complete::validate(&schema, &stripped)
                     .err()
@@ -612,7 +628,7 @@ impl Engine {
                     "workflow node result still fails its output schema after the corrective re-prompt"
                 );
                 self.record_report(path, ReportVerdict::Surfaced, quoted, &reason);
-                self.needs_attention(idx, &reason)
+                self.needs_attention(idx, &reason, &resume_when)
             }
         }
     }
@@ -827,7 +843,10 @@ impl Engine {
 
         // §4.3: idle with no valid result never completes a node.
         match complete::missing_result(Signal::SustainedIdle) {
-            Completion::NeedsAttention { reason } => self.needs_attention(idx, &reason),
+            Completion::NeedsAttention {
+                reason,
+                resume_when,
+            } => self.needs_attention(idx, &reason, &resume_when),
             Completion::Accepted(_) | Completion::Reprompt { .. } => Vec::new(),
         }
     }
@@ -1012,9 +1031,15 @@ impl Engine {
         if done {
             return Vec::new();
         }
+        // The canonical blocker a first-time user meets: a run started with no
+        // workspace has nowhere to put node panes, and the only way out is to
+        // make one and restart the node.
         self.needs_attention(
             idx,
             &format!("the node's pane could not be started: {reason}"),
+            "the run has a workspace to host node panes; create one with \
+             `kvx workspace create`, then restart the node with \
+             `kvx workflow node restart <run_id> <path>`",
         )
     }
 
@@ -1255,6 +1280,20 @@ impl Engine {
         };
         node.status = NodeStatus::Succeeded;
         node.result = Some(result);
+        // A node that succeeded is not blocked any more. `NeedsAttention` is
+        // not terminal, and the resume condition the blocker itself prints —
+        // steer the node until it writes a valid `result.json` — lands right
+        // here without going through `restart`, which is the other place a
+        // blocker is shed. `resolve_succession` below returns any explicitly
+        // recorded succession verbatim, so leaving the blocker in place would
+        // make it the succeeded node's permanent succession: a `resume:` line
+        // for work that is already done, and a wire `succession` of `blocked`
+        // on a node that succeeded. Only `Blocked` is cleared — it is the only
+        // variant a non-terminal node can be carrying, and the "an explicit
+        // succession wins" contract still holds for the rest.
+        if matches!(node.succession, Some(Succession::Blocked { .. })) {
+            node.succession = None;
+        }
         // `node_checkpoint`'s unique index is `(run_node, seq)`, not
         // `(run, seq)` (`03` §4.3), so this counter is the node's own and
         // starts at 1 — the run journal cursor would make every node's first
@@ -1325,7 +1364,26 @@ impl Engine {
         effects
     }
 
-    fn needs_attention(&mut self, idx: RunNodeIdx, reason: &str) -> Vec<RunEffect> {
+    /// A node the run cannot make progress on without a human.
+    ///
+    /// `resume_when` is required, not optional: `NeedsAttention` pauses the run,
+    /// and a paused run whose UI can only say *that* it is stuck is the failure
+    /// mode `workflows.mdx` promises against. Recording it as a
+    /// [`Succession::Blocked`] is what makes `run show`, `node show`, and the
+    /// JSON API's `blocker` field non-empty — all three already render it and
+    /// were reading a succession this function never set.
+    ///
+    /// It is set **before** [`record_status`], so the same call persists the
+    /// blocker through `StoreWrite::RunNode` and emits a `NodeUpdated` carrying
+    /// it. Recording a succession here does not risk letting a stalled run
+    /// report success: `run_terminal_ready_with` rejects on `NeedsAttention`
+    /// status before it ever looks at succession.
+    fn needs_attention(
+        &mut self,
+        idx: RunNodeIdx,
+        reason: &str,
+        resume_when: &str,
+    ) -> Vec<RunEffect> {
         let mut effects = Vec::new();
         let Some(graph) = self.graph.as_mut() else {
             return effects;
@@ -1334,6 +1392,10 @@ impl Engine {
             return effects;
         };
         node.status = NodeStatus::NeedsAttention;
+        node.succession = Some(Succession::Blocked {
+            reason: reason.to_string(),
+            resume_when: resume_when.to_string(),
+        });
         let path = node.path.clone();
 
         let payload = json!({ "reason": reason });
@@ -1622,6 +1684,36 @@ mod tests {
             .and_then(|graph| graph.node_by_path(&InstancePath::new(path)))
             .map(|node| node.status)
             .expect("the node exists")
+    }
+
+    fn succession_of(engine: &Engine, path: &str) -> Option<Succession> {
+        engine
+            .graph()
+            .and_then(|graph| graph.node_by_path(&InstancePath::new(path)))
+            .expect("the node exists")
+            .succession
+            .clone()
+    }
+
+    /// The blocker as the store would receive it: the last `StoreWrite::RunNode`
+    /// for `path` in an effect batch is what the durable projection reads back.
+    fn persisted_succession(effects: &[RunEffect], path: &str) -> Option<Succession> {
+        let wanted = InstancePath::new(path);
+        effects
+            .iter()
+            .rev()
+            .find_map(|effect| match effect {
+                RunEffect::Persist(write) => match write.as_ref() {
+                    StoreWrite::RunNode {
+                        path: written,
+                        succession,
+                        ..
+                    } if written == &wanted => Some(succession.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the node's status was persisted")
     }
 
     #[test]
@@ -3071,6 +3163,181 @@ mod tests {
             engine.graph().map(|graph| graph.status),
             Some(RunStatus::Paused),
             "the run stalls with a surfaced reason instead of running forever"
+        );
+    }
+
+    /// The canonical `needs_attention` trigger: a run started with no workspace
+    /// to host the node's pane. `workflows.mdx` promises `run show` and
+    /// `node show` name the blocker reason *and* the resume condition, and both
+    /// renderers read `Succession::Blocked` — so the engine has to record one.
+    #[test]
+    fn a_spawn_that_never_happened_records_a_blocker_reason_and_resume_condition() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+
+        engine.apply(EngineInput::SpawnFailed {
+            path: InstancePath::new("plan"),
+            reason: "no workspace to host the node's pane".to_string(),
+        });
+
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+        let Some(Succession::Blocked {
+            reason,
+            resume_when,
+        }) = succession_of(&engine, "plan")
+        else {
+            panic!("a node that needs attention carries a structured blocker");
+        };
+        assert!(
+            reason.contains("no workspace to host the node's pane"),
+            "the blocker names why the node is stuck: {reason}"
+        );
+        assert!(
+            resume_when.contains("kvx workspace create")
+                && resume_when.contains("kvx workflow node restart"),
+            "the resume condition names the commands that unstick the run: {resume_when}"
+        );
+    }
+
+    /// A result that is still invalid after its one corrective re-prompt is the
+    /// other blocker path a user meets, and it must be as actionable as the
+    /// spawn failure — the fix is wired generically, not only for spawns.
+    #[test]
+    fn a_result_that_still_fails_its_schema_records_a_blocker() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+        for _ in 0..2 {
+            engine.apply(EngineInput::NodeSelfReport {
+                path: InstancePath::new("plan"),
+                token: NodeToken::new("token"),
+                result: report(r#"{"notes":"oops"}"#),
+            });
+        }
+
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::NeedsAttention);
+        let Some(Succession::Blocked {
+            reason,
+            resume_when,
+        }) = succession_of(&engine, "plan")
+        else {
+            panic!("a schema-blocked node carries a structured blocker");
+        };
+        assert!(
+            reason.contains("output schema") || reason.contains("result.json"),
+            "the blocker names the failing artifact: {reason}"
+        );
+        assert!(
+            resume_when.contains("kvx workflow node"),
+            "the resume condition names a command the user can run: {resume_when}"
+        );
+    }
+
+    /// The other half of recording a blocker: shedding it. `NeedsAttention` is
+    /// not terminal, and the resume condition the blocker itself prints — steer
+    /// the node, let it write a valid `result.json` — brings the node back
+    /// through `report`/`succeed` *without* a restart. `resolve_succession`
+    /// returns any explicitly recorded succession verbatim, so a blocker left
+    /// behind becomes the succeeded node's permanent succession: `node show`
+    /// keeps printing a `resume:` line for work that is already done, and the
+    /// wire's `succession` reads `blocked` on a node that succeeded.
+    #[test]
+    fn a_node_that_recovers_from_needing_attention_sheds_its_blocker() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+
+        // Two invalid results: one corrective re-prompt, then the blocker.
+        for _ in 0..2 {
+            engine.apply(EngineInput::NodeSelfReport {
+                path: InstancePath::new("plan"),
+                token: NodeToken::new("token"),
+                result: report(r#"{"notes":"oops"}"#),
+            });
+        }
+        assert!(
+            matches!(
+                succession_of(&engine, "plan"),
+                Some(Succession::Blocked { .. })
+            ),
+            "the blocked node is the precondition for this test"
+        );
+
+        // The documented way out, taken without a restart.
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("plan"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"plan":"ship it"}"#),
+        });
+
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Succeeded);
+        assert_eq!(
+            succession_of(&engine, "plan"),
+            Some(Succession::Satisfied),
+            "a node that succeeded records why it succeeded, not the obstruction it cleared"
+        );
+        assert_eq!(
+            persisted_succession(&effects, "plan"),
+            Some(Succession::Satisfied),
+            "and the durable projection must not keep printing a resume condition for \
+             work that is already done"
+        );
+    }
+
+    /// The hand-off that makes the blocker durable: the same `record_status`
+    /// call that flips the node to `NeedsAttention` has to carry the blocker
+    /// into `StoreWrite::RunNode`, or the durable projection reads back `None`
+    /// after a server restart and `node show` goes quiet again.
+    #[test]
+    fn a_needs_attention_blocker_survives_a_store_round_trip() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+
+        let effects = engine.apply(EngineInput::SpawnFailed {
+            path: InstancePath::new("plan"),
+            reason: "no workspace to host the node's pane".to_string(),
+        });
+
+        let persisted = persisted_succession(&effects, "plan");
+        assert!(
+            matches!(persisted, Some(Succession::Blocked { .. })),
+            "the persisted node record carries the blocker: {persisted:?}"
+        );
+    }
+
+    /// A restart is the documented way out of a blocker, so the blocker must not
+    /// outlive the attempt it described. This already held before the blocker
+    /// was recorded at all; it is pinned so a later refactor cannot leave a
+    /// stale `resume:` line on a node that is running again.
+    #[test]
+    fn restarting_a_node_clears_its_blocker() {
+        let (mut engine, graph) = two_node_engine();
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.apply(EngineInput::SpawnFailed {
+            path: InstancePath::new("plan"),
+            reason: "no workspace to host the node's pane".to_string(),
+        });
+
+        engine.apply(EngineInput::RestartNode {
+            path: InstancePath::new("plan"),
+        });
+
+        assert_eq!(status_of(&engine, "plan"), NodeStatus::Ready);
+        assert_eq!(
+            succession_of(&engine, "plan"),
+            None,
+            "a fresh attempt sheds the previous attempt's blocker"
         );
     }
 

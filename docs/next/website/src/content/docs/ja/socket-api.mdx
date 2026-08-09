@@ -644,6 +644,8 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 
 worktree のイベント購読には `worktree.created`、`worktree.opened`、`worktree.removed` があります。worktree イベントは Git チェックアウトのライフサイクルを記述します。`worktree.created` は開かれた `workspace` と作成された `worktree` を含みます。`worktree.opened` は対象の `workspace`、開かれた `worktree`、`already_open` を含みます。`worktree.removed` は `workspace_id`、削除された `worktree`、`forced` を含みます。
 
+1 つの `events.subscribe` 接続は、購読しているすべてのイベントを 1 つのグローバルな順序で配信します。あるノードの `workflow.node.created` は、そのノード自身の `workflow.node.updated`・`workflow.node.output_checkpoint` イベントより必ず先に届き、`workflow.run.finished` はそのランのすべてのノードイベントより必ず後に届きます。
+
 ライフサイクルイベントには `events.subscribe` を使ってください。ワンショットの wait がサポートされる場合、専用の wait ヘルパーが別途ドキュメント化されます。
 
 ## ペインの読み取り

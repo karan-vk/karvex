@@ -286,6 +286,15 @@ pub struct AcceptedExpansion {
 pub struct ExpandOutcome {
     pub accepted: Vec<AcceptedExpansion>,
     pub rejected: Vec<ExpandRejection>,
+    /// How many children the proposal asked for (`ExpandProposal::requested`).
+    /// Carried on the outcome, not just used locally in [`evaluate`], so
+    /// [`commit`] — which only ever sees the outcome, never the proposal — can
+    /// fall back to it when a rejection's own variant does not carry a count
+    /// (every rejection but [`ExpandRejection::Truncated`]). Making the
+    /// `growth_limited` journal payload self-sufficient this way means a
+    /// restored run can report `requested`/`accepted` for *every* limit hit,
+    /// not only a partial one (B2).
+    pub requested: u16,
 }
 
 impl ExpandOutcome {
@@ -326,7 +335,13 @@ pub fn evaluate(
     proposer: RunNodeIdx,
     proposal: &ExpandProposal,
 ) -> ExpandOutcome {
-    let mut outcome = ExpandOutcome::default();
+    let mut outcome = ExpandOutcome {
+        // Set unconditionally, before any gate can return early, so a bare
+        // limit rejection (which carries no count of its own) can still
+        // report what was asked for.
+        requested: proposal.requested(),
+        ..ExpandOutcome::default()
+    };
     let Some(parent) = graph.node(proposer) else {
         debug!(
             ?proposer,
@@ -410,7 +425,7 @@ pub fn evaluate(
         return outcome;
     }
 
-    let requested = proposal.requested();
+    let requested = outcome.requested;
     let capacity = expand_budget.min(node_budget);
     let accepted = requested.min(capacity);
 
@@ -702,10 +717,13 @@ pub fn commit_with_proposal_id(
             if let Some(value) = limit_value {
                 object.insert("limit_value".into(), json!(value));
             }
-            if let Some((requested, accepted)) = rejection.counts() {
-                object.insert("requested".into(), json!(requested));
-                object.insert("accepted".into(), json!(accepted));
-            }
+            // Every rejection but `Truncated` created nothing, and the count it
+            // was refused is the proposal's own (B2) — `outcome.requested`,
+            // carried for exactly this reason since `commit` never sees the
+            // `ExpandProposal` itself.
+            let (requested, accepted) = rejection.counts().unwrap_or((outcome.requested, 0));
+            object.insert("requested".into(), json!(requested));
+            object.insert("accepted".into(), json!(accepted));
         }
         effects.push(journal(
             graph,
@@ -1689,6 +1707,7 @@ mod tests {
             rejected: vec![ExpandRejection::NotAllowed {
                 template: NodeKey::new(TEMPLATE),
             }],
+            requested: 1,
         };
         assert_eq!(
             journal_kinds(&commit(&mut graph, parent, &refusal)),
@@ -1725,6 +1744,46 @@ mod tests {
             payload["message"],
             "max_nodes 3 reached; 1 of 4 requested nodes created"
         );
+    }
+
+    /// B-T3 (P2b): before this fix, only `Truncated` carried `requested`/
+    /// `accepted` in its journal payload — every bare-limit rejection
+    /// (`ExpandMaxReached`, `MaxDepthReached`, `MaxNodesReached`) omitted both
+    /// keys, so a restarted server's `growth_limited` projection could never
+    /// report counts for the common "the whole proposal was refused" case,
+    /// only for a partial acceptance.
+    #[test]
+    fn a_growth_limited_payload_always_carries_requested_and_accepted() {
+        let kvdag = workflow(3, growth(3, 24));
+        let mut graph = run(&kvdag);
+        let parent = idx(&graph, PARENT);
+        // Spend the node's whole `expand_max` budget first, so the next
+        // proposal is refused outright rather than truncated.
+        accept(&mut graph, &kvdag, PARENT, Some(3));
+
+        let outcome = evaluate(&graph, &kvdag, parent, &proposal(Some(2)));
+        assert_eq!(
+            outcome.rejected,
+            vec![ExpandRejection::ExpandMaxReached { limit: 3 }],
+            "a bare limit rejection, not a truncation"
+        );
+        let effects = commit(&mut graph, parent, &outcome);
+
+        let payload = store_writes(&effects)
+            .into_iter()
+            .find_map(|write| match write {
+                StoreWrite::RunEvent {
+                    kind: RunEventKind::GrowthLimited,
+                    payload,
+                    ..
+                } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("a growth_limited journal entry");
+        assert_eq!(payload["reason"], "expand_max_reached");
+        assert_eq!(payload["limit"], "expand_max");
+        assert_eq!(payload["requested"], 2);
+        assert_eq!(payload["accepted"], 0);
     }
 
     #[test]

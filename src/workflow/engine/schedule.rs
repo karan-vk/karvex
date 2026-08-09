@@ -563,6 +563,27 @@ mod tests {
         );
     }
 
+    /// The one way surfacing the blocker could go wrong: `Succession::Blocked`
+    /// is a *recorded* succession, and the succession-gap conjunct is satisfied
+    /// by any succession at all. The status conjunct runs first and holds the
+    /// run open, so a stalled node can never be mistaken for a finished one.
+    #[test]
+    fn a_blocked_needs_attention_node_still_refuses_to_let_the_run_succeed() {
+        let mut graph = linear(&["only"]);
+        let idx = node_at(&graph, "only").idx;
+        if let Some(node) = graph.node_mut(idx) {
+            node.status = NodeStatus::NeedsAttention;
+            node.succession = Some(Succession::Blocked {
+                reason: "the node's pane could not be started".to_string(),
+                resume_when: "a workspace exists and the node is restarted".to_string(),
+            });
+        }
+        assert_eq!(
+            run_terminal_ready(&graph),
+            Err(TerminalBlocker::NodesOutstanding(InstancePath::new("only")))
+        );
+    }
+
     #[test]
     fn terminal_ready_reports_a_succession_gap() {
         let mut graph = linear(&["only"]);

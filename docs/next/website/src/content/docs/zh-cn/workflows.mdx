@@ -132,7 +132,17 @@ port = "shard"
 
 如上所示,汇聚边要 **从提议的那个节点** 画出。模板自身的边在构建运行图时会被丢弃,因此只能经由模板到达的节点会在创建时被判定为不可达而拒绝。真正把子节点连起来的是继承:每个被接受的子节点都会得到一份父节点出边的副本,所以每个 `worker` 也会有一条通向 `collect` 的边,`collect` 等待的是整整一代,而不只是 `fanout`。也因此,模板的 `{{slot}}` 必须能解析到已声明的运行参数,因为它自己没有入边端口。
 
-继承也意味着可能有不止一个子节点的边落到同一个下游节点的同一个端口上 ── 上面的汇聚场景里,每个 `worker` 都落在 `collect` 的 `shard` 端口上。这种情况下,该端口的 `{{slot}}` 会渲染成一个 **JSON 数组**,按子节点的创建顺序排列每条已结算边的负载,而不是让最后一个子节点的负载悄悄覆盖掉其他的。只有一条边结算到某个端口时,该端口仍然像以前一样渲染成标量值 ── 只有在真正把多个结果汇聚到一处时才会出现数组。因此上面 `collect` 的 `{{shard}}` 会看到每一个 `worker` 的报告,而不只是最后完成的那一个。
+继承也意味着可能有不止一个子节点的边落到同一个下游节点的同一个端口上 ── 上面的汇聚场景里,每个 `worker` 都落在 `collect` 的 `shard` 端口上。因此一个端口承载的是 **一组贡献**,而不是单个负载。只有一条边结算到某个端口时不受影响:`inputs/<port>.json` 就是那份负载,`{{slot}}` 仍然像以前一样原样渲染它。一旦有多条边结算到同一个端口,每个贡献者都会在 `inputs/<port>/<source>.json` 拥有自己专属的文件,`inputs/<port>.json` 变成按子节点创建顺序排列的有序索引(`[{from, label, file, payload}, …]`),`{{slot}}` 则渲染成每条贡献各自一段的归属区块:
+
+```text
+[from fanout/worker/1 · Shard 1]
+auth shard reviewed, two findings
+
+[from fanout/worker/2 · Shard 2]
+ui shard reviewed, no findings
+```
+
+这样一来,`collect` 的 `{{shard}}` 就能看到每一个 `worker` 的报告,并且分得清哪份是谁的,而不是被最后完成的子节点悄悄覆盖掉其余的。
 
 节点在自己的窗格里、在完成之前提出提议:
 
@@ -141,7 +151,7 @@ kvx workflow node expand <run_id> <path> --template worker --label "Shard" --cou
 kvx workflow node expand <run_id> <path> --template worker --label "Shard" --input goal="just src/ui" --json
 ```
 
-和 `node complete` 一样,它从节点自己的环境变量里读取 `KARVEX_WORKFLOW_NODE_TOKEN`,所以一个节点只能以自己的名义提议。`--count` 默认为 1。`--input KEY=VALUE` 会覆盖模板 `prompt_template` 中的一个 `{{slot}}`;指向未声明插槽的键会被拒绝,而不是被悄悄忽略,因此这条动态通道始终比创建时的通道更窄。每个子节点会得到 `<parent>/<template>/<n>` 形式的实例路径 ── `fanout/worker/1`、`fanout/worker/2` ── 按父节点和模板从 1 开始编号,并且只有在父节点结束之后才会启动。
+和 `node complete` 一样,它从节点自己的环境变量里读取 `KARVEX_WORKFLOW_NODE_TOKEN`,所以一个节点只能以自己的名义提议。`--count` 默认为 1。`--input KEY=VALUE` 会为这次提议创建的子节点,覆盖模板 `prompt_template` 中的一个 `{{slot}}`;指向未声明插槽的键会被拒绝,而不是被悄悄忽略,因此这条动态通道始终比创建时的通道更窄。这个覆盖值的优先级高于同名的运行参数,并会被填入子节点自己的 `task.md` ── 这正是让一个父节点可以给每个子节点分配不同任务的方式。`--label` 为这次提议创建的子节点命名:它是子节点 `task.md` 的标题、DAG 视图中的方框标签、窗格标题,以及 `claude --name`。每个子节点会得到 `<parent>/<template>/<n>` 形式的实例路径 ── `fanout/worker/1`、`fanout/worker/2` ── 按父节点和模板从 1 开始编号,并且只有在父节点结束之后才会启动。
 
 提议会依次接受四道护栏的判定:提议节点的 `expand_allow`、它的 `expand_max`、运行的 `max_depth`,以及运行的 `max_nodes`。
 
@@ -190,7 +200,8 @@ default_tier = "medium"                          # 该工作流的每一次运�
 | 文件 | 由谁写入 | 内容 |
 | --- | --- | --- |
 | `task.md` | Karvex | 渲染好的提示词:工作流契约、节点角色、任务,以及 `inputs/` 下各文件的路径 |
-| `inputs/<port>.json` | Karvex | 每个入边端口对应的上游检查点负载,一个端口一个文件 ── 结算了两条及以上边的端口(来自动态扩展的汇聚)存放的是按子节点创建顺序排列的 JSON 数组,而不是每条边一个文件 |
+| `inputs/<port>.json` | Karvex | 每个入边端口对应的上游检查点负载 ── 结算了两条及以上边的端口(来自动态扩展的汇聚)存放的是按子节点创建顺序排列的贡献索引 |
+| `inputs/<port>/<source>.json` | Karvex | 每个贡献者专属的文件,以贡献节点的实例路径命名 ── 只为汇聚的端口写入 |
 | `output_schema.json` | Karvex | `result.json` 必须满足的 JSON Schema |
 | `result.json` | 节点自身 | 其结构化结果 |
 | `artifacts/` | 节点自身 | 被 `result.json` 的 `artifacts` 数组引用的文件 |
@@ -242,7 +253,7 @@ kvx workflow run cancel <run_id>
 
 `run` 是一个命名空间,不是用来选择工作流的参数:`start`、`list`、`show`、`cancel` 各自带有自己的参数,所以工作流即使叫 `list` 也不会和子命令冲突。`--tier` 默认使用该工作流自己的 `default_tier`;为每个已声明的运行参数重复使用 `--arg` ── 工作流未声明的 `--arg` 键不会被静默丢弃,而是在运行开始前被拒绝,并列出所有已声明的键。`run cancel` 会取消运行中剩余的节点并关闭它们的窗格;运行到达 `succeeded` 时**不会**自动关闭其节点的窗格 ── 它们会保持打开,方便你读取队友的最终输出,或者继续与它对话。真正会拆除窗格的是 `run cancel`,而 `node restart`(见下文)只会拆除那一个节点自己的窗格,然后重新启动它。
 
-不带 `--json` 的 `run show` 会在运行处于 `paused` 或某个节点卡住时指出负责的节点:`status` 行会显示为 `paused (node "lint": needs_attention)`,随后是该节点的 blocker 原因和恢复条件,以及每个节点的路径、状态和标签 ── 扩展子节点的标签就是它被接受的 `--label`；同一代的子节点共享模板的 key，标签是区分它们的唯一依据。当这次运行曾经命中过增长护栏时,它还会打印一行 `growth:`,报告运行当前的增长状态以及最近一次命中的是哪道护栏 ── `growth:  3 of 12 nodes · limited: max_nodes reached at 14:22` ── 但不包含那次拒绝的请求数与接受数;这些数字在下文的 `kvx workflow node show` 和 DAG 横幅中。
+不带 `--json` 的 `run show` 总会在 `tier:` 之后打印一行 `limits:`,报告这次运行强制执行的上限 ── `limits:  max_nodes=12 · max_depth=3` ── 所以运行强制执行的内容不会只出现在 `--json` 里。它还会在运行处于 `paused` 或某个节点卡住时指出负责的节点:`status` 行会显示为 `paused (node "lint": needs_attention)`,随后是该节点的 blocker 原因和恢复条件,以及每个节点的路径、状态和标签 ── 扩展子节点的标签就是它被接受的 `--label`；同一代的子节点共享模板的 key，标签是区分它们的唯一依据。当这次运行曾经命中过增长护栏时,它还会打印一行 `growth:`,报告运行当前的增长状态以及最近一次命中的是哪道护栏 ── `growth:  3 of 12 nodes · limited: max_nodes reached at 14:22 UTC` ── 但不包含那次拒绝的请求数与接受数;这些数字在下文的 `kvx workflow node show` 和 DAG 横幅中。
 
 ```bash
 kvx workflow node show <run_id> <path> [--json]

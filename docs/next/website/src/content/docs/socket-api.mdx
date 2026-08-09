@@ -779,6 +779,8 @@ updated `PaneLayoutSnapshot` for one tab. Clients that bootstrap with
 
 Worktree event subscriptions include `worktree.created`, `worktree.opened`, and `worktree.removed`. Worktree events describe Git checkout lifecycle. `worktree.created` includes the opened `workspace` and created `worktree`. `worktree.opened` includes the target `workspace`, opened `worktree`, and `already_open`. `worktree.removed` includes the `workspace_id`, removed `worktree`, and `forced`.
 
+A single `events.subscribe` connection delivers every subscribed event in one global order: a node's `workflow.node.created` always precedes that same node's own `workflow.node.updated`/`workflow.node.output_checkpoint` events, and `workflow.run.finished` always follows every node event from that run.
+
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
 
 ## Reading panes

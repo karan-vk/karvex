@@ -1412,6 +1412,95 @@ async fn on_disk_round_trip_survives_close_and_reopen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Fix-wave requirement (B1+B2 combined, restart durability): a run whose
+/// growth was limited and that has expanded children must report the same
+/// `growth_limited` objects (run + node) and `parent_path` values after a
+/// real close/reopen of the on-disk store — not just `kv-mem`, which every
+/// other test in this file uses and which never round-trips through a
+/// SurrealKv file at all. `list_run_nodes`/`growth_limits` are exactly what
+/// `src/app/api/workflows.rs::stored_run` calls for `run.get`/`node.get` once
+/// this server is not the one executing the run, which a restart always
+/// leaves it as.
+#[tokio::test]
+#[ignore = "touches disk"]
+async fn a_restarted_store_reports_the_same_growth_limited_and_parent_path() {
+    let dir = unique_temp_dir("restart");
+
+    let (run, parent_path_before, limits_before) = {
+        let store = WorkflowStore::open(StoreLocation::OnDisk(dir.clone()))
+            .await
+            .expect("opens");
+        let (_, _, run) = setup_expandable_run(&store, "restart-durability").await;
+
+        store
+            .write(node_created_write(
+                &run,
+                "worker",
+                "root/worker/1",
+                Some("root"),
+            ))
+            .await
+            .expect("create the child");
+
+        store
+            .write(StoreWrite::RunEvent {
+                run: run.clone(),
+                seq: 0,
+                kind: RunEventKind::GrowthLimited,
+                path: Some(InstancePath::new("root")),
+                payload: serde_json::json!({
+                    "reason": "max_nodes_reached",
+                    "message": "max_nodes 3 reached; no nodes created",
+                    "limit": "max_nodes",
+                    "limit_value": 3,
+                    "requested": 1,
+                    "accepted": 0,
+                }),
+            })
+            .await
+            .expect("growth_limited event");
+
+        let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+        let child = nodes
+            .iter()
+            .find(|record| record.instance_path.as_str() == "root/worker/1")
+            .expect("the child is in the run");
+        let parent_path_before = child.parent_path.clone();
+        let limits_before = store.growth_limits(&run).await.expect("growth_limits");
+        (run, parent_path_before, limits_before)
+    };
+
+    let store = open_with_retry(&dir).await;
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    let child = nodes
+        .iter()
+        .find(|record| record.instance_path.as_str() == "root/worker/1")
+        .expect("the child survives the restart");
+    assert_eq!(
+        child.parent_path, parent_path_before,
+        "parent_path must survive a real close/reopen of the store, not just kv-mem"
+    );
+    assert_eq!(
+        child.parent_path,
+        Some(InstancePath::new("root")),
+        "and it must actually be the value the live server had, not just a stable None"
+    );
+
+    let limits_after = store.growth_limits(&run).await.expect("growth_limits");
+    assert_eq!(
+        limits_after, limits_before,
+        "growth_limited must survive a real close/reopen of the store, not just kv-mem"
+    );
+    assert!(
+        limits_after.last.is_some(),
+        "and it must actually still carry the limit the live server recorded"
+    );
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── 14: Phase 2 — growth, create paths, assignments, node history ────────
 //
 // `06-phase2-plan.md` WS-C. Each case pins one of the four things the store
@@ -1692,6 +1781,22 @@ async fn a_created_run_node_round_trips_with_its_parent_depth_and_spawned_relati
     assert_eq!(child.model, "sonnet");
     assert_eq!(child.effort, "xhigh");
     assert_eq!(child.assignment_reason, "auto/downgrade-standard");
+    // B-T1 (P2b, restart durability): `run_node.parent` is a real column, but
+    // `run_node_record` used to drop it on the floor rather than resolving it
+    // to the instance path a restarted server can report.
+    assert_eq!(
+        child.parent_path,
+        Some(InstancePath::new("root")),
+        "the child's provenance resolves to its proposing parent's path"
+    );
+    let root = before
+        .iter()
+        .find(|record| record.instance_path.as_str() == "root")
+        .expect("the static root node is in the run");
+    assert_eq!(
+        root.parent_path, None,
+        "a static node has no proposer to resolve"
+    );
 
     // The run's denominator moves with the graph; a progress counter that
     // ignored expansion children would under-report every growing run.
@@ -1727,6 +1832,154 @@ async fn a_created_run_node_round_trips_with_its_parent_depth_and_spawned_relati
         "the relation runs from the proposing parent"
     );
     assert_eq!(record_id_to_string(&relation.out), ids["root/worker/1"]);
+}
+
+/// B-T2 (P2b, restart durability): `growth_limited` is journalled as a
+/// `run_event` row keyed to the proposing node, but before this fix nothing
+/// read it back — a restarted server reported `growth_limited: null`
+/// regardless of what had actually happened.
+#[tokio::test]
+async fn a_growth_limited_journal_entry_projects_back_as_a_run_and_node_fact() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_expandable_run(&store, "growth-projects").await;
+
+    store
+        .write(node_created_write(
+            &run,
+            "worker",
+            "root/worker/1",
+            Some("root"),
+        ))
+        .await
+        .expect("create the child");
+
+    store
+        .write(StoreWrite::RunEvent {
+            run: run.clone(),
+            seq: 0,
+            kind: RunEventKind::GrowthLimited,
+            path: Some(InstancePath::new("root")),
+            payload: serde_json::json!({
+                "reason": "max_nodes_reached",
+                "message": "max_nodes 3 reached; no nodes created",
+                "limit": "max_nodes",
+                "limit_value": 3,
+                "requested": 1,
+                "accepted": 0,
+            }),
+        })
+        .await
+        .expect("first growth_limited event");
+
+    store
+        .write(StoreWrite::RunEvent {
+            run: run.clone(),
+            seq: 1,
+            kind: RunEventKind::GrowthLimited,
+            path: Some(InstancePath::new("root/worker/1")),
+            payload: serde_json::json!({
+                "reason": "expand_max_reached",
+                "message": "expand_max 2 reached; no nodes created",
+                "limit": "expand_max",
+                "limit_value": 2,
+                "requested": 1,
+                "accepted": 0,
+            }),
+        })
+        .await
+        .expect("second growth_limited event");
+
+    let limits = store.growth_limits(&run).await.expect("growth_limits");
+
+    let last = limits.last.expect("the run's most recent limit");
+    assert_eq!(last.kind, "expand_max");
+    assert_eq!(last.limit_value, 2);
+    assert_eq!(last.requested, 1);
+    assert_eq!(last.accepted, 0);
+    assert_eq!(last.message, "expand_max 2 reached; no nodes created");
+
+    let by_root = limits
+        .by_path
+        .get(&InstancePath::new("root"))
+        .expect("the first proposer's own limit is keyed by path");
+    assert_eq!(by_root.kind, "max_nodes");
+    assert_eq!(by_root.limit_value, 3);
+    assert_eq!(by_root.requested, 1);
+    assert_eq!(by_root.accepted, 0);
+
+    let by_child = limits
+        .by_path
+        .get(&InstancePath::new("root/worker/1"))
+        .expect("the second proposer's own limit is keyed by path");
+    assert_eq!(by_child.kind, "expand_max");
+    assert_eq!(by_child.limit_value, 2);
+}
+
+/// `workflow.run.list` answers about a whole page of runs, and its `limit` is
+/// caller-supplied and uncapped, so it cannot afford one `growth_limits` call
+/// per listed run. Without a batched read it would keep reporting
+/// `growth_limited: null` for exactly the runs `workflow.run.get` now reports a
+/// limit for — the same fact disagreeing with itself depending on which verb
+/// asked. This also pins the `run IN $runs` filter, the one piece of SurrealQL
+/// in the store with no other caller to catch a syntax drift.
+#[tokio::test]
+async fn listed_runs_report_the_same_last_growth_limit_that_run_get_does() {
+    let store = open_mem_store().await;
+    let (_, _, limited) = setup_expandable_run(&store, "growth-listed-a").await;
+    let (_, _, untouched) = setup_expandable_run(&store, "growth-listed-b").await;
+
+    for (seq, limit_value) in [(0, 3), (1, 5)] {
+        store
+            .write(StoreWrite::RunEvent {
+                run: limited.clone(),
+                seq,
+                kind: RunEventKind::GrowthLimited,
+                path: Some(InstancePath::new("root")),
+                payload: serde_json::json!({
+                    "reason": "max_nodes_reached",
+                    "message": format!("max_nodes {limit_value} reached; no nodes created"),
+                    "limit": "max_nodes",
+                    "limit_value": limit_value,
+                    "requested": 1,
+                    "accepted": 0,
+                }),
+            })
+            .await
+            .expect("growth_limited event");
+    }
+
+    let listed = store
+        .last_growth_limit_by_run(&[limited.clone(), untouched.clone()])
+        .await
+        .expect("last_growth_limit_by_run");
+
+    let last = listed
+        .get(&limited)
+        .expect("a run that hit a guardrail reports it when listed, not only when fetched");
+    assert_eq!(
+        last.limit_value, 5,
+        "the run's most recent limit wins, the same last-write-wins rule `growth_limits` uses"
+    );
+    assert_eq!(
+        Some(last),
+        store
+            .growth_limits(&limited)
+            .await
+            .expect("growth_limits")
+            .last
+            .as_ref(),
+        "the batched read and the single-run read must not disagree"
+    );
+    assert!(
+        !listed.contains_key(&untouched),
+        "a run that never hit a guardrail contributes nothing, and must not pick up \
+         another run's limit"
+    );
+    assert!(store
+        .last_growth_limit_by_run(&[])
+        .await
+        .expect("an empty page is not an error")
+        .is_empty());
 }
 
 /// R-4: `commit` emits the create before any update for the same path, and the

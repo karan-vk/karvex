@@ -110,6 +110,11 @@ pub struct RunNodeRecord {
     /// The accepted `--input k=v` slot overrides this instance was created
     /// with; empty for a static node.
     pub inputs: BTreeMap<String, String>,
+    /// Spawn provenance, resolved from `run_node.parent` against this run's
+    /// own rows: `Some` for an expansion child, `None` for a static node (or
+    /// for a `parent` that does not resolve within this run, which should not
+    /// happen today but is read as "no provenance" rather than an error).
+    pub parent_path: Option<InstancePath>,
     pub depth: u16,
     pub status: NodeStatus,
     pub model: String,
@@ -191,6 +196,35 @@ pub struct RunSummaryRecord {
     pub highlights: Vec<String>,
     pub open_gaps: Vec<String>,
     pub token_estimate: u32,
+}
+
+/// The run's journalled growth limits, projected back into the shape the live
+/// engine holds (`WorkflowState::growth_limits` / `last_growth_limit`,
+/// `src/app/workflow.rs`): last-write-wins per proposing node, plus the run's
+/// most recent limit overall (whichever node hit it). Read from the
+/// `growth_limited` journal — nothing else durably records a growth
+/// rejection.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StoredGrowthLimits {
+    pub last: Option<StoredGrowthLimit>,
+    pub by_path: BTreeMap<InstancePath, StoredGrowthLimit>,
+}
+
+/// One journalled `growth_limited` fact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredGrowthLimit {
+    /// `"expand_max" | "max_depth" | "max_nodes"` — `ExpandLimit::as_str`'s
+    /// spelling, which is also what `commit` writes into the journal payload.
+    pub kind: String,
+    pub limit_value: u32,
+    pub requested: u32,
+    pub accepted: u32,
+    /// Journal-fidelity, not engine-fidelity: the `run_event` row's own `at`,
+    /// which can differ from the live `current_unix_ms()` reading by a few
+    /// milliseconds. The only renderer is `HH:MM`, so the drift is invisible;
+    /// noted here so a future reader does not "fix" it.
+    pub at_unix_ms: u64,
+    pub message: String,
 }
 
 impl WorkflowStore {
@@ -374,7 +408,20 @@ impl WorkflowStore {
             .await
             .map_err(query_error)?;
         let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
-        rows.into_iter().map(run_node_record).collect()
+        // Same shape `list_run_edges` builds: the row id -> instance path map
+        // that resolves `run_node.parent` (B1) without a join per row.
+        let path_by_id: BTreeMap<String, InstancePath> = rows
+            .iter()
+            .map(|row| {
+                (
+                    record_id_to_string(&row.id),
+                    InstancePath::new(row.instance_path.clone()),
+                )
+            })
+            .collect();
+        rows.into_iter()
+            .map(|row| run_node_record(row, &path_by_id))
+            .collect()
     }
 
     /// Every `run_edge` for a run, with both endpoints resolved to instance
@@ -624,6 +671,153 @@ impl WorkflowStore {
         let rows: Vec<records::RunSummaryRow> = response.take(0).map_err(query_error)?;
         rows.into_iter().next().map(run_summary_record).transpose()
     }
+
+    /// The run's journalled growth limits (P2b). See [`StoredGrowthLimits`].
+    pub async fn growth_limits(&self, run: &RunId) -> Result<StoredGrowthLimits, StoreError> {
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+
+        // Bound to `RunEventKind::GrowthLimited`'s own spelling rather than a
+        // hand-typed literal, so the join cannot drift from
+        // `run_event_kind_str`'s encoding.
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_event WHERE run = $run AND kind = $kind ORDER BY seq")
+            .bind(("run", id.clone()))
+            .bind(("kind", RunEventKind::GrowthLimited.as_str().to_string()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunEventRow> = response.take(0).map_err(query_error)?;
+        // Most runs never hit a guardrail, and the node map below only exists
+        // to key `by_path`. Asking for it before knowing there is anything to
+        // key would double the cost of the common case.
+        if rows.is_empty() {
+            return Ok(StoredGrowthLimits::default());
+        }
+
+        // Same shape `list_run_edges`/`list_run_nodes` build: the row id ->
+        // instance path map that resolves `run_event.run_node` to the path the
+        // rest of the run surface addresses nodes by.
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_node WHERE run = $run")
+            .bind(("run", id))
+            .await
+            .map_err(query_error)?;
+        let node_rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
+        let path_by_id: BTreeMap<String, InstancePath> = node_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    record_id_to_string(&row.id),
+                    InstancePath::new(row.instance_path),
+                )
+            })
+            .collect();
+
+        let mut limits = StoredGrowthLimits::default();
+        for row in &rows {
+            let Some(limit) = stored_growth_limit(row) else {
+                continue;
+            };
+            // `commit` always journals `growth_limited` against the proposing
+            // node (`expand.rs`), so a row with no `run_node`, or one that
+            // resolves to nothing in this run, should not happen; when it
+            // does, the limit still counts toward `last` but not `by_path`.
+            if let Some(path) = row
+                .run_node
+                .as_ref()
+                .and_then(|id| path_by_id.get(&record_id_to_string(id)))
+            {
+                limits.by_path.insert(path.clone(), limit.clone());
+            }
+            limits.last = Some(limit);
+        }
+        Ok(limits)
+    }
+
+    /// Each listed run's most recent journalled growth limit — the run-level
+    /// half of [`StoredGrowthLimits`], for callers that answer about many runs
+    /// at once.
+    ///
+    /// One query for the whole list rather than one per run: `run list`'s
+    /// `limit` is caller-supplied and uncapped, so a per-run loop would be an
+    /// unbounded N+1. `by_path` is deliberately not resolved here — it is the
+    /// only part that needs each run's `run_node` rows, and no list surface
+    /// reports per-node limits.
+    pub async fn last_growth_limit_by_run(
+        &self,
+        runs: &[RunId],
+    ) -> Result<BTreeMap<RunId, StoredGrowthLimit>, StoreError> {
+        if runs.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let ids: Vec<_> = runs
+            .iter()
+            .filter_map(|run| parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()))
+            .collect();
+        if ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_event WHERE kind = $kind AND run IN $runs ORDER BY seq")
+            .bind(("runs", ids))
+            .bind(("kind", RunEventKind::GrowthLimited.as_str().to_string()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunEventRow> = response.take(0).map_err(query_error)?;
+
+        // `seq` is per-run, so a global `ORDER BY seq` still leaves each run's
+        // own rows in ascending order; last write wins per run.
+        let mut last = BTreeMap::new();
+        for row in &rows {
+            let Some(limit) = stored_growth_limit(row) else {
+                continue;
+            };
+            last.insert(RunId::new(record_id_to_string(&row.run)), limit);
+        }
+        Ok(last)
+    }
+}
+
+/// Parses one `growth_limited` journal row's payload back into a
+/// [`StoredGrowthLimit`]. `commit` (`src/workflow/engine/expand.rs`) always
+/// writes `limit`/`limit_value`/`requested`/`accepted`/`message` for a row of
+/// this kind (B2 made the counts unconditional); a row missing `limit` is not
+/// one `commit` wrote and is skipped rather than guessed.
+fn stored_growth_limit(row: &records::RunEventRow) -> Option<StoredGrowthLimit> {
+    let kind = row.payload.get("limit")?.as_str()?.to_string();
+    let limit_value = row
+        .payload
+        .get("limit_value")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    let requested = row
+        .payload
+        .get("requested")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    let accepted = row
+        .payload
+        .get("accepted")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u32;
+    let message = row
+        .payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(StoredGrowthLimit {
+        kind,
+        limit_value,
+        requested,
+        accepted,
+        at_unix_ms: unix_ms(&row.at),
+        message,
+    })
 }
 
 fn workflow_summary(row: records::WorkflowRow) -> Result<WorkflowSummary, StoreError> {
@@ -711,13 +905,25 @@ fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
     })
 }
 
-fn run_node_record(row: records::RunNodeRow) -> Result<RunNodeRecord, StoreError> {
+fn run_node_record(
+    row: records::RunNodeRow,
+    path_by_id: &BTreeMap<String, InstancePath>,
+) -> Result<RunNodeRecord, StoreError> {
+    // Resolved against this run's own rows rather than a live `Kvdag` — a
+    // restored run has no live definition to consult, and `parent` only ever
+    // points at another `run_node` row in the same run.
+    let parent_path = row
+        .parent
+        .as_ref()
+        .and_then(|parent| path_by_id.get(&record_id_to_string(parent)))
+        .cloned();
     Ok(RunNodeRecord {
         run: RunId::new(record_id_to_string(&row.run)),
         node_key: NodeKey::new(row.node_key),
         instance_path: InstancePath::new(row.instance_path),
         label: row.label,
         inputs: super::string_map_from_json(&row.inputs),
+        parent_path,
         depth: row.depth as u16,
         status: parse_node_status(&row.status)?,
         model: row.model,

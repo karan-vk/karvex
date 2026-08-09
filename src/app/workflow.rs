@@ -1011,8 +1011,49 @@ impl App {
 
     fn dispatch_workflow_effects(&mut self, effects: Vec<RunEffect>) -> bool {
         let mut changed = false;
+        // A run whose node set grew has to say so on the run stream. The engine
+        // emits `RunUpdated` only from `pause()` and `resume()`, so before this
+        // an expansion moved `nodes_total` from 2 to 12 without a single
+        // `workflow.run.updated` — a subscriber tracking the run could see the
+        // eleven `workflow.node.created` events and the final
+        // `workflow.run.finished`, and nothing in between that carried the new
+        // total.
+        //
+        // One synthetic event per effect batch that materialised nodes, not one
+        // per node: a run start creates every static node in one batch, and a
+        // client wants the settled total, not N intermediate ones.
+        let mut grown_run: Option<RunId> = None;
         for effect in effects {
+            match &effect {
+                // The engine's own run update already re-reads the run
+                // projection, so it carries the grown `nodes_total` itself.
+                // Emitting a synthetic one immediately before it would be two
+                // events for one fact.
+                RunEffect::Emit(WorkflowEvent::RunUpdated { .. }) => {
+                    grown_run = None;
+                }
+                // `RunFinished` is the last thing a subscriber hears about the
+                // run, so the growth has to be announced before it — a client
+                // watching only `workflow.run.updated` must not have to infer
+                // the total from the terminal event.
+                RunEffect::Emit(WorkflowEvent::RunFinished { .. }) => {
+                    if let Some(run) = grown_run.take() {
+                        changed |= self.emit_workflow_run_growth(&run);
+                    }
+                }
+                _ => {}
+            }
+            let created_run = match &effect {
+                RunEffect::Emit(WorkflowEvent::NodeCreated { run, .. }) => Some(run.clone()),
+                _ => None,
+            };
             changed |= self.dispatch_workflow_effect(effect);
+            if let Some(run) = created_run {
+                grown_run = Some(run);
+            }
+        }
+        if let Some(run) = grown_run.take() {
+            changed |= self.emit_workflow_run_growth(&run);
         }
         self.flush_workflow_writes();
         self.mirror_workflow_run_graph();
@@ -1689,6 +1730,23 @@ impl App {
         }
     }
 
+    /// Announces the run's refreshed shape after a batch materialised nodes.
+    ///
+    /// Silently does nothing for a run that is no longer the active one —
+    /// `workflow_run_info` is the same guard every other run event goes
+    /// through, and a stale effect must not emit an event about a run this
+    /// server no longer holds.
+    fn emit_workflow_run_growth(&mut self, run: &RunId) -> bool {
+        let Some(info) = self.workflow_run_info(run) else {
+            return false;
+        };
+        self.emit_event(EventEnvelope {
+            event: EventKind::WorkflowRunUpdated,
+            data: EventData::WorkflowRunUpdated { run: info },
+        });
+        true
+    }
+
     fn emit_workflow_event(&mut self, event: WorkflowEvent) {
         let envelope = match event {
             WorkflowEvent::RunStarted { run } => self.workflow_run_info(&run).map(|run| {
@@ -1849,9 +1907,11 @@ impl App {
             max_nodes: u32::from(graph.growth.max_nodes),
             nodes_live: u32::from(GrowthLimits::live_node_count(&graph.nodes)),
             // §4 D11: the run's most recent guardrail breach, whichever node
-            // hit it. A durable read of a finished run cannot report this —
-            // `workflow_run` has no column for it — which is exactly why the
-            // live projection wins for the active run.
+            // hit it. `workflow_run` still has no column for it; a run read
+            // back after a restart recovers the same fact from its own
+            // `growth_limited` journal instead
+            // (`src/workflow/store/queries.rs::growth_limits`), so the two
+            // projections agree rather than one of them going quiet.
             growth_limited: self.workflow.last_growth_limit().cloned(),
         })
     }
@@ -3887,6 +3947,103 @@ mod tests {
         assert!(
             !app.reconcile_workflow_pane_bindings(),
             "the direct call already reported it, so the tick backstop has nothing to do"
+        );
+    }
+
+    /// P1's second half: a run whose node set grows has to say so on the run
+    /// stream. The engine emits `RunUpdated` only from `pause()`/`resume()`, so
+    /// an expansion used to move `nodes_total` without a single
+    /// `workflow.run.updated` — a subscriber saw the node events and then a
+    /// finished run, and nothing carrying the new total in between.
+    #[test]
+    fn an_expansion_emits_a_run_updated_before_the_run_finishes() {
+        let event_hub = EventHub::default();
+        let mut app = test_app_with_hub(event_hub.clone());
+        let definition = definition();
+        let graph = graph_of(&definition);
+        let run_id = RunId::new("workflow_run:test");
+        app.workflow
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the run starts");
+        let cursor = event_hub.current_sequence();
+
+        app.dispatch_workflow_effects(vec![
+            RunEffect::Emit(WorkflowEvent::NodeCreated {
+                run: run_id.clone(),
+                path: InstancePath::new("plan"),
+            }),
+            RunEffect::Emit(WorkflowEvent::NodeCreated {
+                run: run_id.clone(),
+                path: InstancePath::new("implement"),
+            }),
+            RunEffect::Emit(WorkflowEvent::RunFinished {
+                run: run_id.clone(),
+                status: RunStatus::Succeeded,
+            }),
+        ]);
+
+        let emitted: Vec<_> = event_hub.events_after(cursor).into_iter().collect();
+        let kinds: Vec<EventKind> = emitted.iter().map(|(_, event)| event.event).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::WorkflowNodeCreated,
+                EventKind::WorkflowNodeCreated,
+                EventKind::WorkflowRunUpdated,
+                EventKind::WorkflowRunFinished,
+            ],
+            "exactly one run.updated per batch that materialised nodes, and it lands \
+             before the run.finished it precedes"
+        );
+
+        let EventData::WorkflowRunUpdated { run } = emitted[2].1.data.clone() else {
+            panic!("unexpected event data");
+        };
+        assert_eq!(
+            run.nodes_total, 2,
+            "the synthetic update carries the refreshed total, which is the whole point of it"
+        );
+        assert_eq!(run.run_id, "workflow_run:test");
+    }
+
+    /// The growth flag is cleared by the engine's own `RunUpdated` rather than
+    /// firing alongside it: a paused run must not get two updates for one fact.
+    #[test]
+    fn a_batch_that_already_carries_a_run_update_does_not_get_a_second_one() {
+        let event_hub = EventHub::default();
+        let mut app = test_app_with_hub(event_hub.clone());
+        let definition = definition();
+        let graph = graph_of(&definition);
+        let run_id = RunId::new("workflow_run:test");
+        app.workflow
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the run starts");
+        let cursor = event_hub.current_sequence();
+
+        app.dispatch_workflow_effects(vec![
+            RunEffect::Emit(WorkflowEvent::NodeCreated {
+                run: run_id.clone(),
+                path: InstancePath::new("plan"),
+            }),
+            RunEffect::Emit(WorkflowEvent::RunUpdated {
+                run: run_id.clone(),
+                status: RunStatus::Paused,
+            }),
+        ]);
+
+        let kinds: Vec<EventKind> = event_hub
+            .events_after(cursor)
+            .into_iter()
+            .map(|(_, event)| event.event)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::WorkflowNodeCreated,
+                EventKind::WorkflowRunUpdated,
+            ],
+            "the engine's own run update already carries the grown total, so the batch \
+             does not also get a synthetic one"
         );
     }
 

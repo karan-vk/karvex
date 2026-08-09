@@ -640,6 +640,8 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 
 Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree.removed`。Worktree 事件描述 Git 检出的生命周期。`worktree.created` 包含打开的 `workspace` 和创建的 `worktree`。`worktree.opened` 包含目标 `workspace`、打开的 `worktree` 和 `already_open`。`worktree.removed` 包含 `workspace_id`、被移除的 `worktree` 和 `forced`。
 
+单个 `events.subscribe` 连接会按照统一的全局顺序投递所有已订阅的事件:某个节点的 `workflow.node.created` 总是先于该节点自身的 `workflow.node.updated`/`workflow.node.output_checkpoint` 事件到达,而 `workflow.run.finished` 总是晚于该运行的所有节点事件到达。
+
 生命周期事件用 `events.subscribe`。支持一次性等待时,专门的等待辅助命令会单独在文档中说明。
 
 ## 读取窗格

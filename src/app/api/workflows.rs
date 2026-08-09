@@ -61,7 +61,9 @@ use crate::workflow::model::{
     WorkflowId,
 };
 #[cfg(feature = "workflow")]
-use crate::workflow::store::{NewRun, StoreError, VersionMetadata, VersionOrigin, VersionRecord};
+use crate::workflow::store::{
+    NewRun, StoreError, StoredGrowthLimits, VersionMetadata, VersionOrigin, VersionRecord,
+};
 #[cfg(feature = "workflow")]
 use crate::workflow::tier::{HistoryIndex, Tier};
 
@@ -790,19 +792,30 @@ impl App {
                 WorkflowSelector::NotFound => return Ok::<_, StoreError>(LookupResult::NotFound),
                 WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
             };
-            Ok(LookupResult::Found(
-                cx.block_on(cx.store().list_runs(&workflow_id, limit))?,
-            ))
+            let records = cx.block_on(cx.store().list_runs(&workflow_id, limit))?;
+            // One batched query for the whole page rather than one per run:
+            // `limit` is caller-supplied and uncapped, so a per-run call would
+            // be an unbounded N+1. Without it `run.list` would report
+            // `growth_limited: null` for the same run `run.get` reports a
+            // limit for, which is the inconsistency B2 exists to remove.
+            let ids: Vec<_> = records.iter().map(|record| record.id.clone()).collect();
+            let limits = cx.block_on(cx.store().last_growth_limit_by_run(&ids))?;
+            Ok(LookupResult::Found((records, limits)))
         });
         match listed {
-            Ok(Ok(LookupResult::Found(runs))) => {
+            Ok(Ok(LookupResult::Found((records, limits)))) => {
                 // The live run's authoritative status is the engine's, not the
                 // journal's, so the in-memory projection wins where it applies.
-                let runs = runs
+                let runs = records
                     .into_iter()
                     .map(|record| {
-                        self.workflow_run_info(&record.id)
-                            .unwrap_or_else(|| wire_run_record(record))
+                        self.workflow_run_info(&record.id).unwrap_or_else(|| {
+                            let limits = StoredGrowthLimits {
+                                last: limits.get(&record.id).cloned(),
+                                by_path: BTreeMap::new(),
+                            };
+                            wire_run_record(record, &limits)
+                        })
                     })
                     .collect();
                 encode_success(id, ResponseResult::WorkflowRunList { runs })
@@ -837,6 +850,14 @@ impl App {
                 NO_ACTIVE_RUN_CODE,
                 format!("run {} is not the run this server is executing", run_id),
             );
+        }
+        // B3: the same H2 closed-run guard `steer`/`interrupt`/`restart`/
+        // `expand` already use. A run that is already closed will never
+        // settle again, so cancelling it a second time answered `ok` with an
+        // envelope literally named `workflow_run_cancelled` for a run whose
+        // status stayed whatever it already was — a lie the retest flagged.
+        if let Some(error) = self.require_open_run(&id, &run_id, "be cancelled") {
+            return error;
         }
         self.cancel_workflow_run();
         match self.workflow_run_info(&run_id) {
@@ -1332,15 +1353,22 @@ impl App {
             // propagation, so a restored run carries both its topology and the
             // branches it actually took.
             let edges = cx.block_on(cx.store().list_run_edges(&wanted))?;
-            Ok(Some((record, nodes, edges)))
+            // B2: one extra round trip in the same context rather than a
+            // second `workflow_store.call`, since `run.get`/`node.get` need it
+            // alongside the nodes/edges this closure already loaded.
+            let limits = cx.block_on(cx.store().growth_limits(&wanted))?;
+            Ok(Some((record, nodes, edges, limits)))
         });
         match loaded {
-            Ok(Ok(Some((record, nodes, edges)))) => {
+            Ok(Ok(Some((record, nodes, edges, limits)))) => {
                 let graph = WorkflowRunGraph {
-                    nodes: nodes.into_iter().map(wire_run_node_record).collect(),
+                    nodes: nodes
+                        .into_iter()
+                        .map(|node| wire_run_node_record(node, &limits))
+                        .collect(),
                     edges: edges.into_iter().map(wire_run_edge_record).collect(),
                 };
-                Ok(Some((wire_run_record(record), graph)))
+                Ok(Some((wire_run_record(record, &limits), graph)))
             }
             Ok(Ok(None)) => Ok(None),
             Ok(Err(error)) => {
@@ -1892,8 +1920,39 @@ fn wire_edge_info(edge: &KvdagEdge) -> KvdagEdgeInfo {
     }
 }
 
+/// Maps one journalled limit's kind spelling back to the wire enum. Fail
+/// closed: a string `commit` never wrote (a future kind this build does not
+/// know about) is reported as no limit at all rather than guessed, and never
+/// panics.
 #[cfg(feature = "workflow")]
-fn wire_run_record(record: crate::workflow::store::RunRecord) -> WorkflowRunInfo {
+fn wire_stored_growth_limit_kind(kind: &str) -> Option<WorkflowGrowthLimitKind> {
+    match kind {
+        "expand_max" => Some(WorkflowGrowthLimitKind::ExpandMax),
+        "max_depth" => Some(WorkflowGrowthLimitKind::MaxDepth),
+        "max_nodes" => Some(WorkflowGrowthLimitKind::MaxNodes),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "workflow")]
+fn wire_stored_growth_limit(
+    limit: &crate::workflow::store::StoredGrowthLimit,
+) -> Option<WorkflowGrowthLimit> {
+    Some(WorkflowGrowthLimit {
+        kind: wire_stored_growth_limit_kind(&limit.kind)?,
+        limit_value: limit.limit_value,
+        requested: limit.requested,
+        accepted: limit.accepted,
+        at_unix_ms: limit.at_unix_ms,
+        message: limit.message.clone(),
+    })
+}
+
+#[cfg(feature = "workflow")]
+fn wire_run_record(
+    record: crate::workflow::store::RunRecord,
+    limits: &StoredGrowthLimits,
+) -> WorkflowRunInfo {
     WorkflowRunInfo {
         run_id: record.id.to_string(),
         workflow_id: record.workflow.to_string(),
@@ -1915,24 +1974,27 @@ fn wire_run_record(record: crate::workflow::store::RunRecord) -> WorkflowRunInfo
         // Every materialised node counts against `max_nodes` regardless of
         // status, which is exactly what `nodes_total` records.
         nodes_live: record.nodes_total,
-        // A growth limit is a *live* fact: it is journalled as `growth_limited`
-        // and emitted as `workflow.growth.limited`, but `workflow_run` carries
-        // no column for it, so a run read back from the journal has nothing to
-        // project. The live projection in `src/app/workflow.rs` is where a
-        // recorded limit surfaces.
-        growth_limited: None,
+        // B2: recovered from the `growth_limited` journal (`limits.last` is
+        // whichever node's rejection landed last), not from a `workflow_run`
+        // column — the run row still carries none.
+        growth_limited: limits.last.as_ref().and_then(wire_stored_growth_limit),
     }
 }
 
 #[cfg(feature = "workflow")]
-fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> WorkflowRunNodeInfo {
+fn wire_run_node_record(
+    record: crate::workflow::store::RunNodeRecord,
+    limits: &StoredGrowthLimits,
+) -> WorkflowRunNodeInfo {
     WorkflowRunNodeInfo {
         path: record.instance_path.to_string(),
         node_key: record.node_key.to_string(),
         // Persisted per instance on `run_node.label`, so a run read back after
         // a restart still names its children the way their proposals did.
         label: record.label.clone(),
-        parent_path: None,
+        // B1: resolved from `run_node.parent` against this run's own rows
+        // (`run_node_record`), rather than dropped on the floor.
+        parent_path: record.parent_path.as_ref().map(InstancePath::to_string),
         depth: u32::from(record.depth),
         status: wire_node_status(record.status),
         demand: wire_demand(record.demand),
@@ -1957,11 +2019,16 @@ fn wire_run_node_record(record: crate::workflow::store::RunNodeRecord) -> Workfl
         // finished run can still explain why a node ran on the model it did.
         // Empty for a fixed tier, whose §7.1/§7.2 row *is* the explanation.
         assignment_reason: record.assignment_reason,
-        // Delivery failures and growth limits both live on the engine rather
-        // than on a `run_node` column, so the durable projection cannot report
-        // either. The live projection in `src/app/workflow.rs` does.
+        // Delivery failures live only on the engine — the durable projection
+        // has no column for one and cannot report it.
         delivery_failure: None,
-        growth_limited: None,
+        // B2: this node's own last journalled limit, as a *proposer* — the
+        // same key the live projection uses (`by_path`, keyed by instance
+        // path).
+        growth_limited: limits
+            .by_path
+            .get(&record.instance_path)
+            .and_then(wire_stored_growth_limit),
     }
 }
 
@@ -3030,6 +3097,47 @@ output_schema = { type = "object", required = ["done"] }
         );
     }
 
+    /// B-T5 (P2b decision): `run cancel` on an already-closed run used to
+    /// answer `ok` with an envelope literally named `workflow_run_cancelled`
+    /// while the run's status stayed whatever it already was — inconsistent
+    /// with `steer`/`interrupt`/`restart`, which all reject a closed run with
+    /// `workflow_run_closed`.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn cancelling_a_closed_run_is_refused_like_steer_and_interrupt() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        app.handle_workflow_run_cancel(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+        );
+        assert_eq!(
+            app.workflow.run_status(),
+            Some(RunStatus::Cancelled),
+            "the fixture run is cancelled before the second cancel"
+        );
+
+        let response = app.handle_workflow_run_cancel(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+        );
+        assert_eq!(error_code(&response), RUN_CLOSED_CODE, "{response}");
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("cancelled") && message.contains("kvx workflow run start"),
+            "the refusal names the run's status and what to do instead: {message}"
+        );
+        assert_eq!(
+            app.workflow.run_status(),
+            Some(RunStatus::Cancelled),
+            "the refusal does not reopen or otherwise mutate the run"
+        );
+    }
+
     /// 2.14: `workflow_run_in_flight` claimed the blocking run was "still
     /// executing" when it was in fact paused waiting for a human, and named
     /// neither the run nor a way out.
@@ -3742,5 +3850,98 @@ port = "summary"
             shown["result"]["detail"]["workflow"]["description"], "v2 description",
             "the one projection reports the same thing: {shown}"
         );
+    }
+
+    /// B-T4 (P2a/P2b): the durable projection hardcoded `parent_path: None`
+    /// and `growth_limited: None` regardless of what `stored_run` read back,
+    /// even though both facts are recoverable from already-persisted data
+    /// (`run_node.parent` and the `growth_limited` journal, B1/B2).
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn the_durable_projection_reports_parent_path_and_growth_limited() {
+        use crate::workflow::model::Demand;
+        use crate::workflow::store::{RunNodeRecord, RunRecord, StoredGrowthLimit};
+
+        let node = RunNodeRecord {
+            run: RunId::new("workflow_run:t4"),
+            node_key: NodeKey::new("worker"),
+            instance_path: InstancePath::new("root/worker/1"),
+            label: "worker".into(),
+            inputs: BTreeMap::new(),
+            parent_path: Some(InstancePath::new("root")),
+            depth: 1,
+            status: NodeStatus::Succeeded,
+            model: "sonnet".into(),
+            effort: "high".into(),
+            demand: Demand::Standard,
+            attempt: 1,
+            assignment_reason: String::new(),
+            pane_id: None,
+            terminal_id: None,
+            agent_session_id: None,
+            cwd: None,
+            node_dir: None,
+            evidence: None,
+            succession: None,
+            total_tokens: 0,
+            tool_uses: 0,
+            duration_ms: 0,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+        };
+
+        let limit = StoredGrowthLimit {
+            kind: "max_nodes".into(),
+            limit_value: 3,
+            requested: 4,
+            accepted: 1,
+            at_unix_ms: 1_700_000_000_000,
+            message: "max_nodes 3 reached; 1 of 4 requested nodes created".into(),
+        };
+        let mut limits = StoredGrowthLimits::default();
+        limits
+            .by_path
+            .insert(InstancePath::new("root/worker/1"), limit.clone());
+        limits.last = Some(limit);
+
+        let wired_node = wire_run_node_record(node, &limits);
+        assert_eq!(
+            wired_node.parent_path,
+            Some("root".to_string()),
+            "spawn provenance survives the durable projection"
+        );
+        let node_limit = wired_node
+            .growth_limited
+            .expect("this node's own journalled growth limit survives the durable projection");
+        assert_eq!(node_limit.kind, WorkflowGrowthLimitKind::MaxNodes);
+        assert_eq!(node_limit.limit_value, 3);
+        assert_eq!(node_limit.requested, 4);
+        assert_eq!(node_limit.accepted, 1);
+
+        let run = RunRecord {
+            id: RunId::new("workflow_run:t4"),
+            workflow: WorkflowId::new("workflow:t4"),
+            version: KvdagVersionId::new("kvdag_version:t4"),
+            tier: Tier::Auto,
+            status: RunStatus::Succeeded,
+            args: BTreeMap::new(),
+            context_runs: Vec::new(),
+            max_depth: 3,
+            max_nodes: 12,
+            workspace_id: None,
+            tab_id: None,
+            nodes_total: 2,
+            nodes_done: 2,
+            total_tokens: 0,
+            total_tool_uses: 0,
+            started_at_unix_ms: 1_700_000_000_000,
+            ended_at_unix_ms: Some(1_700_000_001_000),
+            failure: None,
+        };
+        let wired_run = wire_run_record(run, &limits);
+        let run_limit = wired_run.growth_limited.expect(
+            "the run's most recent journalled growth limit survives the durable projection",
+        );
+        assert_eq!(run_limit.kind, WorkflowGrowthLimitKind::MaxNodes);
     }
 }
