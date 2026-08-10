@@ -71,6 +71,12 @@ pub(crate) struct LiveLeadRun {
     pub(crate) snapshot: ProjectionSnapshot,
     /// The definition's node keys, for subject→node matching.
     pub(crate) node_keys: Vec<NodeKey>,
+    /// Whether the lead has been handed its plan. Latched, so the plan is
+    /// delivered exactly once no matter how many polls see the lead idle.
+    pub(crate) seeded: bool,
+    /// The instruction to deliver, held so the poller does not have to rebuild
+    /// the run directory layout to say it.
+    pub(crate) seed_prompt: String,
     /// Set once `workflow.run.finish` or lead-exit has closed the run, so a
     /// late poll cannot reopen it.
     pub(crate) closed: bool,
@@ -130,6 +136,23 @@ impl crate::app::App {
             .map_err(|error| LeadSpawnError::ClaudeUnavailable(error.to_string()))?;
         let text = String::from_utf8_lossy(&output.stdout);
         lead::check_claude_version(text.trim()).map(|_| ())
+    }
+
+    /// The second half of the launch preflight: Claude Code must already trust
+    /// the directory the lead will open in, or the lead loses its plan to the
+    /// folder-trust dialog (see `lead::cwd_is_trusted`).
+    pub(crate) fn preflight_cwd_trust_for_lead(&self, cwd: &Path) -> Result<(), LeadSpawnError> {
+        let config = crate::integration::claude_dir()
+            .ok()
+            .and_then(|dir| dir.parent().map(|home| home.join(".claude.json")))
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        if lead::cwd_is_trusted(config.as_deref(), cwd) {
+            Ok(())
+        } else {
+            Err(LeadSpawnError::CwdNotTrusted(
+                cwd.to_string_lossy().into_owned(),
+            ))
+        }
     }
 
     /// Writes the run directory and the rendered lead prompt (§3.1 step 2).
@@ -244,6 +267,8 @@ impl crate::app::App {
             split_pane_confirmed: false,
             snapshot: ProjectionSnapshot::default(),
             node_keys: kvdag.nodes.iter().map(|node| node.key.clone()).collect(),
+            seeded: false,
+            seed_prompt: lead::lead_seed_prompt(&spec.prompt_path()),
             closed: false,
             next_poll_at: None,
         });
@@ -287,6 +312,7 @@ impl crate::app::App {
         };
 
         let mut changed = self.bind_run_team(&claude_dir);
+        changed |= self.seed_lead_if_ready();
         changed |= self.absorb_run_projection(&claude_dir);
         changed
     }
@@ -338,6 +364,46 @@ impl crate::app::App {
                 run.split_pane_confirmed = true;
             }
         }
+        true
+    }
+
+    /// Hands the lead its plan, once.
+    ///
+    /// Gated on the team config existing rather than on a timer: Claude Code
+    /// writes it as the session comes up, so a bound run is a running `claude`.
+    /// The delivery goes through `agent.prompt`, the same path every other
+    /// karvex agent is steered by, which means a failure to deliver surfaces as
+    /// a delivery failure instead of as a lead that quietly sits idle.
+    fn seed_lead_if_ready(&mut self) -> bool {
+        let Some(run) = self.workflow_lead.as_ref() else {
+            return false;
+        };
+        if run.seeded || run.closed || run.binding.is_none() {
+            return false;
+        }
+        let ready = self
+            .state
+            .terminals
+            .get(&run.lead_terminal_id)
+            .is_some_and(|terminal| terminal.managed_agent_interactive_ready());
+        if !ready {
+            return false;
+        }
+        let pane_id = run.lead_pane_id.clone();
+        let text = run.seed_prompt.clone();
+        let run_id = run.run_id.clone();
+        if let Some(run) = self.workflow_lead.as_mut() {
+            run.seeded = true;
+        }
+        debug!(run = %run_id, pane = %pane_id, "handing the team lead its plan");
+        let _ = self.dispatch_runtime_mutation(
+            "workflow.lead.seed",
+            crate::api::schema::Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                target: pane_id,
+                text,
+                wait: None,
+            }),
+        );
         true
     }
 

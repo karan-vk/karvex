@@ -952,6 +952,12 @@ impl App {
             }
         };
         let cwd = self.workflow_node_cwd_for(ws_idx);
+        // The cwd is only known once the workspace is resolved, so this half of
+        // the preflight lands here rather than beside the version check. It
+        // still runs before anything is spawned.
+        if let Err(error) = self.preflight_cwd_trust_for_lead(&cwd) {
+            return encode_error(id, error.code(), error.to_string());
+        }
         let run_dir = crate::workflow::binding::spawn::run_dir(
             &crate::workflow::binding::spawn::runs_root(),
             &run_id,

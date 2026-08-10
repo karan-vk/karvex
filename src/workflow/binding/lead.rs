@@ -109,6 +109,9 @@ pub enum LeadSpawnError {
     },
     /// The run directory or the rendered prompt could not be written.
     RunDirUnwritable(String),
+    /// Claude Code has not been told this directory is trusted, so the lead
+    /// would open on the folder-trust dialog instead of on its plan.
+    CwdNotTrusted(String),
     /// The run's workspace has no pane to split the lead off.
     NoTargetPane,
     PaneLaunchFailed(String),
@@ -133,6 +136,12 @@ impl fmt::Display for LeadSpawnError {
             Self::RunDirUnwritable(message) => {
                 write!(f, "the run directory could not be prepared: {message}")
             }
+            Self::CwdNotTrusted(cwd) => write!(
+                f,
+                "Claude Code has not been told {cwd} is trusted, so a run started here would \
+                 open on its folder-trust prompt and never see its plan. Run `claude` in that \
+                 directory once, answer \"Yes, I trust this folder\", then start the run."
+            ),
             Self::NoTargetPane => {
                 f.write_str("the run's workspace has no pane to split the lead off")
             }
@@ -158,7 +167,8 @@ impl LeadSpawnError {
         match self {
             Self::ClaudeUnavailable(_)
             | Self::ClaudeVersionUnreadable(_)
-            | Self::ClaudeTooOld { .. } => LEAD_UNAVAILABLE_CODE,
+            | Self::ClaudeTooOld { .. }
+            | Self::CwdNotTrusted(_) => LEAD_UNAVAILABLE_CODE,
             Self::RunDirUnwritable(_) | Self::NoTargetPane | Self::PaneLaunchFailed(_) => {
                 LEAD_SPAWN_FAILED_CODE
             }
@@ -221,6 +231,37 @@ pub fn check_claude_version(output: &str) -> Result<(u32, u32, u32), LeadSpawnEr
     Ok(found)
 }
 
+/// Whether Claude Code will open in `cwd` without its folder-trust dialog.
+///
+/// This is a preflight rather than a nicety, because of how the dialog fails:
+/// verified live, a lead spawned into an untrusted directory shows the trust
+/// prompt *and discards its initial prompt entirely*. Answering the dialog
+/// leaves a perfectly healthy `claude` sitting at an empty prompt with no plan
+/// and no error — a run that looks started and will never do anything. Failing
+/// the launch with an actionable message is strictly better.
+///
+/// Reads `~/.claude.json`'s `projects.<cwd>.hasTrustDialogAccepted`. A file
+/// that cannot be read or parsed answers `true`: refusing every run because a
+/// foreign config moved would be a worse failure than the one this prevents.
+pub fn cwd_is_trusted(claude_json: Option<&str>, cwd: &Path) -> bool {
+    let Some(text) = claude_json else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return true;
+    };
+    let Some(projects) = value.get("projects").and_then(|p| p.as_object()) else {
+        return true;
+    };
+    let Some(entry) = projects.get(&cwd.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    entry
+        .get("hasTrustDialogAccepted")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 // ── argv and env ───────────────────────────────────────────────────────────
 
 /// The `--settings` payload that forces split-pane teammates. Kept beside the
@@ -229,10 +270,15 @@ pub const TEAMMATE_MODE_SETTINGS: &str = r#"{"teammateMode":"tmux"}"#;
 
 /// The lead's argv.
 ///
-/// The initial input points at the rendered prompt file rather than carrying
-/// the rendered markdown inline. That is the convention the node contract
-/// already uses (`spawn::seed_prompt_for`), it keeps a multi-kilobyte plan out
-/// of every `ps` listing, and §3.1 requires the file to exist either way.
+/// Deliberately carries **no** initial prompt. A positional prompt was the
+/// obvious spelling and it does not survive: verified live, an interactive
+/// `claude` launched into a fresh pane with a positional prompt comes up at an
+/// empty input box, and the plan is simply gone — a run that looks started and
+/// never does anything. karvex already knows this failure mode for node panes
+/// (`an_agent_that_never_saw_its_seed_prompt_is_reseeded_with_an_absolute_path`).
+/// The lead is therefore seeded once through `agent.prompt` after its session
+/// is up, which is how karvex steers every other agent and is observable when
+/// it fails.
 pub fn lead_argv(spec: &LeadSpawnSpec) -> Vec<String> {
     vec![
         crate::detect::interactive_agent_executable(crate::detect::Agent::Claude).to_string(),
@@ -246,11 +292,11 @@ pub fn lead_argv(spec: &LeadSpawnSpec) -> Vec<String> {
         spec.assignment.effort.as_str().to_string(),
         "--add-dir".to_string(),
         spec.run_dir.to_string_lossy().into_owned(),
-        lead_seed_prompt(&spec.prompt_path()),
     ]
 }
 
-/// The lead's initial input.
+/// The lead's opening instruction, delivered into its pane once its session is
+/// up. Points at the rendered file rather than inlining a multi-kilobyte plan.
 pub fn lead_seed_prompt(prompt_path: &Path) -> String {
     format!(
         "Read {} and follow it. It is your plan for this workflow run.",
@@ -321,15 +367,23 @@ pub fn match_team<'a>(
         if bound_elsewhere.iter().any(|name| name == &team.name) {
             continue;
         }
+        // Freshness is mandatory, not one signal among several. karvex pane
+        // ids are per-server, so a long-dead karvex's team config can name
+        // `w1:p2` while this server also has a `w1:p2` — verified live, where
+        // that collision made an unrelated team look like proof. Only teams
+        // created around this spawn can be this run's, and the pane rule is a
+        // preference *within* that set rather than a way out of it.
+        if team.created_at_unix_ms < floor {
+            continue;
+        }
         let claims_our_pane = team
             .members
             .iter()
             .filter_map(|member| member.tmux_pane_id())
             .any(|pane| own_pane_ids.iter().any(|own| own == pane));
-        let cwd_matches = team.created_at_unix_ms >= floor
-            && team
-                .lead_cwd()
-                .is_some_and(|cwd| Path::new(cwd) == lead_cwd);
+        let cwd_matches = team
+            .lead_cwd()
+            .is_some_and(|cwd| Path::new(cwd) == lead_cwd);
 
         let strength = if claims_our_pane {
             MatchStrength::OwnPane
@@ -451,6 +505,42 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_claude_has_been_trusted_in_passes_the_preflight() {
+        let config = r#"{"projects":{"/home/dev/project":{"hasTrustDialogAccepted":true}}}"#;
+        assert!(cwd_is_trusted(Some(config), Path::new("/home/dev/project")));
+    }
+
+    #[test]
+    fn an_untrusted_or_unseen_directory_fails_the_preflight() {
+        let config = r#"{"projects":{"/home/dev/project":{"hasTrustDialogAccepted":false}}}"#;
+        assert!(!cwd_is_trusted(
+            Some(config),
+            Path::new("/home/dev/project")
+        ));
+        assert!(!cwd_is_trusted(Some(config), Path::new("/home/dev/other")));
+        // The flag missing entirely is not consent either.
+        let bare = r#"{"projects":{"/home/dev/project":{}}}"#;
+        assert!(!cwd_is_trusted(Some(bare), Path::new("/home/dev/project")));
+    }
+
+    #[test]
+    fn an_unreadable_claude_config_does_not_block_every_run() {
+        assert!(cwd_is_trusted(None, Path::new("/home/dev/project")));
+        assert!(cwd_is_trusted(
+            Some("not json"),
+            Path::new("/home/dev/project")
+        ));
+        assert!(cwd_is_trusted(Some("{}"), Path::new("/home/dev/project")));
+    }
+
+    #[test]
+    fn the_untrusted_message_names_the_directory_and_the_fix() {
+        let message = LeadSpawnError::CwdNotTrusted("/home/dev/project".to_string()).to_string();
+        assert!(message.contains("/home/dev/project"));
+        assert!(message.contains("Yes, I trust this folder"));
+    }
+
+    #[test]
     fn the_argv_forces_split_pane_teammates_both_ways() {
         let argv = lead_argv(&spec());
         let flag = argv
@@ -466,17 +556,29 @@ mod tests {
     }
 
     #[test]
-    fn the_argv_carries_the_lead_assignment_and_points_at_the_prompt_file() {
+    fn the_argv_carries_the_lead_assignment_and_no_positional_prompt() {
         let argv = lead_argv(&spec());
         assert!(argv.windows(2).any(|w| w[0] == "--model" && w[1] == "opus"));
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "--effort" && w[1] == "high"));
-        let last = argv.last().expect("the seed prompt is last");
-        assert!(last.contains("/runs/abc/lead-prompt.md"));
-        assert!(last.contains("follow it"));
         // Not `-p`: the lead is interactive on purpose (§3.1).
         assert!(!argv.iter().any(|arg| arg == "-p" || arg == "--print"));
+        // And no positional prompt. A launched-with prompt is dropped on the
+        // floor by an interactive `claude` in a fresh pane (verified live), so
+        // the plan is delivered afterwards through `agent.prompt` instead.
+        assert!(
+            !argv.iter().any(|arg| arg.contains("lead-prompt.md")),
+            "the plan must not ride in argv: {argv:?}"
+        );
+        assert_eq!(argv.last().map(String::as_str), Some("/runs/abc"));
+    }
+
+    #[test]
+    fn the_seed_prompt_names_the_rendered_plan() {
+        let text = lead_seed_prompt(&spec().prompt_path());
+        assert!(text.contains("/runs/abc/lead-prompt.md"));
+        assert!(text.contains("follow it"));
     }
 
     #[test]
@@ -592,27 +694,34 @@ mod tests {
         assert_eq!(strength, MatchStrength::OwnPane);
     }
 
+    /// The live regression this rule exists for: karvex pane ids are per
+    /// server, so a stale team config from a long-dead karvex can name a pane
+    /// id this server also uses. Before the freshness gate became mandatory,
+    /// that collision alone was enough to bind a run to an unrelated team —
+    /// observed end to end, where a run adopted a months-old test team purely
+    /// because both had a `w1:p2`.
     #[test]
-    fn the_pane_rule_ignores_the_spawn_window_because_it_is_proof_not_inference() {
+    fn a_stale_team_naming_a_colliding_pane_id_is_not_adopted() {
         let teams = vec![team(
-            "session-ourpane0",
-            "ourpane0-0000-0000-0000-000000000000",
+            "session-stale000",
+            "stale000-0000-0000-0000-000000000000",
             1,
             vec![
-                member("team-lead", "leader", "in-process", "/elsewhere"),
-                member("research", "w1:p4", "tmux", "/elsewhere"),
+                member("team-lead", "leader", "in-process", "/somewhere/else"),
+                member("gate-mate", "w1:p2", "tmux", "/somewhere/else"),
             ],
         )];
-        let (binding, strength) = match_team(
-            &teams,
-            9_999_999,
-            Path::new("/home/dev/project"),
-            &["w1:p4".to_string()],
-            &[],
-        )
-        .expect("our own pane id still matches");
-        assert_eq!(binding.team_name, "session-ourpane0");
-        assert_eq!(strength, MatchStrength::OwnPane);
+        assert!(
+            match_team(
+                &teams,
+                9_999_999,
+                Path::new("/home/dev/project"),
+                &["w1:p2".to_string()],
+                &[]
+            )
+            .is_none(),
+            "a pane id is not a globally unique identifier and must not override freshness"
+        );
     }
 
     #[test]
