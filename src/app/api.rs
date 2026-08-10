@@ -11,7 +11,7 @@ pub(crate) mod plugins;
 mod responses;
 mod session;
 mod tabs;
-mod workflows;
+pub(crate) mod workflows;
 mod workspaces;
 mod worktrees;
 

@@ -13,5 +13,6 @@
 //! parallel work never has to edit it.
 
 pub mod interrogate;
+pub mod lead;
 pub mod observe;
 pub mod spawn;

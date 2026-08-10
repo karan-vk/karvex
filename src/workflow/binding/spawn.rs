@@ -84,8 +84,8 @@ pub const NODE_AGENT_LAUNCH_WINDOW: Duration = Duration::from_secs(30);
 
 /// `split_pane_argv_command` is given a geometry estimate; the existing
 /// in-process callers clamp it the same way before splitting.
-const MIN_PANE_ROWS: u16 = 4;
-const MIN_PANE_COLS: u16 = 10;
+pub(crate) const MIN_PANE_ROWS: u16 = 4;
+pub(crate) const MIN_PANE_COLS: u16 = 10;
 
 // ── errors ──────────────────────────────────────────────────────────────────
 
