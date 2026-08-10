@@ -235,13 +235,6 @@ impl NodeDirLayout {
     }
 }
 
-/// `inputs/<port>`, relative to the node directory, in the same sanitised
-/// spelling [`NodeDirLayout::port_dir`] writes to — so `task.md` and the
-/// `inputs/<port>.json` index can only ever name files that exist.
-pub fn port_dir_relative(port: &str) -> String {
-    format!("{INPUTS_DIR}/{}", path_segment(port))
-}
-
 /// One upstream's contribution to a single inbound port.
 ///
 /// A port used to be a `port -> payload` entry, which silently held only the
@@ -410,7 +403,10 @@ fn write_port_inputs(
         index.push(serde_json::json!({
             "from": contribution.from,
             "label": contribution.label,
-            "file": format!("{}/{stem}.json", port_dir_relative(port)),
+            // Absolute, like every path `task.md` names: the reader of this
+            // index is the node, and its cwd is the workspace directory, not
+            // the node directory a relative entry would be resolved against.
+            "file": file.display().to_string(),
             "payload": contribution.payload,
         }));
     }
@@ -513,7 +509,15 @@ fn write_json(file: &Path, value: &serde_json::Value) -> io::Result<()> {
 /// The node prompt contract (`05-phase-plan.md` §3 item 8). Changing the
 /// rendered shape invalidates every node prompt template, so it is a frozen
 /// contract rather than presentation.
-#[derive(Debug, Clone, Default)]
+///
+/// Every karvex-owned path it names is **absolute**, for the same reason
+/// [`seed_prompt_for`] is: a node's cwd is the workspace directory (§4.2), not
+/// its node directory, so `./result.json` names a file in the workspace and
+/// `./inputs/plan.json` names one that does not exist at all. `task.md` is read
+/// both by a shell command and by an agent reading prose, and only an absolute
+/// path is unambiguous to both — `$KARVEX_WORKFLOW_NODE_DIR` needs a shell to
+/// expand it, which a model quoting a path into a file-read tool does not have.
+#[derive(Debug, Clone)]
 pub struct TaskDocument<'a> {
     pub label: &'a str,
     pub role: &'a str,
@@ -533,6 +537,12 @@ pub struct TaskDocument<'a> {
     /// Phase 1–2 `task.md`, which is what keeps this frozen-contract change from
     /// invalidating existing prompt expectations (§7 R-7).
     pub prior_runs: Option<&'a str>,
+    /// This node's own directory, the one [`NodeDirLayout`] was built from.
+    ///
+    /// Every path the document names is rendered from it, so the node reads and
+    /// writes the files karvex actually watches rather than same-named files in
+    /// whatever workspace directory it was started in.
+    pub node_dir: &'a Path,
 }
 
 /// One inbound port as `task.md` describes it (§4.1, 2026-08-08 amendment).
@@ -544,8 +554,10 @@ pub struct TaskDocument<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskInputPort {
     pub port: String,
-    /// `(contributing instance path, path relative to the node dir)`.
-    pub sources: Vec<(String, String)>,
+    /// `(contributing instance path, absolute path of that contributor's
+    /// file)`. Absolute for the same reason the rest of the document is: the
+    /// node's cwd is not its node directory.
+    pub sources: Vec<(String, PathBuf)>,
 }
 
 impl TaskDocument<'_> {
@@ -566,13 +578,12 @@ impl TaskDocument<'_> {
         out.push_str("\n\n");
 
         if !self.input_ports.is_empty() {
+            let inputs_dir = self.node_dir.join(INPUTS_DIR);
             out.push_str("## Inputs\n\n");
             for input in self.input_ports {
                 let port = &input.port;
-                out.push_str(&format!(
-                    "- `{port}`: `./{INPUTS_DIR}/{}.json`",
-                    path_segment(port)
-                ));
+                let file = inputs_dir.join(format!("{}.json", path_segment(port)));
+                out.push_str(&format!("- `{port}`: `{}`", file.display()));
                 if input.sources.len() > 1 {
                     // The count is stated rather than left to be counted: a
                     // fan-in node that reads one of five contributions and
@@ -582,7 +593,7 @@ impl TaskDocument<'_> {
                         input.sources.len()
                     ));
                     for (from, file) in &input.sources {
-                        out.push_str(&format!("  - `{from}`: `./{file}`\n"));
+                        out.push_str(&format!("  - `{from}`: `{}`\n", file.display()));
                     }
                 } else {
                     out.push('\n');
@@ -608,14 +619,27 @@ impl TaskDocument<'_> {
 
         // `summary` and `artifacts` are the keys the engine's checkpoint
         // summariser reads; without them a checkpoint degrades to raw JSON.
+        //
+        // The paths are absolute and the cwd is stated outright: a node that
+        // took `./result.json` literally wrote it into the workspace directory,
+        // karvex found no result where it watches, and the node failed its
+        // completion gate having done all of the work.
+        let result = self.node_dir.join(RESULT_FILE);
+        let schema = self.node_dir.join(OUTPUT_SCHEMA_FILE);
+        let artifacts = self.node_dir.join(ARTIFACTS_DIR);
         out.push_str("## Reporting\n\n");
         out.push_str(&format!(
-            "Write your result to `./{RESULT_FILE}`. It must validate against \
-`./{OUTPUT_SCHEMA_FILE}`.\nInclude a `summary` string for downstream nodes and \
-an `artifacts` array of paths under `./{ARTIFACTS_DIR}/` for anything large.\n\
-Then report completion:\n\n```\nkvx workflow node complete\n```\n\nThat is the \
-only way this node finishes. Ending your turn without a valid `{RESULT_FILE}` \
-leaves the node waiting for attention.\n"
+            "Your working directory is **not** this node's directory, so use \
+these paths exactly as written; in a shell, `${NODE_DIR_ENV_VAR}` names the \
+same directory.\n\nWrite your result to `{}`. It must validate against \
+`{}`.\nInclude a `summary` string for downstream nodes and an `artifacts` array \
+of paths under `{}/` for anything large.\nThen report completion:\n\n```\nkvx \
+workflow node complete\n```\n\nThat is the only way this node finishes. Ending \
+your turn without a valid `{RESULT_FILE}` leaves the node waiting for \
+attention.\n",
+            result.display(),
+            schema.display(),
+            artifacts.display(),
         ));
         out
     }
@@ -1417,12 +1441,39 @@ mod tests {
         }
     }
 
-    fn port(name: &str, sources: &[(&str, &str)]) -> TaskInputPort {
+    /// The node directory every task-document test renders against. Built the
+    /// same way `NodeDirLayout` builds one, so the expectations below are the
+    /// paths the node would really be given.
+    fn task_node_dir() -> PathBuf {
+        PathBuf::from(if cfg!(windows) {
+            r"C:\runs\r1\implement"
+        } else {
+            "/runs/r1/implement"
+        })
+    }
+
+    /// `` `<node dir>/<tail>` `` as the document spells it, so a test never has
+    /// to hardcode a separator.
+    fn quoted_node_path(tail: &[&str]) -> String {
+        let mut path = task_node_dir();
+        for segment in tail {
+            path.push(segment);
+        }
+        format!("`{}`", path.display())
+    }
+
+    fn port(name: &str, sources: &[(&str, &[&str])]) -> TaskInputPort {
         TaskInputPort {
             port: name.to_string(),
             sources: sources
                 .iter()
-                .map(|(from, file)| ((*from).to_string(), (*file).to_string()))
+                .map(|(from, tail)| {
+                    let mut file = task_node_dir();
+                    for segment in *tail {
+                        file.push(segment);
+                    }
+                    ((*from).to_string(), file)
+                })
                 .collect(),
         }
     }
@@ -1430,6 +1481,7 @@ mod tests {
     #[test]
     fn task_document_names_the_result_contract() {
         let ports = vec![port("plan", &[])];
+        let node_dir = task_node_dir();
         let rendered = TaskDocument {
             label: "Implement",
             role: "You are the implementer.",
@@ -1437,19 +1489,80 @@ mod tests {
             prompt: "Implement this plan.",
             input_ports: &ports,
             prior_runs: None,
+            node_dir: &node_dir,
         }
         .render();
 
         assert!(rendered.starts_with("# Implement\n"));
         assert!(rendered.contains("You are the implementer."));
         assert!(rendered.contains("Implement this plan."));
-        assert!(rendered.contains("`./inputs/plan.json`"));
+        assert!(rendered.contains(&quoted_node_path(&["inputs", "plan.json"])));
         assert!(rendered.contains("Reply only through result.json."));
         assert!(rendered.contains("kvx workflow node complete"));
-        assert!(rendered.contains("output_schema.json"));
+        assert!(rendered.contains(&quoted_node_path(&[OUTPUT_SCHEMA_FILE])));
         // The engine's checkpoint summariser reads these two keys.
         assert!(rendered.contains("`summary`"));
         assert!(rendered.contains("`artifacts`"));
+    }
+
+    /// The regression this whole shape exists for: a node's cwd is the
+    /// workspace directory, so a `task.md` that says `./result.json` tells the
+    /// node to write into the user's workspace. The node then does all of the
+    /// work and fails its completion gate with "no result.json", which is
+    /// exactly what a live `runner = "command"` node did.
+    #[test]
+    fn task_document_never_names_a_karvex_file_relative_to_the_cwd() {
+        let ports = vec![port(
+            "plan",
+            &[
+                ("planner/1", &["inputs", "plan", "planner-1.json"]),
+                ("planner/2", &["inputs", "plan", "planner-2.json"]),
+            ],
+        )];
+        let node_dir = task_node_dir();
+        let rendered = TaskDocument {
+            label: "Implement",
+            role: "",
+            contract: "",
+            prompt: "Implement this plan.",
+            input_ports: &ports,
+            prior_runs: Some("/runs/r1/context/prior-runs.md"),
+            node_dir: &node_dir,
+        }
+        .render();
+
+        for relative in [
+            "`./result.json`",
+            "`./output_schema.json`",
+            "`./artifacts/`",
+            "`./inputs/",
+            "`./",
+        ] {
+            assert!(
+                !rendered.contains(relative),
+                "{relative} resolves against the workspace directory, not the node \
+                 directory: {rendered}"
+            );
+        }
+
+        // …and every one of them is named absolutely instead.
+        for tail in [
+            vec![RESULT_FILE],
+            vec![OUTPUT_SCHEMA_FILE],
+            vec![ARTIFACTS_DIR],
+            vec![INPUTS_DIR, "plan.json"],
+            vec![INPUTS_DIR, "plan", "planner-1.json"],
+        ] {
+            let quoted = quoted_node_path(&tail);
+            assert!(
+                rendered.contains(quoted.trim_end_matches('`')),
+                "{quoted} is missing from: {rendered}"
+            );
+        }
+        assert!(
+            rendered.contains(NODE_DIR_ENV_VAR),
+            "a shell node is pointed at the env var that names the same directory: {rendered}"
+        );
     }
 
     /// The retest's third P0: §3.4's inherited fan-in gives one port a whole
@@ -1511,7 +1624,17 @@ mod tests {
             "no contribution may be overwritten by another: {index}"
         );
         assert_eq!(entries[0]["from"], "fanout/worker/1");
-        assert_eq!(entries[0]["file"], "inputs/shard/fanout-worker-1.json");
+        assert_eq!(
+            entries[0]["file"],
+            serde_json::Value::String(
+                layout
+                    .input_source_file("shard", "fanout-worker-1")
+                    .display()
+                    .to_string()
+            ),
+            "the index is read by the node, whose cwd is not the node directory, \
+             so it names the file absolutely"
+        );
         assert_eq!(entries[0]["payload"], serde_json::json!("report one"));
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -1611,10 +1734,17 @@ mod tests {
         let ports = vec![port(
             "shard",
             &[
-                ("fanout/worker/1", "inputs/shard/fanout-worker-1.json"),
-                ("fanout/worker/2", "inputs/shard/fanout-worker-2.json"),
+                (
+                    "fanout/worker/1",
+                    &["inputs", "shard", "fanout-worker-1.json"],
+                ),
+                (
+                    "fanout/worker/2",
+                    &["inputs", "shard", "fanout-worker-2.json"],
+                ),
             ],
         )];
+        let node_dir = task_node_dir();
         let rendered = TaskDocument {
             label: "Collect",
             role: "",
@@ -1622,20 +1752,31 @@ mod tests {
             prompt: "Collect them.",
             input_ports: &ports,
             prior_runs: None,
+            node_dir: &node_dir,
         }
         .render();
 
-        assert!(rendered.contains("- `shard`: `./inputs/shard.json`"));
+        assert!(rendered.contains(&format!(
+            "- `shard`: {}",
+            quoted_node_path(&["inputs", "shard.json"])
+        )));
         assert!(
             rendered.contains("2 contributions"),
             "the count is stated so a node cannot read one of two and report: {rendered}"
         );
-        assert!(rendered.contains("- `fanout/worker/1`: `./inputs/shard/fanout-worker-1.json`"));
-        assert!(rendered.contains("- `fanout/worker/2`: `./inputs/shard/fanout-worker-2.json`"));
+        assert!(rendered.contains(&format!(
+            "- `fanout/worker/1`: {}",
+            quoted_node_path(&["inputs", "shard", "fanout-worker-1.json"])
+        )));
+        assert!(rendered.contains(&format!(
+            "- `fanout/worker/2`: {}",
+            quoted_node_path(&["inputs", "shard", "fanout-worker-2.json"])
+        )));
     }
 
     #[test]
     fn task_document_omits_empty_optional_sections() {
+        let node_dir = task_node_dir();
         let rendered = TaskDocument {
             label: "Plan",
             role: "  ",
@@ -1643,6 +1784,7 @@ mod tests {
             prompt: "Do the thing.",
             input_ports: &[],
             prior_runs: None,
+            node_dir: &node_dir,
         }
         .render();
         assert!(!rendered.contains("## Role"));
@@ -1658,6 +1800,7 @@ mod tests {
     /// invalidated.
     #[test]
     fn the_prior_runs_section_is_absent_when_the_run_has_no_history() {
+        let node_dir = task_node_dir();
         let document = TaskDocument {
             label: "Plan",
             role: "You plan.",
@@ -1665,6 +1808,7 @@ mod tests {
             prompt: "Do the thing.",
             input_ports: &[],
             prior_runs: None,
+            node_dir: &node_dir,
         };
         let without = document.render();
         assert!(!without.contains("## Prior runs"), "{without}");

@@ -1107,10 +1107,16 @@ pub(crate) fn workflow_node_label<'a>(definition: &'a Kvdag, node: &'a RunNode) 
 
 /// One port's per-contributor files as `task.md` lists them, empty for the
 /// ordinary single-edge port whose file is exactly the upstream payload.
+///
+/// The paths come from the node's own [`spawn::NodeDirLayout`], so they are
+/// absolute and spelled exactly as `materialise_node_dir` wrote them — a node's
+/// cwd is the workspace directory, and a relative listing here would send it
+/// looking for `inputs/` beside the user's own files.
 fn task_input_sources(
+    layout: &spawn::NodeDirLayout,
     port: &str,
     contributions: &[spawn::PortContribution],
-) -> Vec<(String, String)> {
+) -> Vec<(String, PathBuf)> {
     if contributions.len() < 2 {
         return Vec::new();
     }
@@ -1121,12 +1127,7 @@ fn task_input_sources(
     spawn::input_source_stems(&sources)
         .into_iter()
         .zip(sources.iter())
-        .map(|(stem, from)| {
-            (
-                (*from).to_string(),
-                format!("{}/{stem}.json", spawn::port_dir_relative(port)),
-            )
-        })
+        .map(|(stem, from)| ((*from).to_string(), layout.input_source_file(port, &stem)))
         .collect()
 }
 
@@ -2521,11 +2522,17 @@ impl App {
             _ => definition.contract.clone(),
         };
         let prompt = spawn::fill_slots(&spec_node.prompt_template, &slots);
+        // The layout is resolved before the task document, not after: every
+        // karvex-owned path `task.md` names is rendered from it, so the node is
+        // told where its files actually are rather than where they would be if
+        // its cwd were its node directory.
+        let run_dir = spawn::run_dir(&spawn::runs_root(), &run.run_id);
+        let layout = spawn::NodeDirLayout::for_node(&run_dir, path);
         let input_ports: Vec<spawn::TaskInputPort> = inputs
             .iter()
             .map(|(port, contributions)| spawn::TaskInputPort {
                 port: port.clone(),
-                sources: task_input_sources(port, contributions),
+                sources: task_input_sources(&layout, port, contributions),
             })
             .collect();
         let node_label = workflow_node_label(definition, node);
@@ -2542,11 +2549,10 @@ impl App {
             // absent entirely when the run has none — which is what keeps every
             // Phase 1–2 `task.md` byte-identical (§7 R-7).
             prior_runs: run.prior_runs_path.as_deref(),
+            node_dir: &layout.root,
         }
         .render();
 
-        let run_dir = spawn::run_dir(&spawn::runs_root(), &run.run_id);
-        let layout = spawn::NodeDirLayout::for_node(&run_dir, path);
         let agent_session_id = spawn::derive_agent_session_id(&run.run_id, path, node.attempt);
         let transcript_path = spawn::transcript_path(&cwd, &agent_session_id)
             .map_err(|err| format!("the node's transcript path is unknown: {err}"))?;
@@ -4960,7 +4966,24 @@ mod tests {
             "a summary edge writes the upstream summary to inputs/<port>.json"
         );
         assert!(plan.task_markdown.contains("Implement ship the api"));
-        assert!(plan.task_markdown.contains("`plan`: `./inputs/plan.json`"));
+        assert!(plan.task_markdown.contains(&format!(
+            "`plan`: `{}`",
+            plan.layout.input_file("plan").display()
+        )));
+        // The node's cwd is `/repo`, not its node directory, so a `./` path in
+        // `task.md` names a file in the workspace: the defect that made nodes
+        // write `result.json` where nothing was watching for it.
+        assert!(
+            !plan.task_markdown.contains("`./"),
+            "task.md may not name a karvex file relative to the node's cwd: {}",
+            plan.task_markdown
+        );
+        assert!(plan
+            .task_markdown
+            .contains(&format!("`{}`", plan.layout.result.display())));
+        assert!(plan
+            .task_markdown
+            .contains(&format!("`{}`", plan.layout.output_schema.display())));
     }
 
     /// `fanout → collect` on a `shard` data edge, with a `worker` template
@@ -5205,9 +5228,14 @@ mod tests {
             plan.task_markdown
         );
         assert!(
-            plan.task_markdown
-                .contains("`fanout/worker/2`: `./inputs/shard/fanout-worker-2.json`"),
-            "and to a file it can open on its own: {}",
+            plan.task_markdown.contains(&format!(
+                "`fanout/worker/2`: `{}`",
+                plan.layout
+                    .input_source_file("shard", "fanout-worker-2")
+                    .display()
+            )),
+            "and to a file it can open on its own, named absolutely because the \
+             node's cwd is not its node directory: {}",
             plan.task_markdown
         );
     }

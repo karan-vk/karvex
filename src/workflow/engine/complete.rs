@@ -455,15 +455,24 @@ const RESUME_BY_CORRECTING_THE_RESULT: &str = "the node writes a result.json tha
 ///
 /// A malformed `expand` is named as its own fault rather than folded into the
 /// output-schema sentence: the schema never sees the key (§4 D6), so telling a
-/// node its payload failed `./output_schema.json` when only `expand` is wrong
+/// node its payload failed `output_schema.json` when only `expand` is wrong
 /// would send it looking in the wrong file.
+///
+/// The two files are named without a `./`. The engine does not know the node
+/// directory — only the binder does — and a node's cwd is the workspace
+/// directory, so a relative spelling here would name files that are not there.
+/// The node's `task.md` carries the absolute paths; this re-prompt only has to
+/// say which file is wrong.
 pub fn corrective_prompt(schema: &OutputSchema, errors: &[SchemaViolation]) -> String {
     let expand_failed = errors.iter().any(is_expand_violation);
     let schema_failed = errors.iter().any(|error| !is_expand_violation(error));
 
     let mut text = String::new();
     if schema_failed {
-        text.push_str("Your result.json does not validate against ./output_schema.json. ");
+        text.push_str(
+            "Your result.json does not validate against the output_schema.json in your node \
+             directory. ",
+        );
     }
     if expand_failed {
         text.push_str("Your result.json's `expand` field is malformed. ");
@@ -1189,7 +1198,7 @@ mod tests {
     }
 
     /// The schema never sees `expand`, so a node whose only fault is the
-    /// proposal must not be sent looking in `./output_schema.json`.
+    /// proposal must not be sent looking in `output_schema.json`.
     #[test]
     fn the_corrective_prompt_blames_expand_only_when_expand_is_what_failed() {
         let schema = schema(
@@ -1200,21 +1209,29 @@ mod tests {
         let text = corrective_prompt(&schema, &expand_only);
         assert!(text.contains("`expand` field is malformed"));
         assert!(
-            !text.contains("does not validate against ./output_schema.json"),
+            !text.contains("does not validate against the output_schema.json"),
             "the payload did not fail a schema that never saw the key"
         );
         assert!(text.contains("\"template\""), "the contract is restated");
 
         let schema_only = validate(&schema, &report(r#"{"notes":"oops"}"#)).expect_err("invalid");
         let text = corrective_prompt(&schema, &schema_only);
-        assert!(text.contains("does not validate against ./output_schema.json"));
+        assert!(text.contains("does not validate against the output_schema.json"));
         assert!(!text.contains("`expand`"));
 
         let mut both = schema_only;
         both.extend(expand_only);
         let text = corrective_prompt(&schema, &both);
-        assert!(text.contains("does not validate against ./output_schema.json"));
+        assert!(text.contains("does not validate against the output_schema.json"));
         assert!(text.contains("`expand` field is malformed"));
+        // A node's cwd is the workspace directory, not its node directory, so
+        // `./output_schema.json` named a file that is not there. The engine has
+        // no node directory to render an absolute path from — `task.md` carries
+        // those — so it names the file without pretending to locate it.
+        assert!(
+            !text.contains("./"),
+            "a re-prompt may not name a node file relative to the node's cwd: {text}"
+        );
     }
 
     #[test]
