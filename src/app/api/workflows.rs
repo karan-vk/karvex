@@ -3066,7 +3066,7 @@ fn wire_stored_growth_limit(
 }
 
 #[cfg(feature = "workflow")]
-fn wire_run_record(
+pub(crate) fn wire_run_record(
     record: crate::workflow::store::RunRecord,
     limits: &StoredGrowthLimits,
 ) -> WorkflowRunInfo {
@@ -3107,7 +3107,7 @@ fn wire_run_record(
 }
 
 #[cfg(feature = "workflow")]
-fn wire_run_node_record(
+pub(crate) fn wire_run_node_record(
     record: crate::workflow::store::RunNodeRecord,
     limits: &StoredGrowthLimits,
 ) -> WorkflowRunNodeInfo {
@@ -5274,6 +5274,10 @@ port = "summary"
             duration_ms: 0,
             started_at_unix_ms: None,
             ended_at_unix_ms: None,
+            task_id: None,
+            subject: String::new(),
+            owner: String::new(),
+            emergent: false,
         };
 
         let limit = StoredGrowthLimit {
@@ -5325,6 +5329,11 @@ port = "summary"
             started_at_unix_ms: 1_700_000_000_000,
             ended_at_unix_ms: Some(1_700_000_001_000),
             failure: None,
+            lead_session_id: None,
+            team_name: None,
+            lead_pane_id: None,
+            lead_terminal_id: None,
+            lead_prompt_version: None,
         };
         let wired_run = wire_run_record(run, &limits);
         let run_limit = wired_run.growth_limited.expect(

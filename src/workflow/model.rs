@@ -1512,6 +1512,16 @@ pub enum RunEventKind {
     /// for summaries is the `run_summary` row, never this payload
     /// (`07-phase3-plan.md` §4 D10).
     Summary,
+    /// The projection saw a change in the run's team config: a teammate
+    /// appeared, went active, or moved pane (`09-agent-teams-rework.md` §3.4).
+    /// Journalled because Claude Code deletes the team config when the lead
+    /// session ends, so the `run_member` snapshot is a *current* picture and
+    /// this is the only record of how it got there.
+    Member,
+    /// The projection saw a change in the run's Claude Code task list: a task
+    /// was created, claimed, or closed (§3.4). Karvex observes these, it does
+    /// not decide them.
+    Task,
 }
 
 impl RunEventKind {
@@ -1538,6 +1548,8 @@ impl RunEventKind {
             Self::Succession => "succession",
             Self::Error => "error",
             Self::Summary => "summary",
+            Self::Member => "member",
+            Self::Task => "task",
         }
     }
 }
@@ -1770,6 +1782,77 @@ pub enum StoreWrite {
         id: InterrogationId,
         forked_session_id: Option<String>,
         ended_at_unix_ms: Option<u64>,
+    },
+    /// The run's lead binding, learned once the spawned `claude` pane registers
+    /// its session (`09-agent-teams-rework.md` §3.1 step 4).
+    ///
+    /// Not part of `create_run`: the run row exists before the pane does, and
+    /// the session id only appears in `~/.claude/sessions/` after the lead has
+    /// started. An `UPDATE`, and idempotent — the projection may re-learn the
+    /// same binding after a server restart.
+    RunLeadBinding {
+        run: RunId,
+        lead_session_id: String,
+        team_name: String,
+        lead_pane_id: Option<String>,
+        lead_terminal_id: Option<String>,
+        /// Which revision of the render contract (§3.2) produced the prompt
+        /// this lead was launched with, so a resume renders the same contract
+        /// rather than whatever karvex ships by then.
+        lead_prompt_version: u32,
+    },
+    /// One projected Claude Code task (§3.4). Upsert-shaped on
+    /// `(run, instance_path)`: the projection re-observes the same task every
+    /// poll and must not accumulate rows.
+    ///
+    /// A *planned* task lands on a `run_node` row `create_run` already
+    /// materialised, so it is always an `UPDATE`. Only an *emergent* task
+    /// creates, and only into the reserved namespace — the store asserts that,
+    /// the same way [`StoreWrite::RunNodeCreated`]'s epilogue branch does,
+    /// because a create here binds `kvdag_node = NONE`.
+    RunTaskProjected {
+        run: RunId,
+        /// `<node key>` for a planned task, or the reserved `.task/<task id>`
+        /// namespace for an emergent one.
+        path: InstancePath,
+        node_key: NodeKey,
+        /// The id of the file under `~/.claude/tasks/<team>/`, e.g. `"7"`.
+        task_id: String,
+        /// The observed subject, verbatim. The lead may reword it; the
+        /// definition's own name stays in `label`.
+        subject: String,
+        /// The claiming teammate's name, or empty for an unclaimed task —
+        /// which is a real state in the source data, not a missing value.
+        owner: String,
+        status: NodeStatus,
+        /// A task the definition never planned.
+        emergent: bool,
+        /// `blockedBy`, as the instance paths of the blocking tasks.
+        blocked_by: Vec<InstancePath>,
+        /// When the projection read this, and the only clock it has for a
+        /// projected task: the source files carry no timestamps.
+        observed_at_unix_ms: u64,
+    },
+    /// One member of the run's team, snapshotted on every observed change
+    /// because Claude Code deletes the team config when the lead session ends
+    /// (§3.4, and the §4 risk row).
+    ///
+    /// Upsert-shaped on `(run, name)`, like [`StoreWrite::RunTaskProjected`]
+    /// and for the same reason: this arrives once per poll for every member.
+    RunMemberSnapshot {
+        run: RunId,
+        name: String,
+        agent_type: String,
+        model: String,
+        /// The team config's `tmuxPaneId`, which is a karvex public pane id —
+        /// karvex's own identifier handed back to it through Claude Code's
+        /// team state (§1). `None` for the in-process lead, which has no pane
+        /// of its own here.
+        pane_id: Option<String>,
+        backend_type: String,
+        is_active: bool,
+        cwd: Option<String>,
+        observed_at_unix_ms: u64,
     },
 }
 

@@ -37,8 +37,8 @@ pub use error::StoreError;
 #[allow(unused_imports)]
 pub use queries::{
     CheckpointRecord, InterrogationRecord, RestorableCheckpoint, RunEdgeRecord, RunEventRecord,
-    RunNodeRecord, RunRecord, RunSummaryRecord, StoredGrowthLimit, StoredGrowthLimits,
-    VersionRecord, WorkflowSummary, DEFAULT_NODE_HISTORY_RUNS,
+    RunMemberRecord, RunNodeRecord, RunRecord, RunSummaryRecord, StoredGrowthLimit,
+    StoredGrowthLimits, VersionRecord, WorkflowSummary, DEFAULT_NODE_HISTORY_RUNS,
 };
 use sha2::{Digest, Sha256};
 use surrealdb::engine::local::{Db, Mem, SurrealKv};
@@ -71,6 +71,7 @@ const TABLE_KVDAG_NODE: &str = "kvdag_node";
 const TABLE_WORKFLOW_RUN: &str = "workflow_run";
 const TABLE_RUN_NODE: &str = "run_node";
 const TABLE_INTERROGATION: &str = "interrogation";
+const TABLE_RUN_MEMBER: &str = "run_member";
 
 /// Every statically materialised `run_node` sits at expansion depth 0; see
 /// [`WorkflowStore::materialise_run_nodes`] for why this is not topological
@@ -111,6 +112,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0004_journal_time_and_interrogation",
         include_str!("migrations/0004_journal_time_and_interrogation.surql"),
+    ),
+    (
+        "0005_lead_binding_and_projection",
+        include_str!("migrations/0005_lead_binding_and_projection.surql"),
     ),
 ];
 
@@ -263,6 +268,38 @@ struct RunNodeCreate {
     assignment_reason: String,
     attempt: u8,
     proposal_id: String,
+}
+
+/// The destructured fields of [`StoreWrite::RunTaskProjected`], grouped for the
+/// same reason as [`RunNodeCreate`]: the writer would otherwise be a
+/// ten-argument function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskProjection {
+    run: RunId,
+    path: InstancePath,
+    node_key: NodeKey,
+    task_id: String,
+    subject: String,
+    owner: String,
+    status: NodeStatus,
+    emergent: bool,
+    blocked_by: Vec<InstancePath>,
+    observed_at_unix_ms: u64,
+}
+
+/// The destructured fields of [`StoreWrite::RunMemberSnapshot`], grouped for
+/// the same reason as [`TaskProjection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemberSnapshot {
+    run: RunId,
+    name: String,
+    agent_type: String,
+    model: String,
+    pane_id: Option<String>,
+    backend_type: String,
+    is_active: bool,
+    cwd: Option<String>,
+    observed_at_unix_ms: u64,
 }
 
 /// A flat `string -> string` map as the JSON object the column holds. The same
@@ -1086,6 +1123,74 @@ impl WorkflowStore {
                 self.write_interrogation_update(id, forked_session_id, ended_at_unix_ms)
                     .await
             }
+            StoreWrite::RunLeadBinding {
+                run,
+                lead_session_id,
+                team_name,
+                lead_pane_id,
+                lead_terminal_id,
+                lead_prompt_version,
+            } => {
+                self.write_run_lead_binding(
+                    run,
+                    lead_session_id,
+                    team_name,
+                    lead_pane_id,
+                    lead_terminal_id,
+                    lead_prompt_version,
+                )
+                .await
+            }
+            StoreWrite::RunTaskProjected {
+                run,
+                path,
+                node_key,
+                task_id,
+                subject,
+                owner,
+                status,
+                emergent,
+                blocked_by,
+                observed_at_unix_ms,
+            } => {
+                self.write_run_task_projected(TaskProjection {
+                    run,
+                    path,
+                    node_key,
+                    task_id,
+                    subject,
+                    owner,
+                    status,
+                    emergent,
+                    blocked_by,
+                    observed_at_unix_ms,
+                })
+                .await
+            }
+            StoreWrite::RunMemberSnapshot {
+                run,
+                name,
+                agent_type,
+                model,
+                pane_id,
+                backend_type,
+                is_active,
+                cwd,
+                observed_at_unix_ms,
+            } => {
+                self.write_run_member_snapshot(MemberSnapshot {
+                    run,
+                    name,
+                    agent_type,
+                    model,
+                    pane_id,
+                    backend_type,
+                    is_active,
+                    cwd,
+                    observed_at_unix_ms,
+                })
+                .await
+            }
         }
     }
 
@@ -1175,6 +1280,7 @@ impl WorkflowStore {
                  DELETE spawned WHERE run = $run;\
                  DELETE run_edge WHERE run = $run;\
                  DELETE run_node WHERE run = $run;\
+                 DELETE run_member WHERE run = $run;\
                  DELETE $run;",
             )
             .bind(("run", run.clone()))
@@ -2939,6 +3045,315 @@ impl WorkflowStore {
             .bind(("ended_at_ms", ended_at_unix_ms.map(|ms| ms as i64)))
             .await
             .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    // ── the agent-teams rework: lead binding and projection ──────────────
+
+    /// Binds the run to the Claude Code team-lead session it spawned
+    /// (`09-agent-teams-rework.md` §3.1 step 4).
+    ///
+    /// A plain `UPDATE`, not a create: the run row exists from `create_run`
+    /// onward and the session id only appears once the pane's `claude` has
+    /// registered itself. Every column is written unconditionally, so
+    /// re-learning the same binding after a server restart is a no-op rather
+    /// than a second row.
+    async fn write_run_lead_binding(
+        &self,
+        run: RunId,
+        lead_session_id: String,
+        team_name: String,
+        lead_pane_id: Option<String>,
+        lead_terminal_id: Option<String>,
+        lead_prompt_version: u32,
+    ) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let response = self
+            .db
+            .query(
+                "UPDATE $run SET lead_session_id = $lead_session_id, team_name = $team_name, \
+                 lead_pane_id = $lead_pane_id, lead_terminal_id = $lead_terminal_id, \
+                 lead_prompt_version = $lead_prompt_version",
+            )
+            .bind(("run", run_id))
+            .bind(("lead_session_id", lead_session_id))
+            .bind(("team_name", team_name))
+            .bind(("lead_pane_id", lead_pane_id))
+            .bind(("lead_terminal_id", lead_terminal_id))
+            .bind(("lead_prompt_version", i64::from(lead_prompt_version)))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    /// Projects one observed Claude Code task onto its `run_node` row (§3.4).
+    ///
+    /// Upsert on `(run, instance_path)` — the pair the `run_node_instance`
+    /// UNIQUE index already covers — because the projection re-observes every
+    /// task on every poll and an append would turn a 2s cadence into unbounded
+    /// row growth.
+    ///
+    /// The two branches are not symmetric:
+    ///
+    /// - A **planned** task lands on a row `create_run` materialised, so it is
+    ///   always the `UPDATE` branch and never needs a create.
+    /// - An **emergent** task has no `kvdag_node` behind it, so its create
+    ///   binds `kvdag_node = NONE` — the same loosened column migration `0004`
+    ///   opened for the epilogue. The reserved-path assertion from
+    ///   [`Self::write_epilogue_node_created`] is repeated here for exactly the
+    ///   same reason: it is what keeps the loosened column unreachable from an
+    ///   ordinary node write, and it is asserted here rather than trusted from
+    ///   the caller so a store test can prove it directly.
+    ///
+    /// `observed_at_unix_ms` is the only clock a projected task has — the
+    /// source files carry no timestamps — so it stamps `started_at` the first
+    /// time the task is seen anywhere past `pending` and `ended_at` the first
+    /// time it is seen terminal. Neither is ever re-stamped: the run's history
+    /// records when karvex first saw the transition, not when it last looked.
+    async fn write_run_task_projected(&self, task: TaskProjection) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, task.run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {}", task.run)))?;
+        let started_ms =
+            (task.status != NodeStatus::Pending).then_some(task.observed_at_unix_ms as i64);
+        let ended_ms = task
+            .status
+            .is_terminal()
+            .then_some(task.observed_at_unix_ms as i64);
+
+        let existing = self.select_run_node_row(&run_id, &task.path).await?;
+        let node_id = match existing {
+            Some(row) => {
+                let response = self
+                    .db
+                    .query(
+                        "UPDATE $id SET task_id = $task_id, subject = $subject, owner = $owner, \
+                         status = $status, emergent = $emergent, \
+                         started_at = IF $started_ms = NONE THEN started_at \
+                             ELSE (IF started_at = NONE THEN time::from_millis($started_ms) \
+                                   ELSE started_at END) END, \
+                         ended_at = IF $ended_ms = NONE THEN ended_at \
+                             ELSE (IF ended_at = NONE THEN time::from_millis($ended_ms) \
+                                   ELSE ended_at END) END",
+                    )
+                    .bind(("id", row.id.clone()))
+                    .bind(("task_id", task.task_id.clone()))
+                    .bind(("subject", task.subject.clone()))
+                    .bind(("owner", task.owner.clone()))
+                    .bind(("status", node_status_str(task.status).to_string()))
+                    .bind(("emergent", task.emergent))
+                    .bind(("started_ms", started_ms))
+                    .bind(("ended_ms", ended_ms))
+                    .await
+                    .map_err(query_error)?;
+                response.check().map_err(query_error)?;
+                row.id
+            }
+            None => {
+                if !is_reserved_path(task.path.as_str()) {
+                    return Err(StoreError::Invariant(format!(
+                        "projected task would create run_node {} with no kvdag_node; \
+                         only the \".\"-prefixed namespace may hold an emergent task",
+                        task.path
+                    )));
+                }
+                let mut response = self
+                    .db
+                    .query(
+                        "CREATE run_node SET run = $run, kvdag_node = NONE, node_key = $node_key, \
+                         instance_path = $instance_path, label = $subject, inputs = {}, \
+                         parent = NONE, depth = 0, status = $status, model = \"\", \
+                         effort = \"\", demand = $demand, attempt = 1, \
+                         assignment_reason = \"\", task_id = $task_id, subject = $subject, \
+                         owner = $owner, emergent = $emergent, \
+                         started_at = IF $started_ms = NONE THEN NONE \
+                                      ELSE time::from_millis($started_ms) END, \
+                         ended_at = IF $ended_ms = NONE THEN NONE \
+                                    ELSE time::from_millis($ended_ms) END RETURN AFTER",
+                    )
+                    .bind(("run", run_id.clone()))
+                    .bind(("node_key", task.node_key.to_string()))
+                    .bind(("instance_path", task.path.to_string()))
+                    // The DAG view names a node by `label`, and an emergent task
+                    // has no authored name to use — its subject is the only name
+                    // it has ever had.
+                    .bind(("subject", task.subject.clone()))
+                    .bind(("status", node_status_str(task.status).to_string()))
+                    .bind(("demand", demand_str(Demand::Standard).to_string()))
+                    .bind(("task_id", task.task_id.clone()))
+                    .bind(("owner", task.owner.clone()))
+                    .bind(("emergent", task.emergent))
+                    .bind(("started_ms", started_ms))
+                    .bind(("ended_ms", ended_ms))
+                    .await
+                    .map_err(query_error)?
+                    .check()
+                    .map_err(query_error)?;
+                let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
+                rows.into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        StoreError::Query(format!(
+                            "create emergent run_node {} returned no row",
+                            task.path
+                        ))
+                    })?
+                    .id
+            }
+        };
+
+        self.project_blocked_by(&run_id, &node_id, &task.blocked_by)
+            .await?;
+        // An emergent node lives in the reserved namespace, which both counters
+        // already exclude (`refresh_run_node_counters` filters on the prefix),
+        // so this is only ever moving `nodes_done` for a planned task.
+        self.refresh_nodes_done(&task.run).await
+    }
+
+    /// Materialises a projected task's `blockedBy` list as `sequence`
+    /// `run_edge` relations (§3.4: `blockedBy` is the edge structure).
+    ///
+    /// Two rules make this safe to run on every poll:
+    ///
+    /// - **Idempotent.** An edge that already exists between the same two
+    ///   endpoints is left alone, so re-observing the same task does not
+    ///   accumulate parallel relations.
+    /// - **Self-healing rather than ordering-dependent.** A blocker whose own
+    ///   task has not been projected yet has no `run_node` row to point at; the
+    ///   edge is skipped rather than erroring, and the next poll — which sees
+    ///   both tasks — draws it. The projection has no ordering guarantee to
+    ///   offer, so the writer must not need one.
+    async fn project_blocked_by(
+        &self,
+        run_id: &surrealdb_types::RecordId,
+        node_id: &surrealdb_types::RecordId,
+        blocked_by: &[InstancePath],
+    ) -> Result<(), StoreError> {
+        for blocker in blocked_by {
+            let Some(blocker_row) = self.select_run_node_row(run_id, blocker).await? else {
+                continue;
+            };
+            let mut response = self
+                .db
+                .query(
+                    "SELECT VALUE id FROM run_edge \
+                     WHERE run = $run AND in = $from AND out = $to AND kind = $kind LIMIT 1",
+                )
+                .bind(("run", run_id.clone()))
+                .bind(("from", blocker_row.id.clone()))
+                .bind(("to", node_id.clone()))
+                .bind(("kind", edge_kind_str(EdgeKind::Sequence).to_string()))
+                .await
+                .map_err(query_error)?;
+            let existing: Vec<surrealdb_types::RecordId> = response.take(0).map_err(query_error)?;
+            if !existing.is_empty() {
+                continue;
+            }
+            let response = self
+                .db
+                .query(
+                    "RELATE $from -> run_edge -> $to SET run = $run, kind = $kind, \
+                     kvdag_edge = NONE, condition_result = NONE, fired_at = NONE",
+                )
+                .bind(("from", blocker_row.id))
+                .bind(("to", node_id.clone()))
+                .bind(("run", run_id.clone()))
+                .bind(("kind", edge_kind_str(EdgeKind::Sequence).to_string()))
+                .await
+                .map_err(query_error)?;
+            response.check().map_err(query_error)?;
+        }
+        Ok(())
+    }
+
+    /// The `Option`-returning sibling of [`Self::find_run_node_id`], which
+    /// errors on a missing row. Both upsert-shaped projection writers need
+    /// "does this row exist yet" as an answer rather than as an error.
+    async fn select_run_node_row(
+        &self,
+        run_id: &surrealdb_types::RecordId,
+        path: &InstancePath,
+    ) -> Result<Option<records::RunNodeRow>, StoreError> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_node WHERE run = $run AND instance_path = $path LIMIT 1")
+            .bind(("run", run_id.clone()))
+            .bind(("path", path.to_string()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Snapshots one member of the run's team (§3.4).
+    ///
+    /// Upsert on `(run, name)` — the `run_member_name` UNIQUE index — because
+    /// the projection re-reads the whole team config on every poll. First sight
+    /// creates with `first_seen_at == last_seen_at`; every later sighting
+    /// rewrites the mutable half in place and advances `last_seen_at` only, so
+    /// the pair brackets the window the member was visible in.
+    ///
+    /// Both stamps are bound from the observation's own
+    /// `observed_at_unix_ms`. The database never mints one: a `time::now()`
+    /// here would be the flush-time second clock migrations `0002` and `0004`
+    /// exist to keep out of this schema.
+    async fn write_run_member_snapshot(&self, member: MemberSnapshot) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, member.run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {}", member.run)))?;
+        let observed_ms = member.observed_at_unix_ms as i64;
+
+        let mut response = self
+            .db
+            .query("SELECT VALUE id FROM run_member WHERE run = $run AND name = $name LIMIT 1")
+            .bind(("run", run_id.clone()))
+            .bind(("name", member.name.clone()))
+            .await
+            .map_err(query_error)?;
+        let existing: Vec<surrealdb_types::RecordId> = response.take(0).map_err(query_error)?;
+
+        let response = match existing.into_iter().next() {
+            Some(id) => {
+                self.db
+                    .query(
+                        "UPDATE $id SET agent_type = $agent_type, model = $model, \
+                         pane_id = $pane_id, backend_type = $backend_type, \
+                         is_active = $is_active, cwd = $cwd, \
+                         last_seen_at = time::from_millis($observed_ms)",
+                    )
+                    .bind(("id", id))
+                    .bind(("agent_type", member.agent_type))
+                    .bind(("model", member.model))
+                    .bind(("pane_id", member.pane_id))
+                    .bind(("backend_type", member.backend_type))
+                    .bind(("is_active", member.is_active))
+                    .bind(("cwd", member.cwd))
+                    .bind(("observed_ms", observed_ms))
+                    .await
+            }
+            None => {
+                self.db
+                    .query(
+                        "CREATE run_member SET run = $run, name = $name, \
+                         agent_type = $agent_type, model = $model, pane_id = $pane_id, \
+                         backend_type = $backend_type, is_active = $is_active, cwd = $cwd, \
+                         first_seen_at = time::from_millis($observed_ms), \
+                         last_seen_at = time::from_millis($observed_ms)",
+                    )
+                    .bind(("run", run_id))
+                    .bind(("name", member.name))
+                    .bind(("agent_type", member.agent_type))
+                    .bind(("model", member.model))
+                    .bind(("pane_id", member.pane_id))
+                    .bind(("backend_type", member.backend_type))
+                    .bind(("is_active", member.is_active))
+                    .bind(("cwd", member.cwd))
+                    .bind(("observed_ms", observed_ms))
+                    .await
+            }
+        }
+        .map_err(query_error)?;
         response.check().map_err(query_error)?;
         Ok(())
     }

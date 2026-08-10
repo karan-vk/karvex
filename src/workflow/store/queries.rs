@@ -101,6 +101,21 @@ pub struct RunRecord {
     pub started_at_unix_ms: u64,
     pub ended_at_unix_ms: Option<u64>,
     pub failure: Option<serde_json::Value>,
+    /// The Claude Code session this run's team lead is, and what
+    /// `claude --resume` takes (`09-agent-teams-rework.md` §3.1, §3.7).
+    /// `None` for every pre-rework run, which karvex executed itself and which
+    /// never had a lead — not a missing value, a truthful one.
+    pub lead_session_id: Option<String>,
+    /// The team name derived from the lead session id; it addresses
+    /// `~/.claude/tasks/<team>/` and `~/.claude/teams/<team>/`.
+    pub team_name: Option<String>,
+    /// karvex's own public handles on the lead's pane, so "focus the lead"
+    /// survives a server restart.
+    pub lead_pane_id: Option<String>,
+    pub lead_terminal_id: Option<String>,
+    /// Which revision of the render contract (§3.2) produced the prompt this
+    /// lead was launched with.
+    pub lead_prompt_version: Option<u32>,
 }
 
 /// One `run_node` row.
@@ -160,6 +175,46 @@ pub struct RunNodeRecord {
     /// Set only for a node seeded by restore; `None` for every node this run
     /// actually executed (`07-phase3-plan.md` §4 D4).
     pub restored_from: Option<RestoredRef>,
+    /// The projected Claude Code task id, e.g. `"7"` (§3.4). `None` for a
+    /// planned node whose task the lead has not created yet — which is what
+    /// makes "planned but never started" readable off the row.
+    pub task_id: Option<String>,
+    /// The observed task subject, verbatim. Distinct from [`Self::label`] on
+    /// purpose: the lead may reword, split, or merge tasks, so the definition's
+    /// name and the name the team worked under are two separate facts.
+    pub subject: String,
+    /// The claiming teammate's name; empty means unclaimed, which is a real
+    /// state in the source data rather than a missing value.
+    pub owner: String,
+    /// A task the definition never planned. The drift is the record — §3.7's
+    /// `workflow capture` promotes it back into a definition later.
+    pub emergent: bool,
+}
+
+/// One `run_member` row: a member of the run's Claude Code team as the
+/// projection last saw it (`09-agent-teams-rework.md` §3.4).
+///
+/// A snapshot, not a journal entry. `first_seen_at`/`last_seen_at` bracket the
+/// window the member was visible in the team config; a member that vanishes
+/// (or a whole config that Claude Code deletes at session end) keeps its row
+/// and simply stops advancing `last_seen_at`, because these rows are the only
+/// durable record that the run had teammates at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunMemberRecord {
+    pub run: RunId,
+    pub name: String,
+    pub agent_type: String,
+    pub model: String,
+    /// The team config's `tmuxPaneId` — a karvex public pane id, handed back
+    /// through Claude Code's team state. `None` for the in-process lead.
+    pub pane_id: Option<String>,
+    /// `tmux` for a split-pane teammate, `in-process` for the lead; it is what
+    /// decides whether a member is separately resumable (§3.7).
+    pub backend_type: String,
+    pub is_active: bool,
+    pub cwd: Option<String>,
+    pub first_seen_at_unix_ms: u64,
+    pub last_seen_at_unix_ms: u64,
 }
 
 /// One `run_edge` relation, with both endpoints resolved to the instance paths
@@ -1052,6 +1107,24 @@ impl WorkflowStore {
     /// caller filters these further today: `load_historical_run` (WS-H) and
     /// the interrogate handler's active-interrogation check (WS-D) both want
     /// the whole set for one run.
+    /// Every member snapshot the projection took for this run, oldest first.
+    ///
+    /// Ordered by `first_seen_at, name` — the order the team was assembled in,
+    /// with the name as the tie-breaker for members that appeared in the same
+    /// observation, so a listing is stable across calls.
+    pub async fn list_run_members(&self, run: &RunId) -> Result<Vec<RunMemberRecord>, StoreError> {
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_member WHERE run = $run ORDER BY first_seen_at, name")
+            .bind(("run", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunMemberRow> = response.take(0).map_err(query_error)?;
+        Ok(rows.into_iter().map(run_member_record).collect())
+    }
+
     pub async fn list_interrogations(
         &self,
         run: &RunId,
@@ -1335,6 +1408,11 @@ fn run_record(row: records::RunRow, workflow_name: String) -> Result<RunRecord, 
         started_at_unix_ms: unix_ms(&row.started_at),
         ended_at_unix_ms: row.ended_at.as_ref().map(unix_ms),
         failure: row.failure,
+        lead_session_id: row.lead_session_id,
+        team_name: row.team_name,
+        lead_pane_id: row.lead_pane_id,
+        lead_terminal_id: row.lead_terminal_id,
+        lead_prompt_version: row.lead_prompt_version.map(|version| version as u32),
     })
 }
 
@@ -1384,7 +1462,26 @@ fn run_node_record(
         started_at_unix_ms: row.started_at.as_ref().map(unix_ms),
         ended_at_unix_ms: row.ended_at.as_ref().map(unix_ms),
         restored_from,
+        task_id: row.task_id,
+        subject: row.subject,
+        owner: row.owner,
+        emergent: row.emergent,
     })
+}
+
+fn run_member_record(row: records::RunMemberRow) -> RunMemberRecord {
+    RunMemberRecord {
+        run: RunId::new(record_id_to_string(&row.run)),
+        name: row.name,
+        agent_type: row.agent_type,
+        model: row.model,
+        pane_id: row.pane_id,
+        backend_type: row.backend_type,
+        is_active: row.is_active,
+        cwd: row.cwd,
+        first_seen_at_unix_ms: unix_ms(&row.first_seen_at),
+        last_seen_at_unix_ms: unix_ms(&row.last_seen_at),
+    }
 }
 
 /// A total order over [`EdgeKind`], which is a plain tag with no meaningful
@@ -1490,6 +1587,8 @@ fn parse_run_event_kind(value: &str) -> Result<RunEventKind, StoreError> {
         "succession" => Ok(RunEventKind::Succession),
         "error" => Ok(RunEventKind::Error),
         "summary" => Ok(RunEventKind::Summary),
+        "member" => Ok(RunEventKind::Member),
+        "task" => Ok(RunEventKind::Task),
         other => Err(StoreError::Decode(format!(
             "unknown run event kind {other:?}"
         ))),

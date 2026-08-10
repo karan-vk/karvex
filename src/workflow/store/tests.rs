@@ -191,6 +191,68 @@ fn next_run_start_unix_ms() -> u64 {
     NEXT.fetch_add(1_000, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// One `workflow_run` and its single `run_node`, written directly in SQL for a
+/// store deliberately opened at an older migration level.
+///
+/// [`WorkflowStore::create_run`] reads its rows back through `records::RunRow`
+/// and `records::RunNodeRow`, and those structs always describe the *current*
+/// schema — a column a later migration adds is a decode error against an
+/// earlier one. Production never hits this (`WorkflowStore::open` migrates
+/// before anything else runs), so it is only the migration tests that need a
+/// writer that speaks the old schema.
+///
+/// Mirrors `single_node_spec`'s one `solo` node, and binds `started_at`
+/// explicitly because migration `0002` removed its `DEFAULT time::now()`.
+async fn create_run_row_directly(
+    store: &WorkflowStore,
+    workflow: &WorkflowId,
+    kvdag: &Kvdag,
+) -> RunId {
+    let version_id =
+        parse_record_id(TABLE_KVDAG_VERSION, kvdag.version_id.as_str()).expect("version id");
+    let mut response = store
+        .db
+        .query("SELECT * FROM kvdag_node WHERE version = $version LIMIT 1")
+        .bind(("version", version_id.clone()))
+        .await
+        .expect("select kvdag_node");
+    let node_rows: Vec<records::KvdagNodeRow> = response.take(0).expect("decode kvdag_node");
+    let kvdag_node_id = node_rows.into_iter().next().expect("the node exists").id;
+
+    let mut response = store
+        .db
+        .query(
+            "CREATE workflow_run SET workflow = $workflow, kvdag_version = $version, \
+             tier = \"auto\", status = \"running\", max_depth = 3, max_nodes = 24, \
+             started_at = time::from_millis($started_at_ms), nodes_total = 1 RETURN AFTER",
+        )
+        .bind((
+            "workflow",
+            parse_record_id(TABLE_WORKFLOW, workflow.as_str()).expect("workflow id"),
+        ))
+        .bind(("version", version_id))
+        .bind(("started_at_ms", 1_700_000_000_000_i64))
+        .await
+        .expect("create workflow_run");
+    let run_rows: Vec<IdOnly> = response.take(0).expect("decode workflow_run");
+    let run_row_id = run_rows.into_iter().next().expect("the run row").id;
+
+    let response = store
+        .db
+        .query(
+            "CREATE run_node SET run = $run, kvdag_node = $kvdag_node, node_key = \"solo\", \
+             instance_path = \"solo\", depth = 0, status = \"ready\", model = \"opus\", \
+             effort = \"high\", demand = \"standard\"",
+        )
+        .bind(("run", run_row_id.clone()))
+        .bind(("kvdag_node", kvdag_node_id))
+        .await
+        .expect("create run_node");
+    response.check().expect("the pre-migration row is valid");
+
+    RunId::new(record_id_to_string(&run_row_id))
+}
+
 async fn create_run_in_workspace(
     store: &WorkflowStore,
     workflow: &WorkflowId,
@@ -333,6 +395,7 @@ async fn migrations_apply_cleanly_and_reapplying_is_a_noop() {
             "0002_growth_and_history".to_string(),
             "0003_node_identity".to_string(),
             "0004_journal_time_and_interrogation".to_string(),
+            "0005_lead_binding_and_projection".to_string(),
         ])
     );
 
@@ -2409,7 +2472,7 @@ async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_colu
     store
         .migrate()
         .await
-        .expect("0002, 0003, and 0004 apply on top of 0001");
+        .expect("0002 through 0005 apply on top of 0001");
     assert_eq!(
         store.applied_migrations().await.expect("read schema_meta"),
         std::collections::BTreeSet::from([
@@ -2417,6 +2480,7 @@ async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_colu
             "0002_growth_and_history".to_string(),
             "0003_node_identity".to_string(),
             "0004_journal_time_and_interrogation".to_string(),
+            "0005_lead_binding_and_projection".to_string(),
         ])
     );
 
@@ -2570,12 +2634,17 @@ async fn migration_0004_applies_over_a_0001_to_0003_database() {
     );
 
     let (workflow, kvdag) = setup_workflow(&store).await;
-    let run = create_run(&store, &workflow, &kvdag).await;
+    // Not `create_run`: it decodes through `records::RunNodeRow`, which always
+    // describes the *current* schema, so it cannot run against a deliberately
+    // older migration level (migration `0005` adds three non-option `run_node`
+    // columns). The 0002 test above writes its pre-migration rows in SQL for
+    // the same reason.
+    let run = create_run_row_directly(&store, &workflow, &kvdag).await;
 
     store
         .migrate()
         .await
-        .expect("0004 applies on top of 0001..0003, including over existing rows");
+        .expect("0004 and 0005 apply on top of 0001..0003, including over existing rows");
     assert_eq!(
         store.applied_migrations().await.expect("read schema_meta"),
         std::collections::BTreeSet::from([
@@ -2583,6 +2652,7 @@ async fn migration_0004_applies_over_a_0001_to_0003_database() {
             "0002_growth_and_history".to_string(),
             "0003_node_identity".to_string(),
             "0004_journal_time_and_interrogation".to_string(),
+            "0005_lead_binding_and_projection".to_string(),
         ])
     );
 
@@ -3651,4 +3721,576 @@ async fn a_rejected_version_leaves_the_workflow_metadata_untouched() {
         .expect("the workflow still exists");
     assert_eq!(after.description, before.description);
     assert_eq!(after.default_tier, before.default_tier);
+}
+
+// ── the agent-teams rework: lead binding, task projection, members ──────
+
+/// The `run_member` shape this file needs to look at the raw row, where
+/// `RunMemberRecord` only exposes millisecond stamps.
+#[derive(Debug, Clone, SurrealValue)]
+struct MemberStamps {
+    first_seen_at: surrealdb_types::Datetime,
+    last_seen_at: surrealdb_types::Datetime,
+}
+
+fn member_snapshot(run: &RunId, name: &str, model: &str, observed_at_unix_ms: u64) -> StoreWrite {
+    StoreWrite::RunMemberSnapshot {
+        run: run.clone(),
+        name: name.to_string(),
+        agent_type: "Explore".to_string(),
+        model: model.to_string(),
+        pane_id: Some("w3:p1P".to_string()),
+        backend_type: "tmux".to_string(),
+        is_active: true,
+        cwd: Some("/home/karan/code/karvex".to_string()),
+        observed_at_unix_ms,
+    }
+}
+
+fn task_projection(
+    run: &RunId,
+    path: &str,
+    node_key: &str,
+    task_id: &str,
+    subject: &str,
+    owner: &str,
+    status: NodeStatus,
+    emergent: bool,
+    observed_at_unix_ms: u64,
+) -> StoreWrite {
+    StoreWrite::RunTaskProjected {
+        run: run.clone(),
+        path: InstancePath::new(path),
+        node_key: NodeKey::new(node_key),
+        task_id: task_id.to_string(),
+        subject: subject.to_string(),
+        owner: owner.to_string(),
+        status,
+        emergent,
+        blocked_by: Vec::new(),
+        observed_at_unix_ms,
+    }
+}
+
+#[tokio::test]
+async fn a_lead_binding_round_trips_through_get_run() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    let before = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(
+        before.lead_session_id, None,
+        "a run has no lead until its pane's claude registers a session"
+    );
+
+    store
+        .write(StoreWrite::RunLeadBinding {
+            run: run.clone(),
+            lead_session_id: "213aa9bf-2652-45ca-ac73-1cf00b493ef3".to_string(),
+            team_name: "session-213aa9bf".to_string(),
+            lead_pane_id: Some("w1:p2A".to_string()),
+            lead_terminal_id: Some("t7".to_string()),
+            lead_prompt_version: 1,
+        })
+        .await
+        .expect("write lead binding");
+
+    let bound = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(
+        bound.lead_session_id.as_deref(),
+        Some("213aa9bf-2652-45ca-ac73-1cf00b493ef3")
+    );
+    assert_eq!(bound.team_name.as_deref(), Some("session-213aa9bf"));
+    assert_eq!(bound.lead_pane_id.as_deref(), Some("w1:p2A"));
+    assert_eq!(bound.lead_terminal_id.as_deref(), Some("t7"));
+    assert_eq!(bound.lead_prompt_version, Some(1));
+
+    // Re-learning the same binding after a restart is an update, never a
+    // second row.
+    store
+        .write(StoreWrite::RunLeadBinding {
+            run: run.clone(),
+            lead_session_id: "213aa9bf-2652-45ca-ac73-1cf00b493ef3".to_string(),
+            team_name: "session-213aa9bf".to_string(),
+            lead_pane_id: Some("w1:p9Z".to_string()),
+            lead_terminal_id: None,
+            lead_prompt_version: 2,
+        })
+        .await
+        .expect("re-write lead binding");
+    let rebound = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(rebound.lead_pane_id.as_deref(), Some("w1:p9Z"));
+    assert_eq!(rebound.lead_terminal_id, None);
+    assert_eq!(rebound.lead_prompt_version, Some(2));
+}
+
+#[tokio::test]
+async fn a_planned_task_projection_updates_the_run_node_row_it_already_has() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    store
+        .write(task_projection(
+            &run,
+            "solo",
+            "solo",
+            "1",
+            "1. Solve the thing",
+            "solo-worker",
+            NodeStatus::Running,
+            false,
+            1_700_000_000_000,
+        ))
+        .await
+        .expect("project a planned task");
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(
+        nodes.len(),
+        1,
+        "a planned task must not create a second row"
+    );
+    let node = &nodes[0];
+    assert_eq!(node.task_id.as_deref(), Some("1"));
+    assert_eq!(node.subject, "1. Solve the thing");
+    assert_eq!(node.owner, "solo-worker");
+    assert_eq!(node.status, NodeStatus::Running);
+    assert!(!node.emergent);
+    // `label` is the authored name and stays the authored name even though the
+    // lead reworded the task.
+    assert_eq!(node.label, "solo");
+    assert_eq!(node.started_at_unix_ms, Some(1_700_000_000_000));
+    assert_eq!(node.ended_at_unix_ms, None);
+
+    store
+        .write(task_projection(
+            &run,
+            "solo",
+            "solo",
+            "1",
+            "1. Solve the thing, revised",
+            "someone-else",
+            NodeStatus::Succeeded,
+            false,
+            1_700_000_005_000,
+        ))
+        .await
+        .expect("re-project the same task");
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(nodes.len(), 1, "re-observing a task is an update");
+    let node = &nodes[0];
+    assert_eq!(node.subject, "1. Solve the thing, revised");
+    assert_eq!(node.owner, "someone-else");
+    assert_eq!(node.status, NodeStatus::Succeeded);
+    assert_eq!(
+        node.started_at_unix_ms,
+        Some(1_700_000_000_000),
+        "the first non-pending sighting is never re-stamped"
+    );
+    assert_eq!(node.ended_at_unix_ms, Some(1_700_000_005_000));
+
+    let reloaded = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(reloaded.nodes_done, 1, "a closed task closes its node");
+}
+
+#[tokio::test]
+async fn an_emergent_task_projection_creates_one_reserved_path_row_however_often_it_is_seen() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    for (owner, status, observed) in [
+        ("", NodeStatus::Pending, 1_700_000_000_000_u64),
+        ("scout", NodeStatus::Running, 1_700_000_001_000),
+        ("scout", NodeStatus::Succeeded, 1_700_000_002_000),
+    ] {
+        store
+            .write(task_projection(
+                &run,
+                ".task/7",
+                "task-7",
+                "7",
+                "7. Something the plan never mentioned",
+                owner,
+                status,
+                true,
+                observed,
+            ))
+            .await
+            .expect("project an emergent task");
+    }
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    let emergent: Vec<_> = nodes.iter().filter(|node| node.emergent).collect();
+    assert_eq!(
+        emergent.len(),
+        1,
+        "re-projecting the same emergent task is idempotent"
+    );
+    let node = emergent[0];
+    assert_eq!(node.instance_path.as_str(), ".task/7");
+    assert_eq!(node.task_id.as_deref(), Some("7"));
+    assert_eq!(node.owner, "scout");
+    assert_eq!(node.status, NodeStatus::Succeeded);
+    assert_eq!(
+        node.label, "7. Something the plan never mentioned",
+        "an emergent node's only name is its subject"
+    );
+    assert_eq!(
+        node.started_at_unix_ms,
+        Some(1_700_000_001_000),
+        "the pending first sighting does not start the node"
+    );
+    assert_eq!(node.ended_at_unix_ms, Some(1_700_000_002_000));
+
+    // No kvdag node behind it — the loosened `0004` column, reached only
+    // through the reserved namespace.
+    let mut response = store
+        .db
+        .query("SELECT VALUE id FROM run_node WHERE run = $run AND kvdag_node = NONE")
+        .bind((
+            "run",
+            parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id"),
+        ))
+        .await
+        .expect("select run_node");
+    let without_kvdag: Vec<surrealdb_types::RecordId> =
+        response.take(0).expect("decode run_node ids");
+    assert_eq!(without_kvdag.len(), 1);
+
+    // Reserved paths stay out of both run counters.
+    let reloaded = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(reloaded.nodes_total, 1);
+    assert_eq!(reloaded.nodes_done, 0);
+}
+
+#[tokio::test]
+async fn an_emergent_task_outside_the_reserved_namespace_is_rejected() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    let error = store
+        .write(task_projection(
+            &run,
+            "not-in-the-definition",
+            "not-in-the-definition",
+            "9",
+            "9. Off-plan",
+            "scout",
+            NodeStatus::Running,
+            true,
+            1_700_000_000_000,
+        ))
+        .await
+        .expect_err("a create with no kvdag node outside the reserved namespace is refused");
+    assert!(
+        matches!(error, StoreError::Invariant(_)),
+        "unexpected error: {error:?}"
+    );
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(nodes.len(), 1, "the refused create wrote nothing");
+}
+
+#[tokio::test]
+async fn a_projected_blocked_by_becomes_one_run_edge_once_both_tasks_exist() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("fanout", "two children", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let kvdag = store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", fanout_spec(1))
+        .await
+        .expect("create_version");
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    // `child0`'s blocker is projected before `root`'s own task is: the
+    // projection has no ordering guarantee, so the edge is skipped rather than
+    // erroring, and the next poll draws it.
+    let blocked = |observed: u64| StoreWrite::RunTaskProjected {
+        run: run.clone(),
+        path: InstancePath::new("child0"),
+        node_key: NodeKey::new("child0"),
+        task_id: "2".to_string(),
+        subject: "2. Child".to_string(),
+        owner: String::new(),
+        status: NodeStatus::Pending,
+        emergent: false,
+        blocked_by: vec![InstancePath::new(".task/1")],
+        observed_at_unix_ms: observed,
+    };
+
+    store
+        .write(blocked(1_700_000_000_000))
+        .await
+        .expect("write");
+    let edges = store.list_run_edges(&run).await.expect("list_run_edges");
+    let projected: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.from.as_str() == ".task/1")
+        .collect();
+    assert!(
+        projected.is_empty(),
+        "a blocker with no row yet is skipped, not an error"
+    );
+
+    store
+        .write(task_projection(
+            &run,
+            ".task/1",
+            "task-1",
+            "1",
+            "1. The blocker",
+            "lead",
+            NodeStatus::Running,
+            true,
+            1_700_000_001_000,
+        ))
+        .await
+        .expect("project the blocker");
+
+    // Two more polls; the edge appears once and stays once.
+    store
+        .write(blocked(1_700_000_002_000))
+        .await
+        .expect("write");
+    store
+        .write(blocked(1_700_000_003_000))
+        .await
+        .expect("write");
+
+    let edges = store.list_run_edges(&run).await.expect("list_run_edges");
+    let projected: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.from.as_str() == ".task/1" && edge.to.as_str() == "child0")
+        .collect();
+    assert_eq!(projected.len(), 1, "blockedBy edges do not accumulate");
+    assert_eq!(projected[0].kind, EdgeKind::Sequence);
+}
+
+#[tokio::test]
+async fn member_snapshots_upsert_in_place_and_list_in_first_seen_order() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    store
+        .write(member_snapshot(
+            &run,
+            "solo-worker",
+            "sonnet",
+            1_700_000_000_000,
+        ))
+        .await
+        .expect("first sighting");
+
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("list_run_members");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].name, "solo-worker");
+    assert_eq!(members[0].model, "sonnet");
+    assert_eq!(
+        members[0].first_seen_at_unix_ms, members[0].last_seen_at_unix_ms,
+        "a member first seen is a member seen once"
+    );
+    assert_eq!(members[0].first_seen_at_unix_ms, 1_700_000_000_000);
+
+    // A later observation with a changed model and pane rewrites in place.
+    store
+        .write(StoreWrite::RunMemberSnapshot {
+            run: run.clone(),
+            name: "solo-worker".to_string(),
+            agent_type: "Explore".to_string(),
+            model: "opus".to_string(),
+            pane_id: Some("w3:p4Q".to_string()),
+            backend_type: "tmux".to_string(),
+            is_active: false,
+            cwd: Some("/home/karan/code/karvex".to_string()),
+            observed_at_unix_ms: 1_700_000_009_000,
+        })
+        .await
+        .expect("second sighting");
+
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("list_run_members");
+    assert_eq!(members.len(), 1, "a re-observed member is one row");
+    assert_eq!(members[0].model, "opus");
+    assert_eq!(members[0].pane_id.as_deref(), Some("w3:p4Q"));
+    assert!(!members[0].is_active);
+    assert_eq!(
+        members[0].first_seen_at_unix_ms, 1_700_000_000_000,
+        "first_seen_at is never moved"
+    );
+    assert_eq!(members[0].last_seen_at_unix_ms, 1_700_000_009_000);
+
+    // Ordering: `first_seen_at` first, then `name`. `zz` is seen before `aa`.
+    store
+        .write(member_snapshot(
+            &run,
+            "zz-later",
+            "sonnet",
+            1_700_000_010_000,
+        ))
+        .await
+        .expect("third member");
+    store
+        .write(member_snapshot(
+            &run,
+            "aa-latest",
+            "sonnet",
+            1_700_000_011_000,
+        ))
+        .await
+        .expect("fourth member");
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("list_run_members");
+    let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["solo-worker", "zz-later", "aa-latest"]);
+
+    // The raw stamps, so this is not just a projection artefact.
+    let mut response = store
+        .db
+        .query("SELECT first_seen_at, last_seen_at FROM run_member WHERE name = $name")
+        .bind(("name", "solo-worker".to_string()))
+        .await
+        .expect("select run_member");
+    let rows: Vec<MemberStamps> = response.take(0).expect("decode run_member");
+    assert_eq!(rows.len(), 1);
+    assert_ne!(rows[0].first_seen_at, rows[0].last_seen_at);
+
+    // Pruning a run takes its members with it: no dangling snapshot.
+    store
+        .prune_run_history(&workflow, 0)
+        .await
+        .expect("prune_run_history");
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("list_run_members");
+    assert!(members.is_empty(), "a pruned run leaves no member rows");
+}
+
+// ── the agent-teams rework: migration 0005 ──────────────────────────────
+
+#[tokio::test]
+async fn migration_0005_applies_over_a_0001_to_0004_database() {
+    let store = WorkflowStore::open_with_migrations(StoreLocation::Memory, 4)
+        .await
+        .expect("a 0001..0004 database opens");
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
+            "0004_journal_time_and_interrogation".to_string(),
+        ])
+    );
+
+    // A run and its node, written the way a pre-rework karvex wrote them: no
+    // lead binding, no task columns. Written in SQL rather than through
+    // `create_run`, which decodes `records::RunNodeRow` and therefore requires
+    // the columns this migration is about to add.
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run_row_directly(&store, &workflow, &kvdag).await;
+
+    store
+        .migrate()
+        .await
+        .expect("0005 applies on top of 0001..0004, including over existing rows");
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
+            "0004_journal_time_and_interrogation".to_string(),
+            "0005_lead_binding_and_projection".to_string(),
+        ])
+    );
+
+    // The point of the test: a row written before 0005 still decodes through
+    // the widened `RunRow`/`RunNodeRow`. The `option` lead columns read back
+    // as `None`; the three non-option task columns read back as the values
+    // the migration's backfill `UPDATE` put there, not as a decode error.
+    let reloaded = store
+        .get_run(&run)
+        .await
+        .expect("a pre-0005 workflow_run row still decodes")
+        .expect("run exists");
+    assert_eq!(reloaded.id, run);
+    assert_eq!(reloaded.lead_session_id, None);
+    assert_eq!(reloaded.team_name, None);
+    assert_eq!(reloaded.lead_prompt_version, None);
+
+    let nodes = store
+        .list_run_nodes(&run)
+        .await
+        .expect("a pre-0005 run_node row still decodes");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].task_id, None);
+    assert_eq!(nodes[0].subject, "");
+    assert_eq!(nodes[0].owner, "");
+    assert!(!nodes[0].emergent);
+
+    // And the new write paths work against the migrated database.
+    store
+        .write(StoreWrite::RunLeadBinding {
+            run: run.clone(),
+            lead_session_id: "s1".to_string(),
+            team_name: "session-s1".to_string(),
+            lead_pane_id: None,
+            lead_terminal_id: None,
+            lead_prompt_version: 1,
+        })
+        .await
+        .expect("the lead binding is writable after 0005");
+    store
+        .write(member_snapshot(
+            &run,
+            "solo-worker",
+            "opus",
+            1_700_000_000_000,
+        ))
+        .await
+        .expect("run_member is writable after 0005");
+    assert_eq!(
+        store
+            .list_run_members(&run)
+            .await
+            .expect("list_run_members")
+            .len(),
+        1
+    );
 }

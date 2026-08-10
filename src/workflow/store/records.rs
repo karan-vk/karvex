@@ -138,6 +138,15 @@ pub struct RunRow {
     pub nodes_total: i64,
     pub nodes_done: i64,
     pub failure: Option<Json>,
+    // ── added by migrations/0005_lead_binding_and_projection.surql ──
+    /// The `claude` session this run's team lead is, and what
+    /// `claude --resume` takes (`09-agent-teams-rework.md` §3.1, §3.7).
+    pub lead_session_id: Option<String>,
+    /// Addresses `~/.claude/tasks/<team>/` and `~/.claude/teams/<team>/`.
+    pub team_name: Option<String>,
+    pub lead_pane_id: Option<String>,
+    pub lead_terminal_id: Option<String>,
+    pub lead_prompt_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, SurrealValue)]
@@ -184,6 +193,17 @@ pub struct RunNodeRow {
     /// The accepted `--input k=v` slot overrides this instance was created
     /// with, as a flat `string -> string` object. Empty for a static node.
     pub inputs: Json,
+    // ── added by migrations/0005_lead_binding_and_projection.surql ──
+    /// The projected Claude Code task id, e.g. `"7"`; `None` for a planned
+    /// node whose task the lead has not created yet.
+    pub task_id: Option<String>,
+    /// The observed task subject, verbatim — the lead may reword what the
+    /// definition called [`Self::label`].
+    pub subject: String,
+    /// The claiming teammate's name; empty means unclaimed.
+    pub owner: String,
+    /// A task the definition never planned (§3.4).
+    pub emergent: bool,
 }
 
 /// `run_edge` is `TYPE RELATION FROM run_node TO run_node`.
@@ -197,6 +217,27 @@ pub struct RunEdgeRow {
     pub kvdag_edge: Option<RecordId>,
     pub condition_result: Option<bool>,
     pub fired_at: Option<Datetime>,
+}
+
+/// One snapshot of a member of the run's Claude Code team, taken from
+/// `~/.claude/teams/<team>/config.json` while the run is live. Claude Code
+/// deletes that file when the lead session ends, so these rows are the only
+/// durable record of who was on the team (`09-agent-teams-rework.md` §3.4).
+#[derive(Debug, Clone, PartialEq, SurrealValue)]
+pub struct RunMemberRow {
+    pub id: RecordId,
+    pub run: RecordId,
+    pub name: String,
+    pub agent_type: String,
+    pub model: String,
+    /// The config's `tmuxPaneId` — a karvex public pane id, because the
+    /// teammate was spawned through karvex's tmux shim.
+    pub pane_id: Option<String>,
+    pub backend_type: String,
+    pub is_active: bool,
+    pub cwd: Option<String>,
+    pub first_seen_at: Datetime,
+    pub last_seen_at: Datetime,
 }
 
 // ── journal, checkpoints, summaries ────────────────────────────────────────
