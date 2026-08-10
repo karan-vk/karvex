@@ -2460,6 +2460,48 @@ mod tests {
         );
     }
 
+    /// A channel build composes `<base>-<channel>.<build id>`
+    /// ([`crate::build_info::version`]), which is the shape a locally built
+    /// `KARVEX_BUILD_CHANNEL=avx2 KARVEX_BUILD_ID=<sha>` binary reports. It has
+    /// two dot-separated prerelease identifiers, and the second is a git sha
+    /// that may be all digits or lead with one, so it is worth pinning rather
+    /// than assuming.
+    ///
+    /// Note this string never reaches [`Version::current`], which parses
+    /// `CARGO_PKG_VERSION` alone — keeping the suffix out of `Cargo.toml` is
+    /// what stops a non-numeric core from making `current()` return `None`
+    /// inside a request handler. This test guards the other half: that the
+    /// composed string a user pastes into a bug report still parses.
+    #[test]
+    fn parse_version_accepts_a_channel_build_with_a_build_id() {
+        assert_eq!(
+            Version::parse("0.12.0-avx2.fbf62cf3"),
+            Some(Version {
+                major: 0,
+                minor: 12,
+                patch: 0,
+                pre: Some("avx2.fbf62cf3".to_string()),
+            })
+        );
+        // An all-numeric build id is still a prerelease identifier, not a
+        // fourth version component.
+        assert_eq!(
+            Version::parse("0.12.0-avx2.12345678"),
+            Some(Version {
+                major: 0,
+                minor: 12,
+                patch: 0,
+                pre: Some("avx2.12345678".to_string()),
+            })
+        );
+        // And a channel build sorts before the plain release, so a local
+        // AVX2 build is never offered an "update" to the version it already is.
+        assert!(
+            Version::parse("0.12.0-avx2.fbf62cf3") < Version::parse("0.12.0"),
+            "a channel build must sort before its own release"
+        );
+    }
+
     #[test]
     fn parse_version_with_build_metadata() {
         assert_eq!(
