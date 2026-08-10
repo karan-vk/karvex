@@ -72,6 +72,8 @@ Each `[[node]]` needs a unique `key`, a `label`, a `prompt_template`, and an `ou
 
 Each `[[edge]]` connects a `from` node to a `to` node and needs a `kind`: `sequence` (source must succeed), `data` (source must succeed *and* its result validate), or `conditional` (evaluates a `condition` against the source's result; false makes the edge dead). Omit `kind` and the edge defaults to `sequence`. A `conditional` edge must declare a `condition` — one with none is rejected at authoring time rather than accepted and silently never resolving. `payload` controls how much of the source's checkpoint the target receives: `none`, `summary` (default), or `full`. `port` names the `{{slot}}` in the target's `prompt_template` that the edge's payload fills; a `port` that names no `{{slot}}` actually present in the target's `prompt_template` is also rejected at authoring time, since it would otherwise produce a workflow whose data silently goes nowhere.
 
+A rejected definition writes nothing at all: the whole document, graph validators included, is checked before the workflow is created, so a create that fails leaves no workflow behind and the `name` it was rejected under stays free. `name` is unique across workflows — creating one under a name another workflow already holds is refused with `workflow_name_taken`, and revising that workflow with `kvx workflow update` is what you want instead.
+
 Run it with the declared args:
 
 ```bash

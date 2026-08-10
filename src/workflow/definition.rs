@@ -13,9 +13,17 @@
 use serde::Deserialize;
 
 use crate::workflow::model::{
-    ArgSpec, EdgeKind, GrowthLimits, KvdagEdge, KvdagNode, KvdagSpec, NodeKey, WorkflowId,
+    ArgSpec, EdgeKind, GrowthLimits, Kvdag, KvdagEdge, KvdagError, KvdagNode, KvdagSpec, NodeKey,
+    WorkflowId,
 };
 use crate::workflow::tier::Tier;
+
+/// The identity [`Definition::validate_graph`] binds the document to for its
+/// throwaway construction. Never persisted and never compared: `Kvdag::try_new`
+/// validates node/edge/arg/template *content* only, so the identity it is
+/// handed cannot change the verdict. The store's own probe inside
+/// `create_version_with_metadata` works the same way.
+const VALIDATION_PROBE_WORKFLOW: &str = "workflow:validation_probe";
 
 /// A parsed definition document, before it is bound to a workflow identity.
 ///
@@ -212,6 +220,26 @@ impl Definition {
             nodes: self.node.clone(),
             edges: self.edge.clone(),
         }
+    }
+
+    /// Runs the graph-level validators — the ones `Definition::check` does not
+    /// own — against this document without writing anything.
+    ///
+    /// `create_version_with_metadata` already gates every write on
+    /// `Kvdag::try_new`, but it does so *after* the caller has committed the
+    /// `workflow` row, so a cycle / duplicate node key / unknown edge endpoint
+    /// used to leave a version-less workflow behind that permanently squatted
+    /// the name (there is no `workflow delete`). Hoisting the identical check
+    /// in front of the first write is what makes `workflow.create` all-or-
+    /// nothing: a rollback would still lose the race against a crash between
+    /// the two writes, and this cannot, because nothing has been written yet.
+    ///
+    /// Deliberately the same validator rather than a re-implementation of it,
+    /// so the pre-check and the store's gate cannot drift apart and let a
+    /// document through here that the store then rejects.
+    pub fn validate_graph(&self) -> Result<(), KvdagError> {
+        let probe = WorkflowId::new(VALIDATION_PROBE_WORKFLOW.to_string());
+        Kvdag::try_new(self.spec(&probe)).map(|_| ())
     }
 }
 
@@ -600,5 +628,79 @@ port = "summary"
         assert_eq!(spec.edges.len(), 1);
         assert_eq!(spec.args.len(), 1);
         assert_eq!(spec.contract, "Reply only through result.json.");
+    }
+
+    /// The pre-write gate `workflow.create` relies on to stay all-or-nothing.
+    /// Each of these passes [`Definition::check`] and used to be caught only
+    /// once the `workflow` row had already been committed.
+    #[test]
+    fn validate_graph_catches_what_definition_check_does_not() {
+        let good = Definition::parse_toml(DOCUMENT).expect("document parses");
+        assert!(good.validate_graph().is_ok());
+
+        let cycle = r#"
+name = "cycle"
+[[node]]
+key = "a"
+label = "A"
+prompt_template = "a"
+output_schema = { type = "object" }
+[[node]]
+key = "b"
+label = "B"
+prompt_template = "b"
+output_schema = { type = "object" }
+[[edge]]
+from = "a"
+to = "b"
+kind = "sequence"
+[[edge]]
+from = "b"
+to = "a"
+kind = "sequence"
+"#;
+        assert!(Definition::parse_toml(cycle)
+            .expect("a cycle still parses")
+            .validate_graph()
+            .is_err());
+
+        let duplicate_key = r#"
+name = "duplicate"
+[[node]]
+key = "a"
+label = "A"
+prompt_template = "a"
+output_schema = { type = "object" }
+[[node]]
+key = "a"
+label = "A again"
+prompt_template = "a"
+output_schema = { type = "object" }
+"#;
+        assert!(matches!(
+            Definition::parse_toml(duplicate_key)
+                .expect("a duplicate key still parses")
+                .validate_graph(),
+            Err(KvdagError::DuplicateNodeKey(_))
+        ));
+
+        let unknown_endpoint = r#"
+name = "dangling"
+[[node]]
+key = "a"
+label = "A"
+prompt_template = "a"
+output_schema = { type = "object" }
+[[edge]]
+from = "a"
+to = "ghost"
+kind = "sequence"
+"#;
+        assert!(matches!(
+            Definition::parse_toml(unknown_endpoint)
+                .expect("a dangling edge still parses")
+                .validate_graph(),
+            Err(KvdagError::UnknownEdgeEndpoint { .. })
+        ));
     }
 }

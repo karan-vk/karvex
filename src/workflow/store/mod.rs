@@ -423,8 +423,10 @@ impl WorkflowStore {
             .bind(("description", description.to_string()))
             .bind(("default_tier", default_tier.as_str().to_string()))
             .await
-            .map_err(query_error)?;
-        let rows: Vec<WorkflowRow> = response.take(0).map_err(query_error)?;
+            .map_err(|error| create_workflow_error(name, error))?;
+        let rows: Vec<WorkflowRow> = response
+            .take(0)
+            .map_err(|error| create_workflow_error(name, error))?;
         let row = rows
             .into_iter()
             .next()
@@ -463,6 +465,9 @@ impl WorkflowStore {
     /// The refresh happens **before** the no-op-revision early return on
     /// purpose: an update that changes only the description leaves the graph
     /// digest identical, which is exactly the case that used to go missing.
+    /// It happens **after** `Kvdag::try_new` for the opposite reason: a
+    /// rejected document must not leave the workflow row describing itself with
+    /// metadata from a revision that was never written.
     pub async fn create_version_with_metadata(
         &self,
         workflow: &WorkflowId,
@@ -472,10 +477,6 @@ impl WorkflowStore {
         metadata: Option<&VersionMetadata>,
     ) -> Result<Kvdag, StoreError> {
         let workflow_id = workflow_record_id(workflow)?;
-        if let Some(metadata) = metadata {
-            self.refresh_workflow_metadata(&workflow_id, metadata)
-                .await?;
-        }
         let workflow_row =
             self.select_workflow(&workflow_id)
                 .await?
@@ -506,6 +507,16 @@ impl WorkflowStore {
             ..spec
         };
         let validated = Kvdag::try_new(probe_spec)?;
+
+        // Only now: everything above this line is a read or a pure validation,
+        // so a document that fails the gate leaves the workflow exactly as it
+        // was found. Before this moved, a rejected `workflow.update` still
+        // rewrote the row's `description`/`default_tier` to describe a revision
+        // that was never written.
+        if let Some(metadata) = metadata {
+            self.refresh_workflow_metadata(&workflow_id, metadata)
+                .await?;
+        }
 
         // A no-op revision is compared against the tip of the chain, and on
         // everything a version stores — `spec_digest` covers only nodes and
@@ -1274,6 +1285,34 @@ fn classify_open_error(path: &Path, error: surrealdb::Error) -> StoreError {
 
 fn query_error(error: surrealdb::Error) -> StoreError {
     StoreError::Query(error.to_string())
+}
+
+/// The UNIQUE index `workflow.name` carries
+/// (`migrations/0001_init.surql`). Named here so the conflict sniffer below
+/// stays tied to the migration that defines it.
+const INDEX_WORKFLOW_NAME: &str = "workflow_name";
+
+/// A failed `CREATE workflow` is a name collision far more often than it is
+/// anything else, and SurrealDB reports that collision as a generic query
+/// error carrying its own index message ("Database index `workflow_name`
+/// already contains 'x', with record workflow:…"). Forwarding that string to
+/// the caller leaked a database internal as the user-facing error, so it is
+/// recognised here and named instead. Anything unrecognised stays a plain
+/// [`StoreError::Query`] — this narrows the message, it never swallows an
+/// unrelated failure.
+fn create_workflow_error(name: &str, error: surrealdb::Error) -> StoreError {
+    let message = error.to_string();
+    if is_workflow_name_conflict(&message) {
+        return StoreError::NameTaken {
+            name: name.to_string(),
+        };
+    }
+    StoreError::Query(message)
+}
+
+fn is_workflow_name_conflict(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains(INDEX_WORKFLOW_NAME) && lowered.contains("already contains")
 }
 
 fn migration_error(version: &str, error: surrealdb::Error) -> StoreError {
