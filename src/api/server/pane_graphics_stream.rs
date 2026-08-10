@@ -119,6 +119,20 @@ fn serve_with_timeouts(
         return Ok(());
     }
 
+    // Register as soon as the app has accepted the owner, and before the client
+    // is told the stream is live. `cancel_inactive_streams` cancels by flipping
+    // the flag held here, so a cancellation raised before registration finds
+    // nothing to flip and is dropped, leaving a stream that should have stopped
+    // drawing running until its next frame or disconnect. Registering after the
+    // ack leaves that gap spanning a socket write, which is long enough for the
+    // server loop to observe the owner going inactive and lose the cancel.
+    // Registering only after the open succeeded also matters in the other
+    // direction: the app inserts this owner while handling the open request, so
+    // an earlier registration could be cancelled at birth for not yet being
+    // known to the app.
+    let stream_active = Arc::new(AtomicBool::new(true));
+    register_stream(&owner, &stream_active);
+
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
@@ -126,6 +140,7 @@ fn serve_with_timeouts(
             result: ResponseResult::Ok {},
         },
     ) {
+        unregister_stream(&owner);
         clear_layer(&pane_id, &owner, api_tx);
         if is_connection_closed_error(&err) {
             return Ok(());
@@ -133,8 +148,6 @@ fn serve_with_timeouts(
         return Err(err);
     }
 
-    let stream_active = Arc::new(AtomicBool::new(true));
-    register_stream(&owner, &stream_active);
     let result = serve_frames(
         &mut stream,
         &request_id,
@@ -610,6 +623,13 @@ mod tests {
         assert!(owner.starts_with("pane.graphics.stream:"));
     }
 
+    fn registered_owners() -> Vec<String> {
+        match stream_registry().lock() {
+            Ok(streams) => streams.keys().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     #[test]
     fn timed_read_skips_reset_after_stream_ends() {
         let mut reset_called = false;
@@ -982,26 +1002,49 @@ mod tests {
         let ack: SuccessResponse = serde_json::from_str(&read_response_line(&mut client)).unwrap();
         assert_eq!(ack.id, "stream-cancel");
 
+        // The client is only acked after the stream is registered, so a cancel
+        // issued now always has a flag to flip. This is the invariant that
+        // makes the wait below bounded rather than a coin toss.
+        assert!(
+            registered_owners().contains(&owner),
+            "stream must be registered before the client is acked, or a cancel \
+             raised here is silently dropped"
+        );
+
         cancel_inactive_streams(|registered| registered != owner);
 
         // `cancel_inactive_streams` only flips `stream_active`; the server
-        // thread notices it in `read_line`'s poll loop, which blocks on the
-        // socket for up to CONNECTION_POLL_INTERVAL (100ms) between checks.
-        // That is a genuine cross-thread wait with no in-process clock to
-        // inject (the timeout lives in a real socket recv), so — as with the
-        // wait_for_file budget — the bound below is evidence-scaled rather
-        // than picked blind: 3s is the CONNECTION_POLL_INTERVAL-driven
-        // nominal case (~100ms) multiplied by the same ~3x oversubscription
-        // factor measured for wait_for_file (48 threads on 16 cores), with
-        // extra headroom since this waits on real OS thread scheduling
-        // rather than a single poll. It only costs wall-clock time on the
-        // failure path; a passing wait returns as soon as the close request
-        // arrives.
+        // thread reads it at the top of `serve_frames`' loop. Left alone it
+        // would sit in `read_line`'s blocking recv for up to
+        // CONNECTION_POLL_INTERVAL (100ms) first, so wake it explicitly with an
+        // empty frame line — a protocol-legal no-op that `serve_frames` skips —
+        // and the flag is observed on the very next loop iteration. That
+        // removes the timer from the wait entirely: what remains is only the
+        // scheduling of two threads, not a poll interval scaled by runner load.
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        // Bound only to convert a regression into a diagnosable failure instead
+        // of a hung CI job; it is not a tuned timing budget, and it costs
+        // wall-clock time only on the failure path.
         let (close_tx, close_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || close_tx.send(api_rx.blocking_recv()).unwrap());
+        std::thread::spawn(move || {
+            let _ = close_tx.send(api_rx.blocking_recv());
+        });
         let close = close_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("canceled idle stream should dispatch a close")
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                // Discriminates the two ways this can fail: a still-registered
+                // owner means the cancel never reached this stream, while an
+                // unregistered one means the flag flipped but the server thread
+                // never acted on it.
+                panic!(
+                    "canceled idle stream should dispatch a close; owner {owner} still \
+                     registered: {}, registered stream count: {}",
+                    registered_owners().contains(&owner),
+                    REGISTERED_STREAM_COUNT.load(Ordering::Acquire),
+                )
+            })
             .expect("API request channel should remain open");
         match &close.request.method {
             Method::PaneGraphicsStreamClose(params) => {
@@ -1148,12 +1191,28 @@ mod tests {
         client.write_all(b"{").unwrap();
         client.flush().unwrap();
 
+        // Unlike the cancellation test, this close is driven by the server's own
+        // absolute `header_total` deadline, so there is no flag to flip and no
+        // way for the client to make it fire sooner — writing more bytes would
+        // only push `idle_deadline` back. The deadline is absolute, so a starved
+        // server thread makes this late rather than never, and the bound below
+        // is a backstop against a hang rather than a latency budget. It costs
+        // wall-clock time only on the failure path.
         let (close_tx, close_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || close_tx.send(api_rx.blocking_recv()).unwrap());
+        std::thread::spawn(move || {
+            let _ = close_tx.send(api_rx.blocking_recv());
+        });
         let close = close_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap()
-            .unwrap();
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed-out header should dispatch a close; owner {owner} still \
+                     registered: {}, registered stream count: {}",
+                    registered_owners().contains(&owner),
+                    REGISTERED_STREAM_COUNT.load(Ordering::Acquire),
+                )
+            })
+            .expect("API request channel should remain open");
         match &close.request.method {
             Method::PaneGraphicsStreamClose(params) => {
                 assert_eq!(params.pane_id, "pane_1");
