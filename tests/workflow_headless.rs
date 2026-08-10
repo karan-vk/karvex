@@ -2163,6 +2163,32 @@ fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
         collect_task.contains("[from fanout/worker/1 · Shard 1]"),
         "each contribution is attributed to the node that produced it: {collect_task}"
     );
+    // A node's cwd is the workspace directory, not its node directory, so a
+    // `./result.json` in `task.md` named a file in the workspace: the node did
+    // the work, wrote its result where nothing was watching, and failed its
+    // completion gate. Every karvex-owned path the document names is absolute.
+    assert!(
+        !collect_task.contains("`./"),
+        "task.md may not name a node file relative to the node's cwd: {collect_task}"
+    );
+    for file in ["result.json", "output_schema.json"] {
+        let expected = collect_dir.join(file);
+        assert!(
+            collect_task.contains(&expected.display().to_string()),
+            "task.md must name {} by its absolute path: {collect_task}",
+            expected.display()
+        );
+    }
+    assert!(
+        collect_task.contains(
+            &collect_dir
+                .join("inputs")
+                .join("shard.json")
+                .display()
+                .to_string()
+        ),
+        "and the inputs it lists too: {collect_task}"
+    );
 
     server.shutdown();
 }
