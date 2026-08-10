@@ -145,6 +145,12 @@ impl fmt::Display for LeadSpawnError {
 
 impl std::error::Error for LeadSpawnError {}
 
+/// This machine's `claude` cannot run a workflow's team lead: absent,
+/// unreadable, or older than agent teams.
+pub const LEAD_UNAVAILABLE_CODE: &str = "workflow_lead_unavailable";
+/// `claude` is fine; the lead's pane or run directory could not be made.
+pub const LEAD_SPAWN_FAILED_CODE: &str = "workflow_lead_spawn_failed";
+
 impl LeadSpawnError {
     /// The wire error code. Reuses the workflow subsystem's existing vocabulary
     /// rather than minting per-variant codes a client would have to learn.
@@ -152,9 +158,9 @@ impl LeadSpawnError {
         match self {
             Self::ClaudeUnavailable(_)
             | Self::ClaudeVersionUnreadable(_)
-            | Self::ClaudeTooOld { .. } => "workflow_lead_unavailable",
+            | Self::ClaudeTooOld { .. } => LEAD_UNAVAILABLE_CODE,
             Self::RunDirUnwritable(_) | Self::NoTargetPane | Self::PaneLaunchFailed(_) => {
-                "workflow_lead_spawn_failed"
+                LEAD_SPAWN_FAILED_CODE
             }
         }
     }

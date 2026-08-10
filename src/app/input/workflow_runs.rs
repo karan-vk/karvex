@@ -521,6 +521,10 @@ mod tests {
             workflow_name: "ship-it".to_string(),
             context_runs: Vec::new(),
             restore_from_run: None,
+            lead_session_id: None,
+            team_name: None,
+            lead_pane_id: None,
+            lead_prompt_version: None,
         }
     }
 
@@ -823,6 +827,7 @@ output_schema = {{ type = "object" }}
 
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn the_browser_lists_a_started_run() {
         let mut app = test_app();
         let workflow_id = create_workflow(&mut app, "ship-feature");
@@ -885,6 +890,7 @@ output_schema = {{ type = "object" }}
 
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn refresh_on_a_run_level_event_reloads_and_reanchors_selection_by_run_id() {
         let mut app = test_app();
         let first = create_workflow(&mut app, "first");

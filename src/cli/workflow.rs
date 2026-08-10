@@ -10,8 +10,9 @@ use crate::api::schema::{
     Method, Request, WorkflowCreateParams, WorkflowDefinitionDocument, WorkflowDefinitionFormat,
     WorkflowInterrogationMode, WorkflowNodeExpandParams, WorkflowNodeInterrogateParams,
     WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRestoreRequest,
-    WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget, WorkflowSummaryListParams,
-    WorkflowTarget, WorkflowTier, WorkflowVersionCreateParams, WorkflowVersionTarget,
+    WorkflowRunFinishParams, WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget,
+    WorkflowSummaryListParams, WorkflowTarget, WorkflowTier, WorkflowVersionCreateParams,
+    WorkflowVersionTarget,
 };
 
 /// Env karvex injects into a node's pane
@@ -40,6 +41,7 @@ pub(super) const VERB_PATHS: &[&[&str]] = &[
     &["run", "list"],
     &["run", "show"],
     &["run", "cancel"],
+    &["run", "finish"],
     &["node", "show"],
     &["node", "steer"],
     &["node", "interrupt"],
@@ -87,6 +89,7 @@ fn run_workflow_run_command(args: &[String]) -> std::io::Result<i32> {
         "list" => workflow_run_list(&args[1..]),
         "show" => workflow_run_show(&args[1..]),
         "cancel" => workflow_run_cancel(&args[1..]),
+        "finish" => workflow_run_finish(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workflow_run_help();
             Ok(0)
@@ -821,6 +824,103 @@ fn workflow_run_cancel(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+/// `kvx workflow run finish` — the team lead's own end-of-run report
+/// (`09-agent-teams-rework.md` §3.3).
+///
+/// The run id defaults to `KARVEX_WORKFLOW_RUN_ID`, which karvex exports into
+/// the lead's pane, so the lead runs this with nothing but a summary path.
+fn workflow_run_finish(args: &[String]) -> std::io::Result<i32> {
+    match parse_workflow_run_finish_args(args, std::env::var(NODE_ENV_RUN_ID).ok()) {
+        Ok((params, json)) => send_workflow_mutation(
+            "cli:workflow:run:finish",
+            Method::WorkflowRunFinish(params),
+            json,
+        ),
+        Err(message) => {
+            eprintln!("{message}");
+            Ok(2)
+        }
+    }
+}
+
+fn parse_workflow_run_finish_args(
+    args: &[String],
+    env_run_id: Option<String>,
+) -> Result<(WorkflowRunFinishParams, bool), String> {
+    let usage = "usage: kvx workflow run finish [--run <run_id>] \
+                 (--summary-file <path> | --summary <text>) [--outcome <word>] [--json]";
+    let mut run_id: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut summary_file: Option<String> = None;
+    let mut outcome: Option<String> = None;
+    let mut json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let take_value = |slot: &mut Option<String>| -> Result<(), String> {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{arg} needs a value\n{usage}"))?;
+            *slot = Some(value.clone());
+            Ok(())
+        };
+        match arg {
+            "--run" | "--run-id" => {
+                take_value(&mut run_id)?;
+                index += 2;
+            }
+            "--summary" => {
+                take_value(&mut summary)?;
+                index += 2;
+            }
+            "--summary-file" => {
+                take_value(&mut summary_file)?;
+                index += 2;
+            }
+            "--outcome" => {
+                take_value(&mut outcome)?;
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            _ => return Err(usage.into()),
+        }
+    }
+
+    let run_id = run_id
+        .or(env_run_id)
+        .filter(|run_id| !run_id.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "no run to finish: pass --run <run_id>, or run this from the run's lead pane \
+                 where {NODE_ENV_RUN_ID} is exported\n{usage}"
+            )
+        })?;
+    if summary.is_none() && summary_file.is_none() {
+        return Err(format!(
+            "a run summary is required: pass --summary-file <path> or --summary <text>\n{usage}"
+        ));
+    }
+    if summary.is_some() && summary_file.is_some() {
+        return Err(format!(
+            "pass either --summary or --summary-file, not both\n{usage}"
+        ));
+    }
+
+    Ok((
+        WorkflowRunFinishParams {
+            run_id,
+            summary,
+            summary_file,
+            outcome,
+        },
+        json,
+    ))
 }
 
 fn parse_workflow_run_cancel_args(args: &[String]) -> Result<(WorkflowRunTarget, bool), String> {
@@ -1660,6 +1760,10 @@ fn print_workflow_run_response(response: &serde_json::Value, json: bool) -> std:
         }
     }
 
+    if let Some(team) = run["team_name"].as_str().filter(|name| !name.is_empty()) {
+        println!("team:    {team}");
+    }
+
     if let Some(nodes) = nodes {
         if !nodes.is_empty() {
             println!();
@@ -1670,7 +1774,46 @@ fn print_workflow_run_response(response: &serde_json::Value, json: bool) -> std:
         }
     }
 
+    // §3.4: who actually worked on the run, and in which pane. Snapshotted
+    // rather than live, so this still answers for a finished run whose team
+    // config Claude Code has already deleted.
+    if let Some(members) = response["result"]["graph"]["members"].as_array() {
+        if !members.is_empty() {
+            println!();
+            println!("members:");
+            for member in members {
+                println!("{}", format_run_member_line(member));
+            }
+        }
+    }
+
     Ok(0)
+}
+
+/// One team member's line under `run show`'s `members:` heading.
+fn format_run_member_line(member: &serde_json::Value) -> String {
+    let name = member["name"].as_str().unwrap_or("");
+    let pane = member["pane_id"].as_str().unwrap_or("");
+    let model = member["model"].as_str().unwrap_or("");
+    let backend = member["backend_type"].as_str().unwrap_or("");
+    let active = if member["is_active"].as_bool().unwrap_or(false) {
+        "active"
+    } else {
+        "idle"
+    };
+    let mut line = format!("  {name} ({active}");
+    if !model.is_empty() {
+        line.push_str(&format!(", {model}"));
+    }
+    line.push(')');
+    if pane.is_empty() {
+        // The lead has no pane of its own in the team config; it is the
+        // session, not a teammate.
+        line.push_str(&format!(" — {backend}"));
+    } else {
+        line.push_str(&format!(" — pane {pane}"));
+    }
+    line
 }
 
 /// One node's line under `run show`'s `nodes:` heading.
@@ -2275,6 +2418,9 @@ fn print_workflow_run_help() {
     eprintln!("  kvx workflow run list <name|id> [--limit N] [--json]");
     eprintln!("  kvx workflow run show <run_id> [--json]");
     eprintln!("  kvx workflow run cancel <run_id> [--json]");
+    eprintln!(
+        "  kvx workflow run finish [--run <run_id>] (--summary-file <path> | --summary <text>) [--outcome <word>] [--json]"
+    );
 }
 
 fn print_workflow_node_help() {

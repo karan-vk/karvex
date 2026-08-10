@@ -587,6 +587,10 @@ mod tests {
             workflow_name: "ux-dag-probe".to_string(),
             context_runs: Vec::new(),
             restore_from_run: None,
+            lead_session_id: None,
+            team_name: None,
+            lead_pane_id: None,
+            lead_prompt_version: None,
         }
     }
 
@@ -603,6 +607,7 @@ mod tests {
                 condition_result: None,
                 fired: true,
             }],
+            members: Vec::new(),
         }
     }
 

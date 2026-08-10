@@ -446,6 +446,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorkflowRunGet(_) => "workflow.run.get",
         Method::WorkflowRunList(_) => "workflow.run.list",
         Method::WorkflowRunCancel(_) => "workflow.run.cancel",
+        Method::WorkflowRunFinish(_) => "workflow.run.finish",
         Method::WorkflowNodeGet(_) => "workflow.node.get",
         Method::WorkflowNodeSteer(_) => "workflow.node.steer",
         Method::WorkflowNodeInterrupt(_) => "workflow.node.interrupt",

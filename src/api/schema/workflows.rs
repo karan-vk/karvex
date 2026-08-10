@@ -228,6 +228,27 @@ pub struct WorkflowRunParams {
     pub include_prior_summaries: Option<bool>,
 }
 
+/// The team lead's own end-of-run report (`09-agent-teams-rework.md` §3.3).
+///
+/// Authorised by possession of the run id: karvex puts `KARVEX_WORKFLOW_RUN_ID`
+/// in the lead's pane, so `kvx workflow run finish` needs no argument and
+/// nothing that has not been handed the run can close it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunFinishParams {
+    pub run_id: String,
+    /// The summary text itself. Exactly one of this and `summary_file` is
+    /// required; the file form exists because a lead writes markdown to disk
+    /// and should not have to inline it through argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_file: Option<String>,
+    /// A one-word verdict for the run. Defaults to `succeeded`; a lead that
+    /// concluded the run could not finish says so here and still calls finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowRunListParams {
     /// `None` lists runs across every workflow, newest first
@@ -513,6 +534,23 @@ pub struct WorkflowRunInfo {
     /// The run this one restored checkpoints from, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_from_run: Option<String>,
+    /// The Claude Code session id of the run's team lead
+    /// (`09-agent-teams-rework.md` §3.1). Absent for a run that predates the
+    /// agent-teams rework, and until karvex has recognised the lead's team.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_session_id: Option<String>,
+    /// The team the lead created, `session-` plus the first eight characters
+    /// of its session id. The key both `~/.claude/tasks/<team>/` and
+    /// `~/.claude/teams/<team>/` are addressed by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_name: Option<String>,
+    /// The lead's own pane, which is where a user steers the whole run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_pane_id: Option<String>,
+    /// Which version of karvex's rendered lead prompt started this run, so a
+    /// stored run says what contract produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_prompt_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -603,10 +641,41 @@ pub struct WorkflowRunEdgeInfo {
     pub fired: bool,
 }
 
+/// One member of the run's Claude Code team, as karvex last observed it
+/// (`09-agent-teams-rework.md` §3.4).
+///
+/// Snapshotted rather than read live: Claude Code deletes the team config when
+/// the lead session ends, so this is the durable record of who worked on the
+/// run and in which pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunMemberInfo {
+    pub name: String,
+    #[serde(default)]
+    pub agent_type: String,
+    #[serde(default)]
+    pub model: String,
+    /// The member's karvex pane, for a split-pane teammate. Absent for the
+    /// in-process lead, which is a session rather than a pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default)]
+    pub backend_type: String,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub first_seen_at_unix_ms: u64,
+    pub last_seen_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowRunGraph {
     pub nodes: Vec<WorkflowRunNodeInfo>,
     pub edges: Vec<WorkflowRunEdgeInfo>,
+    /// The run's team, newest observation first seen order. Empty for a run
+    /// that predates the agent-teams rework.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<WorkflowRunMemberInfo>,
 }
 
 // ── run history, summaries, interrogation, restore ─────────────────────────
@@ -1107,6 +1176,17 @@ pub(crate) mod tests {
                 condition_result: None,
                 fired: true,
             }],
+            members: vec![WorkflowRunMemberInfo {
+                name: "research".into(),
+                agent_type: "Explore".into(),
+                model: "sonnet".into(),
+                pane_id: Some("w1:p4".into()),
+                backend_type: "tmux".into(),
+                is_active: true,
+                cwd: Some("/home/dev/project".into()),
+                first_seen_at_unix_ms: 1,
+                last_seen_at_unix_ms: 2,
+            }],
         };
 
         let response = SuccessResponse {
@@ -1135,6 +1215,10 @@ pub(crate) mod tests {
                     workflow_name: String::new(),
                     context_runs: Vec::new(),
                     restore_from_run: None,
+                    lead_session_id: None,
+                    team_name: None,
+                    lead_pane_id: None,
+                    lead_prompt_version: None,
                 },
                 graph,
             },
@@ -1243,6 +1327,10 @@ pub(crate) mod tests {
             workflow_name: "ship-feature".into(),
             context_runs: Vec::new(),
             restore_from_run: None,
+            lead_session_id: None,
+            team_name: None,
+            lead_pane_id: None,
+            lead_prompt_version: None,
         };
         let node = sample_run_node_info("plan", None);
 
@@ -1602,6 +1690,10 @@ pub(crate) mod tests {
                     workflow_name: "ship-feature".into(),
                     context_runs: Vec::new(),
                     restore_from_run: Some("workflow_run:1".into()),
+                    lead_session_id: None,
+                    team_name: None,
+                    lead_pane_id: None,
+                    lead_prompt_version: None,
                 },
                 restore: Some(WorkflowRestoreReport {
                     restored: vec!["plan".into()],

@@ -4443,6 +4443,8 @@ impl HeadlessServer {
         // Unlike git status, this is not gated on a connected client: session
         // names are served over the API too, so they stay current headless.
         self.app.start_agent_session_name_refresh_if_due(now);
+        // §3.4: the run projection is server-owned and runs headless too.
+        self.app.poll_run_projection(now);
 
         if self
             .app

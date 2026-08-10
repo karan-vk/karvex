@@ -288,6 +288,13 @@ pub enum ResponseResult {
     WorkflowRunCancelled {
         run: WorkflowRunInfo,
     },
+    /// The team lead's own end-of-run report was accepted
+    /// (`09-agent-teams-rework.md` §3.3). Carries the closed run and the
+    /// summary as stored, so the caller sees exactly what was recorded.
+    WorkflowRunFinished {
+        run: WorkflowRunInfo,
+        summary: WorkflowRunSummaryInfo,
+    },
     WorkflowNodeGet {
         node: WorkflowRunNodeInfo,
     },

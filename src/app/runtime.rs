@@ -351,6 +351,7 @@ impl App {
 
         self.start_git_status_refresh_if_due(now);
         self.start_agent_session_name_refresh_if_due(now);
+        self.poll_run_projection(now);
 
         if self
             .next_auto_update_check
@@ -595,6 +596,13 @@ impl App {
             // Not gated on a connected client: the resolved name is also served
             // over the API, so a headless server keeps it current on its own.
             self.agent_session_name_refresh_deadline(),
+            // The run projection reads Claude Code's own task and team files
+            // for the run this server launched a team lead for
+            // (`09-agent-teams-rework.md` §3.4). Not gated on a connected
+            // client, for the same reason the line above is not: the
+            // projection is a shared runtime fact served over the API, so a
+            // headless server has to keep it current on its own.
+            self.run_projection_deadline(),
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,

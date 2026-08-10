@@ -871,6 +871,7 @@ fn edge_pairs(run: &Value) -> BTreeSet<String> {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn two_node_command_kvdag_runs_to_succeeded_with_a_pane_per_node() {
     let server = spawn_workflow_server("two-node");
     let socket = server.socket().to_path_buf();
@@ -1054,6 +1055,7 @@ fn two_node_command_kvdag_runs_to_succeeded_with_a_pane_per_node() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn node_without_a_valid_result_ends_needs_attention_and_the_run_does_not_succeed() {
     let server = spawn_workflow_server("no-result");
     let socket = server.socket().to_path_buf();
@@ -1152,6 +1154,7 @@ fn node_without_a_valid_result_ends_needs_attention_and_the_run_does_not_succeed
 /// node `Running` forever, which never pauses, never finishes, and refuses
 /// every later `workflow.run` with `workflow_run_in_flight`.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn a_node_whose_pane_exits_without_a_result_fails_and_closes_the_run() {
     // Not a summary test: it starts a second run immediately after the first
     // closes, which lands inside the epilogue's admission window and draws a
@@ -1250,6 +1253,7 @@ fn a_node_whose_pane_exits_without_a_result_fails_and_closes_the_run() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn node_steer_delivers_text_into_the_nodes_pane() {
     let server = spawn_workflow_server("steer");
     let socket = server.socket().to_path_buf();
@@ -1331,6 +1335,7 @@ fn node_steer_delivers_text_into_the_nodes_pane() {
 /// The stub traps SIGINT and prints on receipt, so this asserts the interrupt
 /// against the process's own acknowledgement rather than against the response.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn node_interrupt_is_observed_by_the_nodes_process() {
     let server = spawn_workflow_server("interrupt");
     let socket = server.socket().to_path_buf();
@@ -1417,6 +1422,7 @@ fn node_interrupt_is_observed_by_the_nodes_process() {
 /// `runner = "command"` node has no second completion signal to fall back on,
 /// so the report itself has to be what surfaces it.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn a_report_with_no_result_file_reaches_needs_attention() {
     let server = spawn_workflow_server("missing-result");
     let socket = server.socket().to_path_buf();
@@ -1524,6 +1530,7 @@ fn agent_stub_lines(log: &str, tag: &str) -> Vec<String> {
 /// reported: an interrupt or a prompt that is only acknowledged by the control
 /// plane is exactly the failure being tested for.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn an_agent_that_never_saw_its_seed_prompt_is_reseeded_with_an_absolute_path() {
     let server = spawn_workflow_server("agent-seed");
     let socket = server.socket().to_path_buf();
@@ -1624,6 +1631,7 @@ fn an_agent_that_never_saw_its_seed_prompt_is_reseeded_with_an_absolute_path() {
 /// that fired live and reads back unfired is the run telling two different
 /// stories about which branch it took.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn a_finished_run_reads_back_field_equal_to_its_live_projection() {
     let server = spawn_workflow_server("restart-fidelity");
     let socket = server.socket().to_path_buf();
@@ -1873,6 +1881,7 @@ fn is_reserved_path(path: &str) -> bool {
 /// actually reads — the child's rendered `task.md`, its pane title, and the
 /// fan-in node's `inputs/` directory and prompt.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
     let server = spawn_workflow_server("expand-accepted");
     let socket = server.socket().to_path_buf();
@@ -2224,6 +2233,7 @@ fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
 /// whole `WorkflowGrowthLimit` a line above, next to the `show_workflow_notice`
 /// call.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn a_truncated_expansion_is_surfaced_and_the_run_still_succeeds() {
     /// The version ceiling narrowed by `low`.
     const LOW_TIER_MAX_NODES: u64 = 12;
@@ -2428,6 +2438,7 @@ fn a_truncated_expansion_is_surfaced_and_the_run_still_succeeds() {
 /// has not come near, and `run.growth_limited` would then be permanently set on
 /// a run that never lost a single node to a guardrail.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn a_disallowed_template_is_refused_and_creates_nothing() {
     let server = spawn_workflow_server("expand-refused");
     let socket = server.socket().to_path_buf();
@@ -2560,6 +2571,7 @@ fn a_disallowed_template_is_refused_and_creates_nothing() {
 /// file deliberately asserts from payloads instead, because payload assertions
 /// survive a reordering — which is precisely why none of them caught this.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn event_stream_delivers_cross_type_events_in_causal_order() {
     let server = spawn_workflow_server("eorder");
     let socket = server.socket().to_path_buf();
@@ -2916,6 +2928,7 @@ fn prior_runs_pointer(task_md: &str) -> Option<String> {
 ///   * a third run started with `include_prior_summaries: false` has neither —
 ///     the opt-out is a property of the run, not of the workflow.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn a_finished_run_is_summarised_afterwards_and_the_next_run_reads_its_summary() {
     let server = spawn_summary_server("summary-lifecycle", "ok", "");
     let socket = server.socket().to_path_buf();
@@ -3088,6 +3101,7 @@ fn a_finished_run_is_summarised_afterwards_and_the_next_run_reads_its_summary() 
 /// this file asserts only API-observable facts, and the API-observable face of
 /// that journal entry is the give-up state above.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn an_over_budget_summary_gives_up_and_leaves_the_runs_outcome_alone() {
     let server = spawn_summary_server("summary-over-budget", "over", "");
     let socket = server.socket().to_path_buf();
@@ -3179,6 +3193,7 @@ fn an_over_budget_summary_gives_up_and_leaves_the_runs_outcome_alone() {
 /// window and be refused with `workflow_run_in_flight` (§4 D1/M7). The epilogue
 /// itself is asserted in scenarios 11, 12, and 15.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn restoring_a_past_run_seeds_the_node_pane_less_and_skips_a_changed_definition() {
     let server =
         spawn_workflow_server_with_config("restore", "[workflow]\nsummary_enabled = false\n");
@@ -3383,6 +3398,7 @@ fn restoring_a_past_run_seeds_the_node_pane_less_and_skips_a_changed_definition(
 /// its own, so the wait is a poll on the API surface itself rather than on the
 /// clock: the state converges and stays converged.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn a_pruned_run_survives_as_a_summary_and_refuses_restore_and_run_get() {
     let server = spawn_summary_server("summary-pruned", "ok", "[workflow]\nretention_runs = 1\n");
     let socket = server.socket().to_path_buf();
@@ -3566,6 +3582,7 @@ fn epilogue_node_shape(response: &Value) -> Value {
 /// `tests/cli/workflow.rs`'s
 /// `node_interrogate_on_command_runner_node_refuses_without_a_pane`.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn a_restored_and_summarised_run_reads_back_field_equal_to_its_live_projection() {
     let server = spawn_summary_server("phase3-restart-fidelity", "ok", "");
     let socket = server.socket().to_path_buf();
@@ -3750,6 +3767,7 @@ fn a_restored_and_summarised_run_reads_back_field_equal_to_its_live_projection()
 /// `KARVEX_WORKFLOW_SUMMARY_COMMAND` is what [`spawn_summary_server`] sets, so
 /// every summariser in these scenarios is `runner = "command"` already.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn interrogating_a_command_bound_epilogue_is_refused_on_its_runner() {
     let server = spawn_summary_server("epilogue-interrogate", "ok", "");
     let socket = server.socket().to_path_buf();

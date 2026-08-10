@@ -923,6 +923,7 @@ output_schema = {{ type = "object" }}
 
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn confirm_is_refused_until_the_required_arg_is_filled_then_starts_the_run() {
         let mut app = test_app();
         let workflow_id = create_workflow(&mut app, "ship-feature", "high");

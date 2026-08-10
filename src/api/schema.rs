@@ -255,6 +255,8 @@ pub enum Method {
     WorkflowRunList(WorkflowRunListParams),
     #[serde(rename = "workflow.run.cancel")]
     WorkflowRunCancel(WorkflowRunTarget),
+    #[serde(rename = "workflow.run.finish")]
+    WorkflowRunFinish(WorkflowRunFinishParams),
     #[serde(rename = "workflow.node.get")]
     WorkflowNodeGet(WorkflowNodeTarget),
     #[serde(rename = "workflow.node.steer")]

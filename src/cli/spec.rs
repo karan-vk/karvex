@@ -951,6 +951,17 @@ fn workflow_run_command() -> Command {
                 .arg(required("run_id", "RUN_ID"))
                 .arg(json_flag()),
         )
+        .subcommand(
+            Command::new("finish")
+                .about("Report a workflow run finished (the team lead's own end-of-run report)")
+                .arg(option("run", "RUN_ID").help(
+                    "Defaults to KARVEX_WORKFLOW_RUN_ID, which is exported in the lead's pane",
+                ))
+                .arg(option("summary-file", "PATH").help("Read the run summary from a file"))
+                .arg(option("summary", "TEXT").help("The run summary itself"))
+                .arg(option("outcome", "WORD").help("One-word verdict; defaults to succeeded"))
+                .arg(json_flag()),
+        )
 }
 
 fn workflow_summary_command() -> Command {

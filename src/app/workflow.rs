@@ -3104,6 +3104,13 @@ impl App {
             // it restored from.
             context_runs: active.context_runs.iter().map(RunId::to_string).collect(),
             restore_from_run: active.restore_from_run.as_ref().map(RunId::to_string),
+            // The engine's live projection has no lead: a run it is executing
+            // is an engine run, and a lead run's binding is read from the
+            // store instead (`09-agent-teams-rework.md` §3.1).
+            lead_session_id: None,
+            team_name: None,
+            lead_pane_id: None,
+            lead_prompt_version: None,
         })
     }
 
@@ -3230,7 +3237,13 @@ impl App {
                 })
             })
             .collect();
-        Some(WorkflowRunGraph { nodes, edges })
+        Some(WorkflowRunGraph {
+            nodes,
+            edges,
+            // The live engine projection has no team; a lead run's members are
+            // read from the store by `stored_run` (§3.4).
+            members: Vec::new(),
+        })
     }
 }
 

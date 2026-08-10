@@ -868,6 +868,10 @@ mod tests {
                     workflow_name: String::new(),
                     context_runs: Vec::new(),
                     restore_from_run: None,
+                    lead_session_id: None,
+                    team_name: None,
+                    lead_pane_id: None,
+                    lead_prompt_version: None,
                 },
             },
         }

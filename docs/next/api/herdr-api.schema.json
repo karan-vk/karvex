@@ -1533,6 +1533,29 @@
               ],
               "description": "The run's most recent growth limit, if any."
             },
+            "lead_pane_id": {
+              "description": "The lead's own pane, which is where a user steers the whole run.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lead_prompt_version": {
+              "description": "Which version of karvex's rendered lead prompt started this run, so a\nstored run says what contract produced it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lead_session_id": {
+              "description": "The Claude Code session id of the run's team lead\n(`09-agent-teams-rework.md` §3.1). Absent for a run that predates the\nagent-teams rework, and until karvex has recognised the lead's team.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "max_depth": {
               "default": 0,
               "description": "The run's **effective** growth ceilings — the version's, narrowed by the\ntier. One authority: what the run graph enforces is what the run row\npersists and what this reports.",
@@ -1584,6 +1607,13 @@
               "$ref": "#/schemas/event/$defs/WorkflowRunStatus"
             },
             "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "team_name": {
+              "description": "The team the lead created, `session-` plus the first eight characters\nof its session id. The key both `~/.claude/tasks/<team>/` and\n`~/.claude/teams/<team>/` are addressed by.",
               "type": [
                 "string",
                 "null"
@@ -5334,6 +5364,38 @@
           ],
           "type": "object"
         },
+        "WorkflowRunFinishParams": {
+          "description": "The team lead's own end-of-run report (`09-agent-teams-rework.md` §3.3).\n\nAuthorised by possession of the run id: karvex puts `KARVEX_WORKFLOW_RUN_ID`\nin the lead's pane, so `kvx workflow run finish` needs no argument and\nnothing that has not been handed the run can close it.",
+          "properties": {
+            "outcome": {
+              "description": "A one-word verdict for the run. Defaults to `succeeded`; a lead that\nconcluded the run could not finish says so here and still calls finish.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "summary": {
+              "description": "The summary text itself. Exactly one of this and `summary_file` is\nrequired; the file form exists because a lead writes markdown to disk\nand should not have to inline it through argv.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "summary_file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        },
         "WorkflowRunListParams": {
           "properties": {
             "limit": {
@@ -7350,6 +7412,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorkflowRunTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.run.finish",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunFinishParams"
             }
           },
           "required": [
@@ -12009,6 +12087,27 @@
               "type": "object"
             },
             {
+              "description": "The team lead's own end-of-run report was accepted\n(`09-agent-teams-rework.md` §3.3). Carries the closed run and the\nsummary as stored, so the caller sees exactly what was recorded.",
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
+                },
+                "summary": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunSummaryInfo"
+                },
+                "type": {
+                  "const": "workflow_run_finished",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run",
+                "summary"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "node": {
                   "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
@@ -12774,6 +12873,13 @@
               },
               "type": "array"
             },
+            "members": {
+              "description": "The run's team, newest observation first seen order. Empty for a run\nthat predates the agent-teams rework.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkflowRunMemberInfo"
+              },
+              "type": "array"
+            },
             "nodes": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
@@ -12822,6 +12928,29 @@
                 }
               ],
               "description": "The run's most recent growth limit, if any."
+            },
+            "lead_pane_id": {
+              "description": "The lead's own pane, which is where a user steers the whole run.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "lead_prompt_version": {
+              "description": "Which version of karvex's rendered lead prompt started this run, so a\nstored run says what contract produced it.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "lead_session_id": {
+              "description": "The Claude Code session id of the run's team lead\n(`09-agent-teams-rework.md` §3.1). Absent for a run that predates the\nagent-teams rework, and until karvex has recognised the lead's team.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "max_depth": {
               "default": 0,
@@ -12879,6 +13008,13 @@
                 "null"
               ]
             },
+            "team_name": {
+              "description": "The team the lead created, `session-` plus the first eight characters\nof its session id. The key both `~/.claude/tasks/<team>/` and\n`~/.claude/teams/<team>/` are addressed by.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "tier": {
               "$ref": "#/schemas/success_response/$defs/WorkflowTier"
             },
@@ -12919,6 +13055,59 @@
             "tier",
             "status",
             "started_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunMemberInfo": {
+          "description": "One member of the run's Claude Code team, as karvex last observed it\n(`09-agent-teams-rework.md` §3.4).\n\nSnapshotted rather than read live: Claude Code deletes the team config when\nthe lead session ends, so this is the durable record of who worked on the\nrun and in which pane.",
+          "properties": {
+            "agent_type": {
+              "default": "",
+              "type": "string"
+            },
+            "backend_type": {
+              "default": "",
+              "type": "string"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "first_seen_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "is_active": {
+              "default": false,
+              "type": "boolean"
+            },
+            "last_seen_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "model": {
+              "default": "",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "pane_id": {
+              "description": "The member's karvex pane, for a split-pane teammate. Absent for the\nin-process lead, which is a session rather than a pane.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "first_seen_at_unix_ms",
+            "last_seen_at_unix_ms"
           ],
           "type": "object"
         },

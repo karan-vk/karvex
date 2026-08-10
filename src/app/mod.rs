@@ -27,8 +27,8 @@ mod terminal_titles;
 mod theme_sync;
 pub(crate) mod workflow;
 mod workflow_history;
-#[cfg(feature = "workflow")]
 pub(crate) mod workflow_lead;
+#[cfg(feature = "workflow")]
 pub(crate) mod workflow_store;
 mod worktrees;
 

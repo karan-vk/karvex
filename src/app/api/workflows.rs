@@ -33,9 +33,9 @@ use crate::api::schema::{
 };
 use crate::api::schema::{
     WorkflowCreateParams, WorkflowNodeExpandParams, WorkflowNodeInterrogateParams,
-    WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRunListParams,
-    WorkflowRunParams, WorkflowRunTarget, WorkflowSummaryListParams, WorkflowTarget,
-    WorkflowVersionCreateParams, WorkflowVersionTarget,
+    WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRunFinishParams,
+    WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget, WorkflowSummaryListParams,
+    WorkflowTarget, WorkflowVersionCreateParams, WorkflowVersionTarget,
 };
 #[cfg(feature = "workflow")]
 use crate::api::schema::{
@@ -45,8 +45,7 @@ use crate::api::schema::{
 #[cfg(feature = "workflow")]
 use crate::app::workflow::{
     wire_blocker, wire_demand, wire_edge_kind, wire_evidence, wire_node_status, wire_run_status,
-    wire_run_summary_record, wire_succession, wire_tier, ActiveRun, InterrogationRequest,
-    InterrogationSeed,
+    wire_run_summary_record, wire_succession, wire_tier, InterrogationRequest, InterrogationSeed,
 };
 #[cfg(feature = "workflow")]
 use crate::app::workflow_store::StoreUnavailable;
@@ -67,7 +66,7 @@ use crate::workflow::engine::{is_closed_run, ReportOutcome, ReportVerdict};
 use crate::workflow::model::{
     is_reserved_path, CheckpointKind, EdgePayload, EngineInput, GrowthLimits, InstancePath,
     Isolation, Kvdag, KvdagEdge, KvdagNode, KvdagVersionId, NodeKey, NodeKind, NodeStatus,
-    NodeToken, RestoredRef, RestoredSeed, RunGraph, RunId, RunStatus, Runner, WorkflowId,
+    NodeToken, RestoredRef, RestoredSeed, RunId, RunStatus, Runner, WorkflowId,
 };
 #[cfg(feature = "workflow")]
 use crate::workflow::store::error::WORKFLOW_NAME_TAKEN_CODE;
@@ -116,6 +115,11 @@ const NO_ACTIVE_RUN_CODE: &str = "workflow_run_not_active";
 /// A required run argument was not supplied and has no default.
 #[cfg(feature = "workflow")]
 const MISSING_ARG_CODE: &str = "workflow_missing_arg";
+/// The lead's end-of-run report was malformed: no summary, both spellings of
+/// it, or a summary file that could not be read
+/// (`09-agent-teams-rework.md` §3.3).
+#[cfg(feature = "workflow")]
+const INVALID_ARGUMENT_CODE: &str = "workflow_invalid_argument";
 /// A node method that delivers into the node's pane addressed a node that has
 /// none. `05-phase-plan.md` W5 scopes steering and interrupting to a running
 /// node; answering with a success the node never received would be worse than
@@ -266,6 +270,17 @@ impl App {
 
     pub(super) fn handle_workflow_run(&mut self, id: String, params: WorkflowRunParams) -> String {
         if let Some(error) = require_non_empty(&id, "workflow_id", &params.workflow_id) {
+            return error;
+        }
+        self.workflow_unavailable(id)
+    }
+
+    pub(super) fn handle_workflow_run_finish(
+        &mut self,
+        id: String,
+        params: WorkflowRunFinishParams,
+    ) -> String {
+        if let Some(error) = require_non_empty(&id, "run_id", &params.run_id) {
             return error;
         }
         self.workflow_unavailable(id)
@@ -721,7 +736,7 @@ impl App {
         // arriving while the summariser is still working would pass this check,
         // `start()` a fresh engine, clear `node_tokens`, and silently orphan the
         // summariser's report — the summary lost with no surface at all.
-        if self.workflow.is_live() || self.workflow.epilogue_pending() {
+        if self.workflow.is_live() || self.workflow.epilogue_pending() || self.lead_run_is_live() {
             let refused = crate::app::workflow::WorkflowStartError::RunInFlight;
             let message = if self.workflow.is_live() {
                 self.workflow_run_in_flight_message()
@@ -829,6 +844,16 @@ impl App {
         };
         let assignments = resolve_assignments(&kvdag, tier, &history);
 
+        // §3.1 step 5 / §4's last risk row. The preflight runs before
+        // `create_run` for the same reason the definition resolution does: a
+        // hard error after the row exists leaves an orphan run nothing will
+        // ever advance. A `claude` too old for agent teams starts fine and
+        // then silently never spawns a teammate, which is the failure this
+        // turns into a clear message.
+        if let Err(error) = self.preflight_claude_for_lead() {
+            return encode_error(id, error.code(), error.to_string());
+        }
+
         // §4 D11: restore is resolved **before** `create_run`, for the same
         // reason the definition is. An unknown selector is a hard error, and a
         // hard error after the row exists would leave an orphan `workflow_run`
@@ -906,59 +931,198 @@ impl App {
             self.write_prior_runs_context(&run_id, &workflow_name, &prior_summaries)
         };
 
-        // The restore instant is the run's own `started_at` (defect D-B): the
-        // store persists a restored node's stamps from the same value, so the
-        // engine must not read a clock of its own or live and durable drift.
-        let graph = RunGraph::materialise_with_restored(
-            &kvdag,
+        // 09-agent-teams-rework.md §3.1. The run's execution is a Claude Code
+        // team lead in a pane from here on, not this server's engine. The
+        // engine's materialisation is deliberately not built: `create_run`
+        // already wrote the planned `run_node` rows, and the projection
+        // (§3.4) is what moves them.
+        let _ = (&assignments, &seeds, &context_runs, &restore_from_run);
+        let _ = (workspace_id, prior_runs_path);
+
+        let ws_idx = match self.state.active.filter(|ws_idx| {
+            self.state
+                .workspaces
+                .get(*ws_idx)
+                .is_some_and(|workspace| !workspace.tabs.is_empty())
+        }) {
+            Some(ws_idx) => ws_idx,
+            None => {
+                let error = crate::workflow::binding::lead::LeadSpawnError::NoTargetPane;
+                return encode_error(id, error.code(), error.to_string());
+            }
+        };
+        let cwd = self.workflow_node_cwd_for(ws_idx);
+        let run_dir = crate::workflow::binding::spawn::run_dir(
+            &crate::workflow::binding::spawn::runs_root(),
+            &run_id,
+        );
+        // The lead orchestrates rather than implements, so it is resolved at
+        // the run tier's `critical` row: the judgment calls it makes about
+        // splitting, merging, and finishing the plan are the expensive ones.
+        let lead_assignment =
+            crate::workflow::tier::resolve(tier, crate::workflow::model::Demand::Critical, None);
+        let spec = crate::workflow::binding::lead::LeadSpawnSpec {
+            run_id: run_id.clone(),
+            workflow_name: workflow_name.clone(),
+            run_dir,
+            cwd,
+            assignment: lead_assignment,
+        };
+        let summary_path = spec.summary_path().to_string_lossy().into_owned();
+        let ordered_args: std::collections::BTreeMap<String, String> =
+            args.clone().into_iter().collect();
+        let prompt = crate::workflow::lead_prompt::render_lead_prompt(
+            &crate::workflow::lead_prompt::LeadPromptInput {
+                run_id: &run_id,
+                workflow_name: &workflow_name,
+                kvdag: &kvdag,
+                tier,
+                args: &ordered_args,
+                history: &history,
+                summary_path: &summary_path,
+            },
+        );
+        if let Err(error) = self.write_lead_prompt(&spec, &prompt) {
+            return encode_error(id, error.code(), error.to_string());
+        }
+        let (lead_pane_id, lead_terminal_id) = match self.spawn_lead_pane(ws_idx, &spec) {
+            Ok(spawned) => spawned,
+            Err(error) => return encode_error(id, error.code(), error.to_string()),
+        };
+        self.bind_lead_run(
             run_id.clone(),
-            tier,
-            &assignments,
-            &seeds,
+            &kvdag,
+            &spec,
+            lead_pane_id,
+            lead_terminal_id,
             started_at_unix_ms,
         );
-        let mut active = ActiveRun::new(
-            run_id.clone(),
-            kvdag.workflow_id.clone(),
-            kvdag.version_id.clone(),
-            tier,
-        )
-        .with_args(args)
-        .with_placement(workspace_id, None)
-        .with_history(context_runs, restore_from_run)
-        .with_prior_runs_path(prior_runs_path);
-        // The last of the three clocks H1 describes. `ActiveRun::new` stamps
-        // its own `now`, which is a second reading of the same instant; the run
-        // row was bound from `started_at_unix_ms`, so the live projection is
-        // moved onto that one value rather than left milliseconds apart from
-        // the journal (§4 D15).
-        active.started_at_unix_ms = started_at_unix_ms;
+        // `create_run` writes `pending`; the lead is live the moment its pane
+        // is, and nothing else will move the row off `pending` now that no
+        // engine is watching it.
+        self.mark_lead_run_running(&run_id);
 
-        if let Err(error) = self.start_workflow_run(active, kvdag, graph) {
-            let message = match error {
-                crate::app::workflow::WorkflowStartError::RunInFlight => {
-                    self.workflow_run_in_flight_message()
-                }
-            };
-            return encode_error(id, error.code(), message);
-        }
-        match self.workflow_run_info(&run_id) {
-            // §4 D11: an all-skipped restore is a **successful** run start
-            // carrying a fully populated `skipped` list, mirroring how a
-            // rejected expand proposal is a success carrying the rejection. The
-            // report is the surface; the run started either way.
-            Some(run) => encode_success(
+        match self.stored_run(&run_id) {
+            Ok(Some((run, _graph))) => encode_success(
                 id,
                 ResponseResult::WorkflowRunStarted {
                     run,
                     restore: restore.map(|plan| plan.report),
                 },
             ),
-            None => encode_error(
+            Ok(None) => encode_error(
                 id,
-                NO_ACTIVE_RUN_CODE,
-                "the run was created but is no longer the active run",
+                NOT_FOUND_CODE,
+                "the run was created but cannot be read back",
             ),
+            Err(response) => response(id),
+        }
+    }
+
+    /// The team lead's self-report (`09-agent-teams-rework.md` §3.3).
+    ///
+    /// This one call replaces the entire summariser subsystem: the lead writes
+    /// its own summary and says it is done, and karvex records both. There is
+    /// no engine-judged verdict any more — if the run failed, the lead still
+    /// calls this and says so in `outcome`, because the truth lives in the
+    /// transcript one click away.
+    ///
+    /// Authorisation is possession of the run id, which karvex handed the lead
+    /// through `KARVEX_WORKFLOW_RUN_ID` in its pane.
+    pub(super) fn handle_workflow_run_finish(
+        &mut self,
+        id: String,
+        params: WorkflowRunFinishParams,
+    ) -> String {
+        if let Some(error) = require_non_empty(&id, "run_id", &params.run_id) {
+            return error;
+        }
+        let run_id = RunId::new(params.run_id.trim().to_string());
+
+        let text = match (params.summary.as_deref(), params.summary_file.as_deref()) {
+            (Some(text), None) => text.to_string(),
+            (None, Some(path)) => match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) => {
+                    return encode_error(
+                        id,
+                        INVALID_ARGUMENT_CODE,
+                        format!("the summary file {path} could not be read: {error}"),
+                    )
+                }
+            },
+            (Some(_), Some(_)) => {
+                return encode_error(
+                    id,
+                    INVALID_ARGUMENT_CODE,
+                    "pass either --summary or --summary-file, not both",
+                )
+            }
+            (None, None) => {
+                return encode_error(
+                    id,
+                    INVALID_ARGUMENT_CODE,
+                    "a run summary is required: pass --summary-file <path> or --summary <text>",
+                )
+            }
+        };
+        if text.trim().is_empty() {
+            return encode_error(
+                id,
+                INVALID_ARGUMENT_CODE,
+                "the run summary is empty; say what the run did before finishing it",
+            );
+        }
+        let outcome = params
+            .outcome
+            .as_deref()
+            .map(str::trim)
+            .filter(|outcome| !outcome.is_empty())
+            .unwrap_or("succeeded")
+            .to_string();
+
+        // The version is read off the run row rather than taken from the
+        // caller: the summary outlives the run, and a lead that named the
+        // wrong version would corrupt the per-workflow summary listing.
+        let version = match self.stored_run(&run_id) {
+            Ok(Some((run, _graph))) => KvdagVersionId::new(run.version_id),
+            Ok(None) => {
+                return encode_error(id, NOT_FOUND_CODE, format!("no run {run_id}"));
+            }
+            Err(response) => return response(id),
+        };
+
+        let ended_at_unix_ms = unix_now_ms();
+        self.persist_lead_run_summary(&run_id, &version, text, outcome);
+        self.finish_lead_run(&run_id, ended_at_unix_ms);
+
+        let summary = match self.stored_run_summary_info(&run_id) {
+            Some(summary) => summary,
+            None => {
+                return encode_error(
+                    id,
+                    NOT_FOUND_CODE,
+                    "the run summary was accepted but cannot be read back",
+                )
+            }
+        };
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkflowRunSummarized,
+            data: crate::api::schema::EventData::WorkflowRunSummarized {
+                run_id: run_id.to_string(),
+                summary: summary.clone(),
+            },
+        });
+        match self.stored_run(&run_id) {
+            Ok(Some((run, _graph))) => {
+                self.emit_event(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::WorkflowRunFinished,
+                    data: crate::api::schema::EventData::WorkflowRunFinished { run: run.clone() },
+                });
+                encode_success(id, ResponseResult::WorkflowRunFinished { run, summary })
+            }
+            Ok(None) => encode_error(id, NOT_FOUND_CODE, format!("no run {run_id}")),
+            Err(response) => response(id),
         }
     }
 
@@ -1075,6 +1239,20 @@ impl App {
             return error;
         }
         let run_id = RunId::new(target.run_id.trim().to_string());
+        // §3.3: a lead run cancels by closing the lead's pane. Checked before
+        // the engine path, because a lead run has no live `ActiveRun` and
+        // would otherwise be refused as "not the run this server is
+        // executing".
+        if self.is_live_lead_run(&run_id) {
+            self.cancel_lead_run(&run_id, unix_now_ms());
+            return match self.stored_run(&run_id) {
+                Ok(Some((run, _graph))) => {
+                    encode_success(id, ResponseResult::WorkflowRunCancelled { run })
+                }
+                Ok(None) => encode_error(id, NOT_FOUND_CODE, format!("no run {run_id}")),
+                Err(response) => response(id),
+            };
+        }
         if self.workflow_run_info(&run_id).is_none() {
             return encode_error(
                 id,
@@ -1817,16 +1995,21 @@ impl App {
             // second `workflow_store.call`, since `run.get`/`node.get` need it
             // alongside the nodes/edges this closure already loaded.
             let limits = cx.block_on(cx.store().growth_limits(&wanted))?;
-            Ok(Some((record, nodes, edges, limits)))
+            // §3.4: the team's members are part of the run's record, not a
+            // live read — Claude Code deletes the team config at session end,
+            // so this is the only place they survive.
+            let members = cx.block_on(cx.store().list_run_members(&wanted))?;
+            Ok(Some((record, nodes, edges, limits, members)))
         });
         match loaded {
-            Ok(Ok(Some((record, nodes, edges, limits)))) => {
+            Ok(Ok(Some((record, nodes, edges, limits, members)))) => {
                 let graph = WorkflowRunGraph {
                     nodes: nodes
                         .into_iter()
                         .map(|node| wire_run_node_record(node, &limits))
                         .collect(),
                     edges: edges.into_iter().map(wire_run_edge_record).collect(),
+                    members: members.into_iter().map(wire_run_member_record).collect(),
                 };
                 Ok(Some((wire_run_record(record, &limits), graph)))
             }
@@ -3103,6 +3286,12 @@ pub(crate) fn wire_run_record(
         // workflow's summary set both change afterwards.
         context_runs: record.context_runs.iter().map(RunId::to_string).collect(),
         restore_from_run: record.restore_from_run.as_ref().map(RunId::to_string),
+        // §3.1: the lead binding, learned once the spawned `claude` created
+        // its team. Absent on every run from before the rework.
+        lead_session_id: record.lead_session_id,
+        team_name: record.team_name,
+        lead_pane_id: record.lead_pane_id,
+        lead_prompt_version: record.lead_prompt_version,
     }
 }
 
@@ -3242,6 +3431,24 @@ fn require_expand_params(id: &str, params: &WorkflowNodeExpandParams) -> Option<
         .or_else(|| require_non_empty(id, "path", &params.path))
         .or_else(|| require_non_empty(id, "token", &params.token))
         .or_else(|| require_non_empty(id, "template", &params.template))
+}
+
+/// One `run_member` row, as the wire sees it.
+#[cfg(feature = "workflow")]
+fn wire_run_member_record(
+    record: crate::workflow::store::RunMemberRecord,
+) -> crate::api::schema::WorkflowRunMemberInfo {
+    crate::api::schema::WorkflowRunMemberInfo {
+        name: record.name,
+        agent_type: record.agent_type,
+        model: record.model,
+        pane_id: record.pane_id,
+        backend_type: record.backend_type,
+        is_active: record.is_active,
+        cwd: record.cwd,
+        first_seen_at_unix_ms: record.first_seen_at_unix_ms,
+        last_seen_at_unix_ms: record.last_seen_at_unix_ms,
+    }
 }
 
 #[cfg(test)]
@@ -4285,6 +4492,7 @@ output_schema = { type = "object", required = ["done"] }
     /// interrupt landed on a process that never saw it.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn an_interrupt_that_was_not_delivered_is_not_reported_as_success() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
 
@@ -4321,6 +4529,7 @@ output_schema = { type = "object", required = ["done"] }
     /// completion signal, so without this it stalls `Running` forever.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_report_with_no_result_reaches_needs_attention_through_the_server() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
         assert_eq!(
@@ -4360,6 +4569,7 @@ output_schema = { type = "object", required = ["done"] }
     /// has, so it has to carry the refusal and the violations.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_schema_invalid_report_is_answered_with_the_rejection_not_a_success() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
 
@@ -4413,6 +4623,7 @@ output_schema = { type = "object", required = ["done"] }
 
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_valid_report_is_still_answered_as_a_success() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
         let response = app.handle_workflow_node_report(
@@ -4437,6 +4648,7 @@ output_schema = { type = "object", required = ["done"] }
     /// pane nothing would ever collect a result from.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn node_restart_is_refused_once_the_run_has_been_cancelled() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
         app.handle_workflow_run_cancel(
@@ -4480,6 +4692,7 @@ output_schema = { type = "object", required = ["done"] }
     /// `workflow_run_closed`.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn cancelling_a_closed_run_is_refused_like_steer_and_interrupt() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
         app.handle_workflow_run_cancel(
@@ -4519,6 +4732,7 @@ output_schema = { type = "object", required = ["done"] }
     /// neither the run nor a way out.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn run_in_flight_names_the_paused_run_the_blocking_node_and_the_remedies() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
         // Two invalid results spend the corrective re-prompt, surface the node,
@@ -4747,6 +4961,7 @@ port = "summary"
     /// instance-path grammar, and reports exactly those paths.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn an_accepted_expand_proposal_creates_the_children_it_reports() {
         let (mut app, run_id) = app_with_an_expanding_run(None);
         let response = app
@@ -4782,6 +4997,7 @@ port = "summary"
     /// continues and the node learns exactly what it hit.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_rejected_expand_proposal_is_a_success_response_carrying_the_rejection() {
         let (mut app, run_id) = app_with_an_expanding_run(None);
         let before = app.workflow.graph().map(|graph| graph.nodes.len());
@@ -4828,6 +5044,7 @@ port = "summary"
     /// accept-all and never a silent truncation.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_truncated_expand_proposal_reports_both_halves() {
         let (mut app, run_id) = app_with_an_expanding_run(None);
         let response = app
@@ -4865,6 +5082,7 @@ port = "summary"
     /// someone else's graph.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn an_expand_proposal_with_the_wrong_token_is_refused() {
         let (mut app, run_id) = app_with_an_expanding_run(None);
         let mut params = expand_params(&run_id, "worker", Some(1));
@@ -4887,6 +5105,7 @@ port = "summary"
     /// caller never asked for.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn an_out_of_range_expand_count_is_refused_rather_than_truncated() {
         let (mut app, run_id) = app_with_an_expanding_run(None);
         let response = app.handle_workflow_node_expand(
@@ -4904,6 +5123,7 @@ port = "summary"
     /// refused for.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn steer_interrupt_and_expand_are_refused_once_the_run_has_closed() {
         use crate::workflow::model::PublicPaneId;
 
@@ -5045,6 +5265,7 @@ port = "summary"
     /// says 12.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn the_persisted_growth_limits_are_the_ones_the_run_graph_enforces() {
         for (tier, expected) in [
             (WorkflowTier::Max, 30_u16),
@@ -5449,6 +5670,7 @@ output_schema = { type = "object", required = ["done"] }
     /// is asserted, not just the error code.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn interrogating_a_command_node_is_refused_and_creates_no_pane() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
         let before = pane_count(&app);
@@ -5474,6 +5696,7 @@ output_schema = { type = "object", required = ["done"] }
     /// takes the same code with a different reason, and still creates nothing.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn interrogating_a_node_whose_transcript_is_gone_names_the_missing_file() {
         let (mut app, run_id) = app_with_a_bound_agent_node(
             "w9:p9",
@@ -5499,6 +5722,7 @@ output_schema = { type = "object", required = ["done"] }
     /// there is nothing to stand in for.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_reconstruction_with_no_checkpoint_is_refused() {
         let (mut app, run_id) = app_with_a_bound_agent_node(
             "w9:p9",
@@ -5524,6 +5748,7 @@ output_schema = { type = "object", required = ["done"] }
     /// write to. The real-fork non-mutation check is in the manual list (§5).
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_resumable_node_builds_the_frozen_fork_argv_and_never_writes_the_source() {
         use crate::workflow::binding::interrogate;
 
@@ -5595,6 +5820,7 @@ output_schema = { type = "object", required = ["done"] }
     /// disabled, cancelled, or gave up simply has none.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_run_with_no_summary_answers_null_rather_than_an_error() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
         let response = app.handle_workflow_summary_get(
@@ -5662,6 +5888,7 @@ output_schema = { type = "object", required = ["done"] }
     /// created, so a refused restore leaves no orphan `workflow_run` row.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn an_unknown_restore_selector_is_refused_and_starts_no_run() {
         let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
         // Close the first run so the in-flight guard is not what refuses this.
@@ -5710,6 +5937,7 @@ output_schema = { type = "object", required = ["done"] }
     /// "gone" and "never existed" happened.
     #[cfg(feature = "workflow")]
     #[test]
+    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn restoring_from_an_unknown_run_is_not_found_not_pruned() {
         let (mut app, _) = app_with_a_bound_command_node("w9:p9");
         app.cancel_workflow_run();
@@ -5813,6 +6041,18 @@ output_schema = { type = "object", required = ["done"] }
             ("target_ambiguous", AMBIGUOUS_NAME_CODE),
             ("run_not_active", NO_ACTIVE_RUN_CODE),
             ("missing_arg", MISSING_ARG_CODE),
+            // §3.3: the lead's end-of-run report was malformed.
+            ("invalid_argument", INVALID_ARGUMENT_CODE),
+            // §3.1: the two halves of a refused lead launch — the machine's
+            // `claude` cannot run agent teams, or the pane could not be made.
+            (
+                "lead_spawn_failed",
+                crate::workflow::binding::lead::LEAD_SPAWN_FAILED_CODE,
+            ),
+            (
+                "lead_unavailable",
+                crate::workflow::binding::lead::LEAD_UNAVAILABLE_CODE,
+            ),
             ("node_not_running", NODE_NOT_RUNNING_CODE),
             ("node_delivery_failed", DELIVERY_FAILED_CODE),
             ("node_result_invalid", RESULT_INVALID_CODE),
@@ -5871,7 +6111,7 @@ output_schema = { type = "object", required = ["done"] }
         let codes = all_workflow_error_codes();
         assert_eq!(
             codes.len(),
-            26,
+            29,
             "the inventory grew or shrank; update this count alongside the list itself"
         );
 

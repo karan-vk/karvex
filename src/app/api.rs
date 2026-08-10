@@ -1214,6 +1214,9 @@ impl App {
             Method::WorkflowRunCancel(target) => {
                 return self.handle_workflow_run_cancel(request.id, target);
             }
+            Method::WorkflowRunFinish(params) => {
+                return self.handle_workflow_run_finish(request.id, params);
+            }
             Method::WorkflowNodeGet(target) => {
                 return self.handle_workflow_node_get(request.id, target);
             }

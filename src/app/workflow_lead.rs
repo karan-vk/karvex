@@ -26,7 +26,6 @@ use crate::workflow::model::{Kvdag, NodeKey, NodeStatus, RunId, RunStatus, Store
 use crate::workflow::projection::{
     self, ObservedTask, ObservedTeam, ProjectionSnapshot, TaskStatus,
 };
-use crate::workflow::tier::Tier;
 
 /// How often the run projection re-reads Claude Code's task and team files.
 ///
@@ -46,18 +45,14 @@ const MAX_TASK_FILES: usize = 512;
 /// this run's team. `~/.claude/teams/` is global and accumulates.
 const MAX_TEAM_CONFIGS: usize = 256;
 
-/// The reserved namespace an emergent task's `run_node` row lives under. Must
-/// agree with `workflow::projection`, which mints the paths.
-const EMERGENT_PATH_PREFIX: &str = ".task/";
-
 /// The live lead-run: what karvex launched, and what it has recognised so far.
 ///
 /// Deliberately small. Everything durable is in the store; this is only what
 /// the poller needs between ticks.
+#[cfg_attr(not(feature = "workflow"), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct LiveLeadRun {
     pub(crate) run_id: RunId,
-    pub(crate) tier: Tier,
     /// The lead's own pane, as a public id.
     pub(crate) lead_pane_id: String,
     pub(crate) lead_terminal_id: crate::terminal::TerminalId,
@@ -76,7 +71,6 @@ pub(crate) struct LiveLeadRun {
     pub(crate) snapshot: ProjectionSnapshot,
     /// The definition's node keys, for subject→node matching.
     pub(crate) node_keys: Vec<NodeKey>,
-    pub(crate) summary_path: PathBuf,
     /// Set once `workflow.run.finish` or lead-exit has closed the run, so a
     /// late poll cannot reopen it.
     pub(crate) closed: bool,
@@ -100,6 +94,13 @@ impl LiveLeadRun {
     }
 }
 
+// Every method below is reachable only through the `workflow.*` API surface,
+// which is stubbed out when the `workflow` feature is off (the MSVC cross-lint
+// and slim source builds). The code still *compiles* without the feature — the
+// store calls inside it are individually gated — so gating the module too would
+// cost more `cfg` noise at the loop's deadline and scheduled-task sites than it
+// saves.
+#[cfg_attr(not(feature = "workflow"), allow(dead_code))]
 impl crate::app::App {
     /// The deadline arm for the run projection. Folded into the loop's
     /// min-of-all-deadlines the same way every other periodic task is.
@@ -113,13 +114,6 @@ impl crate::app::App {
     /// way it uses the engine's `is_live()`.
     pub(crate) fn lead_run_is_live(&self) -> bool {
         self.workflow_lead.as_ref().is_some_and(|run| !run.closed)
-    }
-
-    pub(crate) fn live_lead_run_id(&self) -> Option<RunId> {
-        self.workflow_lead
-            .as_ref()
-            .filter(|run| !run.closed)
-            .map(|run| run.run_id.clone())
     }
 
     // ── launch ─────────────────────────────────────────────────────────────
@@ -234,7 +228,6 @@ impl crate::app::App {
     pub(crate) fn bind_lead_run(
         &mut self,
         run_id: RunId,
-        tier: Tier,
         kvdag: &Kvdag,
         spec: &LeadSpawnSpec,
         lead_pane_id: String,
@@ -243,7 +236,6 @@ impl crate::app::App {
     ) {
         self.workflow_lead = Some(LiveLeadRun {
             run_id,
-            tier,
             lead_pane_id,
             lead_terminal_id,
             lead_cwd: spec.cwd.clone(),
@@ -252,9 +244,18 @@ impl crate::app::App {
             split_pane_confirmed: false,
             snapshot: ProjectionSnapshot::default(),
             node_keys: kvdag.nodes.iter().map(|node| node.key.clone()).collect(),
-            summary_path: spec.summary_path(),
             closed: false,
             next_poll_at: None,
+        });
+    }
+
+    /// Moves the run row off the `pending` `create_run` writes. The lead is
+    /// live the moment its pane is, and no engine will move it now.
+    pub(crate) fn mark_lead_run_running(&mut self, run_id: &RunId) {
+        self.persist_workflow_write(StoreWrite::RunStatus {
+            run: run_id.clone(),
+            status: RunStatus::Running,
+            ended_at_unix_ms: None,
         });
     }
 
@@ -271,6 +272,14 @@ impl crate::app::App {
         }
         if let Some(run) = self.workflow_lead.as_mut() {
             run.rearm(now);
+        }
+
+        // §3.3's lead-exit case. Checked here rather than off a pane-exit
+        // event so every way a lead can vanish — closed pane, crash, server
+        // shutdown reconciliation — lands on the same path, at most one poll
+        // interval late.
+        if self.lead_terminal_is_gone() {
+            return self.lead_run_ended_without_finishing(crate::app::workflow::current_unix_ms());
         }
 
         let Ok(claude_dir) = crate::integration::claude_dir() else {
@@ -477,6 +486,68 @@ impl crate::app::App {
         }
     }
 
+    /// Stores the lead's summary through the same `run_summary` path the
+    /// retired summariser used, so a finished lead run reads back exactly like
+    /// a finished engine run did.
+    pub(crate) fn persist_lead_run_summary(
+        &mut self,
+        run_id: &RunId,
+        version: &crate::workflow::model::KvdagVersionId,
+        text: String,
+        outcome: String,
+    ) {
+        let token_estimate = u32::try_from(text.len() / 4).unwrap_or(u32::MAX);
+        self.persist_workflow_write(StoreWrite::RunSummary {
+            run: run_id.clone(),
+            kvdag_version: version.clone(),
+            text,
+            outcome,
+            // The lead writes prose, not a structured report. Highlights, gaps,
+            // and per-node lines were the old summariser's schema; leaving them
+            // empty is honest, and the prose carries what they carried.
+            highlights: Vec::new(),
+            open_gaps: Vec::new(),
+            per_node: Vec::new(),
+            token_estimate,
+            generated_by_path: None,
+        });
+    }
+
+    /// Reads the stored summary back as its wire shape.
+    #[cfg(feature = "workflow")]
+    pub(crate) fn stored_run_summary_info(
+        &mut self,
+        run_id: &RunId,
+    ) -> Option<crate::api::schema::WorkflowRunSummaryInfo> {
+        let wanted = run_id.clone();
+        match self
+            .workflow_store
+            .call(move |cx| cx.block_on(cx.store().get_run_summary(&wanted)))
+        {
+            Ok(Ok(Some(record))) => Some(crate::app::workflow::wire_run_summary_record(record)),
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => {
+                warn!(%error, "the run summary could not be read back");
+                None
+            }
+            Err(unavailable) => {
+                warn!(
+                    ?unavailable,
+                    "the workflow store is unavailable; no run summary"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "workflow"))]
+    pub(crate) fn stored_run_summary_info(
+        &mut self,
+        _run_id: &RunId,
+    ) -> Option<crate::api::schema::WorkflowRunSummaryInfo> {
+        None
+    }
+
     /// The lead's pane went away without a `finish` (§3.3). The run closes with
     /// whatever the projection last recorded — the task and member snapshots
     /// are already durable, which is what makes it resumable later (§3.7).
@@ -607,11 +678,43 @@ impl crate::app::App {
         ids
     }
 
-    /// Whether a pane that just exited was the run's lead.
-    pub(crate) fn pane_is_run_lead(&self, pane_id: &str) -> bool {
+    /// Whether the lead's terminal has left the layout.
+    fn lead_terminal_is_gone(&self) -> bool {
+        self.workflow_lead.as_ref().is_some_and(|run| {
+            !run.closed && !self.state.terminals.contains_key(&run.lead_terminal_id)
+        })
+    }
+
+    /// `workflow.run.cancel` for a lead run (§3.3).
+    ///
+    /// No task-level kill choreography: teammates belong to the lead, so
+    /// closing the lead's pane is the whole cancellation. The run's snapshot
+    /// stays exactly as the last poll left it.
+    pub(crate) fn cancel_lead_run(&mut self, run_id: &RunId, ended_at_unix_ms: u64) -> bool {
+        let Some(run) = self.workflow_lead.as_ref() else {
+            return false;
+        };
+        if run.closed || &run.run_id != run_id {
+            return false;
+        }
+        let lead_pane_id = run.lead_pane_id.clone();
+        self.persist_workflow_write(StoreWrite::RunStatus {
+            run: run_id.clone(),
+            status: RunStatus::Cancelled,
+            ended_at_unix_ms: Some(ended_at_unix_ms),
+        });
+        if let Some(run) = self.workflow_lead.as_mut() {
+            run.closed = true;
+        }
+        let _ = self.runtime_pane_close("workflow.lead.close", lead_pane_id);
+        true
+    }
+
+    /// Whether this run is the live lead run.
+    pub(crate) fn is_live_lead_run(&self, run_id: &RunId) -> bool {
         self.workflow_lead
             .as_ref()
-            .is_some_and(|run| !run.closed && run.lead_pane_id == pane_id)
+            .is_some_and(|run| !run.closed && &run.run_id == run_id)
     }
 }
 
@@ -679,12 +782,6 @@ fn read_team_configs(dir: &Path) -> Vec<(String, ObservedTeam)> {
     teams
 }
 
-/// The instance path an emergent task is recorded under, for callers outside
-/// the projection that need to recognise one.
-pub(crate) fn is_emergent_path(path: &str) -> bool {
-    path.starts_with(EMERGENT_PATH_PREFIX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,13 +805,6 @@ mod tests {
             node_status_for(&TaskStatus::Unknown("triaged".to_string())),
             NodeStatus::Pending
         );
-    }
-
-    #[test]
-    fn emergent_paths_are_recognisable_and_planned_ones_are_not() {
-        assert!(is_emergent_path(".task/7"));
-        assert!(!is_emergent_path("research"));
-        assert!(!is_emergent_path("task/7"));
     }
 
     #[test]

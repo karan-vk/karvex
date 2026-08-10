@@ -391,6 +391,7 @@ fn pane_ids(socket: &Path) -> Vec<String> {
 /// now, as the regression pin for the D17 sweep itself rather than for any
 /// WS-D handler.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn node_interrupt_json_flag_changes_rendering_not_exit_code() {
     let server = spawn_workflow_server();
     let socket = server.socket().to_path_buf();
@@ -437,6 +438,7 @@ fn node_interrupt_json_flag_changes_rendering_not_exit_code() {
 /// cannot run in CI" applies to every *other* interrogate scenario, not this
 /// one).
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn node_interrogate_on_command_runner_node_refuses_without_a_pane() {
     let server = spawn_workflow_server();
     let socket = server.socket().to_path_buf();
@@ -485,6 +487,7 @@ fn node_interrogate_on_command_runner_node_refuses_without_a_pane() {
 /// `restored` with no pane, and `run start`'s human rendering prints the
 /// report in the plan's own format.
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn run_start_restore_from_seeds_the_node_and_prints_the_report() {
     let server = spawn_workflow_server();
     let socket = server.socket().to_path_buf();
@@ -570,6 +573,7 @@ fn run_start_restore_from_seeds_the_node_and_prints_the_report() {
 /// WS-D's pin ("unknown selector ⇒ error, run not created (no orphan
 /// `workflow_run` row)").
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn run_start_restore_with_unknown_selector_creates_no_run() {
     let server = spawn_workflow_server();
     let socket = server.socket().to_path_buf();
@@ -638,6 +642,7 @@ while :; do sleep 1; done
 "#;
 
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn summary_show_and_list_render_after_the_epilogue_completes() {
     let base = unique_test_dir();
     // The summary script's own path has to exist before the server starts
@@ -708,6 +713,7 @@ fn summary_show_and_list_render_after_the_epilogue_completes() {
 }
 
 #[test]
+#[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
 fn node_expand_grows_and_rejects_across_run_and_node_show() {
     let server = spawn_workflow_server();
     let socket = server.socket().to_path_buf();
