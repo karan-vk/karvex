@@ -351,7 +351,23 @@ impl App {
 
         self.start_git_status_refresh_if_due(now);
         self.start_agent_session_name_refresh_if_due(now);
-        self.poll_run_projection(now);
+        // The DAG overlay's historical snapshot is load-once, which is right
+        // for a closed run and wrong for a live lead run whose tasks, owners,
+        // and members move underneath it. The run id is read *before* the poll
+        // so the tick that closes a run still refreshes the graph one last
+        // time, and only while the overlay is the surface on screen.
+        let open_lead_run = (self.state.mode == crate::app::Mode::WorkflowDag)
+            .then(|| self.live_lead_run_id())
+            .flatten();
+        // The projection is the only thing that moves a lead run's rows, so a
+        // tick that reported no change cannot have staled the overlay — which
+        // is what makes this an edge trigger rather than a poll, and what stops
+        // a reload from re-arming itself.
+        if self.poll_run_projection(now) {
+            if let Some(run_id) = open_lead_run {
+                changed |= self.reload_open_lead_run(&run_id);
+            }
+        }
 
         if self
             .next_auto_update_check

@@ -70,9 +70,32 @@ fn format_failure(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+/// One team member, as the run browser's detail strip names them:
+/// `name · model · pane`, and the member's **backend** where it has no pane —
+/// which is how the in-process lead reads, since it is a session rather than a
+/// pane (`09-agent-teams-rework.md` §3.4). Empty fields drop out rather than
+/// leaving `· ·` behind.
+fn member_label(member: &crate::api::schema::WorkflowRunMemberInfo) -> String {
+    let where_it_runs = member
+        .pane_id
+        .clone()
+        .unwrap_or_else(|| member.backend_type.clone());
+    [
+        member.name.as_str(),
+        member.model.as_str(),
+        where_it_runs.as_str(),
+    ]
+    .into_iter()
+    .map(str::trim)
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
 fn run_entry(
     run: WorkflowRunInfo,
     summary: Option<WorkflowRunSummaryInfo>,
+    members: Vec<String>,
 ) -> WorkflowRunsRunEntry {
     let mut args: Vec<(String, String)> = run.args.into_iter().collect();
     args.sort_by(|a, b| a.0.cmp(&b.0));
@@ -100,6 +123,8 @@ fn run_entry(
             .or_else(|| run.growth_limited.map(|limit| limit.message)),
         summary_outcome: summary.as_ref().map(|summary| summary.outcome.clone()),
         summary_first_highlight: summary.and_then(|summary| summary.highlights.into_iter().next()),
+        team_name: run.team_name,
+        members,
     }
 }
 
@@ -121,6 +146,7 @@ fn pruned_entry(summary: WorkflowRunSummaryInfo) -> WorkflowRunsPrunedEntry {
 fn build_entries(
     runs: Vec<WorkflowRunInfo>,
     summaries: Vec<WorkflowRunSummaryInfo>,
+    members_by_run: &HashMap<String, Vec<String>>,
 ) -> Vec<WorkflowRunsEntry> {
     let mut by_run: HashMap<String, WorkflowRunSummaryInfo> = HashMap::new();
     let mut pruned: Vec<(u64, WorkflowRunsEntry)> = Vec::new();
@@ -138,7 +164,8 @@ fn build_entries(
         .map(|run| {
             let at = run.started_at_unix_ms;
             let summary = by_run.remove(&run.run_id);
-            (at, WorkflowRunsEntry::Run(run_entry(run, summary)))
+            let members = members_by_run.get(&run.run_id).cloned().unwrap_or_default();
+            (at, WorkflowRunsEntry::Run(run_entry(run, summary, members)))
         })
         .collect();
     rows.extend(pruned);
@@ -192,6 +219,40 @@ impl App {
     /// dead end — the overlay says so instead of refusing to appear. Only a
     /// structural failure (no store, wrong build) refuses, so the caller can
     /// tell the user why nothing came up.
+    /// The formatted member list for each lead run in `runs`.
+    ///
+    /// Engine-era runs are skipped outright: they have no team, so a
+    /// `workflow.run.get` for them would be a round trip that could only ever
+    /// answer "no members". A run whose graph will not load is simply absent
+    /// from the map and renders without a member line — the browser degrades
+    /// the way it already does for a missing summary rather than refusing to
+    /// open.
+    fn lead_run_members(&mut self, runs: &[WorkflowRunInfo]) -> HashMap<String, Vec<String>> {
+        let lead_runs: Vec<String> = runs
+            .iter()
+            .filter(|run| run.team_name.is_some())
+            .map(|run| run.run_id.clone())
+            .collect();
+        let mut members_by_run = HashMap::new();
+        for run_id in lead_runs {
+            let response = self.dispatch_api_request(
+                "tui.workflow.run.get",
+                Method::WorkflowRunGet(crate::api::schema::WorkflowRunTarget {
+                    run_id: run_id.clone(),
+                }),
+            );
+            let Some(ResponseResult::WorkflowRunGet { graph, .. }) = success_result(&response)
+            else {
+                continue;
+            };
+            members_by_run.insert(
+                run_id,
+                graph.members.iter().map(member_label).collect::<Vec<_>>(),
+            );
+        }
+        members_by_run
+    }
+
     pub(crate) fn open_workflow_runs(&mut self) -> bool {
         let response = self.dispatch_api_request(
             "tui.workflow.run.list",
@@ -222,8 +283,15 @@ impl App {
             _ => Vec::new(),
         };
 
+        // Members are on the run *graph*, not on `workflow.run.list`'s row, so
+        // they cost one `workflow.run.get` each — and only for the runs that
+        // could possibly have any. `team_name` is the exact predicate for that
+        // (§3.1), which bounds the extra calls by the number of lead runs in a
+        // page the server already caps.
+        let members_by_run = self.lead_run_members(&runs);
+
         self.state.view.workflow_runs = WorkflowRunsState {
-            entries: build_entries(runs, summaries),
+            entries: build_entries(runs, summaries, &members_by_run),
             ..WorkflowRunsState::default()
         };
         self.state.mode = Mode::WorkflowRuns;
@@ -551,6 +619,7 @@ mod tests {
         let entries = build_entries(
             vec![wire_run("run:1", WorkflowRunStatus::Succeeded, 1_000)],
             vec![wire_summary("run:1", false, 1_500)],
+            &HashMap::new(),
         );
         assert_eq!(entries.len(), 1);
         let WorkflowRunsEntry::Run(run) = &entries[0] else {
@@ -563,9 +632,69 @@ mod tests {
         );
     }
 
+    /// §3.4: the browser labels a lead run with its team and its members.
+    /// Members come from the run *graph*, so the list loader fetches them per
+    /// lead run and hands them in here — this asserts the mapping, and that an
+    /// engine-era row is left exactly as it was.
+    #[test]
+    fn a_lead_runs_row_carries_its_team_and_formatted_members() {
+        let mut run = wire_run("run:lead", WorkflowRunStatus::Running, 1_000);
+        run.team_name = Some("session-213aa9bf".to_string());
+        let members = HashMap::from([(
+            "run:lead".to_string(),
+            vec!["research · sonnet · w1:p3".to_string()],
+        )]);
+
+        let entries = build_entries(vec![run], Vec::new(), &members);
+        let WorkflowRunsEntry::Run(row) = &entries[0] else {
+            panic!("expected a run row");
+        };
+        assert_eq!(row.team_name.as_deref(), Some("session-213aa9bf"));
+        assert_eq!(row.members, vec!["research · sonnet · w1:p3"]);
+
+        let engine = build_entries(
+            vec![wire_run("run:1", WorkflowRunStatus::Succeeded, 1_000)],
+            Vec::new(),
+            &members,
+        );
+        let WorkflowRunsEntry::Run(row) = &engine[0] else {
+            panic!("expected a run row");
+        };
+        assert_eq!(row.team_name, None);
+        assert!(row.members.is_empty());
+    }
+
+    /// A member with no pane is a session rather than a pane — the in-process
+    /// lead — so it names its backend instead of leaving the slot blank.
+    #[test]
+    fn a_member_with_no_pane_names_its_backend_instead() {
+        let mut member = crate::api::schema::WorkflowRunMemberInfo {
+            name: "research".to_string(),
+            agent_type: "Explore".to_string(),
+            model: "sonnet".to_string(),
+            pane_id: Some("w1:p3".to_string()),
+            backend_type: "tmux".to_string(),
+            is_active: true,
+            cwd: None,
+            first_seen_at_unix_ms: 1,
+            last_seen_at_unix_ms: 2,
+        };
+        assert_eq!(member_label(&member), "research · sonnet · w1:p3");
+
+        member.name = "team-lead".to_string();
+        member.pane_id = None;
+        member.backend_type = "in-process".to_string();
+        member.model = String::new();
+        assert_eq!(member_label(&member), "team-lead · in-process");
+    }
+
     #[test]
     fn a_pruned_summary_becomes_its_own_dimmed_row() {
-        let entries = build_entries(Vec::new(), vec![wire_summary("run:gone", true, 1_000)]);
+        let entries = build_entries(
+            Vec::new(),
+            vec![wire_summary("run:gone", true, 1_000)],
+            &HashMap::new(),
+        );
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0], WorkflowRunsEntry::PrunedSummary(_)));
     }
@@ -578,6 +707,7 @@ mod tests {
                 wire_run("run:3", WorkflowRunStatus::Succeeded, 3_000),
             ],
             vec![wire_summary("run:gone", true, 2_000)],
+            &HashMap::new(),
         );
         let ids: Vec<&str> = entries.iter().map(entry_run_id).collect();
         assert_eq!(ids, vec!["run:3", "run:gone", "run:1"]);
@@ -589,7 +719,7 @@ mod tests {
         run.args
             .insert("scope".to_string(), "everything".to_string());
         run.args.insert("goal".to_string(), "ship it".to_string());
-        let entry = run_entry(run, None);
+        let entry = run_entry(run, None, Vec::new());
         assert_eq!(entry.args, vec!["goal=ship it", "scope=everything"]);
     }
 
@@ -597,7 +727,7 @@ mod tests {
     fn a_failure_reason_becomes_the_blocker_line() {
         let mut run = wire_run("run:1", WorkflowRunStatus::Failed, 1_000);
         run.failure = Some(serde_json::json!({"reason": "node plan failed"}));
-        let entry = run_entry(run, None);
+        let entry = run_entry(run, None, Vec::new());
         assert_eq!(entry.blocker.as_deref(), Some("node plan failed"));
     }
 
@@ -628,6 +758,8 @@ mod tests {
             blocker: None,
             summary_outcome: None,
             summary_first_highlight: None,
+            team_name: None,
+            members: Vec::new(),
         })
     }
 

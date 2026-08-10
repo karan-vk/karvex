@@ -360,6 +360,9 @@ impl App {
         if self.state.view.dag.run_id.is_empty() {
             return;
         }
+        if self.refuse_engine_verb_on_a_lead_run("steer") {
+            return;
+        }
         // A past run is not the active run, so the server would answer the
         // not-the-active-run guard (`workflow_run_not_active`) — *not*
         // `workflow_run_closed`, which covers only the just-finished run that
@@ -448,6 +451,16 @@ impl App {
             interrogate_intent, interrogate_outcome, InterrogateIntent, InterrogateOutcome,
         };
 
+        // Both `i` and `Shift+I` are engine inputs: they fork or reconstruct a
+        // session karvex's own engine owned. A lead run has neither, so the
+        // refusal comes before the intent is even computed.
+        let verb = match mode {
+            WorkflowInterrogationMode::Resumed => "interrogate",
+            WorkflowInterrogationMode::Reconstructed => "reconstruct",
+        };
+        if self.refuse_engine_verb_on_a_lead_run(verb) {
+            return;
+        }
         let intent = interrogate_intent(&self.state.view.dag, mode);
         let InterrogateIntent::Send { run_id, path, mode } = intent else {
             return;
@@ -505,31 +518,85 @@ impl App {
         self.leave_workflow_dag();
     }
 
-    /// Opens the selected node's teammate. The overlay is full-bleed, so
-    /// focusing a pane means leaving the overlay behind it.
-    pub(super) fn focus_workflow_dag_node(&mut self) {
-        let Some(pane) = self
+    /// Refuses one of the engine's verbs on a run a Claude Code team lead
+    /// executed, and says what to do instead (§3.5). Returns whether the key
+    /// was refused, so each caller can return early.
+    ///
+    /// These are not merely unavailable, they are meaningless: `steer`
+    /// delivers to a node the engine bound, and `interrogate`/`reconstruct`
+    /// fork a session or rebuild one from a checkpoint the engine wrote. A
+    /// lead run has no such bindings and no such checkpoints, so the honest
+    /// answer names the affordance that replaced all three — the node's pane,
+    /// where the teammate is already listening.
+    fn refuse_engine_verb_on_a_lead_run(&mut self, verb: &str) -> bool {
+        if !self.state.view.dag.lead_run {
+            return false;
+        }
+        let path = self
             .state
             .view
             .dag
             .selected_node()
-            .and_then(|node| node.pane_id.clone())
-        else {
+            .map(|node| crate::workflow::model::InstancePath::new(node.path.clone()));
+        self.show_workflow_notice(crate::workflow::model::UserNotice {
+            level: crate::workflow::model::NoticeLevel::Warning,
+            run: None,
+            path,
+            message: format!(
+                "{verb} does not apply to a team run — press enter to focus the node's pane and type there"
+            ),
+        });
+        true
+    }
+
+    /// The pane `Enter` should open for the selected node.
+    ///
+    /// For a lead run that is the **owner's** pane: the work happens in the
+    /// teammate's session, and the node's own binding is only ever set by
+    /// karvex's engine, which did not run this. The binding stays as the
+    /// fallback so an engine-era run — and a lead run whose node somehow
+    /// carries one — resolves exactly as it always did.
+    pub(super) fn workflow_dag_focus_target(&self) -> Option<String> {
+        let node = self.state.view.dag.selected_node()?;
+        if self.state.view.dag.lead_run {
+            return node.owner_pane_id.clone().or_else(|| node.pane_id.clone());
+        }
+        node.pane_id.clone()
+    }
+
+    /// Opens the selected node's teammate. The overlay is full-bleed, so
+    /// focusing a pane means leaving the overlay behind it.
+    pub(super) fn focus_workflow_dag_node(&mut self) {
+        let Some(pane) = self.workflow_dag_focus_target() else {
             // A past run's panes are gone, so this is the common case there
             // rather than a glitch — and a key that does nothing at all is the
             // one thing a read-only view must not do. The footer already drops
             // the `focus` hint for a historical run; this covers the press that
             // happens anyway.
+            let path = self
+                .state
+                .view
+                .dag
+                .selected_node()
+                .map(|node| crate::workflow::model::InstancePath::new(node.path.clone()));
+            // A lead run gets its own wording: `i` is refused there, so
+            // pointing at it would be advice that cannot be followed. An
+            // unclaimed task simply has no pane yet, which is a stage of the
+            // run rather than a fault.
+            if self.state.view.dag.lead_run {
+                self.show_workflow_notice(crate::workflow::model::UserNotice {
+                    level: crate::workflow::model::NoticeLevel::Info,
+                    run: None,
+                    path,
+                    message: "this node has no pane yet — no teammate has claimed it".to_string(),
+                });
+                return;
+            }
             if self.state.view.dag.historical {
                 self.show_workflow_notice(crate::workflow::model::UserNotice {
                     level: crate::workflow::model::NoticeLevel::Info,
                     run: None,
-                    path: self
-                        .state
-                        .view
-                        .dag
-                        .selected_node()
-                        .map(|node| crate::workflow::model::InstancePath::new(node.path.clone())),
+                    path,
                     message: "this node's pane is gone — press i to interrogate it instead"
                         .to_string(),
                 });
@@ -1448,6 +1515,11 @@ mod tests {
             // A `Running` node has a pane by construction; the steer affordance
             // reads exactly this field to know there is something to steer.
             pane_id: Some(format!("w1:p{idx}")),
+            owner: String::new(),
+            subject: String::new(),
+            emergent: false,
+            owner_pane_id: None,
+            agent_state: None,
             successors,
             predecessors,
         }
@@ -1490,10 +1562,20 @@ mod tests {
 
     /// A `DagViewState` projecting a past run, plus the snapshot behind it.
     fn historical_app() -> App {
+        historical_app_with(None)
+    }
+
+    /// The same, for a run executed by a Claude Code team lead when `team` is
+    /// `Some` (`09-agent-teams-rework.md` §3.1). The team lives on the
+    /// snapshot and the flag on the view, exactly as the compute pass derives
+    /// it, so the input path is exercised through the same state the renderer
+    /// sees.
+    fn historical_app_with(team: Option<&str>) -> App {
         let mut app = test_app();
         app.state.mode = Mode::WorkflowDag;
         app.state.view.dag = crate::app::state::DagViewState {
             historical: true,
+            lead_run: team.is_some(),
             ..dag_view()
         };
         app.state
@@ -1512,8 +1594,113 @@ mod tests {
                 }),
                 workflow_name: "past".to_string(),
                 interrogations: Vec::new(),
+                team_name: team.map(str::to_string),
+                lead_pane_id: None,
+                projected: std::collections::BTreeMap::new(),
+                members: Vec::new(),
             }));
         app
+    }
+
+    /// A lead run whose nodes are owned by a teammate holding a pane, and
+    /// whose own bindings are cleared — the engine binds nodes, and it did not
+    /// run this — so nothing masks the owner resolution under test.
+    fn lead_run_app() -> App {
+        let mut app = historical_app_with(Some("session-213aa9bf"));
+        // Notices reach `state.toast` only under karvex's own delivery; the
+        // other deliveries fire an OS notification instead, which a unit test
+        // cannot observe.
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Karvex;
+        for node in &mut app.state.view.dag.nodes {
+            node.pane_id = None;
+            node.owner = "verify".to_string();
+            node.owner_pane_id = Some("w1:p9".to_string());
+        }
+        app
+    }
+
+    /// §3.5: the engine's verbs are refused on a lead run rather than
+    /// half-working. `s` must not open a line that could only be swallowed,
+    /// and `i`/`I` must not dispatch an interrogation against a run whose
+    /// sessions karvex never owned.
+    #[test]
+    fn the_engine_verbs_are_refused_on_a_lead_run() {
+        for key in ['s', 'i', 'I'] {
+            let mut app = lead_run_app();
+            app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+
+            assert_eq!(
+                app.state.view.dag.steer, None,
+                "`{key}` must not open a steer line on a lead run"
+            );
+            assert_eq!(
+                app.state.mode,
+                Mode::WorkflowDag,
+                "`{key}` must not close the overlay"
+            );
+            let toast = app
+                .state
+                .toast
+                .as_ref()
+                .unwrap_or_else(|| panic!("`{key}` must say why it did nothing"));
+            assert!(
+                toast.context.contains("focus the node's pane"),
+                "`{key}` must name the affordance that replaced it: {}",
+                toast.context
+            );
+        }
+    }
+
+    /// The same three keys on an engine-era run behave exactly as they did:
+    /// this is the other half of the refusal, and the reason the refusal is
+    /// gated on the run's execution model rather than on the overlay.
+    #[test]
+    fn the_engine_verbs_still_work_on_an_engine_era_run() {
+        let mut live = test_app();
+        live.state.mode = Mode::WorkflowDag;
+        live.state.view.dag = dag_view();
+        live.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(live.state.view.dag.steer.as_deref(), Some(""));
+    }
+
+    /// §3.5: `Enter` on a lead run opens the pane of the teammate that owns the
+    /// node — the primary steer affordance now — and falls back to the node's
+    /// own binding only when there is no owner pane to prefer.
+    #[test]
+    fn enter_on_a_lead_run_resolves_the_owners_pane() {
+        let app = lead_run_app();
+        assert_eq!(app.workflow_dag_focus_target().as_deref(), Some("w1:p9"));
+
+        let mut fallback = lead_run_app();
+        for node in &mut fallback.state.view.dag.nodes {
+            node.owner_pane_id = None;
+            node.pane_id = Some("w1:p3".to_string());
+        }
+        assert_eq!(
+            fallback.workflow_dag_focus_target().as_deref(),
+            Some("w1:p3")
+        );
+
+        let mut unclaimed = lead_run_app();
+        for node in &mut unclaimed.state.view.dag.nodes {
+            node.owner_pane_id = None;
+        }
+        assert_eq!(unclaimed.workflow_dag_focus_target(), None);
+        unclaimed.handle_workflow_dag_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let toast = unclaimed
+            .state
+            .toast
+            .as_ref()
+            .expect("a node with no pane says so");
+        assert!(toast.context.contains("no pane yet"), "{}", toast.context);
+
+        // An engine-era run ignores the owner entirely and reads its binding.
+        let mut engine = historical_app();
+        for node in &mut engine.state.view.dag.nodes {
+            node.owner_pane_id = Some("w1:p9".to_string());
+            node.pane_id = Some("w1:p3".to_string());
+        }
+        assert_eq!(engine.workflow_dag_focus_target().as_deref(), Some("w1:p3"));
     }
 
     /// m7: a past run is not the active run, so a steer would answer the

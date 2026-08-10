@@ -29,13 +29,14 @@ use super::text::{display_width, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::state::{
     AppState, DagInterrogationView, DagNodeView, DagRunCounts, DagViewState,
-    HistoricalInterrogation, Mode, Palette, WorkflowRunPresentation,
+    HistoricalInterrogation, Mode, Palette, ProjectedNodeFacts, WorkflowRunPresentation,
 };
 use crate::workflow::layout::{
     detached_lane, detached_lane_height, layout, DagLayout, EdgeBits, LayoutRect,
 };
 use crate::workflow::model::{
     EpiloguePhase, NodeStatus, RestoredRef, RunGraph, RunNode, RunNodeIdx, RunStatus, Succession,
+    RESERVED_PATH_PREFIX,
 };
 
 const HEADER_HEIGHT: u16 = 1;
@@ -97,6 +98,11 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
         footer_rect,
         banner,
         historical: historical.is_some(),
+        // A Claude Code team lead executed this run rather than karvex's own
+        // engine (§3.1). Read off the snapshot rather than guessed from the
+        // graph: the graph looks the same either way, and which verbs the
+        // overlay may offer depends entirely on which engine ran it.
+        lead_run: historical.is_some_and(|snapshot| snapshot.is_lead_run()),
         ..DagViewState::default()
     };
 
@@ -158,6 +164,15 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
         .filter(|node| view.layout.rect_of(node.idx).is_some())
         .map(|node| project_node(graph, node, presentation, now_unix_ms))
         .collect();
+    // Only a lead run has a projection to merge, and skipping the walk for an
+    // engine-era run is not just an optimisation: it is what guarantees a run
+    // karvex's own engine executed keeps rendering exactly as it did before the
+    // rework, down to the fields the merge would otherwise fill in.
+    if view.lead_run {
+        if let Some(snapshot) = historical {
+            merge_projection(app, &mut view.nodes, &snapshot.projected, &snapshot.members);
+        }
+    }
     view.selected = carried_selection(previous, &view);
     // The steer line only survives while it still has a node to steer.
     view.steer = if view.selected.is_some() {
@@ -421,9 +436,83 @@ fn project_node(
             .binding
             .as_ref()
             .map(|binding| binding.pane_id.as_str().to_string()),
+        // The observed half is deliberately empty here. `project_node` reads a
+        // `RunNode`, which is the engine's model of a node and carries none of
+        // what a Claude Code team recorded; [`merge_projection`] fills these in
+        // afterwards, and only for a lead run (§3.4).
+        owner: String::new(),
+        subject: String::new(),
+        emergent: false,
+        owner_pane_id: None,
+        agent_state: None,
         successors,
         predecessors,
     }
+}
+
+/// Merges the run projection's observations onto the projected nodes (§3.4).
+///
+/// Two layers land here, from two different authorities on purpose: the task
+/// facts are what the *team* recorded, and `agent_state` is what karvex's own
+/// per-pane detector sees in that pane right now. A node whose task still says
+/// `in_progress` while its pane says it is waiting on input is exactly the case
+/// a single status would hide.
+fn merge_projection(
+    app: &AppState,
+    nodes: &mut [DagNodeView],
+    projected: &std::collections::BTreeMap<String, ProjectedNodeFacts>,
+    members: &[crate::api::schema::WorkflowRunMemberInfo],
+) {
+    for node in nodes {
+        if let Some(facts) = projected.get(&node.path) {
+            node.subject = facts.subject.clone();
+            node.owner = facts.owner.clone();
+            node.emergent = facts.emergent;
+        }
+        // An unclaimed task has an empty owner, which matches no member — so
+        // the lookup answers `None` rather than picking an arbitrary teammate,
+        // which is the honest answer for "nobody has taken this yet".
+        node.owner_pane_id = members
+            .iter()
+            .find(|member| member.name == node.owner && !node.owner.is_empty())
+            .and_then(|member| member.pane_id.clone());
+        // The owner's pane leads and the node's own binding is the fallback:
+        // for a lead run the work happens in the teammate's pane, and the
+        // binding is only ever set for a run the engine bound itself.
+        node.agent_state = node
+            .owner_pane_id
+            .as_ref()
+            .or(node.pane_id.as_ref())
+            .and_then(|pane| pane_agent_state(app, pane));
+    }
+}
+
+/// What karvex's own per-pane detection says `pane` is doing.
+///
+/// Resolves a **public** pane id — the id Claude Code's team config hands back
+/// through `tmuxPaneId` — against the same public numbering
+/// `public_pane_id_for_number` mints, then reads the state off the pane's
+/// attached terminal, which is where every other surface (the sidebar, the
+/// navigator, the agent panel) reads it. No workflow-specific detection is
+/// involved and none should be: §3.4 says this layer is per-pane and needs no
+/// workflow code. `None` means no pane of this server answers to that id,
+/// which is the normal answer for a run whose panes are gone.
+fn pane_agent_state(app: &AppState, pane: &str) -> Option<crate::detect::AgentState> {
+    app.workspaces.iter().find_map(|workspace| {
+        workspace
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .find(|(pane_id, _)| {
+                workspace
+                    .public_pane_number(**pane_id)
+                    .is_some_and(|number| {
+                        crate::workspace::public_pane_id_for_number(&workspace.id, number) == pane
+                    })
+            })
+            .and_then(|(_, state)| app.terminals.get(&state.attached_terminal_id))
+            .map(|terminal| terminal.state)
+    })
 }
 
 /// How long the node has been at work, as the detail strip should show it.
@@ -977,11 +1066,25 @@ fn render_nodes(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
             Style::default().fg(p.text)
         };
         let label_width = rect.width.saturating_sub(4) as usize;
+        // A node the team created without the definition planning it wears the
+        // reserved-namespace prefix, because that is already this graph's word
+        // for "karvex/team-owned, not authored": the `.summary` epilogue is
+        // `.summary`, and an emergent task's instance path is `.task/7`
+        // (`workflow/model.rs`). The box would otherwise hide that marker — it
+        // titles itself with the observed subject, not with the path — so an
+        // off-plan box reads `.add a regression test` beside a planned
+        // `verify` (§3.4). An engine-era node is never emergent, so its title
+        // is byte-identical to what it always was.
+        let title = if node.emergent {
+            format!("{RESERVED_PATH_PREFIX}{}", node.label)
+        } else {
+            node.label.clone()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
             .title(Span::styled(
-                format!(" {} ", truncate_end(&node.label, label_width)),
+                format!(" {} ", truncate_end(&title, label_width)),
                 title_style,
             ))
             .style(Style::default().bg(p.panel_bg));
@@ -1171,44 +1274,108 @@ fn render_detail(dag: &DagViewState, extras: &DagExtras, p: &Palette, frame: &mu
         path_status.push(Span::styled("  ", dim));
         path_status.push(Span::styled(source.clone(), Style::default().fg(p.teal)));
     }
+    // The path already carries the reserved `.` the box title borrows, but the
+    // prefix is a marker and this is the strip that explains markers — and it
+    // is the one place the word "emergent" can be spelled out without costing
+    // a row. Never reached by an engine-era run: its nodes are never emergent.
+    if dag.lead_run && node.emergent {
+        path_status.push(Span::styled("  ", dim));
+        path_status.push(Span::styled("emergent", Style::default().fg(p.teal)));
+    }
     lines.push(Line::from(truncate_spans(path_status, width)));
-    lines.push(Line::from(truncate_spans(
-        vec![
-            Span::styled(" ", dim),
-            Span::styled(
-                format!("{} · {}", node.model, node.effort),
-                Style::default().fg(p.mauve),
+    let mut assignment = vec![
+        Span::styled(" ", dim),
+        Span::styled(
+            format!("{} · {}", node.model, node.effort),
+            Style::default().fg(p.mauve),
+        ),
+        Span::styled(
+            format!(
+                "  {} tokens · {} tools · {}s",
+                node.usage.total_tokens,
+                node.usage.tool_uses,
+                node.duration_ms / 1000
             ),
-            Span::styled(
-                format!(
-                    "  {} tokens · {} tools · {}s",
-                    node.usage.total_tokens,
-                    node.usage.tool_uses,
-                    node.duration_ms / 1000
-                ),
+            dim,
+        ),
+        Span::styled(
+            node.pane_id
+                .as_ref()
+                .map(|pane| format!("  pane {pane}"))
+                .unwrap_or_default(),
+            dim,
+        ),
+    ];
+    // Who holds this node and what their pane is doing right now — §3.4's two
+    // layers, side by side, on the row that already answers "where is this
+    // running". It shares that row rather than claiming a new one because
+    // `DETAIL_HEIGHT` is a constant and no per-node fact may change how much of
+    // the overlay's fixed budget the strip needs.
+    if dag.lead_run {
+        assignment.push(Span::styled(
+            format!("  owner {}", owner_label(node)),
+            Style::default().fg(p.teal),
+        ));
+        if let Some(state) = node.agent_state {
+            assignment.push(Span::styled(
+                format!(" · {}", agent_state_label(state)),
                 dim,
-            ),
-            Span::styled(
-                node.pane_id
-                    .as_ref()
-                    .map(|pane| format!("  pane {pane}"))
-                    .unwrap_or_default(),
-                dim,
-            ),
-        ],
-        width,
-    )));
-    lines.push(match &node.summary {
-        Some(summary) => Line::from(Span::styled(
+            ));
+        }
+    }
+    lines.push(Line::from(truncate_spans(assignment, width)));
+    // §3.4's loose contract made visible: the lead may reword, split, or merge
+    // a task, so what the team called the work can differ from what the
+    // definition called the node. Only the difference is worth a row — a
+    // subject that merely repeats the label says nothing — and it takes the
+    // summary's row because a lead run has no checkpoints to summarise.
+    let observed_subject = dag
+        .lead_run
+        .then(|| node.subject.trim())
+        .filter(|subject| !subject.is_empty() && *subject != node.label.trim());
+    lines.push(match (observed_subject, &node.summary) {
+        (Some(subject), _) => Line::from(Span::styled(
+            format!(" task: {}", truncate_end(subject, width.saturating_sub(7))),
+            Style::default().fg(p.subtext0),
+        )),
+        (None, Some(summary)) => Line::from(Span::styled(
             format!(" {}", truncate_end(summary, width.saturating_sub(1))),
             Style::default().fg(p.subtext0),
         )),
-        None => Line::from(Span::styled(" no checkpoint yet", dim)),
+        (None, None) => Line::from(Span::styled(" no checkpoint yet", dim)),
     });
     frame.render_widget(Paragraph::new(lines), dag.detail_rect);
 }
 
-/// Every hint the overlay offers, in display order.
+/// Who holds this node, as the detail strip names them.
+///
+/// `unclaimed` is a real state in the source data rather than a missing value:
+/// Claude Code omits `owner` until a teammate claims the task, so leaving the
+/// slot blank would read as a rendering gap instead of as "nobody yet".
+fn owner_label(node: &DagNodeView) -> &str {
+    let owner = node.owner.trim();
+    if owner.is_empty() {
+        "unclaimed"
+    } else {
+        owner
+    }
+}
+
+/// karvex's per-pane detection states, in the overlay's vocabulary.
+///
+/// `Blocked` is spelled "needs input" here rather than "blocked": the DAG
+/// already uses `blocked` for a node whose *succession* is gated, and the two
+/// mean opposite things — one is waiting on the user, the other on the graph.
+fn agent_state_label(state: crate::detect::AgentState) -> &'static str {
+    match state {
+        crate::detect::AgentState::Working => "working",
+        crate::detect::AgentState::Idle => "idle",
+        crate::detect::AgentState::Blocked => "needs input",
+        crate::detect::AgentState::Unknown => "unknown",
+    }
+}
+
+/// Every hint an **engine-era** run's overlay offers, in display order.
 const FOOTER_HINTS: [(&str, &str); 6] = [
     ("enter", " focus"),
     ("hjkl/↑↓←→", " move"),
@@ -1226,6 +1393,22 @@ const FOCUS_HINT: usize = 0;
 /// Index of the `s steer` hint in [`FOOTER_HINTS`].
 const STEER_HINT: usize = 2;
 
+/// What a **lead run** offers instead (§3.5).
+///
+/// The engine verbs collapse because the operations behind them are gone: no
+/// node is steered through karvex, no teammate session karvex forked can be
+/// resumed by it, and there is no checkpoint to reconstruct from because the
+/// engine never wrote one. Steering a lead run is opening the pane that owns
+/// the node and typing in it, which is what `enter` now does.
+const LEAD_FOOTER_HINTS: [(&str, &str); 3] = [
+    ("enter", " focus pane"),
+    ("hjkl/↑↓←→", " move"),
+    ("esc", " close"),
+];
+
+/// Index of the `enter focus pane` hint in [`LEAD_FOOTER_HINTS`].
+const LEAD_FOCUS_HINT: usize = 0;
+
 /// Which hints fit in `width`, in display order.
 ///
 /// A hint that does not fit is dropped whole rather than sliced mid-word, and
@@ -1239,9 +1422,21 @@ const STEER_HINT: usize = 2;
 /// has nothing to focus (`07-phase3-plan.md` §1 WS-H).
 fn footer_hints(
     width: usize,
+    lead_run: bool,
     steerable: bool,
     focusable: bool,
 ) -> Vec<(&'static str, &'static str)> {
+    if lead_run {
+        /// Indices into [`LEAD_FOOTER_HINTS`], least useful first. `esc close`
+        /// is last for the same reason it is last in the engine-era order: it
+        /// is the only way out of a full-bleed overlay.
+        const DROP_ORDER: [usize; 3] = [1, 0, 2];
+
+        let mut keep = [true; LEAD_FOOTER_HINTS.len()];
+        keep[LEAD_FOCUS_HINT] = focusable;
+        return fit_hints(&LEAD_FOOTER_HINTS, &DROP_ORDER, &mut keep, width);
+    }
+
     /// Indices into [`FOOTER_HINTS`], least useful first. `reconstruct` is the
     /// rarest action — it is only reachable after `interrogate` has already
     /// refused — so it is the first hint a narrow terminal loses.
@@ -1250,29 +1445,45 @@ fn footer_hints(
     let mut keep = [true; FOOTER_HINTS.len()];
     keep[STEER_HINT] = steerable;
     keep[FOCUS_HINT] = focusable;
-    for index in DROP_ORDER {
-        if footer_hints_width(&keep) <= width {
+    fit_hints(&FOOTER_HINTS, &DROP_ORDER, &mut keep, width)
+}
+
+/// Drops hints in `drop_order` until what is left fits `width`.
+///
+/// Shared by both hint sets rather than duplicated per set: which verbs a run
+/// offers depends on how it was executed, but "a hint that does not fit is
+/// dropped whole, never sliced mid-word" is a property of the footer band.
+fn fit_hints(
+    hints: &'static [(&'static str, &'static str)],
+    drop_order: &[usize],
+    keep: &mut [bool],
+    width: usize,
+) -> Vec<(&'static str, &'static str)> {
+    for index in drop_order {
+        if hints_width(hints, keep) <= width {
             break;
         }
-        keep[index] = false;
+        if let Some(kept) = keep.get_mut(*index) {
+            *kept = false;
+        }
     }
     // Even the last hint can be wider than the band; a partial word is worse
     // than nothing, so the row goes empty instead.
-    if footer_hints_width(&keep) > width {
+    if hints_width(hints, keep) > width {
         return Vec::new();
     }
-    FOOTER_HINTS
+    hints
         .iter()
-        .zip(keep)
-        .filter(|(_, kept)| *kept)
+        .zip(keep.iter())
+        .filter(|(_, kept)| **kept)
         .map(|(hint, _)| *hint)
         .collect()
 }
 
-fn footer_hints_width(keep: &[bool; FOOTER_HINTS.len()]) -> usize {
+fn hints_width(hints: &[(&str, &str)], keep: &[bool]) -> usize {
     let mut used = 0usize;
     let mut first = true;
-    for (hint, kept) in FOOTER_HINTS.iter().zip(keep) {
+    for (hint, kept) in hints.iter().zip(keep) {
         if !kept {
             continue;
         }
@@ -1309,12 +1520,21 @@ fn render_footer(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
         // its nodes' panes are gone — except when one somehow outlived the run,
         // which `Enter` still honours and the hint therefore still offers.
         let steerable = !dag.historical;
-        let focusable = !dag.historical
-            || dag
-                .selected_node()
-                .is_some_and(|node| node.pane_id.is_some());
+        let focusable = if dag.lead_run {
+            // A lead run's `enter` opens the pane that *owns* the node, and a
+            // past run's own node binding is never rehydrated — so the member
+            // pane is what makes the hint honest, with the node's binding kept
+            // only as the fallback the key itself also uses.
+            dag.selected_node()
+                .is_some_and(|node| node.owner_pane_id.is_some() || node.pane_id.is_some())
+        } else {
+            !dag.historical
+                || dag
+                    .selected_node()
+                    .is_some_and(|node| node.pane_id.is_some())
+        };
         let mut spans: Vec<Span<'static>> = Vec::new();
-        for (chord, label) in footer_hints(width, steerable, focusable) {
+        for (chord, label) in footer_hints(width, dag.lead_run, steerable, focusable) {
             let chord = if spans.is_empty() {
                 format!(" {chord}")
             } else {
@@ -2292,12 +2512,12 @@ mod tests {
     /// 2.27: the footer drops hints whole, and never the way out.
     #[test]
     fn footer_hints_degrade_without_ever_losing_escape() {
-        let full = footer_hints(200, true, true);
+        let full = footer_hints(200, false, true, true);
         assert_eq!(full.len(), FOOTER_HINTS.len());
 
         let mut previous = full.len();
         for width in (0..=60).rev() {
-            let hints = footer_hints(width, true, true);
+            let hints = footer_hints(width, false, true, true);
             assert!(hints.len() <= previous, "width {width} gained a hint");
             previous = hints.len();
             let rendered: String = hints
@@ -2525,6 +2745,10 @@ mod tests {
             graph: Box::new(graph),
             workflow_name: "ux-dag-probe".to_string(),
             interrogations,
+            team_name: None,
+            lead_pane_id: None,
+            projected: std::collections::BTreeMap::new(),
+            members: Vec::new(),
         }));
         app
     }
@@ -2552,6 +2776,227 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // ── the agent-teams rework (`09-agent-teams-rework.md` §3.4, §3.5) ─────
+
+    /// A lead run's graph: one node the definition planned, one the team added
+    /// on its own. The emergent node lives in the reserved namespace and is
+    /// named after its subject, which is exactly what the store writes for a
+    /// task no definition planned (`workflow/store/mod.rs`).
+    fn lead_graph() -> RunGraph {
+        let mut plan = test_node(0, "plan");
+        plan.label = "plan".to_string();
+        plan.status = NodeStatus::Running;
+        let mut emergent = test_node(1, ".task/7");
+        emergent.label = "retest".to_string();
+        emergent.status = NodeStatus::Running;
+        RunGraph {
+            run_id: RunId::new("workflow_run:lead"),
+            version_id: KvdagVersionId::new("v1"),
+            tier: Tier::Auto,
+            growth: GrowthLimits::default(),
+            assignments: std::collections::BTreeMap::new(),
+            nodes: vec![plan, emergent],
+            edges: vec![test_edge(0, 1)],
+            status: RunStatus::Running,
+            seq: 0,
+            epilogue: None,
+        }
+    }
+
+    fn member(name: &str, pane: Option<&str>) -> crate::api::schema::WorkflowRunMemberInfo {
+        crate::api::schema::WorkflowRunMemberInfo {
+            name: name.to_string(),
+            agent_type: "Explore".to_string(),
+            model: "sonnet".to_string(),
+            pane_id: pane.map(str::to_string),
+            backend_type: "tmux".to_string(),
+            is_active: true,
+            cwd: None,
+            first_seen_at_unix_ms: 1,
+            last_seen_at_unix_ms: 2,
+        }
+    }
+
+    /// A lead run as the overlay holds it: the snapshot above, a team whose
+    /// `verify` member owns the emergent node, and a **real** pane behind that
+    /// member — the live-agent-state layer reads karvex's own per-pane
+    /// detection, so there has to be a pane for it to have read.
+    fn lead_app(agent_state: crate::detect::AgentState) -> AppState {
+        let mut app = AppState::test_new();
+        app.mode = Mode::WorkflowDag;
+        app.workspaces = vec![crate::workspace::Workspace::test_new("teams")];
+        app.ensure_test_terminals();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        if let Some(terminal) = app.terminals.get_mut(&terminal_id) {
+            terminal.state = agent_state;
+        }
+        let number = app.workspaces[0]
+            .public_pane_number(pane)
+            .expect("the test workspace numbers its root pane");
+        let owner_pane = crate::workspace::public_pane_id_for_number(&app.workspaces[0].id, number);
+
+        let projected = [
+            (
+                "plan".to_string(),
+                ProjectedNodeFacts {
+                    task_id: Some("1".to_string()),
+                    subject: "plan".to_string(),
+                    owner: "research".to_string(),
+                    emergent: false,
+                },
+            ),
+            (
+                ".task/7".to_string(),
+                ProjectedNodeFacts {
+                    task_id: Some("7".to_string()),
+                    subject: "retest the parser".to_string(),
+                    owner: "verify".to_string(),
+                    emergent: true,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        app.set_historical_run(Some(crate::app::state::HistoricalRunSnapshot {
+            graph: Box::new(lead_graph()),
+            workflow_name: "ship-it".to_string(),
+            interrogations: Vec::new(),
+            team_name: Some("session-213aa9bf".to_string()),
+            lead_pane_id: Some("w1:p1".to_string()),
+            projected,
+            members: vec![
+                member("research", None),
+                member("verify", Some(&owner_pane)),
+            ],
+        }));
+        app
+    }
+
+    fn selected_path(app: &mut AppState, path: &str) {
+        let idx = app
+            .view
+            .dag
+            .nodes
+            .iter()
+            .find(|node| node.path == path)
+            .map(|node| node.idx)
+            .unwrap_or_else(|| panic!("no node at {path}"));
+        app.view.dag.selected = Some(idx);
+    }
+
+    /// §3.4's two layers, on screen: the emergent box says it is not in the
+    /// plan, and the detail strip answers both "who holds this" and "what is
+    /// their pane doing right now".
+    #[test]
+    fn a_lead_run_marks_emergent_nodes_and_shows_owner_and_agent_state() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut app = lead_app(crate::detect::AgentState::Blocked);
+        app.view.dag = compute_workflow_dag_view(&app, area);
+        assert!(app.view.dag.lead_run, "the snapshot names a team");
+
+        // The reserved prefix marks the box the definition never planned, and
+        // only that box.
+        let screen = render_of(&app, area);
+        assert!(screen.contains(".retest"), "{screen}");
+        assert!(!screen.contains(".plan"), "{screen}");
+
+        selected_path(&mut app, ".task/7");
+        let screen = render_of(&app, area);
+        assert!(screen.contains("emergent"), "{screen}");
+        assert!(screen.contains("owner verify"), "{screen}");
+        assert!(screen.contains("needs input"), "{screen}");
+        // The team reworded the task, and the difference is what earns the row.
+        assert!(screen.contains("task: retest the parser"), "{screen}");
+
+        // An unclaimed-looking node whose subject repeats its label says so
+        // without repeating itself.
+        selected_path(&mut app, "plan");
+        let screen = render_of(&app, area);
+        assert!(screen.contains("owner research"), "{screen}");
+        assert!(!screen.contains("task: plan"), "{screen}");
+    }
+
+    /// §3.5: the verbs collapse. Steer, interrogate, and reconstruct are engine
+    /// inputs and a lead run has no engine, so offering them would cost the
+    /// user a keystroke to discover a refusal.
+    #[test]
+    fn a_lead_runs_footer_offers_focus_and_none_of_the_engine_verbs() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut app = lead_app(crate::detect::AgentState::Working);
+        app.view.dag = compute_workflow_dag_view(&app, area);
+        selected_path(&mut app, ".task/7");
+        let screen = render_of(&app, area);
+
+        assert!(screen.contains("focus pane"), "{screen}");
+        assert!(!screen.contains("steer"), "{screen}");
+        assert!(!screen.contains("interrogate"), "{screen}");
+        assert!(!screen.contains("reconstruct"), "{screen}");
+        assert!(screen.contains("esc"), "{screen}");
+    }
+
+    /// The narrow half of the engine-era pin: which hint set a run gets is
+    /// decided by how the run was executed, and the engine-era set is untouched.
+    #[test]
+    fn an_engine_era_footer_keeps_every_verb_a_lead_run_drops() {
+        let engine = footer_hints(200, false, true, true);
+        let lead = footer_hints(200, true, false, true);
+        for verb in [" steer", " interrogate", " reconstruct"] {
+            assert!(
+                engine.iter().any(|(_, label)| *label == verb),
+                "engine-era footer lost {verb}: {engine:?}"
+            );
+            assert!(
+                !lead.iter().any(|(_, label)| *label == verb),
+                "a lead run must not offer {verb}: {lead:?}"
+            );
+        }
+        assert!(lead
+            .iter()
+            .any(|(chord, label)| *chord == "enter" && *label == " focus pane"));
+        assert!(lead.iter().any(|(chord, _)| *chord == "esc"));
+    }
+
+    /// The overlay never guesses which pane a node belongs to: the owner is
+    /// resolved through the run's member list, and the member's pane is what
+    /// the live-agent-state layer reads. A member with no pane resolves to
+    /// nothing rather than to some other member's pane.
+    #[test]
+    fn a_nodes_owner_resolves_through_the_member_list_to_a_pane() {
+        let area = Rect::new(0, 0, 120, 40);
+        let app = lead_app(crate::detect::AgentState::Working);
+        let view = compute_workflow_dag_view(&app, area);
+
+        let emergent = view
+            .nodes
+            .iter()
+            .find(|node| node.path == ".task/7")
+            .expect("the emergent node is drawn");
+        assert_eq!(emergent.owner, "verify");
+        assert!(emergent.emergent);
+        assert!(emergent.owner_pane_id.is_some());
+        assert_eq!(
+            emergent.agent_state,
+            Some(crate::detect::AgentState::Working)
+        );
+
+        let planned = view
+            .nodes
+            .iter()
+            .find(|node| node.path == "plan")
+            .expect("the planned node is drawn");
+        assert_eq!(planned.owner, "research");
+        assert!(!planned.emergent);
+        assert_eq!(
+            planned.owner_pane_id, None,
+            "a member with no pane resolves to no pane"
+        );
+        assert_eq!(planned.agent_state, None);
     }
 
     /// The zero-height-when-absent rule, at the level that matters: a
@@ -2750,18 +3195,18 @@ mod tests {
     /// its run.
     #[test]
     fn the_focus_hint_follows_whether_a_pane_is_still_there() {
-        assert!(footer_hints(200, false, false)
+        assert!(footer_hints(200, false, false, false)
             .iter()
             .all(|(chord, _)| *chord != "enter" && *chord != "s"));
-        assert!(footer_hints(200, false, true)
+        assert!(footer_hints(200, false, false, true)
             .iter()
             .any(|(chord, _)| *chord == "enter"));
-        assert!(footer_hints(200, false, true)
+        assert!(footer_hints(200, false, false, true)
             .iter()
             .all(|(chord, _)| *chord != "s"));
         // Whatever is disabled, the way out survives.
         for width in 0..=60 {
-            let hints = footer_hints(width, false, false);
+            let hints = footer_hints(width, false, false, false);
             if !hints.is_empty() {
                 assert_eq!(hints.last(), Some(&("esc", " close")), "width {width}");
             }
@@ -2896,6 +3341,10 @@ mod tests {
             graph: Box::new(finished_graph()),
             workflow_name: "past".to_string(),
             interrogations: vec![interrogation("i1", "start", None)],
+            team_name: None,
+            lead_pane_id: None,
+            projected: std::collections::BTreeMap::new(),
+            members: Vec::new(),
         }));
         let view = compute_workflow_dag_view(&app, area);
         assert!(view.historical);

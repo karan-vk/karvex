@@ -32,7 +32,9 @@ use crate::api::schema::{
     WorkflowRunInfo, WorkflowRunNodeInfo, WorkflowRunStatus, WorkflowRunTarget, WorkflowSuccession,
     WorkflowTier,
 };
-use crate::app::state::{DagViewState, HistoricalInterrogation, HistoricalRunSnapshot, Mode};
+use crate::app::state::{
+    DagViewState, HistoricalInterrogation, HistoricalRunSnapshot, Mode, ProjectedNodeFacts,
+};
 use crate::app::App;
 use crate::workflow::model::{
     EdgeKind, EdgePayload, Evidence, GrowthLimits, InstancePath, KvdagVersionId, NodeKey,
@@ -64,15 +66,57 @@ impl App {
         };
 
         let workflow_name = run.workflow_name.clone();
+        // Taken before `graph` is consumed by the rehydration: the projection's
+        // facts and the team's members are *not* the engine's `RunGraph` and
+        // must not be smuggled into it (§3.4). They travel beside it on the
+        // snapshot instead.
+        let team_name = run.team_name.clone();
+        let lead_pane_id = run.lead_pane_id.clone();
+        let members = graph.members.clone();
+        let projected = projected_facts(&graph);
         let graph = rehydrate_run_graph(&run, graph);
         let interrogations = self.historical_interrogations(&graph.run_id);
         self.state.set_historical_run(Some(HistoricalRunSnapshot {
             graph: Box::new(graph),
             workflow_name,
             interrogations,
+            team_name,
+            lead_pane_id,
+            projected,
+            members,
         }));
         self.state.mode = Mode::WorkflowDag;
         Ok(())
+    }
+
+    /// Re-reads the run the overlay currently has open, when the run
+    /// projection has just moved underneath it (§3.6 refresh).
+    ///
+    /// The historical path is load-once by design, which is right for a closed
+    /// run and wrong for a *live* lead run: its tasks, owners, and members
+    /// change every poll. Guarded three ways so a reload can neither surprise
+    /// nor loop — the overlay must be the surface on screen, it must be showing
+    /// a lead run, and `run_id` must be the run that actually changed. The
+    /// caller only invokes this on a poll that reported a change, so the
+    /// trigger is an edge rather than a level and cannot re-arm itself.
+    pub(crate) fn reload_open_lead_run(&mut self, run_id: &str) -> bool {
+        if self.state.mode != Mode::WorkflowDag {
+            return false;
+        }
+        let open = self.state.historical_run().is_some_and(|snapshot| {
+            snapshot.is_lead_run() && snapshot.graph.run_id.as_str() == run_id
+        });
+        if !open {
+            return false;
+        }
+        if let Err(error) = self.load_historical_run(run_id) {
+            // A reload that fails leaves the last good snapshot on screen: the
+            // run is still openable from the browser, and blanking a graph the
+            // user is watching because one refresh missed is the worse answer.
+            tracing::debug!(%error, run = %run_id, "could not refresh the open lead run");
+            return false;
+        }
+        true
     }
 
     /// Closes the historical projection, putting the overlay back on the live
@@ -293,6 +337,32 @@ pub(crate) fn historical_steer_refusal() -> String {
 /// meaning, so reusing whatever the source run happened to allocate would be
 /// inventing an identity the store never recorded. Instance paths are the
 /// durable identity, and they are what every projection here keys on.
+/// The projection's observations, keyed by instance path (§3.4).
+///
+/// Kept out of [`rehydrate_run_graph`] deliberately: `RunNode` is the engine's
+/// model of a node and has no field for a task id, a subject, an owner, or
+/// emergence — those are facts about what a Claude Code team did, and the
+/// engine has no business describing them. An engine-era run's nodes carry
+/// none of them, so this comes back empty and the overlay's merge is a no-op.
+fn projected_facts(graph: &WorkflowRunGraph) -> BTreeMap<String, ProjectedNodeFacts> {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| node.task_id.is_some() || !node.subject.is_empty() || !node.owner.is_empty())
+        .map(|node| {
+            (
+                node.path.clone(),
+                ProjectedNodeFacts {
+                    task_id: node.task_id.clone(),
+                    subject: node.subject.clone(),
+                    owner: node.owner.clone(),
+                    emergent: node.emergent,
+                },
+            )
+        })
+        .collect()
+}
+
 fn rehydrate_run_graph(run: &WorkflowRunInfo, graph: WorkflowRunGraph) -> RunGraph {
     let index_of: std::collections::HashMap<String, RunNodeIdx> = graph
         .nodes
@@ -635,6 +705,45 @@ mod tests {
         assert_eq!(graph.growth.max_nodes, 24);
     }
 
+    /// §3.4: the projection's observations travel beside the rehydrated graph,
+    /// not inside it. An engine-era run has none, so the map comes back empty
+    /// and the overlay's merge is a no-op — which is what keeps such a run
+    /// rendering exactly as it did before the rework.
+    #[test]
+    fn projected_task_facts_are_kept_beside_the_graph_and_only_for_observed_nodes() {
+        assert!(
+            projected_facts(&wire_graph()).is_empty(),
+            "an engine-era run has no projection to carry"
+        );
+
+        let mut wire = wire_graph();
+        wire.nodes[0].task_id = Some("1".to_string());
+        wire.nodes[0].subject = "plan the work".to_string();
+        wire.nodes[0].owner = "research".to_string();
+        wire.nodes[1].task_id = Some("7".to_string());
+        wire.nodes[1].subject = "retest the parser".to_string();
+        wire.nodes[1].emergent = true;
+
+        let facts = projected_facts(&wire);
+        assert_eq!(facts.len(), 2);
+        let planned = facts.get("plan").expect("keyed by instance path");
+        assert_eq!(planned.owner, "research");
+        assert_eq!(planned.subject, "plan the work");
+        assert!(!planned.emergent);
+        let emergent = facts.get("plan/impl").expect("keyed by instance path");
+        assert!(emergent.emergent);
+        assert_eq!(
+            emergent.owner, "",
+            "an unclaimed task keeps its empty owner rather than being defaulted"
+        );
+
+        // And the graph itself is untouched: `RunNode` has no room for any of
+        // this, and inventing room would make the engine describe a projection
+        // it never produced.
+        let graph = rehydrate_run_graph(&wire_run(), wire);
+        assert_eq!(graph.nodes.len(), 2);
+    }
+
     /// An edge naming a node the projection does not carry is dropped, not
     /// pointed at nothing.
     #[test]
@@ -746,6 +855,11 @@ mod tests {
                 parent: None,
                 blocker: None,
                 pane_id: None,
+                owner: String::new(),
+                subject: String::new(),
+                emergent: false,
+                owner_pane_id: None,
+                agent_state: None,
                 successors: Vec::new(),
                 predecessors: Vec::new(),
             })

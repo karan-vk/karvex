@@ -782,6 +782,17 @@ impl crate::app::App {
             .as_ref()
             .is_some_and(|run| !run.closed && &run.run_id == run_id)
     }
+
+    /// The run a live lead is executing, if any. The single-live-run guard is
+    /// what makes this an `Option` rather than a set, and it is what a
+    /// projection tick's "something changed" answer refers to — the tick has no
+    /// other run to be about.
+    pub(crate) fn live_lead_run_id(&self) -> Option<String> {
+        self.workflow_lead
+            .as_ref()
+            .filter(|run| !run.closed)
+            .map(|run| run.run_id.to_string())
+    }
 }
 
 /// Claude Code's task status vocabulary → karvex's node status.

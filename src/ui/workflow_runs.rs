@@ -385,6 +385,27 @@ fn run_detail_lines(run: &WorkflowRunsRunEntry, p: &Palette) -> Vec<Line<'static
             Style::default().fg(p.red),
         )]));
     }
+    // A lead run says who ran it (§3.4). Gated on `team_name` rather than on a
+    // non-empty member list: an engine-era run has neither, and its detail
+    // strip must stay byte-identical to what it was before the rework.
+    if let Some(team) = &run.team_name {
+        lines.push(Line::from(vec![
+            Span::styled(" team: ", dim),
+            Span::styled(team.clone(), text),
+        ]));
+        // "not observed yet" rather than nothing: karvex learns the members
+        // from the team config the lead writes as it starts, so an empty list
+        // on a live run means "too early", not "nobody worked on this".
+        let members = if run.members.is_empty() {
+            "(not observed yet)".to_string()
+        } else {
+            run.members.join(", ")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" members: ", dim),
+            Span::styled(members, text),
+        ]));
+    }
     match (&run.summary_outcome, &run.summary_first_highlight) {
         (Some(outcome), Some(highlight)) => lines.push(Line::from(vec![
             Span::styled(" summary: ", dim),
@@ -495,7 +516,60 @@ mod tests {
             blocker: None,
             summary_outcome: None,
             summary_first_highlight: None,
+            team_name: None,
+            members: Vec::new(),
         })
+    }
+
+    /// The same row, executed by a Claude Code team lead
+    /// (`09-agent-teams-rework.md` §3.4).
+    fn lead_entry(members: Vec<&str>) -> WorkflowRunsRunEntry {
+        let WorkflowRunsEntry::Run(mut run) = run_entry("run:lead", RunStatus::Running) else {
+            panic!("expected a run row");
+        };
+        run.team_name = Some("session-213aa9bf".to_string());
+        run.members = members.into_iter().map(str::to_string).collect();
+        run
+    }
+
+    /// §3.4: a lead run's detail names the team and who was on it; an
+    /// engine-era run's detail is byte-identical to what it always was.
+    #[test]
+    fn a_lead_runs_detail_names_its_team_and_members() {
+        let p = Palette::catppuccin();
+        let lead = lead_entry(vec![
+            "research · sonnet · w1:p3",
+            "team-lead · opus · in-process",
+        ]);
+        let text = detail_text(&run_detail_lines(&lead, &p));
+        assert!(text.contains("team: session-213aa9bf"), "{text}");
+        assert!(text.contains("research · sonnet · w1:p3"), "{text}");
+        assert!(text.contains("team-lead · opus · in-process"), "{text}");
+
+        // A live lead whose team config has not been read yet says so rather
+        // than implying nobody worked on the run.
+        let early = detail_text(&run_detail_lines(&lead_entry(Vec::new()), &p));
+        assert!(early.contains("members: (not observed yet)"), "{early}");
+
+        let WorkflowRunsEntry::Run(engine) = run_entry("run:1", RunStatus::Succeeded) else {
+            panic!("expected a run row");
+        };
+        let engine_text = detail_text(&run_detail_lines(&engine, &p));
+        assert!(!engine_text.contains("team"), "{engine_text}");
+        assert!(!engine_text.contains("members"), "{engine_text}");
+    }
+
+    fn detail_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn pruned_entry(id: &str) -> WorkflowRunsEntry {

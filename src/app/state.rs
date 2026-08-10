@@ -845,6 +845,28 @@ pub struct DagNodeView {
     pub blocker: Option<String>,
     /// Public pane id of the node's teammate, once it has been bound.
     pub pane_id: Option<String>,
+    /// The teammate that claimed this node's task, empty while unclaimed and
+    /// on every engine-era run — the engine assigned nodes, it never had an
+    /// owner to observe (`docs/design/workflow-builder/09-agent-teams-rework.md`
+    /// §3.4).
+    pub owner: String,
+    /// What the team actually called the work, verbatim. Kept beside `label`
+    /// rather than replacing it: `label` is the definition's name for the node
+    /// and this is the observed one, and the difference between them is the
+    /// "loose" part of the contract made visible.
+    pub subject: String,
+    /// Whether the team created this node's task without the definition
+    /// planning it. Always false for an engine-era run.
+    pub emergent: bool,
+    /// The pane of the member named by [`Self::owner`], which is where a lead
+    /// run is steered — selecting a node and pressing `Enter` opens *this*
+    /// pane, not the node's own binding (§3.5).
+    pub owner_pane_id: Option<String>,
+    /// What karvex's own per-pane detection says the owning pane is doing
+    /// right now. The second of §3.4's two layers: the task status above comes
+    /// from the projection, this comes from the detector, and they answer
+    /// different questions — "is the work done" versus "is the agent stuck".
+    pub agent_state: Option<crate::detect::AgentState>,
     pub successors: Vec<crate::workflow::model::RunNodeIdx>,
     pub predecessors: Vec<crate::workflow::model::RunNodeIdx>,
 }
@@ -895,6 +917,12 @@ pub struct DagViewState {
     pub selected: Option<crate::workflow::model::RunNodeIdx>,
     /// `Some` while the steer input line is open; the pending text.
     pub steer: Option<String>,
+    /// Whether the open run was executed by a Claude Code team lead rather
+    /// than by karvex's own engine (§3.1). The engine verbs — steer,
+    /// interrogate, reconstruct — are meaningless for such a run, so the
+    /// footer and the key handler both read this to collapse to "focus the
+    /// pane that owns the node and type there".
+    pub lead_run: bool,
     /// Last left click on a node, so the next one can be recognised as a
     /// double click. Carried across frames like `selected`.
     pub last_click: Option<DagClick>,
@@ -1130,6 +1158,18 @@ pub struct WorkflowRunsRunEntry {
     /// the summary's outcome, when `workflow.summary.get` has one.
     pub summary_outcome: Option<String>,
     pub summary_first_highlight: Option<String>,
+    /// The Claude Code team that executed this run, when a team lead did
+    /// rather than karvex's own engine
+    /// (`docs/design/workflow-builder/09-agent-teams-rework.md` §3.1). `None`
+    /// for every engine-era run, whose detail strip must stay exactly as it
+    /// was.
+    pub team_name: Option<String>,
+    /// The run's team members, each already formatted for display as
+    /// `name · model · pane` — or the member's backend where it has no pane,
+    /// which is how the in-process lead reads. Pre-formatted because the run
+    /// browser is a list of strings and the wire shape is a shared runtime
+    /// fact that has no business reaching the renderer.
+    pub members: Vec<String>,
 }
 
 /// A pruned run kept only as a summary.
@@ -2085,6 +2125,41 @@ pub(crate) struct HistoricalRunSnapshot {
     /// half). Live-run interrogation data lives on `WorkflowRuntimeState`
     /// instead — this field exists only for runs that are not the active run.
     pub interrogations: Vec<HistoricalInterrogation>,
+    /// The run's team, when a Claude Code team lead executed it rather than
+    /// karvex's own engine
+    /// (`docs/design/workflow-builder/09-agent-teams-rework.md` §3.1). `None`
+    /// for every engine-era run — this is a property of the run, not of the
+    /// overlay, which is why it is named after the team rather than after a
+    /// view mode.
+    pub team_name: Option<String>,
+    /// The lead's own pane, which is where the whole run is steered.
+    pub lead_pane_id: Option<String>,
+    /// What the run projection observed, by instance path (§3.4). Empty for an
+    /// engine-era run, which never had a task list behind it.
+    pub projected: std::collections::BTreeMap<String, ProjectedNodeFacts>,
+    /// The run's team members (§3.4), which is what resolves a node's owner to
+    /// the pane that owns it.
+    pub members: Vec<crate::api::schema::WorkflowRunMemberInfo>,
+}
+
+impl HistoricalRunSnapshot {
+    /// Whether a Claude Code team lead executed this run. The one predicate the
+    /// overlay branches on, so "which execution model produced this run" is
+    /// asked in exactly one place.
+    pub(crate) fn is_lead_run(&self) -> bool {
+        self.team_name.is_some()
+    }
+}
+
+/// One node's observed task facts, held beside the rehydrated graph rather
+/// than on `RunNode`: `RunNode` is the engine's model and the projection is
+/// not the engine's to describe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProjectedNodeFacts {
+    pub task_id: Option<String>,
+    pub subject: String,
+    pub owner: String,
+    pub emergent: bool,
 }
 
 /// One interrogation row on a [`HistoricalRunSnapshot`].
@@ -3102,6 +3177,10 @@ mod tests {
                 reconstructed: false,
                 ended: true,
             }],
+            team_name: None,
+            lead_pane_id: None,
+            projected: std::collections::BTreeMap::new(),
+            members: Vec::new(),
         };
         state.set_historical_run(Some(snapshot));
         let stored = state.historical_run().expect("just set");
