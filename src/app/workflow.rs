@@ -20,7 +20,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Direction;
@@ -38,7 +38,7 @@ use crate::app::App;
 use crate::events::WorkflowAppEvent;
 use crate::workflow::binding::{interrogate, observe, spawn};
 use crate::workflow::engine::expand::ExpandLimit;
-use crate::workflow::engine::{DeliveryFailureNote, Engine, EngineConfig};
+use crate::workflow::engine::{DeliveryFailureNote, Engine, EngineConfig, EpilogueTaskSpec};
 use crate::workflow::model::{
     is_reserved_path, Demand, EdgeKind, EdgePayload, EngineInput, Evidence, GrowthLimits,
     InstancePath, InterrogationId, Isolation, Kvdag, KvdagVersionId, NodeBinding, NodeStatus,
@@ -1129,6 +1129,48 @@ fn task_input_sources(
         .zip(sources.iter())
         .map(|(stem, from)| ((*from).to_string(), layout.input_source_file(port, &stem)))
         .collect()
+}
+
+/// The epilogue's `task.md`, rendered through the **same** document every
+/// authored node's is (`07-phase3-plan.md` §3 rule 2).
+///
+/// The engine owns what the summariser is asked to cover; it does not own how a
+/// node finishes, and it cannot — it is pure, and the reporting contract names
+/// files only the binder knows about. Routing the body through
+/// [`spawn::TaskDocument`] is what closes the defect this function exists for:
+/// the epilogue used to carry a hand-built document that never grew a
+/// `## Reporting` section, so the summariser was the one node never told to
+/// write `result.json` or run `kvx workflow node complete`. It could therefore
+/// only finish under a `KARVEX_WORKFLOW_SUMMARY_COMMAND` stub that already knew
+/// the protocol, and never under the default `claude` runner — end-of-run
+/// summaries were broken in exactly the configuration users have.
+///
+/// A second hand-maintained copy of the contract would have drifted the same
+/// way, so there is one renderer and the epilogue simply passes through it. The
+/// sections it has nothing for are left empty and `TaskDocument` omits them:
+/// the epilogue has no author-supplied role, no workflow contract (D2 — the
+/// author's instructions must not rewrite what karvex's own summariser is for),
+/// no inbound ports, and no prior-runs pointer, because the evidence it needs
+/// is already rendered into its body.
+///
+/// `node_dir` is the epilogue's own [`spawn::NodeDirLayout`] root, and passing
+/// it is the whole point of sharing the renderer rather than copying it: the
+/// summariser's cwd is the workspace directory like every other node's, so the
+/// `## Reporting` section it now gets names `result.json` and
+/// `output_schema.json` absolutely. A hand-built epilogue document would have
+/// had to re-derive both facts, which is how the contract went missing in the
+/// first place.
+fn epilogue_task_markdown(spec: &EpilogueTaskSpec, node_dir: &Path) -> String {
+    spawn::TaskDocument {
+        label: &spec.label,
+        role: "",
+        contract: "",
+        prompt: &spec.task_body,
+        input_ports: &[],
+        prior_runs: None,
+        node_dir,
+    }
+    .render()
 }
 
 /// `SpawnSpec::label` becomes both `claude --name` and the karvex agent name, so
@@ -2626,6 +2668,12 @@ impl App {
             spawn::derive_agent_session_id(&run.run_id, &node.path, node.attempt);
         let transcript_path = spawn::transcript_path(&cwd, &agent_session_id)
             .map_err(|err| format!("the summariser's transcript path is unknown: {err}"))?;
+        // Rendered before the plan is built, for the same reason an authored
+        // node's is: the document names every karvex-owned path from the node's
+        // own directory, so the layout has to exist first. The epilogue is a
+        // node like any other here — its `result.json` is watched in its own
+        // node directory, and its cwd is the workspace, not that directory.
+        let task_markdown = epilogue_task_markdown(&spec, &layout.root);
         Ok(NodeSpawnPlan {
             spec: SpawnSpec {
                 run_id: run.run_id.clone(),
@@ -2658,10 +2706,10 @@ impl App {
             output_schema: OutputSchema::parse(spec.output_schema.clone())
                 .map_err(|err| format!("the built-in summary schema is invalid: {err}"))?,
             layout,
-            task_markdown: spec.task_markdown.clone(),
+            task_markdown,
             // The epilogue has no inbound edges: the evidence it summarises is
-            // rendered into its `task.md` by `summary_task_spec`, not carried
-            // on ports.
+            // rendered into its `task.md` body by `summary_task_spec`, not
+            // carried on ports.
             inputs: BTreeMap::new(),
             transcript_path,
             pane_title: spawn::node_pane_title(
@@ -4372,6 +4420,102 @@ mod tests {
             "with no override the summariser is a real `claude` pane, and the \
              definition's own `Command` nodes must not decide that for it"
         );
+    }
+
+    /// The defect this whole seam exists for: the summariser's `task.md` was
+    /// hand-built by `summary_task_spec` and never went through
+    /// [`spawn::TaskDocument`], so it was the one node document with no
+    /// `## Reporting` section. It told the node what to cover and never how to
+    /// finish — no `result.json`, no `kvx workflow node complete` — which the
+    /// `KARVEX_WORKFLOW_SUMMARY_COMMAND` stubs hid completely, because a stub
+    /// hardcodes the protocol instead of reading it. Under the default
+    /// `claude` runner the epilogue could only idle until the watchdog gave up.
+    #[test]
+    fn the_summarisers_task_document_tells_it_how_to_report_completion() {
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
+        let definition = definition();
+        let graph = graph_of(&definition);
+        state
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the run starts");
+        for (path, result) in [
+            ("plan", r#"{"plan":"do it"}"#),
+            ("implement", r#"{"report":"shipped"}"#),
+        ] {
+            state.bind_node(&InstancePath::new(path), binding_for(path), Instant::now());
+            state.apply(
+                EngineInput::NodeSelfReport {
+                    path: InstancePath::new(path),
+                    token: NodeToken::new("token"),
+                    result: report(result),
+                },
+                Instant::now(),
+            );
+        }
+
+        let spec = state
+            .engine()
+            .summary_task_spec()
+            .expect("a succeeded run has an epilogue");
+        let node_dir = PathBuf::from(if cfg!(windows) {
+            r"C:\runs\r1\.summary"
+        } else {
+            "/runs/r1/.summary"
+        });
+        let rendered = epilogue_task_markdown(&spec, &node_dir);
+
+        assert!(
+            rendered.contains("## Reporting"),
+            "the epilogue is rendered through the shared task document:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("result.json"),
+            "the summariser is told which file to write:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("output_schema.json"),
+            "…which schema it has to validate against:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("kvx workflow node complete"),
+            "…and the only way this node ever finishes:\n{rendered}"
+        );
+
+        // Sharing the renderer means the epilogue inherits the absolute-path
+        // contract too, and it needs it for the same reason every other node
+        // does: the summariser's cwd is the workspace directory, so a
+        // `./result.json` would send it writing where nothing is watching.
+        for file in ["result.json", "output_schema.json"] {
+            let expected = node_dir.join(file);
+            assert!(
+                rendered.contains(&expected.display().to_string()),
+                "the summariser is given {} absolutely:\n{rendered}",
+                expected.display()
+            );
+        }
+        assert!(
+            !rendered.contains("`./"),
+            "the epilogue may not name a karvex file relative to its cwd:\n{rendered}"
+        );
+
+        // The engine's evidence survives the wrap, and the document has exactly
+        // one title.
+        assert!(rendered.starts_with("# summary\n"), "{rendered}");
+        assert_eq!(
+            rendered.matches("\n# ").count() + 1,
+            1,
+            "a single H1, not the engine's plus the document's:\n{rendered}"
+        );
+        assert!(rendered.contains("### `plan`"), "{rendered}");
+        assert!(rendered.contains("### `implement`"), "{rendered}");
+
+        // The author's own contract stays out: the epilogue is karvex's node,
+        // and a workflow must not be able to rewrite what its summariser is
+        // for (§4 D2).
+        assert!(!rendered.contains("## Contract"), "{rendered}");
+        assert!(!rendered.contains("## Inputs"), "{rendered}");
+        assert!(!rendered.contains("## Prior runs"), "{rendered}");
     }
 
     #[test]

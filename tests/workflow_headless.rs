@@ -2987,6 +2987,33 @@ fn a_finished_run_is_summarised_afterwards_and_the_next_run_reads_its_summary() 
     assert_eq!(epilogue["status"], "succeeded", "{epilogue}");
     assert_eq!(epilogue["evidence"], "self_report", "{epilogue}");
 
+    // The epilogue's `task.md` is a node contract like every other node's. The
+    // stub above knows the reporting protocol because it was written by hand;
+    // a real `claude` summariser knows only what this file tells it, and for
+    // v0.12.0 that file said nothing about `result.json` or
+    // `kvx workflow node complete` — so the default agent summariser could
+    // never finish. Asserted on disk rather than on the spec so the whole
+    // render path is covered.
+    let summary_task = task_markdown(&socket, &run1, ".summary");
+    assert!(
+        summary_task.contains("## Reporting"),
+        "the summariser is rendered through the shared task document, so it \
+         carries the same reporting contract every other node gets:\n{summary_task}"
+    );
+    assert!(
+        summary_task.contains("result.json"),
+        "the summariser must be told which file to write:\n{summary_task}"
+    );
+    assert!(
+        summary_task.contains("output_schema.json"),
+        "…and which schema it has to validate against:\n{summary_task}"
+    );
+    assert!(
+        summary_task.contains("kvx workflow node complete"),
+        "…and how to report completion, which is the only way the node \
+         finishes:\n{summary_task}"
+    );
+
     // ── run 2 reads run 1's summary ─────────────────────────────────────────
     let run2 = start_run(&socket, &workflow_id, "add light mode");
     wait_for_run_finished(&mut reader, &mut seen, &run2);

@@ -129,9 +129,19 @@ pub struct EpilogueTaskSpec {
     pub path: InstancePath,
     /// What the DAG view and the pane title call it.
     pub label: String,
-    /// The rendered `task.md` body: what to cover, the budget, and one evidence
-    /// line per user node.
-    pub task_markdown: String,
+    /// The **body** of the summariser's `task.md`: what to cover, the budget,
+    /// and one evidence line per user node.
+    ///
+    /// Deliberately not the whole document. The engine is pure and knows
+    /// nothing about node directories, so the binder renders this through the
+    /// same [`crate::workflow::binding::spawn::TaskDocument`] every authored
+    /// node goes through — which is what gives the epilogue the `## Reporting`
+    /// contract. It used to be the finished document, which meant the
+    /// summariser was the one node never told to write `result.json` or run
+    /// `kvx workflow node complete`: it could only ever finish under a stub
+    /// that already knew the protocol, and never under the default `claude`
+    /// runner.
+    pub task_body: String,
     /// [`summary_output_schema`], carried so the caller writes one file from one
     /// source.
     pub output_schema: serde_json::Value,
@@ -2246,6 +2256,13 @@ pub(crate) fn summary_output_schema() -> serde_json::Value {
 /// The karvex-authored prompt the summariser runs against: the fixed
 /// what-to-cover text plus one evidence line per user node.
 ///
+/// This is the task **body**, not the finished `task.md`. The binder wraps it
+/// in the shared [`crate::workflow::binding::spawn::TaskDocument`], which
+/// supplies the title and — the part that matters — the `## Reporting` section
+/// telling the node to write `result.json` and run `kvx workflow node
+/// complete`. Nothing here may restate that contract: a second copy is exactly
+/// how the epilogue's contract went missing in the first place.
+///
 /// The evidence block is deliberately built from what the run already holds —
 /// status, attempts, succession, and each node's checkpoint `summary`, which
 /// `complete::SUMMARY_BUDGET` already caps at 1,200 characters — rather than
@@ -2261,8 +2278,9 @@ pub fn summary_task_spec(
     kvdag: &Kvdag,
     command: Option<&[String]>,
 ) -> EpilogueTaskSpec {
+    // No title line: `TaskDocument::render` writes the `# <label>` heading, and
+    // a second one here would nest an H1 inside the document's own.
     let mut task = String::new();
-    task.push_str("# Write this run's summary\n\n");
     task.push_str(
         "You are karvex's end-of-run summariser. The run below has already finished; \
          its outcome is final and nothing you write can change it. Your job is to \
@@ -2331,7 +2349,7 @@ pub fn summary_task_spec(
     EpilogueTaskSpec {
         path: InstancePath::new(SUMMARY_INSTANCE_PATH),
         label: EPILOGUE_LABEL.to_string(),
-        task_markdown: task,
+        task_body: task,
         output_schema: summary_output_schema(),
         command: command.map(<[String]>::to_vec),
     }
@@ -5365,15 +5383,29 @@ mod tests {
         assert_eq!(spec.path, InstancePath::new(SUMMARY_INSTANCE_PATH));
         assert_eq!(spec.output_schema, summary_output_schema());
         assert!(
-            spec.task_markdown
-                .contains(&SUMMARY_TEXT_BUDGET.to_string()),
+            spec.task_body.contains(&SUMMARY_TEXT_BUDGET.to_string()),
             "the prompt states the budget the schema enforces"
         );
-        assert!(spec.task_markdown.contains("### `plan`"));
-        assert!(spec.task_markdown.contains("### `implement`"));
+        assert!(spec.task_body.contains("### `plan`"));
+        assert!(spec.task_body.contains("### `implement`"));
         assert!(
-            !spec.task_markdown.contains(SUMMARY_INSTANCE_PATH),
+            !spec.task_body.contains(SUMMARY_INSTANCE_PATH),
             "the summariser is not asked to summarise itself"
+        );
+        // The body is a body, not a document: it carries no title of its own,
+        // because the binder's `TaskDocument` writes one — and it must not
+        // restate the reporting contract, because a second copy is how the
+        // epilogue's contract went missing in the first place.
+        assert!(
+            !spec.task_body.starts_with('#') || spec.task_body.starts_with("##"),
+            "the body must not open with its own H1: {}",
+            spec.task_body
+        );
+        assert!(
+            !spec.task_body.contains("kvx workflow node complete"),
+            "the reporting contract has exactly one author, and it is not this \
+             function: {}",
+            spec.task_body
         );
     }
 
