@@ -1283,15 +1283,24 @@ fn render_detail(dag: &DagViewState, extras: &DagExtras, p: &Palette, frame: &mu
         path_status.push(Span::styled("emergent", Style::default().fg(p.teal)));
     }
     lines.push(Line::from(truncate_spans(path_status, width)));
-    let mut assignment = vec![
-        Span::styled(" ", dim),
-        Span::styled(
+    // An emergent node has no authored assignment: the definition never named
+    // it, so the run never decided a model or an effort for it. The store row
+    // carries the column's default, and rendering that default would state a
+    // decision nobody made — worse than saying nothing, because it reads like
+    // provenance. The team's own choice of model is on the member row instead.
+    let assigned = !(dag.lead_run && node.emergent);
+    let mut assignment = vec![Span::styled(" ", dim)];
+    if assigned {
+        assignment.push(Span::styled(
             format!("{} · {}", node.model, node.effort),
             Style::default().fg(p.mauve),
-        ),
+        ));
+    }
+    assignment.extend([
         Span::styled(
             format!(
-                "  {} tokens · {} tools · {}s",
+                "{} {} tokens · {} tools · {}s",
+                if assigned { " " } else { "" },
                 node.usage.total_tokens,
                 node.usage.tool_uses,
                 node.duration_ms / 1000
@@ -1305,7 +1314,7 @@ fn render_detail(dag: &DagViewState, extras: &DagExtras, p: &Palette, frame: &mu
                 .unwrap_or_default(),
             dim,
         ),
-    ];
+    ]);
     // Who holds this node and what their pane is doing right now — §3.4's two
     // layers, side by side, on the row that already answers "where is this
     // running". It shares that row rather than claiming a new one because
