@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Claude subagents now show their own name instead of a hex session id. Session names were resolved only from Claude Code's per-process session registry (`<claude dir>/sessions/*.json`), which Claude Code writes for interactive sessions alone, so a team of subagents rendered as a row of indistinguishable short session ids. Karvex now also reads the team registry (`<claude dir>/teams/*/config.json`), where a subagent's name is recorded against the Karvex pane it occupies, and falls back to it when the session registry has nothing for a session. The session registry still wins where it has a name. Only members that are still marked active and that occupy a real pane are believed, and only from a team config that has been written since this Karvex came up — public pane ids are handed out by the running server, so a config older than it cannot be describing its panes, whatever flags a hard-killed host left behind. Where two teams both claim a pane, the more recently changed one wins. The name reaches `agent_session.name` on `pane.get`, `pane.list`, `agent.get`, and `agent.list` exactly as an interactive session's does, and an unresolved session still falls back to a short session id.
+
 ## [0.12.1] - 2026-08-15
 
 ### Fixed

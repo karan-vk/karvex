@@ -182,10 +182,10 @@ pub enum AppEvent {
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
     },
-    /// Background read of the agent session registry completed, carrying a
-    /// session-id to display-name map.
+    /// Background read of the agent's own on-disk state completed, carrying the
+    /// display names it resolved for live agent sessions.
     AgentSessionNamesRefreshed {
-        names: std::collections::HashMap<String, String>,
+        names: crate::agent_session_registry::AgentSessionNames,
     },
     /// A plugin action or event command finished.
     PluginCommandFinished {

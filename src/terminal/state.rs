@@ -1352,7 +1352,7 @@ impl TerminalState {
             .then_some(session_ref.value.as_str())
     }
 
-    /// The registry-resolved display name for the current agent session.
+    /// The resolved display name for the current agent session.
     ///
     /// Resolves to `None` unless a name was resolved for exactly the session
     /// this terminal is on now, so a session change never surfaces the previous
@@ -1365,12 +1365,12 @@ impl TerminalState {
             .map(|resolved| resolved.name.as_str())
     }
 
-    /// What the UI shows for this terminal's agent session: the resolved name
+    /// What clients show for this terminal's agent session: the resolved name
     /// when there is one, otherwise an abbreviated session id.
     ///
     /// The abbreviated id is what makes several unnamed sessions in one
     /// workspace distinguishable before the agent names them. Terminals with no
-    /// id-style session resolve to `None` so the row element is simply omitted.
+    /// id-style session resolve to `None` so the element is simply omitted.
     pub fn agent_session_display_name(&self) -> Option<String> {
         match self.agent_session_name() {
             Some(name) => Some(name.to_string()),
@@ -1380,19 +1380,30 @@ impl TerminalState {
         }
     }
 
-    /// Applies a freshly read session-id to name map to this terminal.
+    /// Applies a freshly read set of resolved names to this terminal.
+    ///
+    /// `pane_id` is the public id of the pane hosting this terminal, which is
+    /// the key some name sources use instead of a session id; pass `None` for a
+    /// terminal that is not attached to a pane.
+    ///
+    /// The resolved name is stored against the session id it was resolved for
+    /// whichever key found it, so a pane that moves to a different session drops
+    /// the previous session's name at once rather than at the next refresh.
     ///
     /// Returns whether the resolved name changed, so callers can limit repaints
     /// and change notifications to terminals that actually moved.
     pub fn apply_resolved_agent_session_names(
         &mut self,
-        names: &std::collections::HashMap<String, String>,
+        names: &crate::agent_session_registry::AgentSessionNames,
+        pane_id: Option<&str>,
     ) -> bool {
         let resolved = self.agent_session_id().and_then(|session_id| {
-            names.get(session_id).map(|name| ResolvedAgentSessionName {
-                session_id: session_id.to_string(),
-                name: name.clone(),
-            })
+            names
+                .resolve(session_id, pane_id)
+                .map(|name| ResolvedAgentSessionName {
+                    session_id: session_id.to_string(),
+                    name: name.to_string(),
+                })
         });
         if self.resolved_agent_session_name == resolved {
             return false;
