@@ -1,0 +1,56 @@
+# End-to-end fixture for the agent-teams lead run
+# (`docs/design/workflow-builder/09-agent-teams-rework.md` §3.1–§3.4).
+#
+# Deliberately tiny — two nodes and one edge — because nothing in this document
+# is executed any more. `workflow.run` renders it into a lead prompt and hands
+# that to a Claude Code team lead; the definition's only remaining jobs are to
+# (a) supply the node **keys** the projection matches observed task subjects
+# back to by prefix, and (b) supply an edge so the rendered plan has a
+# `blockedBy` line to state.
+#
+# The keys matter to `tests/workflow_lead_headless.rs`: `lead_stub.sh` writes
+# task files whose subjects carry `plan:` and `build:` prefixes, plus one that
+# carries neither, so the same fixture drives both the planned-node and the
+# emergent-node halves of §3.4.
+#
+# `runner` is still a declared field on a node, so it is set — but no runner
+# runs: the engine's materialisation is not built for a lead run, and
+# `create_run` writes the planned `run_node` rows the projection then moves.
+
+name = "e2e-lead-run"
+description = "two planned nodes a Claude Code team lead is asked to carry out"
+contract = """
+Reply only through the shared task list. Never edit files outside the run dir.
+"""
+max_depth = 3
+max_nodes = 24
+
+[[arg]]
+name = "goal"
+required = true
+description = "what the team is being asked to do"
+
+[[node]]
+key = "plan"
+label = "Draft the approach"
+kind = "agent"
+runner = "agent"
+demand = "standard"
+prompt_template = "Produce an implementation plan for: {{goal}}"
+output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
+
+[[node]]
+key = "build"
+label = "Carry out the approach"
+kind = "agent"
+runner = "agent"
+demand = "standard"
+prompt_template = "Carry out this plan for {{goal}}:\n{{plan}}"
+output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }
+
+[[edge]]
+from = "plan"
+to = "build"
+kind = "data"
+payload = "summary"
+port = "plan"
