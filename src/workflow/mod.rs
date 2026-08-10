@@ -21,6 +21,7 @@ pub mod binding;
 pub mod definition;
 pub mod engine;
 pub mod layout;
+pub mod lead_prompt;
 pub mod model;
 #[cfg(feature = "workflow")]
 pub mod store;
