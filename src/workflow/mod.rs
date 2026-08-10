@@ -23,6 +23,7 @@ pub mod engine;
 pub mod layout;
 pub mod lead_prompt;
 pub mod model;
+pub mod projection;
 #[cfg(feature = "workflow")]
 pub mod store;
 pub mod tier;
