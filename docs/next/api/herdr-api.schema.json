@@ -1713,6 +1713,11 @@
             "effort": {
               "type": "string"
             },
+            "emergent": {
+              "default": false,
+              "description": "Whether the team created this task without the definition planning it.\nEmergent nodes are first-class rather than hidden — the loose part of\nthe contract, recorded.",
+              "type": "boolean"
+            },
             "ended_at_unix_ms": {
               "format": "uint64",
               "minimum": 0,
@@ -1759,6 +1764,11 @@
             "node_key": {
               "type": "string"
             },
+            "owner": {
+              "default": "",
+              "description": "The teammate that claimed the task, empty while unclaimed. Its pane is\nin the run's member list, which is what makes \"select a node, focus the\npane that owns it\" resolvable.",
+              "type": "string"
+            },
             "pane_id": {
               "type": [
                 "string",
@@ -1796,6 +1806,11 @@
             "status": {
               "$ref": "#/schemas/event/$defs/WorkflowNodeStatus"
             },
+            "subject": {
+              "default": "",
+              "description": "The observed task subject, verbatim. Kept beside `label` rather than\nreplacing it: `label` is what the definition called the node, and this\nis what the team actually called the work.",
+              "type": "string"
+            },
             "succession": {
               "anyOf": [
                 {
@@ -1804,6 +1819,13 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "task_id": {
+              "description": "Claude Code's own task id for this node, once the run projection has\nseen a task matching it (`09-agent-teams-rework.md` §3.4). Absent on an\nengine-era run and on a planned node no task has claimed yet.",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "terminal_id": {
@@ -13162,6 +13184,11 @@
             "effort": {
               "type": "string"
             },
+            "emergent": {
+              "default": false,
+              "description": "Whether the team created this task without the definition planning it.\nEmergent nodes are first-class rather than hidden — the loose part of\nthe contract, recorded.",
+              "type": "boolean"
+            },
             "ended_at_unix_ms": {
               "format": "uint64",
               "minimum": 0,
@@ -13208,6 +13235,11 @@
             "node_key": {
               "type": "string"
             },
+            "owner": {
+              "default": "",
+              "description": "The teammate that claimed the task, empty while unclaimed. Its pane is\nin the run's member list, which is what makes \"select a node, focus the\npane that owns it\" resolvable.",
+              "type": "string"
+            },
             "pane_id": {
               "type": [
                 "string",
@@ -13245,6 +13277,11 @@
             "status": {
               "$ref": "#/schemas/success_response/$defs/WorkflowNodeStatus"
             },
+            "subject": {
+              "default": "",
+              "description": "The observed task subject, verbatim. Kept beside `label` rather than\nreplacing it: `label` is what the definition called the node, and this\nis what the team actually called the work.",
+              "type": "string"
+            },
             "succession": {
               "anyOf": [
                 {
@@ -13253,6 +13290,13 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "task_id": {
+              "description": "Claude Code's own task id for this node, once the run projection has\nseen a task matching it (`09-agent-teams-rework.md` §3.4). Absent on an\nengine-era run and on a planned node no task has claimed yet.",
+              "type": [
+                "string",
+                "null"
               ]
             },
             "terminal_id": {

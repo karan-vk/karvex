@@ -3208,6 +3208,12 @@ impl App {
                     checkpoint_seq: source.checkpoint_seq,
                 }
             }),
+            // The engine's live projection has no task list behind it; the
+            // observed half is the run projection's to fill (§3.4).
+            task_id: None,
+            subject: String::new(),
+            owner: String::new(),
+            emergent: false,
         })
     }
 

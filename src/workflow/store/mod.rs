@@ -3215,36 +3215,47 @@ impl WorkflowStore {
     /// Materialises a projected task's `blockedBy` list as `sequence`
     /// `run_edge` relations (§3.4: `blockedBy` is the edge structure).
     ///
-    /// Two rules make this safe to run on every poll:
+    /// Four rules make this safe to run on every poll:
     ///
     /// - **Idempotent.** An edge that already exists between the same two
-    ///   endpoints is left alone, so re-observing the same task does not
-    ///   accumulate parallel relations.
+    ///   endpoints is left alone, whatever its kind, so re-observing the same
+    ///   task neither accumulates parallel relations nor shadows an authored
+    ///   `data` edge with a redundant `sequence` one.
     /// - **Self-healing rather than ordering-dependent.** A blocker whose own
     ///   task has not been projected yet has no `run_node` row to point at; the
     ///   edge is skipped rather than erroring, and the next poll — which sees
     ///   both tasks — draws it. The projection has no ordering guarantee to
     ///   offer, so the writer must not need one.
+    /// - **Withdrawing is part of observing.** A lead may drop a `blockedBy`,
+    ///   and an edge that outlived the dependency it described would make the
+    ///   DAG lie about what the run is waiting on. Edges into this node that
+    ///   the projection itself drew and no longer observes are removed.
+    /// - **Only its own edges.** Withdrawal is scoped to `kvdag_edge = NONE`,
+    ///   so an edge the definition authored and `create_run` materialised is
+    ///   never removed by an observation that merely failed to mention it. The
+    ///   plan's structure is the plan's to state; only the observed structure
+    ///   is the projection's to retract.
     async fn project_blocked_by(
         &self,
         run_id: &surrealdb_types::RecordId,
         node_id: &surrealdb_types::RecordId,
         blocked_by: &[InstancePath],
     ) -> Result<(), StoreError> {
+        let mut observed: Vec<surrealdb_types::RecordId> = Vec::with_capacity(blocked_by.len());
         for blocker in blocked_by {
             let Some(blocker_row) = self.select_run_node_row(run_id, blocker).await? else {
                 continue;
             };
+            observed.push(blocker_row.id.clone());
             let mut response = self
                 .db
                 .query(
                     "SELECT VALUE id FROM run_edge \
-                     WHERE run = $run AND in = $from AND out = $to AND kind = $kind LIMIT 1",
+                     WHERE run = $run AND in = $from AND out = $to LIMIT 1",
                 )
                 .bind(("run", run_id.clone()))
                 .bind(("from", blocker_row.id.clone()))
                 .bind(("to", node_id.clone()))
-                .bind(("kind", edge_kind_str(EdgeKind::Sequence).to_string()))
                 .await
                 .map_err(query_error)?;
             let existing: Vec<surrealdb_types::RecordId> = response.take(0).map_err(query_error)?;
@@ -3265,6 +3276,19 @@ impl WorkflowStore {
                 .map_err(query_error)?;
             response.check().map_err(query_error)?;
         }
+
+        let response = self
+            .db
+            .query(
+                "DELETE run_edge WHERE run = $run AND out = $to AND kvdag_edge = NONE \
+                 AND !array::any($observed, |$blocker| $blocker = in)",
+            )
+            .bind(("run", run_id.clone()))
+            .bind(("to", node_id.clone()))
+            .bind(("observed", observed))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
         Ok(())
     }
 

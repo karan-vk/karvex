@@ -4093,6 +4093,137 @@ async fn a_projected_blocked_by_becomes_one_run_edge_once_both_tasks_exist() {
     assert_eq!(projected[0].kind, EdgeKind::Sequence);
 }
 
+/// The lead may drop a `blockedBy`, and an edge that outlived the dependency
+/// it described would make the DAG lie about what the run is waiting on.
+#[tokio::test]
+async fn a_withdrawn_blocked_by_removes_the_edge_the_projection_drew() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("fanout", "two children", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let kvdag = store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", fanout_spec(1))
+        .await
+        .expect("create_version");
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    store
+        .write(task_projection(
+            &run,
+            ".task/1",
+            "task-1",
+            "1",
+            "1. The blocker",
+            "lead",
+            NodeStatus::Running,
+            true,
+            1_700_000_000_000,
+        ))
+        .await
+        .expect("project the blocker");
+    let child = |blocked_by: Vec<InstancePath>, observed: u64| StoreWrite::RunTaskProjected {
+        run: run.clone(),
+        path: InstancePath::new("child0"),
+        node_key: NodeKey::new("child0"),
+        task_id: "2".to_string(),
+        subject: "2. Child".to_string(),
+        owner: String::new(),
+        status: NodeStatus::Pending,
+        emergent: false,
+        blocked_by,
+        observed_at_unix_ms: observed,
+    };
+
+    store
+        .write(child(vec![InstancePath::new(".task/1")], 1_700_000_001_000))
+        .await
+        .expect("write");
+    let drawn: Vec<_> = store
+        .list_run_edges(&run)
+        .await
+        .expect("list_run_edges")
+        .into_iter()
+        .filter(|edge| edge.from.as_str() == ".task/1" && edge.to.as_str() == "child0")
+        .collect();
+    assert_eq!(drawn.len(), 1, "the observed dependency is drawn");
+
+    // The lead unblocks the task; the next poll must retract the edge.
+    store
+        .write(child(Vec::new(), 1_700_000_002_000))
+        .await
+        .expect("write");
+    let after: Vec<_> = store
+        .list_run_edges(&run)
+        .await
+        .expect("list_run_edges")
+        .into_iter()
+        .filter(|edge| edge.from.as_str() == ".task/1" && edge.to.as_str() == "child0")
+        .collect();
+    assert!(
+        after.is_empty(),
+        "an edge the projection drew and no longer observes is withdrawn"
+    );
+}
+
+/// Withdrawal is scoped to the projection's own edges: an edge the definition
+/// authored and `create_run` materialised is the plan's statement, and an
+/// observation that merely failed to mention it must not delete it.
+#[tokio::test]
+async fn withdrawal_never_removes_an_edge_the_definition_authored() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("fanout", "two children", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let kvdag = store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", fanout_spec(1))
+        .await
+        .expect("create_version");
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    let authored: Vec<_> = store
+        .list_run_edges(&run)
+        .await
+        .expect("list_run_edges")
+        .into_iter()
+        .filter(|edge| edge.to.as_str() == "child0")
+        .collect();
+    assert!(
+        !authored.is_empty(),
+        "sanity: the definition authors an edge into child0"
+    );
+
+    store
+        .write(StoreWrite::RunTaskProjected {
+            run: run.clone(),
+            path: InstancePath::new("child0"),
+            node_key: NodeKey::new("child0"),
+            task_id: "2".to_string(),
+            subject: "2. Child".to_string(),
+            owner: String::new(),
+            status: NodeStatus::Pending,
+            emergent: false,
+            blocked_by: Vec::new(),
+            observed_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("write");
+
+    let after: Vec<_> = store
+        .list_run_edges(&run)
+        .await
+        .expect("list_run_edges")
+        .into_iter()
+        .filter(|edge| edge.to.as_str() == "child0")
+        .collect();
+    assert_eq!(
+        after.len(),
+        authored.len(),
+        "the plan's own edges survive an observation that does not mention them"
+    );
+}
+
 #[tokio::test]
 async fn member_snapshots_upsert_in_place_and_list_in_first_seen_order() {
     let store = open_mem_store().await;

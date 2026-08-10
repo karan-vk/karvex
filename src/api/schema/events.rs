@@ -482,6 +482,10 @@ mod workflow_event_tests {
             growth_limited: None,
             transcript_path: None,
             restored_from: None,
+            task_id: None,
+            subject: String::new(),
+            owner: String::new(),
+            emergent: false,
         }
     }
 

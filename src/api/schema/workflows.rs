@@ -624,6 +624,26 @@ pub struct WorkflowRunNodeInfo {
     /// rather than executed (`07-phase3-plan.md` §4 D4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restored_from: Option<WorkflowRestoredFrom>,
+    /// Claude Code's own task id for this node, once the run projection has
+    /// seen a task matching it (`09-agent-teams-rework.md` §3.4). Absent on an
+    /// engine-era run and on a planned node no task has claimed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// The observed task subject, verbatim. Kept beside `label` rather than
+    /// replacing it: `label` is what the definition called the node, and this
+    /// is what the team actually called the work.
+    #[serde(default)]
+    pub subject: String,
+    /// The teammate that claimed the task, empty while unclaimed. Its pane is
+    /// in the run's member list, which is what makes "select a node, focus the
+    /// pane that owns it" resolvable.
+    #[serde(default)]
+    pub owner: String,
+    /// Whether the team created this task without the definition planning it.
+    /// Emergent nodes are first-class rather than hidden — the loose part of
+    /// the contract, recorded.
+    #[serde(default)]
+    pub emergent: bool,
 }
 
 fn default_attempt() -> u32 {
@@ -1144,6 +1164,10 @@ pub(crate) mod tests {
             growth_limited: None,
             transcript_path: None,
             restored_from: None,
+            task_id: None,
+            subject: String::new(),
+            owner: String::new(),
+            emergent: false,
         }
     }
 

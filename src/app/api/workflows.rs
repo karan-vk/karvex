@@ -3358,6 +3358,12 @@ pub(crate) fn wire_run_node_record(
         // the restore instant, and this is what says where its result came
         // from.
         restored_from: record.restored_from.as_ref().map(wire_restored_from),
+        // §3.4: what the run projection observed. Empty/absent for every
+        // engine-era run, which never had a task list behind it.
+        task_id: record.task_id,
+        subject: record.subject,
+        owner: record.owner,
+        emergent: record.emergent,
     }
 }
 
