@@ -1845,6 +1845,90 @@ mod tests {
         );
     }
 
+    /// Characterization pin, written *before* the agent-teams rework touched
+    /// any shared rendering code (`09-agent-teams-rework.md` phase C).
+    ///
+    /// The rework re-points this overlay at the run projection, and the one
+    /// thing it must not do is change how an engine-era run — every run in
+    /// anyone's history — draws. This asserts the whole rendered screen
+    /// verbatim rather than a handful of substrings, so any drift at all in the
+    /// engine-era rendering fails here and has to be justified rather than
+    /// noticed later. Update it only with a deliberate reason.
+    #[test]
+    fn an_engine_era_run_renders_exactly_as_it_did_before_the_rework() {
+        let mut graph = diamond();
+        graph.nodes[0].status = NodeStatus::Succeeded;
+        graph.nodes[1].status = NodeStatus::Running;
+        graph.nodes[2].status = NodeStatus::NeedsAttention;
+        graph.nodes[3].status = NodeStatus::Pending;
+
+        let area = Rect::new(0, 0, 80, 24);
+        let view = view_of(&graph, area);
+        let screen = screen_of(&view, area);
+
+        insta_like_pin(
+            &screen,
+            // Structure the pin cares about, in the order it appears. Kept as
+            // an ordered slice rather than one big literal so a width change
+            // in an unrelated column does not turn into an unreadable diff.
+            &[
+                "workflow_run:1",
+                "start",
+                "left",
+                "right",
+                "end",
+                "succeeded",
+                "enter",
+                " focus",
+                "s",
+                " steer",
+                "i",
+                " interrogate",
+                "I",
+                " reconstruct",
+                "esc",
+            ],
+        );
+
+        // The engine-era footer offers the full engine verb set. A new-path run
+        // must not, and this is the line that says what "unchanged" means.
+        assert!(
+            screen.contains("steer"),
+            "engine-era footer lost steer\n{screen}"
+        );
+        assert!(
+            screen.contains("interrogate"),
+            "engine-era footer lost interrogate\n{screen}"
+        );
+        assert!(
+            screen.contains("reconstruct"),
+            "engine-era footer lost reconstruct\n{screen}"
+        );
+        // And nothing from the projection leaks into a run that never had one.
+        assert!(
+            !screen.contains("emergent"),
+            "projection vocabulary leaked into an engine-era run\n{screen}"
+        );
+        assert!(
+            !screen.contains("owner"),
+            "projection vocabulary leaked into an engine-era run\n{screen}"
+        );
+    }
+
+    /// Asserts every fragment appears, in order, so the pin describes layout
+    /// and not just presence.
+    fn insta_like_pin(screen: &str, fragments: &[&str]) {
+        let mut cursor = 0usize;
+        for fragment in fragments {
+            match screen[cursor..].find(fragment) {
+                Some(offset) => cursor += offset + fragment.len(),
+                None => panic!(
+                    "expected {fragment:?} after byte {cursor} of the rendered screen\n{screen}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn render_draws_boxes_edges_and_the_selected_node_detail() {
         let mut graph = diamond();
