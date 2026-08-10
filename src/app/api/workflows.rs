@@ -70,6 +70,8 @@ use crate::workflow::model::{
     NodeToken, RestoredRef, RestoredSeed, RunGraph, RunId, RunStatus, Runner, WorkflowId,
 };
 #[cfg(feature = "workflow")]
+use crate::workflow::store::error::WORKFLOW_NAME_TAKEN_CODE;
+#[cfg(feature = "workflow")]
 use crate::workflow::store::{
     NewRun, StoreError, StoredGrowthLimits, VersionMetadata, VersionOrigin, VersionRecord,
 };
@@ -510,18 +512,42 @@ impl App {
             Ok(definition) => definition,
             Err(error) => return encode_error(id, INVALID_DEFINITION_CODE, error.to_string()),
         };
+        // Before the first write, not after it. `create_workflow` and
+        // `create_version` are two separate commits, so a graph the second one
+        // rejects — a cycle, a duplicate node key, an edge naming a node that
+        // does not exist — used to leave the first one behind as a version-less
+        // workflow that permanently squatted the name, with no `workflow
+        // delete` to recover it. Hoisting the store's own gate
+        // (`Definition::validate_graph`, the same `Kvdag::try_new`) in front of
+        // the first write is what makes this all-or-nothing; a
+        // write-then-roll-back would still lose the race against a crash
+        // between the two.
+        if let Err(error) = definition.validate_graph() {
+            return encode_error(id, INVALID_DEFINITION_CODE, error.to_string());
+        }
 
+        let name = definition.name.trim().to_string();
+        // H5: this path holds the authored document, so the `workflow` row's
+        // description/tier come from it — which is also what gives an adopted
+        // row (below) the new document's metadata instead of the empty
+        // placeholder the abandoned create left on it.
+        let metadata = VersionMetadata {
+            description: definition.description.clone(),
+            default_tier: definition.tier(),
+        };
         let created = self.workflow_store.call(move |cx| {
-            let workflow_id = cx.block_on(cx.store().create_workflow(
-                definition.name.trim(),
-                &definition.description,
-                definition.tier(),
-            ))?;
-            let kvdag = cx.block_on(cx.store().create_version(
+            let workflow_id = match create_target(cx, &definition)? {
+                CreateTarget::Fresh(workflow_id) | CreateTarget::Adopted(workflow_id) => {
+                    workflow_id
+                }
+                CreateTarget::NameTaken => return Ok::<_, StoreError>(CreateResult::NameTaken),
+            };
+            let kvdag = cx.block_on(cx.store().create_version_with_metadata(
                 &workflow_id,
                 VersionOrigin::Authored,
                 "",
                 definition.spec(&workflow_id),
+                Some(&metadata),
             ))?;
             cx.block_on(cx.store().set_head_version(&workflow_id, &kvdag.version_id))?;
             let summary = cx
@@ -536,11 +562,11 @@ impl App {
                     table: "kvdag_version",
                     id: kvdag.version_id.to_string(),
                 })?;
-            Ok::<_, StoreError>((summary, version_record))
+            Ok(CreateResult::Created((summary, version_record)))
         });
 
         match created {
-            Ok(Ok((summary, version_record))) => {
+            Ok(Ok(CreateResult::Created((summary, version_record)))) => {
                 let version = wire_version_summary(&version_record);
                 encode_success(
                     id,
@@ -550,6 +576,15 @@ impl App {
                     },
                 )
             }
+            Ok(Ok(CreateResult::NameTaken)) => encode_error(
+                id,
+                WORKFLOW_NAME_TAKEN_CODE,
+                format!(
+                    "a workflow named {name} already exists; \
+                     pick another name, or author a new version of it \
+                     (`kvx workflow update`, `workflow.version.create`)"
+                ),
+            ),
             Ok(Err(error)) => self.store_error(id, &error),
             Err(unavailable) => unavailable_response(id, &unavailable),
         }
@@ -2785,6 +2820,86 @@ fn resolve_workflow_selector(
     }
 }
 
+/// Which `workflow` row `workflow.create` is going to hang its first version
+/// off.
+#[cfg(feature = "workflow")]
+enum CreateTarget {
+    /// The ordinary path: no workflow held that name, so one was created.
+    Fresh(WorkflowId),
+    /// A row holding the name that has no head version and no version rows at
+    /// all — the residue a half-committed create left behind before
+    /// `workflow.create` pre-validated (see `handle_workflow_create`). Such a
+    /// row cannot be shown, run, or revised in any meaningful way; it only
+    /// squats the name, and there is no `workflow delete` to clear it. So a
+    /// create naming it fills it in rather than refusing, which is what makes
+    /// names burned by 0.12.0 recoverable without a new command.
+    Adopted(WorkflowId),
+    /// A real workflow — one with a version — already holds the name.
+    NameTaken,
+}
+
+/// `workflow.create`'s two outcomes past the store boundary. `NameTaken` is
+/// carried back as data rather than as a [`StoreError`] because nothing failed
+/// in the store: the answer is a refusal the handler renders itself.
+#[cfg(feature = "workflow")]
+enum CreateResult<T> {
+    Created(T),
+    NameTaken,
+}
+
+/// Resolves [`CreateTarget`], creating the row on the ordinary path.
+#[cfg(feature = "workflow")]
+fn create_target(
+    cx: &crate::app::workflow_store::StoreContext<'_>,
+    definition: &Definition,
+) -> Result<CreateTarget, StoreError> {
+    let name = definition.name.trim();
+    let mut existing = cx
+        .block_on(cx.store().find_workflows_by_name(name))?
+        .into_iter();
+    if let Some(found) = existing.next() {
+        // `workflow_name` is UNIQUE, so a second match is not reachable under
+        // the current schema; if one ever is, adopting *either* row would be a
+        // guess, and refusing is the safe answer.
+        if existing.next().is_none() && is_versionless(cx, &found)? {
+            tracing::warn!(
+                workflow_id = %found.id,
+                name,
+                "adopting a version-less workflow row left behind by an abandoned create"
+            );
+            return Ok(CreateTarget::Adopted(found.id));
+        }
+        return Ok(CreateTarget::NameTaken);
+    }
+    let workflow_id = cx.block_on(cx.store().create_workflow(
+        name,
+        &definition.description,
+        definition.tier(),
+    ))?;
+    Ok(CreateTarget::Fresh(workflow_id))
+}
+
+/// Whether a workflow row has no version behind it at all.
+///
+/// Both halves are checked: `head_version` is cleared on nothing and set
+/// immediately after v1 is written, so a missing head is the usual marker —
+/// but a create that died between `create_version` and `set_head_version` would
+/// leave a v1 with no head, and adopting *that* would write a second v1-shaped
+/// version beside an orphan. Version 1 is asked for directly because it is the
+/// first number the store ever assigns.
+#[cfg(feature = "workflow")]
+fn is_versionless(
+    cx: &crate::app::workflow_store::StoreContext<'_>,
+    workflow: &crate::workflow::store::WorkflowSummary,
+) -> Result<bool, StoreError> {
+    if workflow.head_version.is_some() {
+        return Ok(false);
+    }
+    Ok(cx
+        .block_on(cx.store().find_version_id(&workflow.id, 1))?
+        .is_none())
+}
+
 /// A store lookup that first resolves a `<name|id>` selector: `NotFound`/
 /// `Ambiguous` short-circuit before whatever the handler would otherwise have
 /// gone on to read.
@@ -3461,11 +3576,201 @@ output_schema = { type = "object" }
                 },
             },
         );
-        let code = error_code(&response);
-        assert!(
-            code == INVALID_DEFINITION_CODE || code == "workflow_store_error",
-            "unexpected code {code}: {response}"
+        // Not "either code": the graph validators run before the first write
+        // now, so which of the two reported it is no longer a coin toss.
+        assert_eq!(error_code(&response), INVALID_DEFINITION_CODE, "{response}");
+    }
+
+    /// One TOML document per graph-level validator that only `Kvdag::try_new`
+    /// owns — `Definition::check` passes all three, which is exactly why they
+    /// used to reach the store with the `workflow` row already committed.
+    #[cfg(feature = "workflow")]
+    fn graph_invalid_definitions() -> Vec<(&'static str, String)> {
+        fn node(key: &str) -> String {
+            format!(
+                "[[node]]\nkey = \"{key}\"\nlabel = \"{key}\"\nrunner = \"command\"\n\
+                 command = [\"/bin/true\"]\nprompt_template = \"do it\"\n\
+                 output_schema = {{ type = \"object\" }}\n"
+            )
+        }
+        vec![
+            (
+                "cycle",
+                format!(
+                    "name = \"zombie-test\"\n{}{}\
+                     [[edge]]\nfrom = \"a\"\nto = \"b\"\n\
+                     [[edge]]\nfrom = \"b\"\nto = \"a\"\n",
+                    node("a"),
+                    node("b")
+                ),
+            ),
+            (
+                "duplicate node key",
+                format!("name = \"zombie-test\"\n{}{}", node("a"), node("a")),
+            ),
+            (
+                "unknown edge endpoint",
+                format!(
+                    "name = \"zombie-test\"\n{}[[edge]]\nfrom = \"a\"\nto = \"ghost\"\n",
+                    node("a")
+                ),
+            ),
+        ]
+    }
+
+    #[cfg(feature = "workflow")]
+    fn create_toml(app: &mut App, text: &str) -> String {
+        app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: WorkflowDefinitionDocument {
+                    format: WorkflowDefinitionFormat::Toml,
+                    text: text.to_string(),
+                },
+            },
+        )
+    }
+
+    #[cfg(feature = "workflow")]
+    fn listed_workflows(app: &mut App) -> Vec<serde_json::Value> {
+        let listed = app.handle_workflow_list("req".into());
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        listed["result"]["workflows"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The zombie-row regression. `create_workflow` and `create_version` are
+    /// two commits; a graph the second one rejects used to leave the first one
+    /// behind as a version-less workflow that squatted the name forever,
+    /// because there is no `workflow delete`.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_graph_invalid_create_writes_nothing_and_leaves_the_name_usable() {
+        for (label, text) in graph_invalid_definitions() {
+            let mut app = app();
+            let response = create_toml(&mut app, &text);
+            assert_eq!(
+                error_code(&response),
+                INVALID_DEFINITION_CODE,
+                "{label}: {response}"
+            );
+            assert!(
+                listed_workflows(&mut app).is_empty(),
+                "{label}: a rejected create left a workflow row behind: {:?}",
+                listed_workflows(&mut app)
+            );
+
+            // …and the name it was rejected under is still available.
+            let valid = create_toml(
+                &mut app,
+                r#"
+name = "zombie-test"
+[[node]]
+key = "only"
+label = "Only"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "do it"
+output_schema = { type = "object" }
+"#,
+            );
+            let valid: serde_json::Value = serde_json::from_str(&valid).unwrap();
+            assert_eq!(
+                valid["result"]["type"], "workflow_created",
+                "{label}: the name stayed burned: {valid}"
+            );
+        }
+    }
+
+    /// The other half of the same incident: the retry after a burned name
+    /// answered with SurrealDB's own index message ("Database index
+    /// workflow_name already contains …"). A genuine collision now has a code
+    /// of its own and a message written for a human.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn creating_a_workflow_under_a_taken_name_is_a_named_refusal() {
+        let definition = r#"
+name = "taken"
+[[node]]
+key = "only"
+label = "Only"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "do it"
+output_schema = { type = "object" }
+"#;
+        let mut app = app();
+        let first: serde_json::Value = serde_json::from_str(&create_toml(&mut app, definition))
+            .expect("the first create is valid json");
+        assert_eq!(first["result"]["type"], "workflow_created", "{first}");
+
+        let response = create_toml(&mut app, definition);
+        assert_eq!(
+            error_code(&response),
+            WORKFLOW_NAME_TAKEN_CODE,
+            "{response}"
         );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("taken"), "{message}");
+        assert!(
+            !message.to_ascii_lowercase().contains("database index"),
+            "the raw store message leaked through: {message}"
+        );
+        assert_eq!(listed_workflows(&mut app).len(), 1, "{response}");
+    }
+
+    /// Names already burned by a 0.12.0 zombie stay recoverable: a row with no
+    /// head and no versions is filled in by the next create rather than
+    /// refusing it, which is the only escape hatch available without a new
+    /// `workflow delete` command.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_create_adopts_a_version_less_row_that_is_squatting_the_name() {
+        let mut app = app();
+        // Exactly the residue the old two-commit path left: the row, and
+        // nothing else.
+        let zombie = app
+            .workflow_store
+            .call(|cx| cx.block_on(cx.store().create_workflow("squatted", "", Tier::High)))
+            .expect("the in-memory store is available")
+            .expect("creating the row succeeds");
+
+        let created: serde_json::Value = serde_json::from_str(&create_toml(
+            &mut app,
+            r#"
+name = "squatted"
+description = "the real one"
+default_tier = "low"
+[[node]]
+key = "only"
+label = "Only"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "do it"
+output_schema = { type = "object" }
+"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            created["result"]["type"], "workflow_created",
+            "the burned name is still unusable: {created}"
+        );
+        // Adopted, not duplicated — the unique index would have refused a
+        // second row anyway, so a second listing entry would mean the id moved.
+        assert_eq!(
+            created["result"]["workflow"]["workflow_id"],
+            zombie.as_str()
+        );
+        assert_eq!(created["result"]["version"]["version"], 1);
+        let workflows = listed_workflows(&mut app);
+        assert_eq!(workflows.len(), 1, "{workflows:?}");
+        // H5: the adopted row describes the document that filled it in, not
+        // the empty placeholder it was created with.
+        assert_eq!(workflows[0]["description"], "the real one");
+        assert_eq!(workflows[0]["default_tier"], "low");
     }
 
     #[cfg(feature = "workflow")]
@@ -5477,7 +5782,8 @@ output_schema = { type = "object", required = ["done"] }
         use crate::app::workflow::WorkflowStartError;
         use crate::workflow::binding::spawn::SpawnError;
         use crate::workflow::store::error::{
-            WORKFLOW_INVALID_DEFINITION_CODE, WORKFLOW_STORE_ERROR_CODE, WORKFLOW_UNAVAILABLE_CODE,
+            WORKFLOW_INVALID_DEFINITION_CODE, WORKFLOW_NAME_TAKEN_CODE, WORKFLOW_STORE_ERROR_CODE,
+            WORKFLOW_UNAVAILABLE_CODE,
         };
 
         vec![
@@ -5489,6 +5795,12 @@ output_schema = { type = "object", required = ["done"] }
             ("definition_invalid", WORKFLOW_INVALID_DEFINITION_CODE),
             ("subsystem_unavailable", WORKFLOW_UNAVAILABLE_CODE),
             ("not_found", NOT_FOUND_CODE),
+            // A create colliding with an existing workflow's name. Its own
+            // domain: the document validated fine (so not
+            // `definition_invalid`), the store did not misbehave (so not
+            // `store_error`), and no selector was ambiguous (so not
+            // `target_ambiguous`).
+            ("name_taken", WORKFLOW_NAME_TAKEN_CODE),
             ("target_ambiguous", AMBIGUOUS_NAME_CODE),
             ("run_not_active", NO_ACTIVE_RUN_CODE),
             ("missing_arg", MISSING_ARG_CODE),
@@ -5550,7 +5862,7 @@ output_schema = { type = "object", required = ["done"] }
         let codes = all_workflow_error_codes();
         assert_eq!(
             codes.len(),
-            25,
+            26,
             "the inventory grew or shrank; update this count alongside the list itself"
         );
 

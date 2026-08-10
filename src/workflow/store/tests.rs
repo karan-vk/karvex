@@ -3552,3 +3552,103 @@ async fn list_runs_with_no_workflow_filter_lists_across_every_workflow() {
         .iter()
         .any(|record| record.id == run_b && record.workflow_name == "second"));
 }
+
+// ── 14: create atomicity and name collisions ─────────────────────────────
+
+/// A name collision came back as `StoreError::Query` carrying SurrealDB's own
+/// index message, which `workflow.create` then handed to the user verbatim.
+#[tokio::test]
+async fn creating_a_workflow_under_a_taken_name_is_a_named_store_error() {
+    let store = open_mem_store().await;
+    store
+        .create_workflow("demo", "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+
+    let error = store
+        .create_workflow("demo", "", Tier::Auto)
+        .await
+        .expect_err("the UNIQUE workflow_name index refuses the second row");
+    assert!(
+        matches!(&error, StoreError::NameTaken { name } if name == "demo"),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(error.api_code(), error::WORKFLOW_NAME_TAKEN_CODE);
+    assert!(
+        !error.to_string().to_ascii_lowercase().contains("index"),
+        "the raw index message leaked: {error}"
+    );
+}
+
+/// The sniffer that recognises the collision. Pinned against the message shape
+/// actually observed, so an upstream rewording fails here rather than silently
+/// reverting the leak.
+#[test]
+fn the_unique_name_index_message_is_recognised_and_nothing_else_is() {
+    assert!(is_workflow_name_conflict(
+        "Database index `workflow_name` already contains 'test-cycle', \
+         with record `workflow:abc`"
+    ));
+    assert!(is_workflow_name_conflict(
+        "Database index workflow_name already contains 'x', with record workflow:abc"
+    ));
+    assert!(!is_workflow_name_conflict(
+        "Database index `run_workflow` already contains 'x'"
+    ));
+    assert!(!is_workflow_name_conflict(
+        "There was a problem with the database"
+    ));
+}
+
+/// A version the graph validators reject must leave the workflow row exactly as
+/// it was: the H5 metadata refresh used to run *before* `Kvdag::try_new`, so a
+/// rejected update still rewrote the row's description and tier to describe a
+/// revision that was never written.
+#[tokio::test]
+async fn a_rejected_version_leaves_the_workflow_metadata_untouched() {
+    let store = open_mem_store().await;
+    let (workflow, _) = setup_workflow(&store).await;
+    let before = store
+        .get_workflow(&workflow)
+        .await
+        .expect("get_workflow")
+        .expect("the workflow exists");
+
+    // Two nodes with the same key: rejected by `Kvdag::try_new`, never by any
+    // check that runs earlier.
+    let duplicate = base_spec(
+        vec![
+            node("same", "Work on {{goal}}"),
+            node("same", "Work on {{goal}}"),
+        ],
+        Vec::new(),
+    );
+    let error = store
+        .create_version_with_metadata(
+            &workflow,
+            VersionOrigin::Authored,
+            "rejected",
+            duplicate,
+            Some(&VersionMetadata {
+                description: "should never be written".to_string(),
+                default_tier: Tier::Low,
+            }),
+        )
+        .await
+        .expect_err("a duplicate node key is refused");
+    assert!(
+        matches!(
+            error,
+            StoreError::InvalidGraph(KvdagError::DuplicateNodeKey(_))
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let after = store
+        .get_workflow(&workflow)
+        .await
+        .expect("get_workflow")
+        .expect("the workflow still exists");
+    assert_eq!(after.description, before.description);
+    assert_eq!(after.default_tier, before.default_tier);
+}

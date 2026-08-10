@@ -34,6 +34,20 @@ pub const WORKFLOW_STORE_ERROR_CODE: &str = "workflow_store_error";
 /// messaging (v0.10.0 retest, `expand_allow` authoring-validation finding).
 pub const WORKFLOW_INVALID_DEFINITION_CODE: &str = "workflow_invalid_definition";
 
+/// The error code for `workflow.create` against a name another workflow
+/// already holds. `workflow_name` is UNIQUE (`migrations/0001_init.surql`), so
+/// this used to surface as a raw SurrealDB index message — "Database index
+/// workflow_name already contains 'x', with record workflow:…" — leaking a
+/// database-internal string as the user-facing error for the single most
+/// ordinary authoring mistake there is.
+///
+/// Deliberately distinct from [`WORKFLOW_INVALID_DEFINITION_CODE`]: the
+/// document is fine, the *name* is taken, and a scripted caller retrying with
+/// a different name needs to tell those apart. Deliberately distinct from
+/// `workflow_target_ambiguous` too — that one is a selector matching more than
+/// one existing workflow, not a create colliding with one.
+pub const WORKFLOW_NAME_TAKEN_CODE: &str = "workflow_name_taken";
+
 #[derive(Debug)]
 pub enum StoreError {
     /// The subsystem cannot be used at all. Surfaced once in the TUI, never
@@ -64,6 +78,13 @@ pub enum StoreError {
     /// resolved assignment. Distinct from [`Self::Query`]: nothing was
     /// attempted against the database, so there is no engine error to report.
     Invariant(String),
+    /// A write would have collided with the UNIQUE `workflow_name` index.
+    /// Named rather than left as a [`Self::Query`] so the API answers with
+    /// [`WORKFLOW_NAME_TAKEN_CODE`] instead of forwarding SurrealDB's own
+    /// index message to the caller.
+    NameTaken {
+        name: String,
+    },
     Io(io::Error),
 }
 
@@ -91,6 +112,8 @@ impl StoreError {
             WORKFLOW_UNAVAILABLE_CODE
         } else if matches!(self, Self::InvalidGraph(_)) {
             WORKFLOW_INVALID_DEFINITION_CODE
+        } else if matches!(self, Self::NameTaken { .. }) {
+            WORKFLOW_NAME_TAKEN_CODE
         } else {
             WORKFLOW_STORE_ERROR_CODE
         }
@@ -114,6 +137,9 @@ impl fmt::Display for StoreError {
             Self::NotFound { table, id } => write!(f, "no {table} with id {id}"),
             Self::InvalidGraph(error) => write!(f, "invalid kvdag: {error}"),
             Self::Invariant(message) => write!(f, "workflow store invariant violated: {message}"),
+            Self::NameTaken { name } => {
+                write!(f, "a workflow named {name} already exists")
+            }
             Self::Io(error) => write!(f, "{error}"),
         }
     }
