@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.12.0] - 2026-08-10
+
 ### Added
 
 - Every finished run — succeeded or failed — now gets an end-of-run summary, written by a real summariser node you can watch. The summariser is an epilogue rather than a graph node: it starts only once the run's terminal status is decided, so `workflow.run.finished` fires exactly when it always did and a new `workflow.run.summarized` event follows when the summary lands. It runs under the reserved instance path `.summary`, is visible in the DAG view (the run's status line reads `· summarising…`, then `· summary failed` if it gave up), and is excluded from `nodes_total`/`nodes_done`, which count the run's declared work. Every failure mode — output that fails its schema twice, a spawn failure, a dead pane, a cancelled run — converges on giving up: journalled, notified once, pane closed, and the run's own status untouched. Read summaries back with `kvx workflow summary show <run_id>` and `kvx workflow summary list [<name|id>] [--limit N]`, or `workflow.summary.get`/`workflow.summary.list` on the JSON API. Turn the summariser off with `workflow.summary_enabled = false`, or bind it to a command of your own with `KARVEX_WORKFLOW_SUMMARY_COMMAND` (a JSON array of argv strings; an unparseable value disables summaries for that server and says so, rather than silently running `claude`).
