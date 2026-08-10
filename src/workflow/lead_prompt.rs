@@ -20,7 +20,7 @@ use crate::workflow::tier::{self, Assignment, HistoryIndex, Tier};
 /// differently for. Recorded in the prompt itself so a stored run says which
 /// contract produced it, and asserted by the render tests so a change to the
 /// template is never silent.
-pub const LEAD_PROMPT_VERSION: u32 = 1;
+pub const LEAD_PROMPT_VERSION: u32 = 2;
 
 /// The separator between a node key and its label in a task subject. The
 /// projection (§3.4) matches Claude Code tasks back to definition nodes by
@@ -45,6 +45,12 @@ pub struct LeadPromptInput<'a> {
     /// Where the lead is told to write its run summary, as an absolute path.
     /// The launch path points this inside the run directory.
     pub summary_path: &'a str,
+    /// `context/prior-runs.md`, when this run was given the summaries of past
+    /// runs of the same workflow (`workflow.run`'s `include_prior_summaries`,
+    /// which defaults on). `None` when the caller opted out or there is no
+    /// history yet — karvex writes the file either way, so the lead has to be
+    /// *told* it exists or the parameter does nothing at all.
+    pub prior_runs_path: Option<&'a str>,
 }
 
 /// The task subject karvex asks the lead to use for a definition node, and
@@ -106,6 +112,7 @@ pub fn render_lead_prompt(input: &LeadPromptInput<'_>) -> String {
     out.push('\n');
 
     render_args(&mut out, input);
+    render_prior_runs(&mut out, input);
     render_contract(&mut out, kvdag);
     render_plan(&mut out, input);
     render_teammates(&mut out, input);
@@ -146,6 +153,20 @@ fn render_args(out: &mut String, input: &LeadPromptInput<'_>) {
             let _ = writeln!(out, "- `{name}` = {}", quoted(value));
         }
     }
+    out.push('\n');
+}
+
+fn render_prior_runs(out: &mut String, input: &LeadPromptInput<'_>) {
+    let Some(path) = input.prior_runs_path else {
+        return;
+    };
+    out.push_str("## What past runs of this workflow found\n\n");
+    let _ = writeln!(
+        out,
+        "`{path}` holds the summaries of previous runs of this same workflow. Read \
+         it before you plan: it is the cheapest way to avoid repeating work that \
+         has already been done, or a mistake that has already been made."
+    );
     out.push('\n');
 }
 
@@ -531,6 +552,7 @@ mod tests {
             args: &args,
             history: &history,
             summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: None,
         })
     }
 
@@ -542,6 +564,10 @@ mod tests {
         assert!(text.contains("- Definition version: `v3`"));
         assert!(text.contains("- Tier: `high`"));
         assert!(text.contains(&format!("- Lead prompt contract: `v{LEAD_PROMPT_VERSION}`")));
+        assert_eq!(
+            LEAD_PROMPT_VERSION, 2,
+            "bump the contract when the render changes"
+        );
     }
 
     #[test]
@@ -611,6 +637,37 @@ mod tests {
         assert!(text.contains("subject `finish: write the run summary and report`"));
     }
 
+    /// The `include_prior_summaries` parameter writes `context/prior-runs.md`
+    /// whether or not anything reads it, so the render is the only thing that
+    /// makes it mean something.
+    #[test]
+    fn prior_run_context_is_named_when_the_run_was_given_any() {
+        let kvdag = fixture();
+        let args = args();
+        let history = HistoryIndex::new();
+        let run = RunId::new("workflow_run:abc123");
+        let text = render_lead_prompt(&LeadPromptInput {
+            run_id: &run,
+            workflow_name: "parser-work",
+            kvdag: &kvdag,
+            tier: Tier::High,
+            args: &args,
+            history: &history,
+            summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: Some("/runs/abc123/context/prior-runs.md"),
+        });
+        assert!(text.contains("## What past runs of this workflow found"));
+        assert!(text.contains("`/runs/abc123/context/prior-runs.md`"));
+        assert!(text.contains("Read it before you plan"));
+    }
+
+    #[test]
+    fn prior_run_context_is_absent_when_the_run_was_given_none() {
+        let text = render(Tier::High);
+        assert!(!text.contains("What past runs of this workflow found"));
+        assert!(!text.contains("prior-runs.md"));
+    }
+
     #[test]
     fn the_loose_paragraph_is_present() {
         let text = render(Tier::High);
@@ -639,6 +696,7 @@ mod tests {
             args: &empty,
             history: &history,
             summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: None,
         });
         assert!(text.contains("This run was started with no arguments."));
         // The unfilled arg slot stays visible in the description.
@@ -688,6 +746,7 @@ mod tests {
             args: &args,
             history: &history,
             summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: None,
         });
         assert!(!text.contains("shard: One shard"));
         assert!(text.contains("This plan has 3 tasks"));

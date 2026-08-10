@@ -937,7 +937,7 @@ impl App {
         // already wrote the planned `run_node` rows, and the projection
         // (§3.4) is what moves them.
         let _ = (&assignments, &seeds, &context_runs, &restore_from_run);
-        let _ = (workspace_id, prior_runs_path);
+        let _ = workspace_id;
 
         let ws_idx = match self.state.active.filter(|ws_idx| {
             self.state
@@ -986,6 +986,10 @@ impl App {
                 args: &ordered_args,
                 history: &history,
                 summary_path: &summary_path,
+                // §3.6: `include_prior_summaries` writes the file whether or
+                // not anything reads it, so naming it here is what makes the
+                // parameter mean something to a lead.
+                prior_runs_path: prior_runs_path.as_deref(),
             },
         );
         if let Err(error) = self.write_lead_prompt(&spec, &prompt) {
