@@ -321,6 +321,194 @@ fn tmux_shim_fakes_a_claude_teammate_lifecycle() {
 }
 
 // ---------------------------------------------------------------------------
+// send-keys key-spec translation: a real Ctrl-C interrupt, not literal text
+// ---------------------------------------------------------------------------
+
+/// Regression coverage for the defect this shim's `send-keys` handler was
+/// fixed for: tmux key specs like `C-c` were being typed into the pane as
+/// the literal three characters "C-c" instead of an actual Ctrl-C keystroke.
+/// A foreground `sleep 30` blocks the shell from acting on any further input
+/// until it exits or is interrupted, so if `C-c` reaches the pane as a real
+/// interrupt, `echo interrupted-ok` runs almost immediately; if it were still
+/// typed as literal text, the shell would not see it until the real 30s
+/// sleep finished, well past this test's wait window.
+#[test]
+fn tmux_shim_send_keys_translates_ctrl_c_to_a_real_interrupt() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("karvex.sock");
+    let shim_dir = base.join("shim");
+
+    let karvex = spawn_karvex(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let leader_pane = root_pane_id(&created);
+
+    let tmux = install_tmux_symlink(&shim_dir);
+    let tmux_env = format!("{},{},0", socket_path.display(), std::process::id());
+    let socket_str = socket_path.to_str().unwrap();
+
+    let start = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args([
+            "-S",
+            socket_str,
+            "send-keys",
+            "-t",
+            &leader_pane,
+            "sh -c 'echo READY-FOR-CTRL-C && sleep 30'",
+            "Enter",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+            pane_read_recent_contains(&socket_path, &leader_pane, "READY-FOR-CTRL-C")
+        }),
+        "the foreground sleep must have started before the interrupt is sent"
+    );
+
+    let interrupt = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args(["-S", socket_str, "send-keys", "-t", &leader_pane, "C-c"])
+        .output()
+        .unwrap();
+    assert!(
+        interrupt.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&interrupt.stderr)
+    );
+
+    let confirm = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args([
+            "-S",
+            socket_str,
+            "send-keys",
+            "-t",
+            &leader_pane,
+            "echo",
+            "interrupted-ok",
+            "Enter",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        confirm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&confirm.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
+            pane_read_recent_contains(&socket_path, &leader_pane, "interrupted-ok")
+        }),
+        "C-c must reach the pane as a real interrupt, not literal text"
+    );
+
+    cleanup_spawned_karvex(karvex, base);
+}
+
+// ---------------------------------------------------------------------------
+// respawn-pane positional form (no `--` separator)
+// ---------------------------------------------------------------------------
+
+/// Real tmux accepts `respawn-pane [-k] [-t target-pane] [shell-command]`
+/// without a `--` separator too; Claude's own backend always sends the `--`
+/// form (covered by the flagship lifecycle test above), but the positional
+/// form must not silently report success without running anything.
+#[test]
+fn tmux_shim_respawn_pane_runs_positional_command_without_separator() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("karvex.sock");
+    let shim_dir = base.join("shim");
+
+    let karvex = spawn_karvex(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let leader_pane = root_pane_id(&created);
+
+    let tmux = install_tmux_symlink(&shim_dir);
+    let tmux_env = format!("{},{},0", socket_path.display(), std::process::id());
+    let socket_str = socket_path.to_str().unwrap();
+
+    let split = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args([
+            "-S",
+            socket_str,
+            "split-window",
+            "-d",
+            "-t",
+            &leader_pane,
+            "-h",
+            "-l",
+            "30%",
+            "-P",
+            "-F",
+            "#{pane_id}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        split.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    let new_pane = String::from_utf8_lossy(&split.stdout).trim().to_string();
+
+    // `respawn-pane -k -t <new> echo teammate-ready-positional` — no `--`.
+    let respawn = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args([
+            "-S",
+            socket_str,
+            "respawn-pane",
+            "-k",
+            "-t",
+            &new_pane,
+            "echo",
+            "teammate-ready-positional",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        respawn.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&respawn.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+            pane_read_recent_contains(&socket_path, &new_pane, "teammate-ready-positional")
+        }),
+        "respawn-pane's positional form (no `--`) must submit the command into the pane's \
+         shell, not silently no-op"
+    );
+
+    cleanup_spawned_karvex(karvex, base);
+}
+
+// ---------------------------------------------------------------------------
 // Version probe without a server
 // ---------------------------------------------------------------------------
 
@@ -605,7 +793,9 @@ fn shim_dir_contains_only_the_tmux_entry() {
         &["workspace", "create", "--cwd", base.to_str().unwrap()],
     );
 
-    let shims_dir = config_home.join(app_dir_name()).join("shims");
+    // The shim dir is per-server state, so it lives beside that server's API
+    // socket rather than in the shared config directory.
+    let shims_dir = server_state_dir(&socket_path).join("shims");
     let link = shims_dir.join("tmux");
     assert!(
         wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
@@ -719,7 +909,7 @@ fn nextest_binary_never_installs_a_tmux_shim() {
         "the pane must still spawn normally even though the shim install is refused"
     );
 
-    let shim_path = config_home.join(app_dir_name()).join("shims").join("tmux");
+    let shim_path = server_state_dir(&socket_path).join("shims").join("tmux");
     assert!(
         !shim_path.exists(),
         "a binary whose stem is not exactly `kvx` must never install the tmux shim"

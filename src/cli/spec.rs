@@ -870,7 +870,7 @@ fn plugin_command() -> Command {
 fn workflow_command() -> Command {
     Command::new("workflow")
         .about("Author and run multi-node agent workflows")
-        .subcommand(Command::new("list").about("List workflows"))
+        .subcommand(Command::new("list").about("List workflows").arg(json_flag()))
         .subcommand(
             Command::new("show")
                 .about("Show a workflow: summary, version history, and the head version's nodes/edges/args")
@@ -905,6 +905,7 @@ fn workflow_command() -> Command {
         )
         .subcommand(workflow_run_command())
         .subcommand(workflow_node_command())
+        .subcommand(workflow_summary_command())
 }
 
 fn workflow_run_command() -> Command {
@@ -916,13 +917,27 @@ fn workflow_run_command() -> Command {
                 .arg(required("target", "TARGET"))
                 .arg(option("tier", "TIER").value_parser(["auto", "max", "high", "medium", "low"]))
                 .arg(repeatable_option("arg", "KEY=VALUE"))
+                .arg(
+                    option("restore-from", "RUN_ID")
+                        .help("Seed nodes from a past run's checkpoints"),
+                )
+                .arg(
+                    repeatable_option("restore", "SELECTOR")
+                        .help("Restrict --restore-from to these nodes (bare --restore-from means every restorable node)"),
+                )
+                .arg(
+                    flag("restore-allow-changed")
+                        .help("Restore a node even when its definition changed since the source run"),
+                )
+                .arg(flag("no-prior-summaries").help("Skip injecting prior runs' summaries into this run's context"))
                 .arg(json_flag()),
         )
         .subcommand(
             Command::new("list")
                 .about("List runs for a workflow")
                 .arg(required("target", "TARGET"))
-                .arg(option("limit", "N")),
+                .arg(option("limit", "N"))
+                .arg(json_flag()),
         )
         .subcommand(
             Command::new("show")
@@ -933,7 +948,26 @@ fn workflow_run_command() -> Command {
         .subcommand(
             Command::new("cancel")
                 .about("Cancel a workflow run")
-                .arg(required("run_id", "RUN_ID")),
+                .arg(required("run_id", "RUN_ID"))
+                .arg(json_flag()),
+        )
+}
+
+fn workflow_summary_command() -> Command {
+    Command::new("summary")
+        .about("Read a run's end-of-run summary")
+        .subcommand(
+            Command::new("show")
+                .about("Show a run's summary")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("List run summaries, newest first")
+                .arg(Arg::new("target").value_name("TARGET"))
+                .arg(option("limit", "N"))
+                .arg(json_flag()),
         )
 }
 
@@ -952,19 +986,22 @@ fn workflow_node_command() -> Command {
                 .about("Steer a running workflow node")
                 .arg(required("run_id", "RUN_ID"))
                 .arg(required("path", "PATH"))
-                .arg(required("text", "TEXT").num_args(1..)),
+                .arg(required("text", "TEXT").num_args(1..))
+                .arg(json_flag()),
         )
         .subcommand(
             Command::new("interrupt")
                 .about("Interrupt a running workflow node")
                 .arg(required("run_id", "RUN_ID"))
-                .arg(required("path", "PATH")),
+                .arg(required("path", "PATH"))
+                .arg(json_flag()),
         )
         .subcommand(
             Command::new("restart")
                 .about("Restart a workflow node")
                 .arg(required("run_id", "RUN_ID"))
-                .arg(required("path", "PATH")),
+                .arg(required("path", "PATH"))
+                .arg(json_flag()),
         )
         .subcommand(
             Command::new("complete")
@@ -991,6 +1028,18 @@ fn workflow_node_command() -> Command {
                         .help("Override a slot the template's prompt_template already declares"),
                 )
                 .arg(option("count", "N").help("How many children to instantiate; defaults to 1"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("interrogate")
+                .about("Ask questions of a past node's Claude session")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(required("path", "PATH"))
+                .arg(
+                    flag("reconstructed")
+                        .help("Seed a fresh session from the stored checkpoint instead of resuming the original transcript"),
+                )
+                .arg(option("note", "TEXT").help("A short note recorded on the interrogation"))
                 .arg(json_flag()),
         )
 }
@@ -1462,11 +1511,14 @@ mod tests {
 
         let mut spec_paths = Vec::new();
         collect_subcommand_paths(workflow, &mut Vec::new(), &mut spec_paths);
-        // Drop the "run"/"node" namespace nodes themselves: they group verbs
-        // for help/completion but are not verbs `VERB_PATHS` enumerates.
+        // Drop the "run"/"node"/"summary" namespace nodes themselves: they
+        // group verbs for help/completion but are not verbs `VERB_PATHS`
+        // enumerates.
         let mut spec_leaf_paths: Vec<Vec<String>> = spec_paths
             .into_iter()
-            .filter(|path| !matches!(path.as_slice(), [group] if group == "run" || group == "node"))
+            .filter(|path| {
+                !matches!(path.as_slice(), [group] if group == "run" || group == "node" || group == "summary")
+            })
             .collect();
         spec_leaf_paths.sort();
 

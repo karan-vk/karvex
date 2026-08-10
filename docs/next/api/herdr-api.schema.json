@@ -900,6 +900,59 @@
                 "message"
               ],
               "type": "object"
+            },
+            {
+              "description": "The epilogue's summary was accepted and enqueued\n(`07-phase3-plan.md` §4 D1). There is no second `workflow.run.finished`\nand no `workflow.run.updated` — the run's status was already final.",
+              "properties": {
+                "run_id": {
+                  "type": "string"
+                },
+                "summary": {
+                  "$ref": "#/schemas/event/$defs/WorkflowRunSummaryInfo"
+                },
+                "type": {
+                  "const": "workflow_run_summarized",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "summary"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "interrogation": {
+                  "$ref": "#/schemas/event/$defs/WorkflowInterrogationInfo"
+                },
+                "type": {
+                  "const": "workflow_interrogation_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "interrogation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "interrogation": {
+                  "$ref": "#/schemas/event/$defs/WorkflowInterrogationInfo"
+                },
+                "type": {
+                  "const": "workflow_interrogation_ended",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "interrogation"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -937,7 +990,10 @@
             "workflow_node_created",
             "workflow_node_updated",
             "workflow_node_output_checkpoint",
-            "workflow_growth_limited"
+            "workflow_growth_limited",
+            "workflow_run_summarized",
+            "workflow_interrogation_started",
+            "workflow_interrogation_ended"
           ],
           "type": "string"
         },
@@ -1334,6 +1390,76 @@
             }
           ]
         },
+        "WorkflowInterrogationInfo": {
+          "description": "A live or ended interrogation of a past node's Claude session\n(`07-phase3-plan.md` §4 D7-D8). Not a `run_node`: interrogations have their\nown lifecycle and are never counted toward a run's node totals.",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "ended_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "forked_session_id": {
+              "description": "Learned from the pane's session report when not pre-assigned at spawn\n(`07-phase3-plan.md` §4 D7).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "note": {
+              "default": "",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "The source node's instance path, not the interrogation's own identity.",
+              "type": "string"
+            },
+            "reconstructed": {
+              "default": false,
+              "type": "boolean"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "source_session_id": {
+              "type": "string"
+            },
+            "started_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "transcript_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "run_id",
+            "path",
+            "source_session_id",
+            "cwd",
+            "started_at_unix_ms"
+          ],
+          "type": "object"
+        },
         "WorkflowNodeStatus": {
           "enum": [
             "pending",
@@ -1349,6 +1475,28 @@
           ],
           "type": "string"
         },
+        "WorkflowRestoredFrom": {
+          "description": "Provenance of a restored node, carried on `WorkflowRunNodeInfo`\n(`07-phase3-plan.md` §4 D4).",
+          "properties": {
+            "checkpoint_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "node_key": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "node_key",
+            "checkpoint_seq"
+          ],
+          "type": "object"
+        },
         "WorkflowRunInfo": {
           "properties": {
             "args": {
@@ -1356,6 +1504,14 @@
                 "type": "string"
               },
               "type": "object"
+            },
+            "context_runs": {
+              "default": [],
+              "description": "Source runs whose summaries this run's nodes were offered via\n`context/prior-runs.md` (`07-phase3-plan.md` §4 D21).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "ended_at_unix_ms": {
               "format": "uint64",
@@ -1409,6 +1565,13 @@
               "minimum": 0,
               "type": "integer"
             },
+            "restore_from_run": {
+              "description": "The run this one restored checkpoints from, if any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "run_id": {
               "type": "string"
             },
@@ -1445,6 +1608,11 @@
               "type": "string"
             },
             "workflow_id": {
+              "type": "string"
+            },
+            "workflow_name": {
+              "default": "",
+              "description": "Denormalised so a cross-workflow run list can label a row without N\nextra calls (`07-phase3-plan.md` §4 D9).",
               "type": "string"
             },
             "workspace_id": {
@@ -1576,6 +1744,17 @@
             "path": {
               "type": "string"
             },
+            "restored_from": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/WorkflowRestoredFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Provenance when this node was seeded from a past run's checkpoint\nrather than executed (`07-phase3-plan.md` §4 D4)."
+            },
             "started_at_unix_ms": {
               "format": "uint64",
               "minimum": 0,
@@ -1615,6 +1794,13 @@
               "minimum": 0,
               "type": "integer"
             },
+            "transcript_path": {
+              "description": "The transcript path a workflow pane's session report last confirmed\n(`07-phase3-plan.md` §4 D6). `None` means no session ever reported one\n— interrogation falls back to the pre-launch estimate.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "watchdog_interventions": {
               "default": 0,
               "format": "uint32",
@@ -1642,6 +1828,82 @@
             "cancelled"
           ],
           "type": "string"
+        },
+        "WorkflowRunSummaryInfo": {
+          "description": "A completed run's epilogue-authored summary\n(`07-phase3-plan.md` §4 D1, D10). `summary.get` returning `None` and this\ntype being absent from a `summary.list` result both mean the same normal\nthing: no summary was written, never an error.",
+          "properties": {
+            "created_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "generated_by_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "highlights": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "open_gaps": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "outcome": {
+              "type": "string"
+            },
+            "per_node": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/event/$defs/WorkflowSummaryNodeLine"
+              },
+              "type": "array"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "run_pruned": {
+              "default": false,
+              "description": "Set once the source run is pruned; the summary itself is the one\nnever-pruned row (`07-phase3-plan.md` §4 D9).",
+              "type": "boolean"
+            },
+            "text": {
+              "type": "string"
+            },
+            "token_estimate": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version_id": {
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            },
+            "workflow_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "workflow_id",
+            "workflow_name",
+            "version_id",
+            "text",
+            "outcome",
+            "token_estimate",
+            "created_at_unix_ms"
+          ],
+          "type": "object"
         },
         "WorkflowSuccession": {
           "description": "Every closing node records exactly one of these\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §3.3).",
@@ -1695,6 +1957,26 @@
               "type": "object"
             }
           ]
+        },
+        "WorkflowSummaryNodeLine": {
+          "description": "One node's line in a run summary's per-node breakdown\n(`04-kvdag-and-execution.md`'s epilogue schema, `07-phase3-plan.md` §4 D1).",
+          "properties": {
+            "node_key": {
+              "type": "string"
+            },
+            "one_liner": {
+              "type": "string"
+            },
+            "verdict": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "node_key",
+            "verdict",
+            "one_liner"
+          ],
+          "type": "object"
         },
         "WorkflowTier": {
           "description": "The run's cost/quality tier.",
@@ -4724,6 +5006,42 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.run.summarized",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.interrogation.started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.interrogation.ended",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -4858,6 +5176,14 @@
           ],
           "type": "string"
         },
+        "WorkflowInterrogationMode": {
+          "description": "Which spawn shape `workflow.node.interrogate` uses.\n`Resumed` forks the source Claude session (`03-storage-schema.md` §4.4);\n`Reconstructed` seeds a fresh session from the stored checkpoint when no\ntranscript is available, and is always explicitly labelled as such —\nnever presented as the original teammate\n(`00-overview.md` Feature 3, `07-phase3-plan.md` §4 D7).",
+          "enum": [
+            "resumed",
+            "reconstructed"
+          ],
+          "type": "string"
+        },
         "WorkflowNodeExpandParams": {
           "description": "A node proposing new nodes\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §3.4).\n\nToken-authenticated exactly like [`WorkflowNodeReportParams`]: an expand\nproposal is a node speaking, not an operator. A *rejected* proposal is a\nsuccessful response carrying the rejection — the run continues; only a bad\nrun/path/token or a closed run is an error.",
           "properties": {
@@ -4901,6 +5227,31 @@
             "path",
             "token",
             "template"
+          ],
+          "type": "object"
+        },
+        "WorkflowNodeInterrogateParams": {
+          "properties": {
+            "mode": {
+              "$ref": "#/schemas/request/$defs/WorkflowInterrogationMode",
+              "default": "resumed"
+            },
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "path"
           ],
           "type": "object"
         },
@@ -4960,6 +5311,29 @@
           ],
           "type": "object"
         },
+        "WorkflowRestoreRequest": {
+          "description": "A `workflow.run` request asking to seed some nodes from a past run's\ncheckpoints instead of re-executing them (`07-phase3-plan.md` §4 D3, D11).\nA bare `nodes: []` means every restorable node of the source run\n(`07-phase3-plan.md` §4 D18).",
+          "properties": {
+            "allow_changed": {
+              "default": false,
+              "type": "boolean"
+            },
+            "nodes": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        },
         "WorkflowRunListParams": {
           "properties": {
             "limit": {
@@ -4971,12 +5345,13 @@
               ]
             },
             "workflow_id": {
-              "type": "string"
+              "description": "`None` lists runs across every workflow, newest first\n(`07-phase3-plan.md` §4 D9).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
-          "required": [
-            "workflow_id"
-          ],
           "type": "object"
         },
         "WorkflowRunParams": {
@@ -4987,6 +5362,24 @@
               },
               "description": "Materialised into `workflow_run.args`; fills the declared `ArgSpec`\nnamespace (`kvx workflow run start … --arg k=v`).",
               "type": "object"
+            },
+            "include_prior_summaries": {
+              "description": "Defaults to `true` when absent (`07-phase3-plan.md` §4 D21): the run's\nnodes read prior runs' summaries via `context/prior-runs.md` unless\nexplicitly opted out.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "restore_from": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/WorkflowRestoreRequest"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Seed some nodes from a past run's checkpoints instead of re-executing\nthem (`07-phase3-plan.md` §4 D3, D11)."
             },
             "tier": {
               "anyOf": [
@@ -5026,6 +5419,25 @@
           "required": [
             "run_id"
           ],
+          "type": "object"
+        },
+        "WorkflowSummaryListParams": {
+          "properties": {
+            "limit": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workflow_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           "type": "object"
         },
         "WorkflowTarget": {
@@ -7041,6 +7453,54 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.node.interrogate",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowNodeInterrogateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.summary.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.summary.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowSummaryListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -8333,6 +8793,59 @@
                 "message"
               ],
               "type": "object"
+            },
+            {
+              "description": "The epilogue's summary was accepted and enqueued\n(`07-phase3-plan.md` §4 D1). There is no second `workflow.run.finished`\nand no `workflow.run.updated` — the run's status was already final.",
+              "properties": {
+                "run_id": {
+                  "type": "string"
+                },
+                "summary": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunSummaryInfo"
+                },
+                "type": {
+                  "const": "workflow_run_summarized",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "summary"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "interrogation": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowInterrogationInfo"
+                },
+                "type": {
+                  "const": "workflow_interrogation_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "interrogation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "interrogation": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowInterrogationInfo"
+                },
+                "type": {
+                  "const": "workflow_interrogation_ended",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "interrogation"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -8385,7 +8898,10 @@
             "workflow_node_created",
             "workflow_node_updated",
             "workflow_node_output_checkpoint",
-            "workflow_growth_limited"
+            "workflow_growth_limited",
+            "workflow_run_summarized",
+            "workflow_interrogation_started",
+            "workflow_interrogation_ended"
           ],
           "type": "string"
         },
@@ -11413,6 +11929,16 @@
             },
             {
               "properties": {
+                "restore": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/WorkflowRestoreReport"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "run": {
                   "$ref": "#/schemas/success_response/$defs/WorkflowRunInfo"
                 },
@@ -11587,6 +12113,64 @@
                 "type",
                 "accepted",
                 "rejected"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "interrogation": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowInterrogationInfo"
+                },
+                "type": {
+                  "const": "workflow_node_interrogated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "interrogation"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`None` means \"no summary was written\" — a normal answer, not an error\n(`07-phase3-plan.md` §4 D1, D10).",
+              "properties": {
+                "summary": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/WorkflowRunSummaryInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "workflow_summary_get",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "summaries": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/WorkflowRunSummaryInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "workflow_summary_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "summaries"
               ],
               "type": "object"
             },
@@ -11979,6 +12563,76 @@
             }
           ]
         },
+        "WorkflowInterrogationInfo": {
+          "description": "A live or ended interrogation of a past node's Claude session\n(`07-phase3-plan.md` §4 D7-D8). Not a `run_node`: interrogations have their\nown lifecycle and are never counted toward a run's node totals.",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "ended_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "forked_session_id": {
+              "description": "Learned from the pane's session report when not pre-assigned at spawn\n(`07-phase3-plan.md` §4 D7).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "note": {
+              "default": "",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "The source node's instance path, not the interrogation's own identity.",
+              "type": "string"
+            },
+            "reconstructed": {
+              "default": false,
+              "type": "boolean"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "source_session_id": {
+              "type": "string"
+            },
+            "started_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "transcript_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "run_id",
+            "path",
+            "source_session_id",
+            "cwd",
+            "started_at_unix_ms"
+          ],
+          "type": "object"
+        },
         "WorkflowIsolation": {
           "description": "Working-directory isolation for a node's pane.",
           "enum": [
@@ -12011,6 +12665,77 @@
             "cancelled"
           ],
           "type": "string"
+        },
+        "WorkflowRestoreReport": {
+          "description": "A restore's outcome, carried on `workflow.run`'s response\n(`07-phase3-plan.md` §4 D11). An all-skipped restore is a successful run\nstart with a fully populated `skipped` list, not an error.",
+          "properties": {
+            "restored": {
+              "default": [],
+              "description": "Instance paths of the nodes seeded from the source run's checkpoints.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "skipped": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkflowRestoreSkip"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "WorkflowRestoreSkip": {
+          "properties": {
+            "message": {
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowRestoreSkipReason"
+            },
+            "selector": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "selector",
+            "reason",
+            "message"
+          ],
+          "type": "object"
+        },
+        "WorkflowRestoreSkipReason": {
+          "description": "Why one selector's restore did not happen. `definition_changed` is\nbypassable with `allow_changed`; the other two never are\n(`07-phase3-plan.md` §4 D11, D19).",
+          "enum": [
+            "definition_changed",
+            "no_checkpoint",
+            "payload_truncated"
+          ],
+          "type": "string"
+        },
+        "WorkflowRestoredFrom": {
+          "description": "Provenance of a restored node, carried on `WorkflowRunNodeInfo`\n(`07-phase3-plan.md` §4 D4).",
+          "properties": {
+            "checkpoint_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "node_key": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "node_key",
+            "checkpoint_seq"
+          ],
+          "type": "object"
         },
         "WorkflowRunEdgeInfo": {
           "properties": {
@@ -12070,6 +12795,14 @@
               },
               "type": "object"
             },
+            "context_runs": {
+              "default": [],
+              "description": "Source runs whose summaries this run's nodes were offered via\n`context/prior-runs.md` (`07-phase3-plan.md` §4 D21).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "ended_at_unix_ms": {
               "format": "uint64",
               "minimum": 0,
@@ -12122,6 +12855,13 @@
               "minimum": 0,
               "type": "integer"
             },
+            "restore_from_run": {
+              "description": "The run this one restored checkpoints from, if any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "run_id": {
               "type": "string"
             },
@@ -12158,6 +12898,11 @@
               "type": "string"
             },
             "workflow_id": {
+              "type": "string"
+            },
+            "workflow_name": {
+              "default": "",
+              "description": "Denormalised so a cross-workflow run list can label a row without N\nextra calls (`07-phase3-plan.md` §4 D9).",
               "type": "string"
             },
             "workspace_id": {
@@ -12289,6 +13034,17 @@
             "path": {
               "type": "string"
             },
+            "restored_from": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRestoredFrom"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Provenance when this node was seeded from a past run's checkpoint\nrather than executed (`07-phase3-plan.md` §4 D4)."
+            },
             "started_at_unix_ms": {
               "format": "uint64",
               "minimum": 0,
@@ -12328,6 +13084,13 @@
               "minimum": 0,
               "type": "integer"
             },
+            "transcript_path": {
+              "description": "The transcript path a workflow pane's session report last confirmed\n(`07-phase3-plan.md` §4 D6). `None` means no session ever reported one\n— interrogation falls back to the pre-launch estimate.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "watchdog_interventions": {
               "default": 0,
               "format": "uint32",
@@ -12355,6 +13118,82 @@
             "cancelled"
           ],
           "type": "string"
+        },
+        "WorkflowRunSummaryInfo": {
+          "description": "A completed run's epilogue-authored summary\n(`07-phase3-plan.md` §4 D1, D10). `summary.get` returning `None` and this\ntype being absent from a `summary.list` result both mean the same normal\nthing: no summary was written, never an error.",
+          "properties": {
+            "created_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "generated_by_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "highlights": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "open_gaps": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "outcome": {
+              "type": "string"
+            },
+            "per_node": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkflowSummaryNodeLine"
+              },
+              "type": "array"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "run_pruned": {
+              "default": false,
+              "description": "Set once the source run is pruned; the summary itself is the one\nnever-pruned row (`07-phase3-plan.md` §4 D9).",
+              "type": "boolean"
+            },
+            "text": {
+              "type": "string"
+            },
+            "token_estimate": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version_id": {
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            },
+            "workflow_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "workflow_id",
+            "workflow_name",
+            "version_id",
+            "text",
+            "outcome",
+            "token_estimate",
+            "created_at_unix_ms"
+          ],
+          "type": "object"
         },
         "WorkflowRunner": {
           "description": "Selects the binding the spawner uses for a node.",
@@ -12467,6 +13306,26 @@
             "default_tier",
             "created_at_unix_ms",
             "updated_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkflowSummaryNodeLine": {
+          "description": "One node's line in a run summary's per-node breakdown\n(`04-kvdag-and-execution.md`'s epilogue schema, `07-phase3-plan.md` §4 D1).",
+          "properties": {
+            "node_key": {
+              "type": "string"
+            },
+            "one_liner": {
+              "type": "string"
+            },
+            "verdict": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "node_key",
+            "verdict",
+            "one_liner"
           ],
           "type": "object"
         },

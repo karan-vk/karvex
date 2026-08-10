@@ -326,6 +326,22 @@ impl ActiveSubscription {
                 event_kind: crate::api::schema::EventKind::WorkflowGrowthLimited,
                 last_sequence: 0,
             })),
+            Subscription::WorkflowRunSummarized {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowRunSummarized,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowInterrogationStarted {} => {
+                Ok(Self::Event(ActiveEventSubscription {
+                    event_kind: crate::api::schema::EventKind::WorkflowInterrogationStarted,
+                    last_sequence: 0,
+                }))
+            }
+            Subscription::WorkflowInterrogationEnded {} => {
+                Ok(Self::Event(ActiveEventSubscription {
+                    event_kind: crate::api::schema::EventKind::WorkflowInterrogationEnded,
+                    last_sequence: 0,
+                }))
+            }
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,
@@ -810,6 +826,8 @@ mod tests {
             assignment_reason: String::new(),
             delivery_failure: None,
             growth_limited: None,
+            transcript_path: None,
+            restored_from: None,
         }
     }
 
@@ -847,6 +865,9 @@ mod tests {
                     max_nodes: 24,
                     nodes_live: 2,
                     growth_limited: None,
+                    workflow_name: String::new(),
+                    context_runs: Vec::new(),
+                    restore_from_run: None,
                 },
             },
         }

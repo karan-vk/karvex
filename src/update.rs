@@ -63,17 +63,35 @@ fn fake_release_notes_body(version: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Parsed semver version for comparison.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `pre` holds an optional prerelease suffix (the text after `-`, e.g.
+/// `dev` or `rc.1`). Build metadata (`+...`) is accepted by [`parse`] but
+/// discarded: per semver it never affects precedence or equality.
+///
+/// [`parse`]: Version::parse
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+    pub pre: Option<String>,
 }
 
 impl Version {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
-        let parts: Vec<&str> = s.split('.').collect();
+        // Build metadata never affects precedence; drop it before anything else.
+        let s = s.split('+').next().unwrap_or(s);
+        let (core, pre) = match s.split_once('-') {
+            Some((core, pre)) => {
+                if pre.is_empty() || pre.split('.').any(|ident| ident.is_empty()) {
+                    return None;
+                }
+                (core, Some(pre.to_string()))
+            }
+            None => (s, None),
+        };
+        let parts: Vec<&str> = core.split('.').collect();
         if parts.len() != 3 {
             return None;
         }
@@ -81,17 +99,56 @@ impl Version {
             major: parts[0].parse().ok()?,
             minor: parts[1].parse().ok()?,
             patch: parts[2].parse().ok()?,
+            pre,
         })
     }
 
-    pub fn current() -> Self {
-        Self::parse(crate::build_info::BASE_VERSION).expect("invalid CARGO_PKG_VERSION")
+    /// Parses [`crate::build_info::BASE_VERSION`]. Returns `None` if the
+    /// build's own `CARGO_PKG_VERSION` is somehow not valid semver — callers
+    /// must treat that as a normal, recoverable error rather than panicking,
+    /// since this runs on request-handling paths (e.g. plugin compatibility
+    /// checks) where a panic would take down a server request handler.
+    pub fn current() -> Option<Self> {
+        Self::parse(crate::build_info::BASE_VERSION)
     }
 }
 
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(pre) = &self.pre {
+            write!(f, "-{pre}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Ordering follows semver precedence for the numeric core, and for
+/// prerelease-vs-release: a prerelease sorts *before* its release (so a
+/// locally built `0.11.1-dev` is never offered an "update" to plain
+/// `0.11.1`, and a preview build correctly sees the matching stable release
+/// as newer). Comparing two *different* prereleases of the same numeric
+/// core falls back to a plain lexicographic compare of the suffix rather
+/// than full semver prerelease-identifier precedence (numeric-vs-alphanumeric
+/// dot-separated identifier rules) — every real comparison in this codebase
+/// is prerelease-vs-release or release-vs-release, never prerelease-vs-
+/// differing-prerelease, so the simpler rule is sufficient here.
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| match (&self.pre, &other.pre) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(a), Some(b)) => a.cmp(b),
+            })
     }
 }
 
@@ -339,7 +396,12 @@ fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>
 }
 
 fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
-    let current = Version::current();
+    let current = Version::current().ok_or_else(|| {
+        format!(
+            "invalid current Karvex version: {}",
+            crate::build_info::BASE_VERSION
+        )
+    })?;
     let latest = Version::parse(&manifest.version)
         .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
 
@@ -506,7 +568,12 @@ fn homebrew_update_from_formula_json(
 }
 
 fn check_homebrew_latest() -> Result<Option<Version>, String> {
-    let current = Version::current();
+    let current = Version::current().ok_or_else(|| {
+        format!(
+            "invalid current Karvex version: {}",
+            crate::build_info::BASE_VERSION
+        )
+    })?;
 
     let output = crate::noninteractive_process::curl_command()
         .args([
@@ -1999,7 +2066,12 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
 
     eprintln!("checking {} channel for updates...", channel.as_str());
 
-    let current = Version::current();
+    let current = Version::current().ok_or_else(|| {
+        format!(
+            "invalid current Karvex version: {}",
+            crate::build_info::BASE_VERSION
+        )
+    })?;
 
     let release = match check_latest()? {
         Some(r) => r,
@@ -2347,7 +2419,8 @@ mod tests {
             Some(Version {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                pre: None,
             })
         );
     }
@@ -2359,7 +2432,56 @@ mod tests {
             Some(Version {
                 major: 0,
                 minor: 1,
-                patch: 0
+                patch: 0,
+                pre: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_version_with_prerelease_suffix() {
+        assert_eq!(
+            Version::parse("0.11.1-dev"),
+            Some(Version {
+                major: 0,
+                minor: 11,
+                patch: 1,
+                pre: Some("dev".to_string()),
+            })
+        );
+        assert_eq!(
+            Version::parse("1.2.3-rc.1"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 3,
+                pre: Some("rc.1".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_version_with_build_metadata() {
+        assert_eq!(
+            Version::parse("1.2.3+build"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 3,
+                pre: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_version_with_prerelease_and_build_metadata() {
+        assert_eq!(
+            Version::parse("1.2.3-rc1+build.42"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 3,
+                pre: Some("rc1".to_string()),
             })
         );
     }
@@ -2369,6 +2491,9 @@ mod tests {
         assert_eq!(Version::parse("1.2"), None);
         assert_eq!(Version::parse("abc"), None);
         assert_eq!(Version::parse(""), None);
+        assert_eq!(Version::parse("1.2.3.4"), None);
+        assert_eq!(Version::parse("1.2.3-"), None);
+        assert_eq!(Version::parse("1.2.3-rc..1"), None);
     }
 
     #[test]
@@ -3155,18 +3280,41 @@ mod tests {
     }
 
     #[test]
+    fn version_ordering_prerelease_sorts_before_release() {
+        // A prerelease must never look like an "update" over its own release,
+        // and a stable release must always look like an update over a
+        // matching preview/dev build with the same numeric core.
+        let release = Version::parse("0.11.1").unwrap();
+        let dev = Version::parse("0.11.1-dev").unwrap();
+        let rc = Version::parse("0.11.1-rc1").unwrap();
+
+        assert!(dev < release);
+        assert!(rc < release);
+        assert!(release >= dev);
+    }
+
+    #[test]
     fn version_display() {
         let v = Version {
             major: 0,
             minor: 1,
             patch: 0,
+            pre: None,
         };
         assert_eq!(v.to_string(), "0.1.0");
+
+        let v = Version {
+            major: 0,
+            minor: 1,
+            patch: 0,
+            pre: Some("dev".to_string()),
+        };
+        assert_eq!(v.to_string(), "0.1.0-dev");
     }
 
     #[test]
     fn current_version_parses() {
-        let v = Version::current();
+        let v = Version::current().expect("CARGO_PKG_VERSION must be valid semver");
         assert!(v.major < 100);
     }
 

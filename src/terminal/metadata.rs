@@ -851,6 +851,12 @@ mod tests {
             None,
             None,
         );
+        // Captured before the metadata (and its 1ms TTL) is even reported, so
+        // it is provably earlier than the TTL deadline regardless of how
+        // long the rest of this test takes to run. Asserting presentation
+        // "as of" this instant instead of "as of Instant::now()" removes the
+        // real-time race a 1ms TTL would otherwise create under load.
+        let before_ttl_reported = Instant::now();
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:status".into(),
             agent_label: Some("claude".into()),
@@ -882,10 +888,18 @@ mod tests {
 
         assert_eq!(terminal.next_agent_metadata_expiry(), Some(old_deadline));
         assert_eq!(
-            terminal.effective_presentation().title.as_deref(),
+            terminal
+                .effective_presentation_for_state_at(terminal.state, before_ttl_reported)
+                .title
+                .as_deref(),
             Some("Prompt title")
         );
-        assert_eq!(terminal.effective_presentation().display_agent, None);
+        assert_eq!(
+            terminal
+                .effective_presentation_for_state_at(terminal.state, before_ttl_reported)
+                .display_agent,
+            None
+        );
 
         let mutation = terminal
             .expire_agent_metadata_at(old_deadline, old_deadline)

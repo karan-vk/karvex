@@ -9,8 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::workflow::engine::schedule;
 use crate::workflow::model::{
-    GrowthLimits, InstancePath, Kvdag, NodeAssignment, NodeKey, NodeStatus, NodeUsage,
-    ProgressTracker, RunEdge, RunGraph, RunId, RunNode, RunNodeIdx, RunStatus,
+    Evidence, GrowthLimits, InstancePath, Kvdag, NodeAssignment, NodeKey, NodeResult, NodeStatus,
+    NodeUsage, ProgressTracker, RestoredSeed, RunEdge, RunGraph, RunId, RunNode, RunNodeIdx,
+    RunStatus, Succession,
 };
 use crate::workflow::tier::{self, HistoryIndex, Tier};
 
@@ -95,6 +96,58 @@ impl RunGraph {
         tier: Tier,
         assignments: &BTreeMap<NodeKey, NodeAssignment>,
     ) -> Self {
+        // No seeds, so the restore stamp is never read; `0` is not a clock
+        // reading, it is "unused".
+        Self::materialise_with_restored(kvdag, run_id, tier, assignments, &[], 0)
+    }
+
+    /// [`RunGraph::materialise_with`] with some of the run's nodes seeded from a
+    /// past run's checkpoints (`07-phase3-plan.md` §4 D3).
+    ///
+    /// **Restore is materialisation, not an engine input.** A seeded node is a
+    /// fact about how the run *begins*: it starts [`NodeStatus::Restored`] with
+    /// its result already present and its succession already satisfied, so the
+    /// `schedule::propagate` at the end of this function fires its outbound
+    /// edges before the graph is ever handed to the engine. There is no window
+    /// in which a restored node is `Pending`, no `EngineInput::Restore`, and so
+    /// no second transition path into `Restored` for the run invariants to
+    /// cover.
+    ///
+    /// A seeded node holds **no binding** and is never `Ready`, so
+    /// `schedule::ready_set` cannot admit it and nothing will ever spawn a pane
+    /// for it. Its timestamps are the restore instant, not the source run's
+    /// (§4 D4): copying them would make this run's timeline claim a node
+    /// finished before the run started. Provenance lives in
+    /// [`RunNode::restored_from`].
+    ///
+    /// A seed naming a key this version does not materialise — a template, or a
+    /// node the target version dropped — is ignored rather than fabricating a
+    /// node the definition does not have. The caller decides compatibility
+    /// (§4 D11) and reports what it skipped; this function only applies what it
+    /// is given.
+    pub fn materialise_with_restored(
+        kvdag: &Kvdag,
+        run_id: RunId,
+        tier: Tier,
+        assignments: &BTreeMap<NodeKey, NodeAssignment>,
+        restored: &[RestoredSeed],
+        restored_at_unix_ms: u64,
+    ) -> Self {
+        let seeds: HashMap<&str, &RestoredSeed> = restored
+            .iter()
+            .map(|seed| (seed.node_key.as_str(), seed))
+            .collect();
+        // One restore is one instant (§4 D4), and the caller supplies it rather
+        // than the engine reading a clock of its own.
+        //
+        // Defect D-B: minting it here made a *second* clock. The store persists
+        // a restored node's stamps from the run's `started_at`, so an engine
+        // reading `now` at materialisation put the live projection tens of
+        // milliseconds ahead of the durable row — the live-vs-durable
+        // disagreement §4 D16 exists to catch, and the same second-clock shape
+        // as the `run_event.at` defect §4 D14 killed. The caller passes the one
+        // value it also binds into the run row.
+        let restored_at = (!seeds.is_empty()).then_some(restored_at_unix_ms);
         let mut nodes: Vec<RunNode> = Vec::with_capacity(kvdag.nodes.len());
         let mut index_by_key: HashMap<&str, RunNodeIdx> = HashMap::with_capacity(kvdag.nodes.len());
 
@@ -110,6 +163,8 @@ impl RunGraph {
                     String::new(),
                 )
             });
+            let seed = seeds.get(node.key.as_str()).copied();
+            let stamped = seed.and(restored_at);
             nodes.push(RunNode {
                 idx,
                 key: node.key.clone(),
@@ -124,18 +179,37 @@ impl RunGraph {
                 inputs: BTreeMap::new(),
                 parent: None,
                 depth: 0,
-                status: NodeStatus::Pending,
+                status: match seed {
+                    Some(_) => NodeStatus::Restored,
+                    None => NodeStatus::Pending,
+                },
                 assignment: resolved.assignment(),
                 assignment_reason: resolved.reason,
                 attempt: FIRST_ATTEMPT,
+                // A restored node never acquires a pane; leaving this `None` is
+                // what makes that structural rather than a rule to remember.
                 binding: None,
-                result: None,
+                result: seed.map(|seed| NodeResult {
+                    payload: seed.payload.clone(),
+                    summary: seed.summary.clone(),
+                    artifact_paths: seed.artifact_paths.clone(),
+                    // The **source** digest, verbatim. Recomputing it here would
+                    // silently repair a payload that no longer matches what the
+                    // source run actually checkpointed.
+                    digest: seed.digest.clone(),
+                    evidence: Evidence::Restored,
+                }),
                 usage: NodeUsage::default(),
-                started_at_unix_ms: None,
-                ended_at_unix_ms: None,
+                started_at_unix_ms: stamped,
+                ended_at_unix_ms: stamped,
                 progress: ProgressTracker::default(),
-                succession: None,
+                // Satisfied, not derived: `resolve_succession` would read the
+                // node's outbound edges, which have not been settled yet at this
+                // point in materialisation. A restored node's result is present
+                // and validated by construction, so its succession is known.
+                succession: seed.map(|_| Succession::Satisfied),
                 checkpoint_seq: 0,
+                restored_from: seed.map(|seed| seed.source.clone()),
             });
         }
 
@@ -169,6 +243,7 @@ impl RunGraph {
             edges,
             status: RunStatus::Pending,
             seq: 0,
+            epilogue: None,
         };
         schedule::propagate(&mut graph);
         graph
@@ -219,6 +294,8 @@ mod tests {
     use crate::workflow::engine::tests_support::{kvdag_of, spec_edge, spec_node, TestNode};
     use crate::workflow::model::{Demand, EdgeKind, NodeKey};
     use crate::workflow::tier::{Effort, ModelAlias, NodeHistory};
+    // `schedule` is already in scope through `super::*`; these two are not.
+    use crate::workflow::engine::schedule;
 
     fn node<'a>(graph: &'a RunGraph, key: &str) -> &'a crate::workflow::model::RunNode {
         graph
@@ -548,6 +625,327 @@ mod tests {
             tier::resolve(Tier::Low, Demand::Standard, None),
             "a run that lost one row still starts"
         );
+    }
+
+    // ── restore materialisation (`07-phase3-plan.md` §4 D3/D4) ─────────────
+
+    /// `plan → {left, right} → join`, all `Data` edges, as a definition.
+    fn diamond_definition() -> crate::workflow::model::Kvdag {
+        kvdag_of(
+            vec![
+                spec_node(&TestNode::new("plan")),
+                spec_node(&TestNode::new("left")),
+                spec_node(&TestNode::new("right")),
+                spec_node(&TestNode::new("join")),
+            ],
+            vec![
+                spec_edge("plan", "left", EdgeKind::Data),
+                spec_edge("plan", "right", EdgeKind::Data),
+                spec_edge("left", "join", EdgeKind::Data),
+                spec_edge("right", "join", EdgeKind::Data),
+            ],
+        )
+    }
+
+    /// A fixed restore instant, so the tests assert an exact value rather than
+    /// whatever the clock said — the point of D-B is that this number comes
+    /// from the caller.
+    const RESTORE_STAMP: u64 = 1_700_000_000_000;
+
+    fn restored(
+        definition: &crate::workflow::model::Kvdag,
+        seeds: &[crate::workflow::model::RestoredSeed],
+    ) -> RunGraph {
+        RunGraph::materialise_with_restored(
+            definition,
+            RunId::new("workflow_run:2"),
+            Tier::High,
+            &BTreeMap::new(),
+            seeds,
+            RESTORE_STAMP,
+        )
+    }
+
+    /// D3's payoff: seeding at materialisation means the existing `propagate`
+    /// fires the restored node's outbound edges with no new transition code, and
+    /// D4's rule that the stamps are the restore instant.
+    #[test]
+    fn a_restored_node_lands_terminal_with_its_edges_already_fired() {
+        let definition = diamond_definition();
+        let payload = serde_json::json!({ "plan": "reuse me" });
+        let graph = restored(
+            &definition,
+            &[crate::workflow::engine::tests_support::restored_seed(
+                "plan",
+                payload.clone(),
+            )],
+        );
+
+        let plan = node(&graph, "plan");
+        assert_eq!(plan.status, NodeStatus::Restored);
+        assert_eq!(plan.succession, Some(Succession::Satisfied));
+        assert!(
+            plan.binding.is_none(),
+            "a restored node never acquires a pane"
+        );
+        let result = plan.result.as_ref().expect("the seed became the result");
+        assert_eq!(result.payload, payload, "the payload is carried verbatim");
+        assert_eq!(result.evidence, Evidence::Restored);
+        assert_eq!(
+            result.digest,
+            crate::workflow::engine::complete::digest(&payload),
+            "the source digest survives, so the node can be restored onward"
+        );
+
+        let source = plan.restored_from.as_ref().expect("provenance is recorded");
+        assert_eq!(source.run, RunId::new("workflow_run:source"));
+        assert_eq!(source.node_key, NodeKey::new("plan"));
+        assert_eq!(source.checkpoint_seq, 1);
+
+        // §4 D4: the restore instant, not the source run's — and equal on both
+        // ends, because nothing ran. D-B: it is the caller's value verbatim, so
+        // the durable row the store writes from the same number cannot drift.
+        assert_eq!(plan.started_at_unix_ms, Some(RESTORE_STAMP));
+        assert_eq!(plan.ended_at_unix_ms, Some(RESTORE_STAMP));
+        assert_eq!(plan.usage.duration_ms, 0);
+
+        // The edges out of it are already settled by `materialise`'s propagate.
+        assert_eq!(node(&graph, "left").status, NodeStatus::Ready);
+        assert_eq!(node(&graph, "right").status, NodeStatus::Ready);
+        assert_eq!(node(&graph, "join").status, NodeStatus::Pending);
+    }
+
+    /// A restored node is not in the ready set, so nothing can ever spawn a pane
+    /// for it — the guarantee that makes "pane-less" structural.
+    #[test]
+    fn a_restored_node_is_never_admitted() {
+        let definition = diamond_definition();
+        let graph = restored(
+            &definition,
+            &[crate::workflow::engine::tests_support::restored_seed(
+                "plan",
+                serde_json::json!({ "plan": "reuse me" }),
+            )],
+        );
+
+        let admitted: Vec<&str> = schedule::ready_set(&graph, 8)
+            .into_iter()
+            .filter_map(|idx| graph.node(idx))
+            .map(|node| node.path.as_str())
+            .collect();
+        assert_eq!(
+            admitted,
+            vec!["left", "right"],
+            "only the nodes this run still has to execute"
+        );
+    }
+
+    #[test]
+    fn a_diamond_with_two_restored_nodes_only_runs_the_other_two() {
+        let definition = diamond_definition();
+        let graph = restored(
+            &definition,
+            &[
+                crate::workflow::engine::tests_support::restored_seed(
+                    "plan",
+                    serde_json::json!({ "plan": "p" }),
+                ),
+                crate::workflow::engine::tests_support::restored_seed(
+                    "left",
+                    serde_json::json!({ "left": "l" }),
+                ),
+            ],
+        );
+
+        assert_eq!(node(&graph, "plan").status, NodeStatus::Restored);
+        assert_eq!(node(&graph, "left").status, NodeStatus::Restored);
+        assert_eq!(node(&graph, "right").status, NodeStatus::Ready);
+        assert_eq!(
+            node(&graph, "join").status,
+            NodeStatus::Pending,
+            "the join still waits on the one branch that has to run"
+        );
+        assert_eq!(schedule::ready_set(&graph, 8).len(), 1);
+    }
+
+    /// The whole run restored: `run_terminal_ready` must hold, or a fully
+    /// restored run would stall instead of finishing.
+    #[test]
+    fn run_terminal_ready_holds_with_every_node_restored() {
+        let definition = diamond_definition();
+        let seeds: Vec<crate::workflow::model::RestoredSeed> = ["plan", "left", "right", "join"]
+            .iter()
+            .map(|key| {
+                crate::workflow::engine::tests_support::restored_seed(
+                    key,
+                    serde_json::json!({ "key": key }),
+                )
+            })
+            .collect();
+        let graph = restored(&definition, &seeds);
+
+        assert_eq!(schedule::run_terminal_ready(&graph), Ok(()));
+        assert!(schedule::ready_set(&graph, 8).is_empty());
+    }
+
+    /// R-4's other half: `Skipped` still propagates out of a restored source, so
+    /// a conditional branch that the restored payload does not satisfy dies
+    /// exactly as it would after a live run.
+    #[test]
+    fn a_false_conditional_out_of_a_restored_node_still_skips_the_branch() {
+        let definition = kvdag_of(
+            vec![
+                spec_node(&TestNode::new("gate")),
+                spec_node(&TestNode::new("hotfix")),
+                spec_node(&TestNode::new("ship")),
+            ],
+            vec![
+                crate::workflow::model::KvdagEdge {
+                    condition: Some(crate::workflow::model::Condition::Eq {
+                        path: crate::workflow::model::FieldPath("verdict".to_string()),
+                        value: crate::workflow::model::JsonScalar::String("fail".to_string()),
+                    }),
+                    ..spec_edge("gate", "hotfix", EdgeKind::Conditional)
+                },
+                spec_edge("hotfix", "ship", EdgeKind::Sequence),
+            ],
+        );
+        let graph = restored(
+            &definition,
+            &[crate::workflow::engine::tests_support::restored_seed(
+                "gate",
+                serde_json::json!({ "verdict": "pass" }),
+            )],
+        );
+
+        assert_eq!(node(&graph, "gate").status, NodeStatus::Restored);
+        assert_eq!(node(&graph, "hotfix").status, NodeStatus::Skipped);
+        assert_eq!(
+            node(&graph, "ship").status,
+            NodeStatus::Skipped,
+            "Skipped propagates through a restored node's dead branch too"
+        );
+    }
+
+    /// The caller decides compatibility and reports its skips (§4 D11);
+    /// materialisation applies what it is given and never invents a node the
+    /// target version does not declare.
+    #[test]
+    fn a_seed_naming_no_node_in_this_version_is_ignored() {
+        let definition = diamond_definition();
+        let graph = restored(
+            &definition,
+            &[crate::workflow::engine::tests_support::restored_seed(
+                "nonesuch",
+                serde_json::json!({}),
+            )],
+        );
+
+        assert_eq!(graph.nodes.len(), 4);
+        assert!(graph
+            .nodes
+            .iter()
+            .all(|node| node.restored_from.is_none() && node.status != NodeStatus::Restored));
+        assert_eq!(node(&graph, "plan").status, NodeStatus::Ready);
+    }
+
+    /// A restored node's fired edges must reach the **store**, not just the
+    /// in-memory graph.
+    ///
+    /// `materialise_with_restored` propagates before the engine ever sees the
+    /// graph, so `Engine::apply(Start)`'s own propagate reports no edge change
+    /// and a delta-only `record_edges` would persist nothing. The durable
+    /// projection would then describe the restored branch as unfired forever,
+    /// and a restarted server would re-run work the restore was meant to skip.
+    #[test]
+    fn a_restored_nodes_fired_edges_are_persisted_at_start() {
+        use crate::workflow::engine::{Engine, EngineConfig};
+        use crate::workflow::model::{EngineInput, RunEffect, StoreWrite};
+
+        let definition = diamond_definition();
+        let graph = restored(
+            &definition,
+            &[crate::workflow::engine::tests_support::restored_seed(
+                "plan",
+                serde_json::json!({ "plan": "reuse me" }),
+            )],
+        );
+        // Already settled before the engine is handed the graph — this is what
+        // makes the delta empty.
+        assert!(graph.edges.iter().any(|edge| edge.fired));
+
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.install_definition(definition);
+        let effects = engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+
+        let persisted: Vec<(String, String, bool)> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RunEffect::Persist(write) => match write.as_ref() {
+                    StoreWrite::RunEdge {
+                        from, to, fired, ..
+                    } => Some((from.to_string(), to.to_string(), *fired)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        for target in ["left", "right"] {
+            assert!(
+                persisted
+                    .iter()
+                    .any(|(from, to, fired)| from == "plan" && to == target && *fired),
+                "the restored node's edge to {target} must be persisted as fired: \
+                 {persisted:?}"
+            );
+        }
+    }
+
+    /// The counterpart: a run with nothing restored has no settled edge at
+    /// Start, so the wider sweep persists exactly what the delta did and the
+    /// Phase 2 effect stream is unchanged.
+    #[test]
+    fn a_run_with_no_restored_nodes_persists_no_edges_at_start() {
+        use crate::workflow::engine::{Engine, EngineConfig};
+        use crate::workflow::model::{EngineInput, RunEffect, StoreWrite};
+
+        let definition = diamond_definition();
+        let graph = restored(&definition, &[]);
+        assert!(graph
+            .edges
+            .iter()
+            .all(|edge| edge.condition_result.is_none()));
+
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.install_definition(definition);
+        let effects = engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                RunEffect::Persist(write) if matches!(write.as_ref(), StoreWrite::RunEdge { .. })
+            )),
+            "no edge is settled at the start of an ordinary run, so none is written"
+        );
+    }
+
+    /// `materialise_with` is the `&[]` wrapper, so the no-restore path is
+    /// byte-identical to what Phase 2 produced.
+    #[test]
+    fn materialise_with_is_the_empty_restore_case() {
+        let definition = diamond_definition();
+        let plain = RunGraph::materialise_with(
+            &definition,
+            RunId::new("workflow_run:2"),
+            Tier::High,
+            &BTreeMap::new(),
+        );
+        assert_eq!(plain, restored(&definition, &[]));
     }
 
     #[test]

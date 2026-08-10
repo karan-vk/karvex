@@ -24,6 +24,7 @@ mod text;
 mod widgets;
 mod workflow_dag;
 mod workflow_launch;
+mod workflow_runs;
 
 use self::dialogs::{
     render_confirm_close_overlay, render_new_linked_worktree_overlay,
@@ -67,11 +68,14 @@ pub(crate) use self::tab_surface::{
 };
 use self::tabs::render_tab_bar;
 use self::workflow_dag::{compute_workflow_dag_view, render_workflow_dag};
-pub(crate) use self::workflow_dag::{workflow_dag_neighbour, DagNavDirection};
+pub(crate) use self::workflow_dag::{
+    workflow_dag_interrogation_at, workflow_dag_neighbour, DagNavDirection,
+};
 use self::workflow_launch::{compute_workflow_launch_view, render_workflow_launch};
 pub(crate) use self::workflow_launch::{
     workflow_launch_contains, workflow_launch_target_at, WorkflowLaunchTarget, LAUNCH_TIERS,
 };
+use self::workflow_runs::{compute_workflow_runs_view, render_workflow_runs};
 pub(crate) use self::{
     dialogs::{
         confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
@@ -323,6 +327,8 @@ fn compute_view_internal(
     // geometry is recomputed here, and only while the modal is open.
     let carried_launch = std::mem::take(&mut app.view.workflow_launch);
     let workflow_launch = compute_workflow_launch_view(app, area, carried_launch);
+    let carried_runs = std::mem::take(&mut app.view.workflow_runs);
+    let workflow_runs = compute_workflow_runs_view(app, area, carried_runs);
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
@@ -341,6 +347,7 @@ fn compute_view_internal(
         split_borders,
         dag,
         workflow_launch,
+        workflow_runs,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -398,6 +405,8 @@ fn compute_mobile_view(
     // geometry is recomputed here, and only while the modal is open.
     let carried_launch = std::mem::take(&mut app.view.workflow_launch);
     let workflow_launch = compute_workflow_launch_view(app, area, carried_launch);
+    let carried_runs = std::mem::take(&mut app.view.workflow_runs);
+    let workflow_runs = compute_workflow_runs_view(app, area, carried_runs);
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
@@ -416,6 +425,7 @@ fn compute_mobile_view(
         split_borders,
         dag,
         workflow_launch,
+        workflow_runs,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -493,6 +503,7 @@ pub fn render_with_runtime_registry(
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::WorkflowDag => render_workflow_dag(app, frame, frame.area()),
         Mode::WorkflowLaunch => render_workflow_launch(app, frame, frame.area()),
+        Mode::WorkflowRuns => render_workflow_runs(app, frame, frame.area()),
         Mode::Terminal => {}
     }
 }

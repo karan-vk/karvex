@@ -275,11 +275,25 @@ pub fn run_terminal_ready(graph: &RunGraph) -> Result<(), TerminalBlocker> {
 
 /// The full conjunction. Never "no node is runnable": a stalled graph produces
 /// the specific unmet conjunct, which the caller surfaces as `Paused`.
+///
+/// Evaluated over the **user graph only**: engine-owned nodes (reserved
+/// `.`-prefixed instance paths — today just the `.summary` epilogue) are outside
+/// the conjunction by construction. That is what makes
+/// `07-phase3-plan.md` §4 D1's guarantee structural rather than incidental: a
+/// summariser that is still running, or that gave up, cannot hold a finished run
+/// open or turn its outcome into a failure, because this function never sees it.
 pub fn run_terminal_ready_with(
     graph: &RunGraph,
     context: &TerminalContext,
 ) -> Result<(), TerminalBlocker> {
-    for node in &graph.nodes {
+    let user_nodes = || {
+        graph
+            .nodes
+            .iter()
+            .filter(|node| !crate::workflow::model::is_reserved_path(node.path.as_str()))
+    };
+
+    for node in user_nodes() {
         if matches!(
             node.status,
             NodeStatus::Pending
@@ -291,7 +305,7 @@ pub fn run_terminal_ready_with(
         }
     }
 
-    for node in &graph.nodes {
+    for node in user_nodes() {
         if node.status != NodeStatus::Skipped && node.succession.is_none() {
             return Err(TerminalBlocker::SuccessionGap(node.path.clone()));
         }
@@ -640,6 +654,94 @@ mod tests {
                 }
             ),
             Err(TerminalBlocker::MonitorWaiting(InstancePath::new("watch")))
+        );
+    }
+
+    /// §3.1 already resolves every edge kind out of a `Restored` source; this
+    /// pins that the Phase 3 producer actually exercises all three, so a later
+    /// edit to `resolve_edge` cannot quietly drop one.
+    #[test]
+    fn a_restored_source_fires_sequence_data_and_conditional_edges() {
+        let mut graph = graph_of(
+            &[
+                TestNode::new("seed"),
+                TestNode::new("after"),
+                TestNode::new("consumer"),
+                TestNode::new("gated"),
+            ],
+            &[
+                edge(0, 1, EdgeKind::Sequence),
+                edge(0, 2, EdgeKind::Data),
+                edge(0, 3, EdgeKind::Conditional).with_condition(Condition::Eq {
+                    path: field("verdict"),
+                    value: JsonScalar::String("pass".to_string()),
+                }),
+            ],
+        );
+        let idx = node_at(&graph, "seed").idx;
+        if let Some(node) = graph.node_mut(idx) {
+            node.status = NodeStatus::Restored;
+            node.succession = Some(Succession::Satisfied);
+            node.result = Some(crate::workflow::model::NodeResult {
+                payload: json(r#"{"verdict":"pass"}"#),
+                summary: String::new(),
+                artifact_paths: Vec::new(),
+                digest: String::new(),
+                evidence: crate::workflow::model::Evidence::Restored,
+            });
+        }
+        propagate(&mut graph);
+
+        assert_eq!(node_at(&graph, "after").status, NodeStatus::Ready);
+        assert_eq!(node_at(&graph, "consumer").status, NodeStatus::Ready);
+        assert_eq!(node_at(&graph, "gated").status, NodeStatus::Ready);
+        assert!(graph.edges.iter().all(|edge| edge.fired));
+    }
+
+    /// §4 D1's structural half: the conjunction is evaluated over the user graph
+    /// only, so a summariser that is still running — or that gave up — can
+    /// neither hold a finished run open nor turn its outcome into a failure.
+    #[test]
+    fn engine_owned_nodes_are_outside_the_terminal_conjunction() {
+        let mut graph = linear(&["only"]);
+        let idx = node_at(&graph, "only").idx;
+        if let Some(node) = graph.node_mut(idx) {
+            node.status = NodeStatus::Succeeded;
+            node.succession = Some(Succession::Satisfied);
+        }
+        assert_eq!(run_terminal_ready(&graph), Ok(()));
+
+        let epilogue = RunNodeIdx(graph.nodes.len());
+        let mut summariser = graph.nodes[0].clone();
+        summariser.idx = epilogue;
+        summariser.key =
+            crate::workflow::model::NodeKey::new(crate::workflow::model::SUMMARY_INSTANCE_PATH);
+        summariser.path = InstancePath::new(crate::workflow::model::SUMMARY_INSTANCE_PATH);
+        summariser.status = NodeStatus::Running;
+        summariser.succession = None;
+        graph.nodes.push(summariser);
+
+        assert_eq!(
+            run_terminal_ready(&graph),
+            Ok(()),
+            "a running summariser neither blocks on status nor reads as a succession gap"
+        );
+
+        // The same holds once it has given up.
+        if let Some(node) = graph.node_mut(epilogue) {
+            node.status = NodeStatus::Failed;
+            node.succession = None;
+        }
+        assert_eq!(run_terminal_ready(&graph), Ok(()));
+
+        // And an authored node with the same failure still blocks, so the
+        // exemption is about the reserved namespace and nothing else.
+        if let Some(node) = graph.node_mut(idx) {
+            node.status = NodeStatus::Running;
+        }
+        assert_eq!(
+            run_terminal_ready(&graph),
+            Err(TerminalBlocker::NodesOutstanding(InstancePath::new("only")))
         );
     }
 

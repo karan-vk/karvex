@@ -36,18 +36,20 @@ pub use error::StoreError;
 // its own the way it would in a published library.
 #[allow(unused_imports)]
 pub use queries::{
-    CheckpointRecord, RunEdgeRecord, RunEventRecord, RunNodeRecord, RunRecord, RunSummaryRecord,
-    StoredGrowthLimit, StoredGrowthLimits, VersionRecord, WorkflowSummary,
-    DEFAULT_NODE_HISTORY_RUNS,
+    CheckpointRecord, InterrogationRecord, RestorableCheckpoint, RunEdgeRecord, RunEventRecord,
+    RunNodeRecord, RunRecord, RunSummaryRecord, StoredGrowthLimit, StoredGrowthLimits,
+    VersionRecord, WorkflowSummary, DEFAULT_NODE_HISTORY_RUNS,
 };
+use sha2::{Digest, Sha256};
 use surrealdb::engine::local::{Db, Mem, SurrealKv};
 use surrealdb::Surreal;
 
 use crate::workflow::model::{
-    CheckpointKind, Demand, EdgeKind, EdgePayload, Evidence, GrowthLimits, InstancePath, Isolation,
-    Kvdag, KvdagEdge, KvdagNode, KvdagSpec, KvdagVersionId, NodeAssignment, NodeBinding, NodeKey,
-    NodeKind, NodeStatus, NodeUsage, OutputSchema, RunEventKind, RunId, RunStatus, StoreWrite,
-    Succession, WorkflowId,
+    canonical, is_reserved_path, CheckpointKind, Demand, EdgeKind, EdgePayload, Evidence,
+    GrowthLimits, InstancePath, InterrogationId, Isolation, Kvdag, KvdagEdge, KvdagNode, KvdagSpec,
+    KvdagVersionId, NodeAssignment, NodeBinding, NodeKey, NodeKind, NodeStatus, NodeUsage,
+    OutputSchema, RestoredRef, RestoredSeed, RunEventKind, RunId, RunStatus, StoreWrite,
+    Succession, SummaryNodeLine, WorkflowId, RESERVED_PATH_PREFIX,
 };
 use crate::workflow::tier::Assignment;
 use crate::workflow::tier::Tier;
@@ -68,6 +70,7 @@ const TABLE_KVDAG_VERSION: &str = "kvdag_version";
 const TABLE_KVDAG_NODE: &str = "kvdag_node";
 const TABLE_WORKFLOW_RUN: &str = "workflow_run";
 const TABLE_RUN_NODE: &str = "run_node";
+const TABLE_INTERROGATION: &str = "interrogation";
 
 /// Every statically materialised `run_node` sits at expansion depth 0; see
 /// [`WorkflowStore::materialise_run_nodes`] for why this is not topological
@@ -104,6 +107,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0003_node_identity",
         include_str!("migrations/0003_node_identity.surql"),
+    ),
+    (
+        "0004_journal_time_and_interrogation",
+        include_str!("migrations/0004_journal_time_and_interrogation.surql"),
     ),
 ];
 
@@ -169,7 +176,10 @@ pub struct VersionMetadata {
 
 /// The inputs of one run, checked against the version's limits on create: a run
 /// narrows its version's growth limits and never widens them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` dropped (kept through Phase 2): `restored: Vec<RestoredSeed>` carries
+/// `serde_json::Value`, which is `PartialEq`-only.
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewRun {
     pub workflow: WorkflowId,
     pub version: KvdagVersionId,
@@ -201,6 +211,35 @@ pub struct NewRun {
     /// without it a run read back from the journal has no workspace binding at
     /// all.
     pub workspace_id: Option<String>,
+    /// What this run's caller asked to restore, if anything — persisted
+    /// verbatim into `workflow_run.restore_from`. Carries the full request
+    /// (`run`, the selectors asked for, `allow_changed`), not just the
+    /// source run id: `RestoredRef` on a seeded node records what
+    /// *happened*, but a selector that was asked for and skipped has no
+    /// other durable trace once the transient API response is gone.
+    /// `RunRecord::restore_from_run` still exposes only the source id — the
+    /// rest is audit trail, not a read path with a consumer today.
+    pub restore_from: Option<RestoreFromRequest>,
+    /// Restored node seeds, keyed by the **target** version's node key
+    /// (`RestoredSeed::node_key`). Consumed by [`WorkflowStore::materialise_run_nodes`],
+    /// which persists each seeded node's full terminal shape up front rather
+    /// than waiting for engine-driven updates that a `Restored` node — which
+    /// never runs — would never produce (`07-phase3-plan.md` §1 WS-B).
+    pub restored: Vec<RestoredSeed>,
+}
+
+/// The durable half of a restore request (`07-phase3-plan.md` §1 WS-B,
+/// judgment call approved by phase3-planner-f): what a run's caller asked
+/// for, recorded alongside what actually happened (`RestoredRef` on each
+/// seeded node). `nodes` holds the selectors as given — `Vec<String>`, not
+/// `Vec<NodeKey>`, because an unknown selector is exactly the case this
+/// exists to keep a record of, and typing it would imply a validation this
+/// struct does not perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreFromRequest {
+    pub run: RunId,
+    pub nodes: Vec<String>,
+    pub allow_changed: bool,
 }
 
 /// The destructured fields of [`StoreWrite::RunNodeCreated`], grouped so the
@@ -777,13 +816,27 @@ impl WorkflowStore {
             .iter()
             .filter_map(|id| parse_record_id(TABLE_WORKFLOW_RUN, id.as_str()))
             .collect();
+        // The full request, not just the source run id: `restored_from` on a
+        // seeded node records what happened, but a selector that was asked
+        // for and skipped has no other durable trace once the transient API
+        // response is gone. `run_record` still parses only `"run"` back into
+        // `RunRecord::restore_from_run` — `nodes`/`allow_changed` are audit
+        // trail with no reader today.
+        let restore_from_json = run.restore_from.as_ref().map(|request| {
+            serde_json::json!({
+                "run": request.run.to_string(),
+                "nodes": request.nodes,
+                "allow_changed": request.allow_changed,
+            })
+        });
 
         let mut response = self
             .db
             .query(
                 "CREATE workflow_run SET workflow = $workflow, kvdag_version = $version, \
                  tier = $tier, status = \"pending\", args = $args, \
-                 context_runs = $context_runs, max_depth = $max_depth, \
+                 context_runs = $context_runs, restore_from = $restore_from, \
+                 max_depth = $max_depth, \
                  max_nodes = $max_nodes, workspace_id = $workspace_id, \
                  started_at = time::from_millis($started_at_ms), \
                  nodes_total = $nodes_total RETURN AFTER",
@@ -794,6 +847,7 @@ impl WorkflowStore {
             .bind(("tier", run.tier.as_str().to_string()))
             .bind(("args", args_json))
             .bind(("context_runs", context_runs))
+            .bind(("restore_from", restore_from_json))
             .bind(("max_depth", i64::from(run.growth.max_depth)))
             .bind(("max_nodes", i64::from(run.growth.max_nodes)))
             .bind(("workspace_id", run.workspace_id))
@@ -810,8 +864,15 @@ impl WorkflowStore {
             .ok_or_else(|| StoreError::Query("create workflow_run returned no row".to_string()))?;
         let run_id = RunId::new(record_id_to_string(&row.id));
 
-        self.materialise_run_nodes(&row.id, &version_id, &run.assignments, &graph)
-            .await?;
+        self.materialise_run_nodes(
+            &row.id,
+            &version_id,
+            &run.assignments,
+            &graph,
+            run.started_at_unix_ms,
+            &run.restored,
+        )
+        .await?;
 
         Ok(run_id)
     }
@@ -827,7 +888,11 @@ impl WorkflowStore {
                 kind,
                 path,
                 payload,
-            } => self.write_run_event(run, seq, kind, path, payload).await,
+                at_unix_ms,
+            } => {
+                self.write_run_event(run, seq, kind, path, payload, at_unix_ms)
+                    .await
+            }
             StoreWrite::RunStatus {
                 run,
                 status,
@@ -844,6 +909,7 @@ impl WorkflowStore {
                 succession,
                 started_at_unix_ms,
                 ended_at_unix_ms,
+                restored_from,
             } => {
                 self.write_run_node(
                     run,
@@ -856,6 +922,7 @@ impl WorkflowStore {
                     succession,
                     started_at_unix_ms,
                     ended_at_unix_ms,
+                    restored_from,
                 )
                 .await
             }
@@ -946,6 +1013,68 @@ impl WorkflowStore {
                 )
                 .await
             }
+            StoreWrite::RunSummary {
+                run,
+                kvdag_version,
+                text,
+                outcome,
+                highlights,
+                open_gaps,
+                per_node,
+                token_estimate,
+                generated_by_path,
+            } => {
+                self.write_run_summary(
+                    run,
+                    kvdag_version,
+                    text,
+                    outcome,
+                    highlights,
+                    open_gaps,
+                    per_node,
+                    token_estimate,
+                    generated_by_path,
+                )
+                .await
+            }
+            StoreWrite::InterrogationStarted {
+                id,
+                run,
+                path,
+                source_session_id,
+                forked_session_id,
+                transcript_path,
+                cwd,
+                pane_id,
+                reconstructed,
+                seeded_from_seq,
+                note,
+                started_at_unix_ms,
+            } => {
+                self.write_interrogation_started(
+                    id,
+                    run,
+                    path,
+                    source_session_id,
+                    forked_session_id,
+                    transcript_path,
+                    cwd,
+                    pane_id,
+                    reconstructed,
+                    seeded_from_seq,
+                    note,
+                    started_at_unix_ms,
+                )
+                .await
+            }
+            StoreWrite::InterrogationUpdate {
+                id,
+                forked_session_id,
+                ended_at_unix_ms,
+            } => {
+                self.write_interrogation_update(id, forked_session_id, ended_at_unix_ms)
+                    .await
+            }
         }
     }
 
@@ -966,7 +1095,7 @@ impl WorkflowStore {
                 "SELECT * FROM workflow_run WHERE workflow = $workflow \
                  ORDER BY started_at DESC LIMIT 1000000",
             )
-            .bind(("workflow", workflow_id))
+            .bind(("workflow", workflow_id.clone()))
             .await
             .map_err(query_error)?;
         let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
@@ -978,7 +1107,40 @@ impl WorkflowStore {
             self.prune_one_run(&run_id).await?;
             pruned += 1;
         }
+        if pruned > 0 {
+            self.bump_pruned_runs_counter(&workflow_id, pruned).await?;
+            tracing::info!(
+                workflow = %workflow,
+                pruned,
+                keep_runs,
+                "pruned workflow run history"
+            );
+        }
         Ok(pruned)
+    }
+
+    /// §9's "journalled at the workflow level": a `pruned_runs` counter bump
+    /// plus `updated_at` refresh on the `workflow` row, rather than a
+    /// dedicated journal table — a prune is one number, and the summary rows
+    /// it leaves behind are their own record (§4 D12).
+    async fn bump_pruned_runs_counter(
+        &self,
+        workflow_id: &surrealdb_types::RecordId,
+        pruned: u64,
+    ) -> Result<(), StoreError> {
+        let response = self
+            .db
+            .query(
+                "UPDATE $workflow SET pruned_runs = \
+                 (IF pruned_runs = NONE THEN 0 ELSE pruned_runs END) + $pruned, \
+                 updated_at = time::now()",
+            )
+            .bind(("workflow", workflow_id.clone()))
+            .bind(("pruned", pruned as i64))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
     }
 
     async fn prune_one_run(&self, run: &surrealdb_types::RecordId) -> Result<(), StoreError> {
@@ -1009,6 +1171,69 @@ impl WorkflowStore {
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
         Ok(())
+    }
+
+    /// Marks every non-terminal run `failed { reason: "interrupted" }` at
+    /// store open, and sweeps their non-terminal nodes to `cancelled` (§4
+    /// D13). A server restart drops any in-memory `Engine`, so a
+    /// `pending`/`running`/`paused` row left over from the previous process
+    /// is a lie the moment the new server starts — nothing will ever move it
+    /// forward again. `Paused` is not offered (04 §9 assumed resume machinery
+    /// that does not exist); `failed/interrupted` is honest and terminal, and
+    /// Phase 3's restore is the recovery path this surfaces (the run
+    /// browser's `R`).
+    ///
+    /// `now_unix_ms` is caller-supplied rather than read here: `time::now()`
+    /// would reintroduce the store-flush second clock §4 D14 exists to kill.
+    /// A swept node's `evidence` is left untouched rather than claiming a
+    /// completion signal that never arrived — the node didn't fail, the
+    /// server left.
+    ///
+    /// Safe because the store's exclusive `LOCK` guarantees no other server
+    /// is executing these runs, and the current server opens the store
+    /// before it can start one. Idempotent: a second call finds nothing
+    /// non-terminal and is a no-op.
+    pub async fn mark_interrupted_runs(&self, now_unix_ms: u64) -> Result<u64, StoreError> {
+        let non_terminal_run: Vec<String> = ["pending", "running", "paused"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut response = self
+            .db
+            .query(
+                "UPDATE workflow_run SET status = \"failed\", \
+                 failure = { reason: \"interrupted\", \
+                             detail: \"server restarted while the run was live\" }, \
+                 ended_at = time::from_millis($now_ms) \
+                 WHERE status IN $non_terminal RETURN AFTER",
+            )
+            .bind(("non_terminal", non_terminal_run))
+            .bind(("now_ms", now_unix_ms as i64))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
+        let run_ids: Vec<surrealdb_types::RecordId> = rows.into_iter().map(|row| row.id).collect();
+        if run_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let terminal_node: Vec<String> = TERMINAL_NODE_STATUSES
+            .iter()
+            .map(|status| node_status_str(*status).to_string())
+            .collect();
+        let response = self
+            .db
+            .query(
+                "UPDATE run_node SET status = \"cancelled\" \
+                 WHERE run IN $runs AND status NOT IN $terminal",
+            )
+            .bind(("runs", run_ids.clone()))
+            .bind(("terminal", terminal_node))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+
+        Ok(run_ids.len() as u64)
     }
 }
 
@@ -1292,6 +1517,22 @@ fn run_event_kind_str(kind: RunEventKind) -> &'static str {
     kind.as_str()
 }
 
+/// Cross-version restore compatibility digests for one kvdag node (§3 rule 5,
+/// §4 D11): `sha256(prompt_template)` and `sha256(canonical(output_schema))`.
+/// Computed on demand from the immutable `kvdag_node` row — no stored digest
+/// column, so this is the one place either digest is computed, for both a
+/// caller's restore decision ([`WorkflowStore::node_compat_digests_for`]) and
+/// the store's own re-validation of a restored node's re-persisted checkpoint
+/// ([`WorkflowStore::create_restored_run_node`]).
+fn node_compat_digests(row: &KvdagNodeRow) -> (String, String) {
+    let prompt_digest = format!("{:x}", Sha256::digest(row.prompt_template.as_bytes()));
+    let schema_digest = format!(
+        "{:x}",
+        Sha256::digest(canonical(&row.output_schema).to_string().as_bytes())
+    );
+    (prompt_digest, schema_digest)
+}
+
 /// §7: a payload over budget is never stored inline; the full text stays only
 /// wherever the caller already spilled it (`artifact_paths`, which this does
 /// not touch).
@@ -1468,23 +1709,25 @@ impl WorkflowStore {
         version_id: &surrealdb_types::RecordId,
         assignments: &BTreeMap<NodeKey, NodeAssignment>,
         graph: &Kvdag,
+        started_at_unix_ms: u64,
+        restored: &[RestoredSeed],
     ) -> Result<(), StoreError> {
         let scheduled: Vec<&KvdagNode> = graph.nodes.iter().filter(|n| !n.is_template).collect();
-        let node_record_ids = self.select_kvdag_nodes(version_id).await?;
-        let node_record_id_by_key: BTreeMap<NodeKey, surrealdb_types::RecordId> = node_record_ids
-            .into_iter()
-            .map(|row| (NodeKey::new(row.node_key.clone()), row.id))
+        let node_rows = self.select_kvdag_nodes(version_id).await?;
+        let node_record_id_by_key: BTreeMap<NodeKey, surrealdb_types::RecordId> = node_rows
+            .iter()
+            .map(|row| (NodeKey::new(row.node_key.clone()), row.id.clone()))
             .collect();
+        let node_row_by_key: BTreeMap<NodeKey, &KvdagNodeRow> = node_rows
+            .iter()
+            .map(|row| (NodeKey::new(row.node_key.clone()), row))
+            .collect();
+        let seed_by_key: BTreeMap<&NodeKey, &RestoredSeed> =
+            restored.iter().map(|seed| (&seed.node_key, seed)).collect();
 
         let mut run_node_id_by_key: BTreeMap<NodeKey, surrealdb_types::RecordId> = BTreeMap::new();
 
         for node in &scheduled {
-            let inbound: Vec<&KvdagEdge> = graph.inbound_edges(&node.key).collect();
-            let status = if inbound.is_empty() {
-                NodeStatus::Ready
-            } else {
-                NodeStatus::Pending
-            };
             let assignment = assignments.get(&node.key).ok_or_else(|| {
                 StoreError::Invariant(format!(
                     "node {} has no resolved assignment; \
@@ -1495,6 +1738,31 @@ impl WorkflowStore {
             let kvdag_node_id = node_record_id_by_key.get(&node.key).ok_or_else(|| {
                 StoreError::Decode(format!("node {} has no stored kvdag_node row", node.key))
             })?;
+
+            if let Some(seed) = seed_by_key.get(&node.key) {
+                let target_row = node_row_by_key.get(&node.key).copied();
+                let row_id = self
+                    .create_restored_run_node(
+                        run_id,
+                        version_id,
+                        kvdag_node_id,
+                        node,
+                        assignment,
+                        seed,
+                        target_row,
+                        started_at_unix_ms,
+                    )
+                    .await?;
+                run_node_id_by_key.insert(node.key.clone(), row_id);
+                continue;
+            }
+
+            let inbound: Vec<&KvdagEdge> = graph.inbound_edges(&node.key).collect();
+            let status = if inbound.is_empty() {
+                NodeStatus::Ready
+            } else {
+                NodeStatus::Pending
+            };
 
             let mut response = self
                 .db
@@ -1555,6 +1823,148 @@ impl WorkflowStore {
             response.check().map_err(query_error)?;
         }
         Ok(())
+    }
+
+    /// Persists one restored node's full terminal shape at creation
+    /// (`07-phase3-plan.md` §1 WS-B). A `Restored` node never runs, so unlike
+    /// a scheduled node it gets no follow-up [`Self::write_run_node`] to fill
+    /// in status/evidence/succession — everything is written here, up front.
+    /// `started_at`/`ended_at` both read the run's own start stamp (the
+    /// restore instant — §4 D4): the caller supplies one explicit clock
+    /// reading for the whole run (§4 D14's rule against a second, store-side
+    /// clock), and every node materialised in the same `create_run` call
+    /// shares it.
+    ///
+    /// Also re-persists the seed as the node's own seq-1 `result` checkpoint
+    /// in the **new** run, so the new run's durable projection is
+    /// self-contained and survives later pruning of the source run.
+    /// `schema_valid` is recomputed here rather than trusted from the caller:
+    /// [`RestoredSeed`] carries no such flag (compatibility was already
+    /// decided once, by the handler, to choose *whether* to restore at all —
+    /// §3 rule 5), so the store independently compares the source and target
+    /// node's digests to decide whether *this* checkpoint may itself seed a
+    /// later restore.
+    async fn create_restored_run_node(
+        &self,
+        run_id: &surrealdb_types::RecordId,
+        version_id: &surrealdb_types::RecordId,
+        kvdag_node_id: &surrealdb_types::RecordId,
+        node: &KvdagNode,
+        assignment: &NodeAssignment,
+        seed: &RestoredSeed,
+        target_row: Option<&KvdagNodeRow>,
+        started_at_unix_ms: u64,
+    ) -> Result<surrealdb_types::RecordId, StoreError> {
+        let restored_from_id = self.resolve_checkpoint_id(&seed.source).await?;
+
+        let response = self
+            .db
+            .query(
+                "CREATE run_node SET run = $run, kvdag_node = $kvdag_node, \
+                 node_key = $node_key, instance_path = $instance_path, \
+                 label = $label, depth = $depth, status = $status, model = $model, \
+                 effort = $effort, demand = $demand, assignment_reason = $assignment_reason, \
+                 evidence = $evidence, succession = $succession, restored_from = $restored_from, \
+                 started_at = time::from_millis($started_at_ms), \
+                 ended_at = time::from_millis($started_at_ms) RETURN AFTER",
+            )
+            .bind(("run", run_id.clone()))
+            .bind(("kvdag_node", kvdag_node_id.clone()))
+            .bind(("node_key", node.key.to_string()))
+            .bind(("instance_path", node.key.to_string()))
+            .bind(("label", node.label.clone()))
+            .bind(("depth", i64::from(STATIC_NODE_DEPTH)))
+            .bind(("status", node_status_str(NodeStatus::Restored).to_string()))
+            .bind(("model", assignment.model.as_str().to_string()))
+            .bind(("effort", assignment.effort.as_str().to_string()))
+            .bind(("demand", demand_str(node.demand).to_string()))
+            .bind(("assignment_reason", assignment.reason.clone()))
+            .bind(("evidence", evidence_str(Evidence::Restored).to_string()))
+            .bind(("succession", "satisfied".to_string()))
+            .bind(("restored_from", restored_from_id))
+            .bind(("started_at_ms", started_at_unix_ms as i64))
+            .await
+            .map_err(query_error)?;
+        let mut response = response.check().map_err(query_error)?;
+        let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
+        let row = rows.into_iter().next().ok_or_else(|| {
+            StoreError::Query(format!(
+                "create restored run_node {} returned no row",
+                node.key
+            ))
+        })?;
+
+        let schema_valid = match (self.source_node_row(&seed.source).await?, target_row) {
+            (Some(source_row), Some(target_row)) => {
+                node_compat_digests(&source_row) == node_compat_digests(target_row)
+            }
+            _ => false,
+        };
+
+        let checkpoint_response = self
+            .db
+            .query(
+                "CREATE node_checkpoint SET run = $run, run_node = $run_node, \
+                 node_key = $node_key, instance_path = $instance_path, \
+                 kvdag_version = $kvdag_version, seq = 1, kind = \"result\", \
+                 schema_valid = $schema_valid, payload = $payload, summary = $summary, \
+                 artifact_paths = $artifact_paths, digest = $digest",
+            )
+            .bind(("run", run_id.clone()))
+            .bind(("run_node", row.id.clone()))
+            .bind(("node_key", node.key.to_string()))
+            .bind(("instance_path", node.key.to_string()))
+            .bind(("kvdag_version", version_id.clone()))
+            .bind(("schema_valid", schema_valid))
+            .bind(("payload", seed.payload.clone()))
+            .bind(("summary", seed.summary.clone()))
+            .bind(("artifact_paths", seed.artifact_paths.clone()))
+            .bind(("digest", seed.digest.clone()))
+            .await
+            .map_err(query_error)?;
+        checkpoint_response.check().map_err(query_error)?;
+
+        Ok(row.id)
+    }
+
+    /// The source node's own `kvdag_node` row for a [`RestoredRef`], resolved
+    /// via the source run's `kvdag_version` (a `RestoredRef` names a node key,
+    /// not a version). `None` for a source run or node that no longer
+    /// resolves — treated as "cannot verify compatibility", not an error.
+    async fn source_node_row(
+        &self,
+        source: &RestoredRef,
+    ) -> Result<Option<KvdagNodeRow>, StoreError> {
+        let Some(run_id) = parse_record_id(TABLE_WORKFLOW_RUN, source.run.as_str()) else {
+            return Ok(None);
+        };
+        let Some(run_row) = self.select_run_row(&run_id).await? else {
+            return Ok(None);
+        };
+        let rows = self.select_kvdag_nodes(&run_row.kvdag_version).await?;
+        Ok(rows
+            .into_iter()
+            .find(|row| row.node_key == source.node_key.as_str()))
+    }
+
+    /// Public accessor for [`node_compat_digests`]: resolves the node by
+    /// `(version, key)` first, for a caller (the restore handler, WS-D) that
+    /// only has the node's key and a version, not a row. `None` when the
+    /// version has no node under that key, so an unknown selector is a plain
+    /// comparison input rather than a special case for every caller
+    /// (`07-phase3-plan.md` §3 rule 5, §4 D11).
+    pub async fn node_compat_digests_for(
+        &self,
+        version: &KvdagVersionId,
+        key: &NodeKey,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        let version_id = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a kvdag_version id: {version}")))?;
+        let rows = self.select_kvdag_nodes(&version_id).await?;
+        Ok(rows
+            .iter()
+            .find(|row| row.node_key == key.as_str())
+            .map(node_compat_digests))
     }
 
     async fn find_kvdag_edge_id(
@@ -1619,6 +2029,7 @@ impl WorkflowStore {
         kind: RunEventKind,
         path: Option<crate::workflow::model::InstancePath>,
         payload: serde_json::Value,
+        at_unix_ms: u64,
     ) -> Result<(), StoreError> {
         let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
@@ -1631,13 +2042,14 @@ impl WorkflowStore {
             .db
             .query(
                 "CREATE run_event SET run = $run, seq = $seq, kind = $kind, \
-                 run_node = $run_node, payload = $payload",
+                 run_node = $run_node, payload = $payload, at = time::from_millis($at_ms)",
             )
             .bind(("run", run_id))
             .bind(("seq", seq as i64))
             .bind(("kind", run_event_kind_str(kind).to_string()))
             .bind(("run_node", run_node_id))
             .bind(("payload", payload))
+            .bind(("at_ms", at_unix_ms as i64))
             .await
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
@@ -1696,8 +2108,13 @@ impl WorkflowStore {
         succession: Option<Succession>,
         started_at_unix_ms: Option<u64>,
         ended_at_unix_ms: Option<u64>,
+        restored_from: Option<RestoredRef>,
     ) -> Result<(), StoreError> {
         let run_node_id = self.find_run_node_id(&run, &path).await?;
+        let restored_from_id = match &restored_from {
+            Some(source) => self.resolve_checkpoint_id(source).await?,
+            None => None,
+        };
         let (succession_str, blocker_json) = match &succession {
             None => (None, None),
             Some(Succession::Satisfied) => (Some("satisfied"), None),
@@ -1721,6 +2138,7 @@ impl WorkflowStore {
                  total_tokens = $total_tokens, tool_uses = $tool_uses, \
                  duration_ms = $duration_ms, evidence = $evidence, \
                  succession = $succession, blocker = $blocker, \
+                 restored_from = $restored_from, \
                  first_pass_succeeded = IF $settles THEN $first_pass \
                                         ELSE first_pass_succeeded END, \
                  started_at = IF $started_at_ms = NONE THEN started_at \
@@ -1740,6 +2158,7 @@ impl WorkflowStore {
             ))
             .bind(("succession", succession_str.map(str::to_string)))
             .bind(("blocker", blocker_json))
+            .bind(("restored_from", restored_from_id))
             // `first_pass_succeeded` is one of the two `NodeHistory` inputs
             // that can be truthful today (§4 D8), and it is a property of how
             // the node *closed*, not of any intermediate transition — so it is
@@ -1783,6 +2202,37 @@ impl WorkflowStore {
         self.refresh_nodes_done(&run).await
     }
 
+    /// Resolves a [`RestoredRef`] to the source `node_checkpoint` record it
+    /// names.
+    ///
+    /// Addressed by `(run, node_key, seq)` rather than `run_node`'s
+    /// `checkpoint_seq` index (`run_node, seq`): the engine only carries the
+    /// source node's *key*, not its store row id, across a restore. Missing is
+    /// not an error — a checkpoint pruned away between restore and this write
+    /// decodes back as `None` rather than failing the write
+    /// (`07-phase3-plan.md` §1, `StoreWrite::RunNode.restored_from` doc).
+    async fn resolve_checkpoint_id(
+        &self,
+        source: &RestoredRef,
+    ) -> Result<Option<surrealdb_types::RecordId>, StoreError> {
+        let Some(run_id) = parse_record_id(TABLE_WORKFLOW_RUN, source.run.as_str()) else {
+            return Ok(None);
+        };
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM node_checkpoint WHERE run = $run AND node_key = $node_key \
+                 AND seq = $seq AND kind = \"result\" ORDER BY instance_path LIMIT 1",
+            )
+            .bind(("run", run_id))
+            .bind(("node_key", source.node_key.to_string()))
+            .bind(("seq", source.checkpoint_seq as i64))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::CheckpointRow> = response.take(0).map_err(query_error)?;
+        Ok(rows.into_iter().next().map(|row| row.id))
+    }
+
     /// Re-derives `workflow_run.nodes_done` from the run's own `run_node`
     /// statuses.
     ///
@@ -1804,10 +2254,12 @@ impl WorkflowStore {
             .db
             .query(
                 "UPDATE $run SET nodes_done = array::len((SELECT VALUE id FROM run_node \
-                 WHERE run = $run AND status IN $terminal))",
+                 WHERE run = $run AND status IN $terminal \
+                 AND !string::starts_with(instance_path, $reserved_prefix)))",
             )
             .bind(("run", run_id))
             .bind(("terminal", terminal))
+            .bind(("reserved_prefix", RESERVED_PATH_PREFIX))
             .await
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
@@ -1832,12 +2284,15 @@ impl WorkflowStore {
             .db
             .query(
                 "UPDATE $run SET \
-                 nodes_total = array::len((SELECT VALUE id FROM run_node WHERE run = $run)), \
+                 nodes_total = array::len((SELECT VALUE id FROM run_node WHERE run = $run \
+                 AND !string::starts_with(instance_path, $reserved_prefix))), \
                  nodes_done = array::len((SELECT VALUE id FROM run_node \
-                 WHERE run = $run AND status IN $terminal))",
+                 WHERE run = $run AND status IN $terminal \
+                 AND !string::starts_with(instance_path, $reserved_prefix)))",
             )
             .bind(("run", run_id))
             .bind(("terminal", terminal))
+            .bind(("reserved_prefix", RESERVED_PATH_PREFIX))
             .await
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
@@ -1853,6 +2308,14 @@ impl WorkflowStore {
     /// `.query()` — one request is one transaction — so a child can never exist
     /// without its provenance.
     async fn write_run_node_created(&self, create: RunNodeCreate) -> Result<(), StoreError> {
+        // The engine-owned epilogue is created through this same variant
+        // (`begin_epilogue`, `engine/mod.rs`), keyed `.summary`, with no
+        // authored `kvdag_node` behind it — the reserved-path branch is the
+        // one create allowed to bind `kvdag_node: NONE` (§4 D5, D15).
+        if is_reserved_path(create.path.as_str()) {
+            return self.write_epilogue_node_created(create).await;
+        }
+
         let run_id = parse_record_id(TABLE_WORKFLOW_RUN, create.run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {}", create.run)))?;
         let run_row = self
@@ -1929,6 +2392,66 @@ impl WorkflowStore {
         }
 
         self.refresh_run_node_counters(&create.run).await
+    }
+
+    /// Creates the `.summary` epilogue's `run_node` row — the one create
+    /// allowed to leave `kvdag_node` `NONE` (migration `0004` loosens the
+    /// column for exactly this case; §4 D5, D15).
+    ///
+    /// Never routed to directly from [`Self::write`]: [`Self::write_run_node_created`]
+    /// dispatches here on [`is_reserved_path`]. Asserting the reserved path
+    /// again here — rather than trusting the caller — is what makes the
+    /// invariant testable on its own: a store test calls this directly with a
+    /// non-reserved path and asserts [`StoreError::Invariant`], proving the
+    /// loosened column can never be reached by an ordinary node write.
+    ///
+    /// The epilogue has no `parent` (it is engine-owned, not an expansion
+    /// child) and is excluded from `nodes_total`/`nodes_done` (§4 D5), so
+    /// unlike [`Self::write_run_node_created`] this never touches
+    /// [`Self::refresh_run_node_counters`].
+    async fn write_epilogue_node_created(&self, create: RunNodeCreate) -> Result<(), StoreError> {
+        if !is_reserved_path(create.path.as_str()) {
+            return Err(StoreError::Invariant(format!(
+                "write_epilogue_node_created called for non-reserved path {}; \
+                 only the \".\"-prefixed namespace may create a run_node with no kvdag_node",
+                create.path
+            )));
+        }
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, create.run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {}", create.run)))?;
+
+        let response = self
+            .db
+            .query(
+                "CREATE run_node SET run = $run, kvdag_node = NONE, node_key = $node_key, \
+                 instance_path = $instance_path, label = $label, inputs = $inputs, \
+                 parent = NONE, depth = $depth, status = $status, model = $model, \
+                 effort = $effort, demand = $demand, attempt = $attempt, \
+                 assignment_reason = $assignment_reason RETURN AFTER",
+            )
+            .bind(("run", run_id))
+            .bind(("node_key", create.key.to_string()))
+            .bind(("instance_path", create.path.to_string()))
+            .bind(("label", create.label.clone()))
+            .bind(("inputs", string_map_json(&create.inputs)))
+            .bind(("depth", i64::from(create.depth)))
+            .bind(("status", node_status_str(create.status).to_string()))
+            .bind(("model", create.assignment.model.as_str().to_string()))
+            .bind(("effort", create.assignment.effort.as_str().to_string()))
+            .bind(("demand", demand_str(create.demand).to_string()))
+            .bind(("attempt", i64::from(create.attempt)))
+            .bind(("assignment_reason", create.assignment_reason))
+            .await
+            .map_err(query_error)?;
+        let mut response = response.check().map_err(query_error)?;
+        let rows: Vec<records::RunNodeRow> = response.take(0).map_err(query_error)?;
+        if rows.is_empty() {
+            return Err(StoreError::Query(format!(
+                "create epilogue run_node {} returned no row",
+                create.path
+            )));
+        }
+        Ok(())
     }
 
     /// Creates a `run_edge` that did not exist when the run started: the
@@ -2200,6 +2723,184 @@ impl WorkflowStore {
                 .map_err(query_error)?;
             response.check().map_err(query_error)?;
         }
+        Ok(())
+    }
+
+    /// A node instance's own checkpoint, addressed the way `list_checkpoints`
+    /// reports it: `(run, instance_path, seq)`, the `checkpoint_by_instance`
+    /// index. Used for a reconstructed interrogation's seed, which is always a
+    /// checkpoint of the node being interrogated in the run being read —
+    /// unlike [`Self::resolve_checkpoint_id`], which crosses runs by
+    /// `node_key` for a cross-version restore.
+    async fn find_checkpoint_id(
+        &self,
+        run: &RunId,
+        path: &InstancePath,
+        seq: u64,
+    ) -> Result<Option<surrealdb_types::RecordId>, StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM node_checkpoint WHERE run = $run AND instance_path = $path \
+                 AND seq = $seq LIMIT 1",
+            )
+            .bind(("run", run_id))
+            .bind(("path", path.to_string()))
+            .bind(("seq", seq as i64))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::CheckpointRow> = response.take(0).map_err(query_error)?;
+        Ok(rows.into_iter().next().map(|row| row.id))
+    }
+
+    /// The end-of-run summary the epilogue produced. Idempotent-rejected on
+    /// the `run_summary_run` UNIQUE index: a second write for a run surfaces
+    /// as a plain [`StoreError::Query`], never a panic — `run_summary` is
+    /// meant to be written exactly once per run.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_run_summary(
+        &self,
+        run: RunId,
+        kvdag_version: KvdagVersionId,
+        text: String,
+        outcome: String,
+        highlights: Vec<String>,
+        open_gaps: Vec<String>,
+        per_node: Vec<SummaryNodeLine>,
+        token_estimate: u32,
+        generated_by_path: Option<InstancePath>,
+    ) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let version_id =
+            parse_record_id(TABLE_KVDAG_VERSION, kvdag_version.as_str()).ok_or_else(|| {
+                StoreError::Decode(format!("not a kvdag_version id: {kvdag_version}"))
+            })?;
+        // `None` is tolerated: a summary without a resolvable producer (the
+        // `.summary` node itself failed to persist, or was pruned mid-flight)
+        // is still a summary.
+        let generated_by = match &generated_by_path {
+            Some(path) => self.find_run_node_id(&run, path).await.ok(),
+            None => None,
+        };
+        let per_node_json: Vec<serde_json::Value> = per_node
+            .into_iter()
+            .map(|line| {
+                serde_json::json!({
+                    "node_key": line.node_key,
+                    "verdict": line.verdict,
+                    "one_liner": line.one_liner,
+                })
+            })
+            .collect();
+
+        let response = self
+            .db
+            .query(
+                "CREATE run_summary SET run = $run, kvdag_version = $kvdag_version, \
+                 text = $text, outcome = $outcome, highlights = $highlights, \
+                 open_gaps = $open_gaps, per_node = $per_node, \
+                 token_estimate = $token_estimate, generated_by = $generated_by",
+            )
+            .bind(("run", run_id))
+            .bind(("kvdag_version", version_id))
+            .bind(("text", text))
+            .bind(("outcome", outcome))
+            .bind(("highlights", highlights))
+            .bind(("open_gaps", open_gaps))
+            .bind(("per_node", per_node_json))
+            .bind(("token_estimate", i64::from(token_estimate)))
+            .bind(("generated_by", generated_by))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    /// A past node's session was revived in a pane. A create, addressed at the
+    /// app-allocated [`InterrogationId`] so the later
+    /// [`Self::write_interrogation_update`] can find the same row without a
+    /// read-back (`07-phase3-plan.md` §3 rule 4).
+    #[allow(clippy::too_many_arguments)]
+    async fn write_interrogation_started(
+        &self,
+        id: InterrogationId,
+        run: RunId,
+        path: InstancePath,
+        source_session_id: String,
+        forked_session_id: Option<String>,
+        transcript_path: Option<String>,
+        cwd: String,
+        pane_id: crate::workflow::model::PublicPaneId,
+        reconstructed: bool,
+        seeded_from_seq: Option<u64>,
+        note: String,
+        started_at_unix_ms: u64,
+    ) -> Result<(), StoreError> {
+        let interrogation_id = parse_record_id(TABLE_INTERROGATION, id.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not an interrogation id: {id}")))?;
+        let run_node_id = self.find_run_node_id(&run, &path).await?;
+        let seeded_from_id = match seeded_from_seq {
+            Some(seq) => self.find_checkpoint_id(&run, &path, seq).await?,
+            None => None,
+        };
+
+        let response = self
+            .db
+            .query(
+                "CREATE $id SET run_node = $run_node, \
+                 source_session_id = $source_session_id, \
+                 forked_session_id = $forked_session_id, \
+                 transcript_path = $transcript_path, cwd = $cwd, pane_id = $pane_id, \
+                 started_at = time::from_millis($started_at_ms), note = $note, \
+                 reconstructed = $reconstructed, seeded_from = $seeded_from",
+            )
+            .bind(("id", interrogation_id))
+            .bind(("run_node", run_node_id))
+            .bind(("source_session_id", source_session_id))
+            .bind(("forked_session_id", forked_session_id))
+            .bind(("transcript_path", transcript_path))
+            .bind(("cwd", cwd))
+            .bind(("pane_id", pane_id.to_string()))
+            .bind(("started_at_ms", started_at_unix_ms as i64))
+            .bind(("note", note))
+            .bind(("reconstructed", reconstructed))
+            .bind(("seeded_from", seeded_from_id))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    /// The two things learned about an interrogation after its record exists.
+    /// `None` on either field means "no change", not "clear": once known, the
+    /// forked session id never goes back to unknown, and an end stamp is never
+    /// un-set (§4 D7).
+    async fn write_interrogation_update(
+        &self,
+        id: InterrogationId,
+        forked_session_id: Option<String>,
+        ended_at_unix_ms: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let interrogation_id = parse_record_id(TABLE_INTERROGATION, id.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not an interrogation id: {id}")))?;
+        let response = self
+            .db
+            .query(
+                "UPDATE $id SET \
+                 forked_session_id = IF $forked_session_id = NONE THEN forked_session_id \
+                                      ELSE $forked_session_id END, \
+                 ended_at = IF $ended_at_ms = NONE THEN ended_at \
+                            ELSE time::from_millis($ended_at_ms) END",
+            )
+            .bind(("id", interrogation_id))
+            .bind(("forked_session_id", forked_session_id))
+            .bind(("ended_at_ms", ended_at_unix_ms.map(|ms| ms as i64)))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
         Ok(())
     }
 }

@@ -542,6 +542,12 @@
           "description": "Open the workflow launcher: pick a workflow, fill its arguments, pick a tier, run it."
         },
         {
+          "key": "keys.open_workflow_runs",
+          "type": "keybinding",
+          "default": "\"prefix+shift+b\"",
+          "description": "Open the run browser: a list-and-detail overlay over past and pruned runs."
+        },
+        {
           "key": "keys.indexed.tabs",
           "type": "string",
           "default": "unset",
@@ -1188,6 +1194,18 @@
           "type": "integer",
           "default": "5",
           "description": "Anti-stuck watchdog ticks with progress observed but no movement toward the output schema before a node is re-prompted for goal drift."
+        },
+        {
+          "key": "workflow.history_context_runs",
+          "type": "integer",
+          "default": "3",
+          "description": "How many of a workflow's most recent run summaries a new run is given as context, written to the run's `context/prior-runs.md`. Zero disables the injection without disabling summaries themselves."
+        },
+        {
+          "key": "workflow.summary_enabled",
+          "type": "boolean",
+          "default": "true",
+          "description": "Whether a finished run gets an end-of-run summary written by a visible summariser node. Off means no summariser node is created at all, not one that runs and discards its output."
         }
       ]
     }

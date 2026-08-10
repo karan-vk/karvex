@@ -984,10 +984,23 @@ mod tests {
 
         cancel_inactive_streams(|registered| registered != owner);
 
+        // `cancel_inactive_streams` only flips `stream_active`; the server
+        // thread notices it in `read_line`'s poll loop, which blocks on the
+        // socket for up to CONNECTION_POLL_INTERVAL (100ms) between checks.
+        // That is a genuine cross-thread wait with no in-process clock to
+        // inject (the timeout lives in a real socket recv), so — as with the
+        // wait_for_file budget — the bound below is evidence-scaled rather
+        // than picked blind: 3s is the CONNECTION_POLL_INTERVAL-driven
+        // nominal case (~100ms) multiplied by the same ~3x oversubscription
+        // factor measured for wait_for_file (48 threads on 16 cores), with
+        // extra headroom since this waits on real OS thread scheduling
+        // rather than a single poll. It only costs wall-clock time on the
+        // failure path; a passing wait returns as soon as the close request
+        // arrives.
         let (close_tx, close_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || close_tx.send(api_rx.blocking_recv()).unwrap());
         let close = close_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(3))
             .expect("canceled idle stream should dispatch a close")
             .expect("API request channel should remain open");
         match &close.request.method {

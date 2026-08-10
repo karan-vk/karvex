@@ -6,8 +6,9 @@
 use std::collections::BTreeMap;
 
 use crate::workflow::model::{
-    CheckpointKind, Demand, EdgeKind, Evidence, InstancePath, KvdagVersionId, NodeKey, NodeStatus,
-    RunEventKind, RunId, RunStatus, Succession, WorkflowId,
+    CheckpointKind, Demand, EdgeKind, Evidence, InstancePath, InterrogationId, KvdagVersionId,
+    NodeKey, NodeStatus, RestoredRef, RunEventKind, RunId, RunStatus, Succession, SummaryNodeLine,
+    WorkflowId,
 };
 use crate::workflow::tier::{NodeHistory, Tier};
 
@@ -77,11 +78,18 @@ pub struct VersionRecord {
 pub struct RunRecord {
     pub id: RunId,
     pub workflow: WorkflowId,
+    /// Denormalised alongside `workflow` so a cross-workflow listing
+    /// (`Self::workflow` is `Option`-filtered by [`WorkflowStore::list_runs`])
+    /// can label a row without an extra call per run (`07-phase3-plan.md` §4
+    /// D9). Resolved by one batched name lookup, never a per-row join.
+    pub workflow_name: String,
     pub version: KvdagVersionId,
     pub tier: Tier,
     pub status: RunStatus,
     pub args: BTreeMap<String, String>,
     pub context_runs: Vec<RunId>,
+    /// The run this one restores from, if any (`07-phase3-plan.md` §4 D4).
+    pub restore_from_run: Option<RunId>,
     pub max_depth: u16,
     pub max_nodes: u16,
     pub workspace_id: Option<String>,
@@ -137,6 +145,11 @@ pub struct RunNodeRecord {
     /// traced back to the `task.md`, `inputs/`, and `artifacts/` it produced.
     pub cwd: Option<String>,
     pub node_dir: Option<String>,
+    /// The pane's session-reported transcript path (§4 D6), or the pre-launch
+    /// estimate for a session that never reported one — the writer has always
+    /// persisted this; this field only stops the reader from dropping it (the
+    /// M2 fix, `07-phase3-plan.md` §1 WS-B).
+    pub transcript_path: Option<String>,
     pub evidence: Option<Evidence>,
     pub succession: Option<Succession>,
     pub total_tokens: u64,
@@ -144,6 +157,9 @@ pub struct RunNodeRecord {
     pub duration_ms: u64,
     pub started_at_unix_ms: Option<u64>,
     pub ended_at_unix_ms: Option<u64>,
+    /// Set only for a node seeded by restore; `None` for every node this run
+    /// actually executed (`07-phase3-plan.md` §4 D4).
+    pub restored_from: Option<RestoredRef>,
 }
 
 /// One `run_edge` relation, with both endpoints resolved to the instance paths
@@ -173,6 +189,35 @@ pub struct RunEventRecord {
     pub payload: serde_json::Value,
 }
 
+/// One node's restorable checkpoint plus its source node's compatibility
+/// digests (§3 rule 5, §4 D11), so the caller — the restore handler, WS-D —
+/// can compare against the target version's node without a second store
+/// round-trip per selector.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestorableCheckpoint {
+    pub checkpoint: CheckpointRecord,
+    pub prompt_digest: String,
+    pub schema_digest: String,
+}
+
+/// One `interrogation` row, resolved to the source node's instance path
+/// (`07-phase3-plan.md` §4 D8: an interrogation is not a run node, but it
+/// names the source node it revived).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterrogationRecord {
+    pub id: InterrogationId,
+    pub path: InstancePath,
+    pub source_session_id: String,
+    pub forked_session_id: Option<String>,
+    pub transcript_path: Option<String>,
+    pub cwd: String,
+    pub pane_id: Option<String>,
+    pub reconstructed: bool,
+    pub note: String,
+    pub started_at_unix_ms: u64,
+    pub ended_at_unix_ms: Option<u64>,
+}
+
 /// One `node_checkpoint` row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckpointRecord {
@@ -187,15 +232,31 @@ pub struct CheckpointRecord {
     pub digest: String,
 }
 
-/// One `run_summary` row.
+/// One `run_summary` row, resolved for the wire's `WorkflowRunSummaryInfo`
+/// (`07-phase3-plan.md` §WS-C): workflow identity, the summary body, and
+/// whether the source run has since been pruned.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunSummaryRecord {
     pub run: RunId,
+    pub workflow: WorkflowId,
+    /// Batched-resolved, same reasoning as `RunRecord::workflow_name`: a
+    /// pruned run's summary is exactly the row the browser most needs
+    /// labelled without an extra call.
+    pub workflow_name: String,
+    pub version: KvdagVersionId,
     pub text: String,
     pub outcome: String,
     pub highlights: Vec<String>,
     pub open_gaps: Vec<String>,
+    pub per_node: Vec<SummaryNodeLine>,
     pub token_estimate: u32,
+    pub generated_by_path: Option<InstancePath>,
+    pub created_at_unix_ms: u64,
+    /// Whether the summary's source `workflow_run` row still exists.
+    /// `run_summary` is the one never-pruned table (`03-storage-schema.md`
+    /// §9), so `true` here means the run's own history is gone but the
+    /// summary survives it (`07-phase3-plan.md` §4 D9).
+    pub run_pruned: bool,
 }
 
 /// The run's journalled growth limits, projected back into the shape the live
@@ -371,29 +432,85 @@ impl WorkflowStore {
             .await
             .map_err(query_error)?;
         let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
-        rows.into_iter().next().map(run_record).transpose()
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let names = self
+            .workflow_names_by_id(std::slice::from_ref(&row.workflow))
+            .await?;
+        let name = names
+            .get(&record_id_to_string(&row.workflow))
+            .cloned()
+            .unwrap_or_default();
+        run_record(row, name).map(Some)
     }
 
-    /// Runs for a workflow, newest first (`03-storage-schema.md` §6).
+    /// Runs, newest first (`03-storage-schema.md` §6). `workflow: None` lists
+    /// across every workflow — the run browser's cross-workflow view
+    /// (`07-phase3-plan.md` §4 D9); a single-workflow caller still gets the
+    /// original filtered form.
     pub async fn list_runs(
         &self,
-        workflow: &WorkflowId,
+        workflow: Option<&WorkflowId>,
         limit: u32,
     ) -> Result<Vec<RunRecord>, StoreError> {
-        let id = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
-            .ok_or_else(|| StoreError::Decode(format!("not a workflow id: {workflow}")))?;
+        let mut response = match workflow {
+            Some(workflow) => {
+                let id = parse_record_id(TABLE_WORKFLOW, workflow.as_str())
+                    .ok_or_else(|| StoreError::Decode(format!("not a workflow id: {workflow}")))?;
+                self.db
+                    .query(
+                        "SELECT * FROM workflow_run WHERE workflow = $workflow \
+                         ORDER BY started_at DESC LIMIT $limit",
+                    )
+                    .bind(("workflow", id))
+                    .bind(("limit", i64::from(limit)))
+                    .await
+                    .map_err(query_error)?
+            }
+            None => self
+                .db
+                .query("SELECT * FROM workflow_run ORDER BY started_at DESC LIMIT $limit")
+                .bind(("limit", i64::from(limit)))
+                .await
+                .map_err(query_error)?,
+        };
+        let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
+        let ids: Vec<_> = rows.iter().map(|row| row.workflow.clone()).collect();
+        let names = self.workflow_names_by_id(&ids).await?;
+        rows.into_iter()
+            .map(|row| {
+                let name = names
+                    .get(&record_id_to_string(&row.workflow))
+                    .cloned()
+                    .unwrap_or_default();
+                run_record(row, name)
+            })
+            .collect()
+    }
+
+    /// One batched `workflow.name` lookup for a set of run rows — the join
+    /// [`Self::list_runs`]/[`Self::get_run`] need to fill
+    /// `RunRecord::workflow_name` without a query per run
+    /// (`07-phase3-plan.md` §4 D9).
+    async fn workflow_names_by_id(
+        &self,
+        ids: &[surrealdb_types::RecordId],
+    ) -> Result<BTreeMap<String, String>, StoreError> {
+        if ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let mut response = self
             .db
-            .query(
-                "SELECT * FROM workflow_run WHERE workflow = $workflow \
-                 ORDER BY started_at DESC LIMIT $limit",
-            )
-            .bind(("workflow", id))
-            .bind(("limit", i64::from(limit)))
+            .query("SELECT * FROM $ids")
+            .bind(("ids", ids.to_vec()))
             .await
             .map_err(query_error)?;
-        let rows: Vec<records::RunRow> = response.take(0).map_err(query_error)?;
-        rows.into_iter().map(run_record).collect()
+        let rows: Vec<records::WorkflowRow> = response.take(0).map_err(query_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (record_id_to_string(&row.id), row.name))
+            .collect())
     }
 
     /// Every `run_node` for a run, in scheduling order (`04` §3.1: depth, then
@@ -419,9 +536,47 @@ impl WorkflowStore {
                 )
             })
             .collect();
+        let checkpoint_ids: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.restored_from.clone())
+            .collect();
+        let restored_ref_by_checkpoint_id =
+            self.restored_refs_by_checkpoint_id(checkpoint_ids).await?;
         rows.into_iter()
-            .map(|row| run_node_record(row, &path_by_id))
+            .map(|row| run_node_record(row, &path_by_id, &restored_ref_by_checkpoint_id))
             .collect()
+    }
+
+    /// Batched `node_checkpoint` -> [`RestoredRef`] resolution for
+    /// [`Self::list_run_nodes`]'s `restored_from` column: one query for the
+    /// whole node set rather than a lookup per restored row.
+    async fn restored_refs_by_checkpoint_id(
+        &self,
+        ids: Vec<surrealdb_types::RecordId>,
+    ) -> Result<BTreeMap<String, RestoredRef>, StoreError> {
+        if ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut response = self
+            .db
+            .query("SELECT * FROM $ids")
+            .bind(("ids", ids))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::CheckpointRow> = response.take(0).map_err(query_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    record_id_to_string(&row.id),
+                    RestoredRef {
+                        run: RunId::new(record_id_to_string(&row.run)),
+                        node_key: NodeKey::new(row.node_key),
+                        checkpoint_seq: row.seq as u64,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Every `run_edge` for a run, with both endpoints resolved to instance
@@ -551,6 +706,45 @@ impl WorkflowStore {
         rows.into_iter().map(checkpoint_record).collect()
     }
 
+    /// [`Self::find_restorable_checkpoints`], paired with each checkpoint's
+    /// source node's compatibility digests (§3 rule 5) — the restore
+    /// handler's read path: resolve the candidates and their comparison
+    /// inputs in one call, rather than a digest lookup per selector.
+    pub async fn restore_source(
+        &self,
+        run: &RunId,
+        node_keys: &[NodeKey],
+    ) -> Result<Vec<RestorableCheckpoint>, StoreError> {
+        let checkpoints = self.find_restorable_checkpoints(run, node_keys).await?;
+        if checkpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let Some(run_row) = self.select_run_row(&run_id).await? else {
+            return Ok(Vec::new());
+        };
+        let node_rows = self.select_kvdag_nodes(&run_row.kvdag_version).await?;
+        let digests_by_key: BTreeMap<String, (String, String)> = node_rows
+            .iter()
+            .map(|row| (row.node_key.clone(), super::node_compat_digests(row)))
+            .collect();
+        Ok(checkpoints
+            .into_iter()
+            .map(|checkpoint| {
+                let (prompt_digest, schema_digest) = digests_by_key
+                    .get(checkpoint.node_key.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                RestorableCheckpoint {
+                    checkpoint,
+                    prompt_digest,
+                    schema_digest,
+                }
+            })
+            .collect())
+    }
+
     /// One node key's measured record across a workflow's most recent closed
     /// runs — the aggregation `tier::resolve`'s `auto` policy has always
     /// described (`04-kvdag-and-execution.md` §7.3) and never had.
@@ -669,7 +863,235 @@ impl WorkflowStore {
             .await
             .map_err(query_error)?;
         let rows: Vec<records::RunSummaryRow> = response.take(0).map_err(query_error)?;
-        rows.into_iter().next().map(run_summary_record).transpose()
+        let mut records = self.run_summary_records(rows).await?;
+        Ok(records.pop())
+    }
+
+    /// `run_summary` rows across a workflow (or every workflow, `workflow:
+    /// None`), newest first (`07-phase3-plan.md` §4 D9 — the run browser's
+    /// pruned-history listing; per-run `Self::get_run_summary` exists
+    /// separately).
+    ///
+    /// The workflow filter cannot go through `run_summary.run`: that
+    /// reference dangles by design once the run is pruned, which is exactly
+    /// the row this listing most needs to return. The surviving route is
+    /// `kvdag_version.workflow` — `kvdag_version` rows are never pruned and
+    /// carry `workflow` — written as the two-step form migration `0004`'s
+    /// `run_summary_version` index accelerates: resolve the workflow's
+    /// version ids first, then filter `run_summary` by that set, rather than
+    /// a per-row link traversal that would walk the record graph once per
+    /// summary instead of hitting the index.
+    pub async fn list_run_summaries(
+        &self,
+        workflow: Option<&WorkflowId>,
+        limit: u32,
+    ) -> Result<Vec<RunSummaryRecord>, StoreError> {
+        let mut response = match workflow {
+            Some(workflow) => {
+                let workflow_id = super::workflow_record_id(workflow)?;
+                let mut version_response = self
+                    .db
+                    .query("SELECT VALUE id FROM kvdag_version WHERE workflow = $workflow")
+                    .bind(("workflow", workflow_id))
+                    .await
+                    .map_err(query_error)?;
+                let version_ids: Vec<surrealdb_types::RecordId> =
+                    version_response.take(0).map_err(query_error)?;
+                self.db
+                    .query(
+                        "SELECT * FROM run_summary WHERE kvdag_version IN $versions \
+                         ORDER BY created_at DESC LIMIT $limit",
+                    )
+                    .bind(("versions", version_ids))
+                    .bind(("limit", i64::from(limit)))
+                    .await
+                    .map_err(query_error)?
+            }
+            None => self
+                .db
+                .query("SELECT * FROM run_summary ORDER BY created_at DESC LIMIT $limit")
+                .bind(("limit", i64::from(limit)))
+                .await
+                .map_err(query_error)?,
+        };
+        let rows: Vec<records::RunSummaryRow> = response.take(0).map_err(query_error)?;
+        self.run_summary_records(rows).await
+    }
+
+    /// The injection feed for a new run's prior-summaries context (§4 D21):
+    /// a workflow's most recent summaries, excluding the run being started.
+    pub async fn run_summaries_for_context(
+        &self,
+        workflow: &WorkflowId,
+        excluding: &RunId,
+        limit: u32,
+    ) -> Result<Vec<RunSummaryRecord>, StoreError> {
+        Ok(self
+            .list_run_summaries(Some(workflow), limit.saturating_add(1))
+            .await?
+            .into_iter()
+            .filter(|record| &record.run != excluding)
+            .take(limit as usize)
+            .collect())
+    }
+
+    /// Shared resolution for [`Self::get_run_summary`]/[`Self::list_run_summaries`]:
+    /// one batched lookup per kind of reference for the whole row set —
+    /// source-run survival, `generated_by`'s instance path, and the version's
+    /// workflow identity/name — never one query per row.
+    async fn run_summary_records(
+        &self,
+        rows: Vec<records::RunSummaryRow>,
+    ) -> Result<Vec<RunSummaryRecord>, StoreError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let run_ids: Vec<_> = rows.iter().map(|row| row.run.clone()).collect();
+        let surviving = self.surviving_ids(&run_ids).await?;
+
+        let version_ids: Vec<_> = rows.iter().map(|row| row.kvdag_version.clone()).collect();
+        let mut version_response = self
+            .db
+            .query("SELECT * FROM $ids")
+            .bind(("ids", version_ids))
+            .await
+            .map_err(query_error)?;
+        let version_rows: Vec<records::KvdagVersionRow> =
+            version_response.take(0).map_err(query_error)?;
+        let version_by_id: BTreeMap<String, records::KvdagVersionRow> = version_rows
+            .into_iter()
+            .map(|row| (record_id_to_string(&row.id), row))
+            .collect();
+
+        let workflow_ids: Vec<_> = version_by_id
+            .values()
+            .map(|row| row.workflow.clone())
+            .collect();
+        let names = self.workflow_names_by_id(&workflow_ids).await?;
+
+        let generated_by_ids: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.generated_by.clone())
+            .collect();
+        let mut node_response = self
+            .db
+            .query("SELECT * FROM $ids")
+            .bind(("ids", generated_by_ids))
+            .await
+            .map_err(query_error)?;
+        let node_rows: Vec<records::RunNodeRow> = node_response.take(0).map_err(query_error)?;
+        let path_by_node_id: BTreeMap<String, InstancePath> = node_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    record_id_to_string(&row.id),
+                    InstancePath::new(row.instance_path),
+                )
+            })
+            .collect();
+
+        rows.into_iter()
+            .map(|row| {
+                let version_key = record_id_to_string(&row.kvdag_version);
+                let workflow_id = version_by_id
+                    .get(&version_key)
+                    .map(|version| record_id_to_string(&version.workflow))
+                    .unwrap_or_default();
+                let workflow_name = names.get(&workflow_id).cloned().unwrap_or_default();
+                let run_pruned = !surviving.contains(&record_id_to_string(&row.run));
+                let generated_by_path = row
+                    .generated_by
+                    .as_ref()
+                    .and_then(|id| path_by_node_id.get(&record_id_to_string(id)))
+                    .cloned();
+                Ok(RunSummaryRecord {
+                    run: RunId::new(record_id_to_string(&row.run)),
+                    workflow: WorkflowId::new(workflow_id),
+                    workflow_name,
+                    version: KvdagVersionId::new(version_key),
+                    text: row.text,
+                    outcome: row.outcome,
+                    highlights: row.highlights,
+                    open_gaps: row.open_gaps,
+                    per_node: row
+                        .per_node
+                        .into_iter()
+                        .filter_map(summary_node_line)
+                        .collect(),
+                    token_estimate: row.token_estimate as u32,
+                    generated_by_path,
+                    created_at_unix_ms: unix_ms(&row.created_at),
+                    run_pruned,
+                })
+            })
+            .collect()
+    }
+
+    /// Which of a set of record ids still resolve — one batched existence
+    /// check. Used to flag a `run_summary` row whose source run has been
+    /// pruned (`03-storage-schema.md` §9).
+    async fn surviving_ids(
+        &self,
+        ids: &[surrealdb_types::RecordId],
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        if ids.is_empty() {
+            return Ok(std::collections::BTreeSet::new());
+        }
+        let mut response = self
+            .db
+            .query("SELECT VALUE id FROM $ids")
+            .bind(("ids", ids.to_vec()))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<surrealdb_types::RecordId> = response.take(0).map_err(query_error)?;
+        Ok(rows.iter().map(record_id_to_string).collect())
+    }
+
+    /// A run's interrogations, in the order they were started. No production
+    /// caller filters these further today: `load_historical_run` (WS-H) and
+    /// the interrogate handler's active-interrogation check (WS-D) both want
+    /// the whole set for one run.
+    pub async fn list_interrogations(
+        &self,
+        run: &RunId,
+    ) -> Result<Vec<InterrogationRecord>, StoreError> {
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        // `interrogation` carries no `run` column of its own — it is
+        // addressed through `run_node`, which does (§4 D8: an interrogation
+        // is not a run node, but it names the source node it revived).
+        let mut node_response = self
+            .db
+            .query("SELECT * FROM run_node WHERE run = $run")
+            .bind(("run", id))
+            .await
+            .map_err(query_error)?;
+        let node_rows: Vec<records::RunNodeRow> = node_response.take(0).map_err(query_error)?;
+        let path_by_id: BTreeMap<String, InstancePath> = node_rows
+            .iter()
+            .map(|row| {
+                (
+                    record_id_to_string(&row.id),
+                    InstancePath::new(row.instance_path.clone()),
+                )
+            })
+            .collect();
+        let node_ids: Vec<_> = node_rows.iter().map(|row| row.id.clone()).collect();
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut response = self
+            .db
+            .query("SELECT * FROM interrogation WHERE run_node IN $nodes ORDER BY started_at")
+            .bind(("nodes", node_ids))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::InterrogationRow> = response.take(0).map_err(query_error)?;
+        rows.into_iter()
+            .map(|row| interrogation_record(row, &path_by_id))
+            .collect()
     }
 
     /// The run's journalled growth limits (P2b). See [`StoredGrowthLimits`].
@@ -864,7 +1286,7 @@ fn version_record(row: records::KvdagVersionRow) -> Result<VersionRecord, StoreE
     })
 }
 
-fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
+fn run_record(row: records::RunRow, workflow_name: String) -> Result<RunRecord, StoreError> {
     let args = row
         .args
         .as_object()
@@ -878,9 +1300,19 @@ fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
                 .collect()
         })
         .unwrap_or_default();
+    // `{"run": "<id>"}`, the shape `WorkflowStore::create_run` writes
+    // (`07-phase3-plan.md` §4 D4); anything else decodes as "no restore
+    // provenance" rather than failing the whole row.
+    let restore_from_run = row
+        .restore_from
+        .as_ref()
+        .and_then(|value| value.get("run"))
+        .and_then(serde_json::Value::as_str)
+        .map(RunId::new);
     Ok(RunRecord {
         id: RunId::new(record_id_to_string(&row.id)),
         workflow: WorkflowId::new(record_id_to_string(&row.workflow)),
+        workflow_name,
         version: KvdagVersionId::new(record_id_to_string(&row.kvdag_version)),
         tier: Tier::parse(&row.tier)
             .ok_or_else(|| StoreError::Decode(format!("unknown tier {:?}", row.tier)))?,
@@ -891,6 +1323,7 @@ fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
             .iter()
             .map(|id| RunId::new(record_id_to_string(id)))
             .collect(),
+        restore_from_run,
         max_depth: row.max_depth as u16,
         max_nodes: row.max_nodes as u16,
         workspace_id: row.workspace_id,
@@ -908,6 +1341,7 @@ fn run_record(row: records::RunRow) -> Result<RunRecord, StoreError> {
 fn run_node_record(
     row: records::RunNodeRow,
     path_by_id: &BTreeMap<String, InstancePath>,
+    restored_ref_by_checkpoint_id: &BTreeMap<String, RestoredRef>,
 ) -> Result<RunNodeRecord, StoreError> {
     // Resolved against this run's own rows rather than a live `Kvdag` — a
     // restored run has no live definition to consult, and `parent` only ever
@@ -916,6 +1350,11 @@ fn run_node_record(
         .parent
         .as_ref()
         .and_then(|parent| path_by_id.get(&record_id_to_string(parent)))
+        .cloned();
+    let restored_from = row
+        .restored_from
+        .as_ref()
+        .and_then(|checkpoint| restored_ref_by_checkpoint_id.get(&record_id_to_string(checkpoint)))
         .cloned();
     Ok(RunNodeRecord {
         run: RunId::new(record_id_to_string(&row.run)),
@@ -936,6 +1375,7 @@ fn run_node_record(
         agent_session_id: row.agent_session_id,
         cwd: row.cwd,
         node_dir: row.node_dir,
+        transcript_path: row.transcript_path,
         evidence: row.evidence.as_deref().map(parse_evidence).transpose()?,
         succession: parse_succession(row.succession.as_deref(), row.blocker.as_ref())?,
         total_tokens: row.total_tokens as u64,
@@ -943,6 +1383,7 @@ fn run_node_record(
         duration_ms: row.duration_ms as u64,
         started_at_unix_ms: row.started_at.as_ref().map(unix_ms),
         ended_at_unix_ms: row.ended_at.as_ref().map(unix_ms),
+        restored_from,
     })
 }
 
@@ -981,14 +1422,48 @@ fn checkpoint_record(row: records::CheckpointRow) -> Result<CheckpointRecord, St
     })
 }
 
-fn run_summary_record(row: records::RunSummaryRow) -> Result<RunSummaryRecord, StoreError> {
-    Ok(RunSummaryRecord {
-        run: RunId::new(record_id_to_string(&row.run)),
-        text: row.text,
-        outcome: row.outcome,
-        highlights: row.highlights,
-        open_gaps: row.open_gaps,
-        token_estimate: row.token_estimate as u32,
+fn interrogation_record(
+    row: records::InterrogationRow,
+    path_by_id: &BTreeMap<String, InstancePath>,
+) -> Result<InterrogationRecord, StoreError> {
+    let path = path_by_id
+        .get(&record_id_to_string(&row.run_node))
+        .cloned()
+        .ok_or_else(|| {
+            StoreError::Decode(format!(
+                "interrogation {} references a run_node not in this run",
+                record_id_to_string(&row.id)
+            ))
+        })?;
+    Ok(InterrogationRecord {
+        id: InterrogationId::new(record_id_to_string(&row.id)),
+        path,
+        source_session_id: row.source_session_id,
+        forked_session_id: row.forked_session_id,
+        transcript_path: row.transcript_path,
+        cwd: row.cwd,
+        pane_id: row.pane_id,
+        reconstructed: row.reconstructed,
+        note: row.note,
+        started_at_unix_ms: unix_ms(&row.started_at),
+        ended_at_unix_ms: row.ended_at.as_ref().map(unix_ms),
+    })
+}
+
+/// Parses one `run_summary.per_node` entry (`{node_key, verdict, one_liner}`)
+/// back into a [`SummaryNodeLine`]. A malformed entry is dropped rather than
+/// failing the whole summary — the store never wrote a summary with a
+/// per-node array unless the epilogue's result already passed
+/// `summary_output_schema()`, so a decode miss here means the shape drifted,
+/// not that the summary itself is unusable.
+fn summary_node_line(value: serde_json::Value) -> Option<SummaryNodeLine> {
+    let node_key = value.get("node_key")?.as_str()?.to_string();
+    let verdict = value.get("verdict")?.as_str()?.to_string();
+    let one_liner = value.get("one_liner")?.as_str()?.to_string();
+    Some(SummaryNodeLine {
+        node_key,
+        verdict,
+        one_liner,
     })
 }
 
@@ -1014,6 +1489,7 @@ fn parse_run_event_kind(value: &str) -> Result<RunEventKind, StoreError> {
         "checkpoint" => Ok(RunEventKind::Checkpoint),
         "succession" => Ok(RunEventKind::Succession),
         "error" => Ok(RunEventKind::Error),
+        "summary" => Ok(RunEventKind::Summary),
         other => Err(StoreError::Decode(format!(
             "unknown run event kind {other:?}"
         ))),

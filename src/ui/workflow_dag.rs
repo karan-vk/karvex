@@ -28,10 +28,15 @@ use super::line_cells::{line_cell_symbol, LineCell};
 use super::text::{display_width, truncate_end};
 use super::widgets::panel_contrast_fg;
 use crate::app::state::{
-    AppState, DagNodeView, DagRunCounts, DagViewState, Mode, Palette, WorkflowRunPresentation,
+    AppState, DagInterrogationView, DagNodeView, DagRunCounts, DagViewState,
+    HistoricalInterrogation, Mode, Palette, WorkflowRunPresentation,
 };
-use crate::workflow::layout::{layout, DagLayout, EdgeBits, LayoutRect};
-use crate::workflow::model::{NodeStatus, RunGraph, RunNode, RunNodeIdx, RunStatus, Succession};
+use crate::workflow::layout::{
+    detached_lane, detached_lane_height, layout, DagLayout, EdgeBits, LayoutRect,
+};
+use crate::workflow::model::{
+    EpiloguePhase, NodeStatus, RestoredRef, RunGraph, RunNode, RunNodeIdx, RunStatus, Succession,
+};
 
 const HEADER_HEIGHT: u16 = 1;
 /// Blocker line, status line, model/usage line, summary line.
@@ -62,14 +67,26 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
     }
 
     let previous = &app.view.dag;
+    // Whichever run this frame is projecting. A historical snapshot wins when
+    // one is open: the DAG view has exactly one graph on screen at a time, and
+    // "the past run the user just opened" is the one they asked for
+    // (`07-phase3-plan.md` §1 WS-H).
+    let historical = app.historical_run();
     // The run's last growth limit, formatted for the banner band. `None` costs
     // zero rows (§3 frozen interface 10). Mirrored onto
     // `WorkflowRunPresentation` alongside the run graph, the same way a refused
     // delivery is — and gated on there being a graph to banner, so a limit left
     // over from a run that has since been cleared cannot head an empty overlay.
-    let banner: Option<String> = app
-        .workflow_run_graph()
-        .and(app.workflow_run_presentation().growth_banner.clone());
+    //
+    // A historical run never banners: the mirrored limit belongs to the
+    // *active* run, and hanging it over a past run's graph would attribute a
+    // guardrail breach to the wrong run.
+    let banner: Option<String> = if historical.is_some() {
+        None
+    } else {
+        app.workflow_run_graph()
+            .and(app.workflow_run_presentation().growth_banner.clone())
+    };
     let (header_rect, banner_rect, graph_rect, detail_rect, footer_rect) =
         overlay_areas(area, banner.as_deref());
     let mut view = DagViewState {
@@ -79,13 +96,52 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
         detail_rect,
         footer_rect,
         banner,
+        historical: historical.is_some(),
         ..DagViewState::default()
     };
 
-    let Some(graph) = app.workflow_run_graph() else {
+    let Some(graph) = historical
+        .map(|snapshot| snapshot.graph.as_ref())
+        .or_else(|| app.workflow_run_graph())
+    else {
         return view;
     };
-    let presentation = app.workflow_run_presentation();
+    // A past run carries its own name but none of the live mirror's
+    // presentation: node labels, refused deliveries, and growth notices are all
+    // facts about a run that is currently executing. Reusing the live
+    // presentation here would label a past run's nodes with the active run's
+    // labels, which is worse than showing the keys.
+    let historical_presentation;
+    let presentation: &WorkflowRunPresentation = match historical {
+        Some(snapshot) => {
+            historical_presentation = WorkflowRunPresentation {
+                workflow_name: snapshot.workflow_name.clone(),
+                ..WorkflowRunPresentation::default()
+            };
+            &historical_presentation
+        }
+        None => app.workflow_run_presentation(),
+    };
+    // Interrogation panes live on `HistoricalRunSnapshot` only: the live run's
+    // interrogations are tracked on `WorkflowRuntimeState` and are not mirrored
+    // into `AppState` (the shape landed in step 1b says so). An empty slice
+    // costs the graph band zero rows.
+    let interrogations: &[HistoricalInterrogation] = historical
+        .map(|snapshot| snapshot.interrogations.as_slice())
+        .unwrap_or(&[]);
+    let lane_height = lane_height_for(graph_rect.height, interrogations.len());
+    let graph_band = Rect::new(
+        graph_rect.x,
+        graph_rect.y,
+        graph_rect.width,
+        graph_rect.height.saturating_sub(lane_height),
+    );
+    let lane_rect = Rect::new(
+        graph_rect.x,
+        graph_band.bottom(),
+        graph_rect.width,
+        lane_height,
+    );
 
     view.run_id = graph.run_id.as_str().to_string();
     view.workflow_name = presentation.workflow_name.clone();
@@ -93,7 +149,8 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
     // Counted over the whole graph, before clipping: a resize must never
     // change the answer the header gives about the run.
     view.counts = run_counts(graph);
-    view.layout = clipped_layout(graph, graph_rect);
+    view.layout = clipped_layout(graph, graph_band);
+    view.interrogation_nodes = project_interrogations(interrogations, lane_rect);
     let now_unix_ms = current_unix_ms();
     view.nodes = graph
         .nodes
@@ -188,6 +245,100 @@ fn clipped_layout(graph: &RunGraph, graph_rect: Rect) -> DagLayout {
     dag
 }
 
+/// Rows the interrogation lane may take out of the bottom of the graph band.
+///
+/// Zero when there is nothing to draw, which is what keeps every pinned graph
+/// geometry number byte-identical for the runs that have no interrogations
+/// (`07-phase3-plan.md` §1 WS-H, the banner's precedent). And zero again when
+/// the band is too short to afford the lane *and* leave the graph its one
+/// guaranteed row — the same yields-before-the-graph rule
+/// [`overlay_areas`] applies to the detail strip. Carving a lane the boxes
+/// cannot fit into would cost the graph rows and draw nothing with them.
+fn lane_height_for(graph_height: u16, count: usize) -> u16 {
+    let wanted = detached_lane_height(count);
+    if wanted > 0 && graph_height > wanted {
+        wanted
+    } else {
+        0
+    }
+}
+
+/// Interrogation rows → the boxes the lane will draw, in row order.
+///
+/// The rects come from [`detached_lane`], which drops any box that does not
+/// fit; zipping consumes the shorter of the two, so a dropped box is simply
+/// absent from the projection — and therefore from the hit-test — rather than
+/// clipped into something invisible that still answers clicks.
+fn project_interrogations(
+    rows: &[HistoricalInterrogation],
+    lane: Rect,
+) -> Vec<DagInterrogationView> {
+    if rows.is_empty() || lane.height == 0 || lane.width == 0 {
+        return Vec::new();
+    }
+    rows.iter()
+        .zip(detached_lane(to_layout_rect(lane), rows.len()))
+        .map(|(row, rect)| DagInterrogationView {
+            id: row.id.clone(),
+            path: row.path.clone(),
+            label: interrogation_label(row),
+            pane_id: row.pane_id.clone(),
+            rect: to_rect(rect),
+            ended: row.ended,
+        })
+        .collect()
+}
+
+/// What the box calls itself. A reconstructed session says so in its own title
+/// — 00 Feature 3's "never presented as the original", made mechanical
+/// (`07-phase3-plan.md` §4 D7).
+fn interrogation_label(row: &HistoricalInterrogation) -> String {
+    let verb = if row.reconstructed {
+        "reconstructed"
+    } else {
+        "interrogate"
+    };
+    format!("{verb} · {}", row.path)
+}
+
+/// The kind word [`interrogation_label`] put at the front of the label.
+///
+/// The `DagInterrogationView` shape landed in step 1b carries no
+/// `reconstructed` flag, so the label is where the distinction lives and the
+/// only place the box can read it back. The separator never appears in the
+/// kind, so the first split is always the right one.
+fn interrogation_kind(item: &DagInterrogationView) -> &str {
+    item.label
+        .split_once(" · ")
+        .map(|(kind, _)| kind)
+        .unwrap_or(item.label.as_str())
+}
+
+/// Hit-test the interrogation lane.
+///
+/// Deliberately a separate lookup from [`DagViewState::node_at`] over a
+/// separate vec: an interrogation is not a `RunGraph` node (§4 D8), so a click
+/// on one must never resolve to a `RunNodeIdx` that some other caller would
+/// then steer, restart, or select.
+pub(crate) fn workflow_dag_interrogation_at(
+    view: &DagViewState,
+    col: u16,
+    row: u16,
+) -> Option<&DagInterrogationView> {
+    view.interrogation_nodes
+        .iter()
+        .find(|item| rect_contains(item.rect, col, row))
+}
+
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && col >= rect.x
+        && col < rect.right()
+        && row >= rect.y
+        && row < rect.bottom()
+}
+
 fn contains_rect(bounds: LayoutRect, rect: LayoutRect) -> bool {
     !rect.is_empty()
         && rect.x >= bounds.x
@@ -224,10 +375,17 @@ fn project_node(
         // for exactly that reason. The per-key entry stays as the fallback for
         // a node the run graph does not carry — and a static node's path *is*
         // its key, so the two can never disagree.
+        //
+        // `RunNode::label` comes last before the bare key, and it is what names
+        // a **historical** run: a past run has no live presentation to mirror,
+        // but its labels were durable all along — on the node itself. Without
+        // this rung every box in the history view falls through to its key, and
+        // a whole fan-out is drawn under N identical names again.
         label: [node.path.as_str(), node.key.as_str()]
             .into_iter()
             .filter_map(|lookup| node_labels.get(lookup))
             .map(|label| label.trim())
+            .chain(std::iter::once(node.label.trim()))
             .find(|label| !label.is_empty())
             .unwrap_or(node.key.as_str())
             .to_string(),
@@ -449,6 +607,58 @@ fn same_band<'a>(
 
 // ── render (pure draw) ──────────────────────────────────────────────────────
 
+/// The two facts the overlay draws that [`DagViewState`] has no field to carry.
+///
+/// Its shape was frozen in step 1b (`07-phase3-plan.md` §1 WS-G) and neither
+/// the epilogue phase nor a node's restore provenance is in it. Both are pure
+/// reads off the projected `RunGraph`, and neither influences a single
+/// rectangle — so they are derived here, at draw time, rather than smuggled
+/// into the view state or recomputed inside two render functions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DagExtras {
+    /// The run's summariser epilogue, when the engine appended one.
+    epilogue: Option<EpiloguePhase>,
+    /// The selected node's `restored from …` provenance line (§4 D4).
+    restored_from: Option<String>,
+}
+
+fn dag_extras(app: &AppState) -> DagExtras {
+    let Some(graph) = app
+        .historical_run()
+        .map(|snapshot| snapshot.graph.as_ref())
+        .or_else(|| app.workflow_run_graph())
+    else {
+        return DagExtras::default();
+    };
+    // By instance path, not by index: the projection and the graph are two
+    // different orderings of the same run, and the path is the identity that
+    // survives both (the same reason `carried_selection` matches on it).
+    let restored_from = app
+        .view
+        .dag
+        .selected_node()
+        .map(|node| node.path.as_str())
+        .and_then(|path| graph.nodes.iter().find(|node| node.path.as_str() == path))
+        .and_then(|node| node.restored_from.as_ref())
+        .map(restored_from_line);
+    DagExtras {
+        epilogue: graph.epilogue.as_ref().map(|epilogue| epilogue.phase),
+        restored_from,
+    }
+}
+
+/// Where a restored node's result actually came from. The run, the node, and
+/// the checkpoint — all three, because a restore is only auditable if it names
+/// the exact row it copied (§4 D4).
+fn restored_from_line(source: &RestoredRef) -> String {
+    format!(
+        "restored from {} · {} · checkpoint {}",
+        source.run.as_str(),
+        source.node_key.as_str(),
+        source.checkpoint_seq
+    )
+}
+
 pub(super) fn render_workflow_dag(app: &AppState, frame: &mut Frame, area: Rect) {
     let dag = &app.view.dag;
     let p = &app.palette;
@@ -466,11 +676,13 @@ pub(super) fn render_workflow_dag(app: &AppState, frame: &mut Frame, area: Rect)
         return;
     }
 
-    render_header(dag, p, frame);
+    let extras = dag_extras(app);
+    render_header(dag, &extras, p, frame);
     render_banner(dag, p, frame);
     render_edges(dag, p, frame);
     render_nodes(dag, p, frame);
-    render_detail(dag, p, frame);
+    render_interrogations(dag, p, frame);
+    render_detail(dag, &extras, p, frame);
     render_footer(dag, p, frame);
 }
 
@@ -543,7 +755,7 @@ fn truncate_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>>
 
 /// The header names the run the way the author does, and reports the graph as
 /// it is — total nodes always, plus what is offscreen and what is wrong.
-fn render_header(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
+fn render_header(dag: &DagViewState, extras: &DagExtras, p: &Palette, frame: &mut Frame) {
     if dag.header_rect.height == 0 {
         return;
     }
@@ -563,6 +775,31 @@ fn render_header(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
             run_status_label(status),
             Style::default().fg(run_status_color(status, p)),
         ));
+    }
+    // A past run says so on the line that names it. Everything else about the
+    // overlay looks identical to a live one, and a user acting on a stale graph
+    // believing it is live is the failure this word prevents.
+    if dag.historical {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled("past run", Style::default().fg(p.teal)));
+    }
+    // The epilogue has no band of its own (§1 WS-H): the summariser is visible
+    // as a normal node in the graph, and its *state* rides the header, so a
+    // succeeded run with a still-working summariser reads truthfully without
+    // costing a row (§4 D1's post-`RunFinished` contract).
+    match extras.epilogue {
+        Some(EpiloguePhase::Pending) | Some(EpiloguePhase::Running) => {
+            spans.push(Span::styled(" · ", dim));
+            spans.push(Span::styled(
+                "summarising…",
+                Style::default().fg(p.subtext0),
+            ));
+        }
+        Some(EpiloguePhase::GaveUp) => {
+            spans.push(Span::styled(" · ", dim));
+            spans.push(Span::styled("summary failed", Style::default().fg(p.peach)));
+        }
+        Some(EpiloguePhase::Done) | None => {}
     }
     spans.push(Span::styled(" · ", dim));
     spans.push(Span::styled(
@@ -795,7 +1032,68 @@ fn render_nodes(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
     }
 }
 
-fn render_detail(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
+/// The detached interrogation lane, below the deepest graph layer.
+///
+/// Drawn after the nodes and never routed to by an edge: an interrogation is
+/// not a `RunGraph` node (§4 D8), so it has no inbound or outbound rail and
+/// must not read as a root. Teal while its forked session's pane is live,
+/// `overlay0` once it has ended — the box stays on screen either way, because
+/// "which past nodes have been interrogated" is history worth keeping.
+fn render_interrogations(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
+    for item in &dag.interrogation_nodes {
+        let rect = item.rect;
+        if rect.width < 4 || rect.height < 3 {
+            continue;
+        }
+        let color = if item.ended { p.overlay0 } else { p.teal };
+        // The **source path** leads, not the word "interrogate". A box is
+        // 22 cells wide (`NODE_WIDTH`), so a title of
+        // `interrogate · <path>` spends fourteen of its eighteen usable cells
+        // saying what the lane already says and truncates away the only part
+        // that identifies which node this is. The kind moves inside, where it
+        // has a row to itself. `DagInterrogationView::label` keeps the full
+        // `<kind> · <path>` name for consumers that are not 22 cells wide.
+        let title_width = rect.width.saturating_sub(5) as usize;
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(color))
+            .title(Span::styled(
+                format!(" ⌕ {} ", truncate_end(&item.path, title_width)),
+                Style::default().fg(color),
+            ))
+            .style(Style::default().bg(p.panel_bg));
+        let inner = block.inner(rect);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(block, rect);
+
+        if inner.height == 0 {
+            continue;
+        }
+        // A reconstructed session names itself on every surface it has (§4 D7).
+        // "ended" is stated as well as coloured: a dimmed border is a hint, and
+        // "is this session still answering?" deserves a word.
+        let spans = truncate_spans(
+            vec![
+                Span::styled(
+                    interrogation_kind(item).to_string(),
+                    Style::default().fg(color),
+                ),
+                Span::styled(
+                    if item.ended {
+                        " · ended".to_string()
+                    } else {
+                        String::new()
+                    },
+                    Style::default().fg(p.overlay0),
+                ),
+            ],
+            inner.width as usize,
+        );
+        frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+    }
+}
+
+fn render_detail(dag: &DagViewState, extras: &DagExtras, p: &Palette, frame: &mut Frame) {
     if dag.detail_rect.height == 0 {
         return;
     }
@@ -863,6 +1161,16 @@ fn render_detail(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
             Style::default().fg(p.peach).add_modifier(Modifier::BOLD),
         ));
     }
+    // Restore provenance shares the status row rather than claiming one of its
+    // own, for the same reason the growth notice does: `DETAIL_HEIGHT` is a
+    // constant, and no per-node fact may change how much of the overlay's fixed
+    // budget the strip needs. It sits next to the status because `↺ restored`
+    // without "restored from what" is the half of the fact that cannot be
+    // acted on (§4 D4).
+    if let Some(source) = &extras.restored_from {
+        path_status.push(Span::styled("  ", dim));
+        path_status.push(Span::styled(source.clone(), Style::default().fg(p.teal)));
+    }
     lines.push(Line::from(truncate_spans(path_status, width)));
     lines.push(Line::from(truncate_spans(
         vec![
@@ -901,23 +1209,47 @@ fn render_detail(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
 }
 
 /// Every hint the overlay offers, in display order.
-const FOOTER_HINTS: [(&str, &str); 4] = [
+const FOOTER_HINTS: [(&str, &str); 6] = [
     ("enter", " focus"),
     ("hjkl/↑↓←→", " move"),
     ("s", " steer"),
+    ("i", " interrogate"),
+    // The degraded path gets its own key rather than a second meaning for
+    // `i`: reconstructing a session that is not the original teammate is
+    // always an explicit choice (`00-overview.md` Feature 3).
+    ("I", " reconstruct"),
     ("esc", " close"),
 ];
+
+/// Index of the `enter focus` hint in [`FOOTER_HINTS`].
+const FOCUS_HINT: usize = 0;
+/// Index of the `s steer` hint in [`FOOTER_HINTS`].
+const STEER_HINT: usize = 2;
 
 /// Which hints fit in `width`, in display order.
 ///
 /// A hint that does not fit is dropped whole rather than sliced mid-word, and
 /// they go least-useful first: `esc close` is the last thing to leave, because
 /// it is the only way out of a full-bleed overlay.
-fn footer_hints(width: usize) -> Vec<(&'static str, &'static str)> {
-    /// Indices into [`FOOTER_HINTS`], least useful first.
-    const DROP_ORDER: [usize; 4] = [2, 1, 0, 3];
+///
+/// `steerable`/`focusable` come before the width budget: a key that would only
+/// produce a refusal is not a hint, it is a lie the user pays a keystroke to
+/// discover. A past run is not the active run, so the server answers
+/// `workflow_run_not_active` for a steer, and a node whose pane is long gone
+/// has nothing to focus (`07-phase3-plan.md` §1 WS-H).
+fn footer_hints(
+    width: usize,
+    steerable: bool,
+    focusable: bool,
+) -> Vec<(&'static str, &'static str)> {
+    /// Indices into [`FOOTER_HINTS`], least useful first. `reconstruct` is the
+    /// rarest action — it is only reachable after `interrogate` has already
+    /// refused — so it is the first hint a narrow terminal loses.
+    const DROP_ORDER: [usize; 6] = [4, 3, 2, 1, 0, 5];
 
     let mut keep = [true; FOOTER_HINTS.len()];
+    keep[STEER_HINT] = steerable;
+    keep[FOCUS_HINT] = focusable;
     for index in DROP_ORDER {
         if footer_hints_width(&keep) <= width {
             break;
@@ -973,8 +1305,16 @@ fn render_footer(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
             Span::styled("▏", Style::default().fg(p.accent)),
         ])
     } else {
+        // A historical run answers `workflow_run_not_active` for a steer, and
+        // its nodes' panes are gone — except when one somehow outlived the run,
+        // which `Enter` still honours and the hint therefore still offers.
+        let steerable = !dag.historical;
+        let focusable = !dag.historical
+            || dag
+                .selected_node()
+                .is_some_and(|node| node.pane_id.is_some());
         let mut spans: Vec<Span<'static>> = Vec::new();
-        for (chord, label) in footer_hints(width) {
+        for (chord, label) in footer_hints(width, steerable, focusable) {
             let chord = if spans.is_empty() {
                 format!(" {chord}")
             } else {
@@ -1095,6 +1435,7 @@ mod tests {
             progress: ProgressTracker::default(),
             succession: None,
             checkpoint_seq: 0,
+            restored_from: None,
         }
     }
 
@@ -1133,6 +1474,7 @@ mod tests {
             ],
             status: RunStatus::Running,
             seq: 0,
+            epilogue: None,
         }
     }
 
@@ -1342,6 +1684,7 @@ mod tests {
             ],
             status: RunStatus::Running,
             seq: 0,
+            epilogue: None,
         };
         let fanout = RunNodeIdx(0);
         let collect = RunNodeIdx(1);
@@ -1865,12 +2208,12 @@ mod tests {
     /// 2.27: the footer drops hints whole, and never the way out.
     #[test]
     fn footer_hints_degrade_without_ever_losing_escape() {
-        let full = footer_hints(200);
+        let full = footer_hints(200, true, true);
         assert_eq!(full.len(), FOOTER_HINTS.len());
 
         let mut previous = full.len();
         for width in (0..=60).rev() {
-            let hints = footer_hints(width);
+            let hints = footer_hints(width, true, true);
             assert!(hints.len() <= previous, "width {width} gained a hint");
             previous = hints.len();
             let rendered: String = hints
@@ -2066,6 +2409,419 @@ mod tests {
             screen.contains(long_notice),
             "detail strip must render the whole growth notice, not the node box's elided form: {screen}"
         );
+    }
+
+    // ── WS-H: historical runs and the detached interrogation lane ───────────
+
+    fn interrogation(id: &str, path: &str, pane: Option<&str>) -> HistoricalInterrogation {
+        HistoricalInterrogation {
+            id: id.to_string(),
+            path: path.to_string(),
+            pane_id: pane.map(str::to_string),
+            reconstructed: false,
+            ended: pane.is_none(),
+        }
+    }
+
+    /// A finished run, as `load_historical_run` would hand it over: every node
+    /// terminal, so nothing in the projection depends on the wall clock.
+    fn finished_graph() -> RunGraph {
+        let mut graph = diamond();
+        graph.status = RunStatus::Succeeded;
+        for node in &mut graph.nodes {
+            node.status = NodeStatus::Succeeded;
+        }
+        graph
+    }
+
+    fn historical_app(graph: RunGraph, interrogations: Vec<HistoricalInterrogation>) -> AppState {
+        let mut app = AppState::test_new();
+        app.mode = Mode::WorkflowDag;
+        app.set_historical_run(Some(crate::app::state::HistoricalRunSnapshot {
+            graph: Box::new(graph),
+            workflow_name: "ux-dag-probe".to_string(),
+            interrogations,
+        }));
+        app
+    }
+
+    fn live_app(graph: RunGraph) -> AppState {
+        let mut app = AppState::test_new();
+        app.mode = Mode::WorkflowDag;
+        app.run_graph = Some(Box::new(graph));
+        app
+    }
+
+    fn render_of(app: &AppState, area: Rect) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).expect("term");
+        terminal
+            .draw(|frame| render_workflow_dag(app, frame, area))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The zero-height-when-absent rule, at the level that matters: a
+    /// historical run with no interrogations must produce **exactly** the
+    /// geometry the same graph produces live. Every pinned number in this file
+    /// is a number about that geometry (`07-phase3-plan.md` §1 WS-H).
+    #[test]
+    fn an_absent_interrogation_lane_leaves_the_graph_geometry_untouched() {
+        let area = Rect::new(0, 0, 120, 40);
+        let live = compute_workflow_dag_view(&live_app(finished_graph()), area);
+        let past = compute_workflow_dag_view(&historical_app(finished_graph(), Vec::new()), area);
+
+        assert!(!live.historical);
+        assert!(past.historical);
+        assert!(past.interrogation_nodes.is_empty());
+        assert_eq!(past.graph_rect, live.graph_rect);
+        assert_eq!(past.detail_rect, live.detail_rect);
+        assert_eq!(past.footer_rect, live.footer_rect);
+        assert_eq!(past.banner_rect, live.banner_rect);
+        assert_eq!(
+            past.layout, live.layout,
+            "an empty lane must not move a single box"
+        );
+    }
+
+    /// The lane takes its rows from the bottom of the graph band, never from
+    /// the bands `overlay_areas` already partitioned, and never from a box.
+    #[test]
+    fn the_interrogation_lane_sits_below_the_graph_without_overlapping_it() {
+        let area = Rect::new(0, 0, 120, 40);
+        let bare = compute_workflow_dag_view(&historical_app(finished_graph(), Vec::new()), area);
+        let app = historical_app(
+            finished_graph(),
+            vec![
+                interrogation("i1", "start", Some("pane-1")),
+                interrogation("i2", "left", None),
+            ],
+        );
+        let view = compute_workflow_dag_view(&app, area);
+
+        assert_eq!(view.interrogation_nodes.len(), 2);
+        // The overlay's five bands are untouched: the lane is carved out of the
+        // graph band's interior, not out of the header/detail/footer budget.
+        assert_eq!(view.graph_rect, bare.graph_rect);
+        assert_eq!(view.detail_rect, bare.detail_rect);
+        assert_eq!(view.footer_rect, bare.footer_rect);
+
+        let band = to_layout_rect(view.graph_rect);
+        for item in &view.interrogation_nodes {
+            let rect = to_layout_rect(item.rect);
+            assert!(contains_rect(band, rect), "{rect:?} escapes {band:?}");
+            for (_, node) in &view.layout.nodes {
+                assert!(!node.intersects(&rect), "{node:?} overlaps {rect:?}");
+                assert!(node.bottom() <= rect.y, "the lane must sit below every box");
+            }
+            for (x, y) in view.layout.edge_cells().keys() {
+                assert!(!rect.contains(*x, *y), "an edge cell landed in the lane");
+            }
+        }
+        for i in 0..view.interrogation_nodes.len() {
+            for j in (i + 1)..view.interrogation_nodes.len() {
+                let (a, b) = (
+                    to_layout_rect(view.interrogation_nodes[i].rect),
+                    to_layout_rect(view.interrogation_nodes[j].rect),
+                );
+                assert!(!a.intersects(&b));
+            }
+        }
+    }
+
+    /// §4 D8: an interrogation is not a run node anywhere. The two hit-tests
+    /// are separate namespaces, and a click in one must never answer from the
+    /// other — otherwise a click on an interrogation box selects a graph node
+    /// that some later caller would steer or restart.
+    #[test]
+    fn the_interrogation_lane_hit_tests_in_its_own_namespace() {
+        let area = Rect::new(0, 0, 120, 40);
+        let app = historical_app(
+            finished_graph(),
+            vec![
+                interrogation("i1", "start", Some("pane-1")),
+                interrogation("i2", "left", None),
+            ],
+        );
+        let view = compute_workflow_dag_view(&app, area);
+
+        for item in &view.interrogation_nodes {
+            for row in item.rect.y..item.rect.bottom() {
+                for col in item.rect.x..item.rect.right() {
+                    assert_eq!(
+                        view.node_at(col, row),
+                        None,
+                        "({col},{row}) resolved to a graph node"
+                    );
+                    assert_eq!(
+                        workflow_dag_interrogation_at(&view, col, row).map(|hit| hit.id.as_str()),
+                        Some(item.id.as_str())
+                    );
+                }
+            }
+        }
+        // And every cell of every drawn node box answers only the node lookup.
+        for (idx, rect) in &view.layout.nodes {
+            assert_eq!(view.node_at(rect.x, rect.y), Some(*idx));
+            assert!(workflow_dag_interrogation_at(&view, rect.x, rect.y).is_none());
+        }
+    }
+
+    /// A box that does not fit the lane is absent from the projection, so it
+    /// is neither drawn nor clickable — the graph band's own clipping rule,
+    /// applied to the lane.
+    #[test]
+    fn interrogation_boxes_that_do_not_fit_are_dropped_from_the_projection() {
+        let area = Rect::new(0, 0, 50, 40);
+        let app = historical_app(
+            finished_graph(),
+            (1..=6)
+                .map(|n| interrogation(&format!("i{n}"), "start", None))
+                .collect(),
+        );
+        let view = compute_workflow_dag_view(&app, area);
+        assert!(!view.interrogation_nodes.is_empty());
+        assert!(view.interrogation_nodes.len() < 6, "nothing was dropped");
+        for item in &view.interrogation_nodes {
+            assert!(item.rect.right() <= view.graph_rect.right());
+        }
+    }
+
+    /// A graph band with no room to spare keeps its one guaranteed row rather
+    /// than spending it on a lane the boxes could not fit into anyway.
+    #[test]
+    fn a_band_too_short_for_the_lane_keeps_the_graphs_rows() {
+        for height in 0..=12u16 {
+            let area = Rect::new(0, 0, 120, height);
+            let app = historical_app(
+                finished_graph(),
+                vec![interrogation("i1", "start", Some("pane-1"))],
+            );
+            let view = compute_workflow_dag_view(&app, area);
+            let lane = lane_height_for(view.graph_rect.height, 1);
+            assert!(
+                lane == 0 || view.graph_rect.height > lane,
+                "height {height}: the lane took the graph's last row"
+            );
+            for item in &view.interrogation_nodes {
+                assert!(contains_rect(
+                    to_layout_rect(view.graph_rect),
+                    to_layout_rect(item.rect)
+                ));
+            }
+        }
+    }
+
+    /// The same stored run projects identically twice — the "renders byte-stably"
+    /// requirement. Every node is terminal, so nothing here reads the clock.
+    #[test]
+    fn a_historical_snapshot_projects_byte_stably() {
+        let area = Rect::new(0, 0, 120, 40);
+        let app = historical_app(
+            finished_graph(),
+            vec![interrogation("i1", "start", Some("pane-1"))],
+        );
+        let first = compute_workflow_dag_view(&app, area);
+        let second = compute_workflow_dag_view(&app, area);
+        assert_eq!(first, second);
+        assert_eq!(first.workflow_name, "ux-dag-probe");
+    }
+
+    /// A past run must be visibly a past run, and must not advertise a key
+    /// whose only possible answer is a refusal (`workflow_run_not_active`).
+    #[test]
+    fn a_historical_run_says_so_and_offers_no_steer() {
+        let area = Rect::new(0, 0, 120, 40);
+        let app = historical_app(
+            finished_graph(),
+            vec![interrogation("i1", "start", Some("pane-1"))],
+        );
+        let mut app = app;
+        app.view.dag = compute_workflow_dag_view(&app, area);
+        let screen = render_of(&app, area);
+
+        assert!(screen.contains("past run"), "{screen}");
+        assert!(!screen.contains("steer"), "{screen}");
+        assert!(screen.contains("interrogate"), "{screen}");
+        assert!(screen.contains("esc"), "{screen}");
+        // The live projection of the same graph keeps the steer hint.
+        let mut live = live_app(finished_graph());
+        live.view.dag = compute_workflow_dag_view(&live, area);
+        let live_screen = render_of(&live, area);
+        assert!(live_screen.contains("steer"), "{live_screen}");
+        assert!(!live_screen.contains("past run"), "{live_screen}");
+    }
+
+    /// `Enter` on a past node has nothing to focus once its pane is gone, so
+    /// the hint goes with it — and comes back for the rare pane that outlived
+    /// its run.
+    #[test]
+    fn the_focus_hint_follows_whether_a_pane_is_still_there() {
+        assert!(footer_hints(200, false, false)
+            .iter()
+            .all(|(chord, _)| *chord != "enter" && *chord != "s"));
+        assert!(footer_hints(200, false, true)
+            .iter()
+            .any(|(chord, _)| *chord == "enter"));
+        assert!(footer_hints(200, false, true)
+            .iter()
+            .all(|(chord, _)| *chord != "s"));
+        // Whatever is disabled, the way out survives.
+        for width in 0..=60 {
+            let hints = footer_hints(width, false, false);
+            if !hints.is_empty() {
+                assert_eq!(hints.last(), Some(&("esc", " close")), "width {width}");
+            }
+        }
+    }
+
+    /// §4 D4: `↺ restored` without "restored from what" is the half of the
+    /// fact nobody can act on, so the detail strip carries the provenance.
+    #[test]
+    fn a_restored_node_renders_its_status_and_its_provenance() {
+        let palette = Palette::catppuccin();
+        assert_eq!(
+            node_status_color(NodeStatus::Restored, &palette),
+            palette.teal
+        );
+        assert_eq!(node_status_glyph(NodeStatus::Restored), "↺");
+        assert_eq!(node_status_label(NodeStatus::Restored), "restored");
+
+        let mut graph = finished_graph();
+        graph.nodes[0].status = NodeStatus::Restored;
+        graph.nodes[0].restored_from = Some(RestoredRef {
+            run: RunId::new("workflow_run:old"),
+            node_key: NodeKey::new("start"),
+            checkpoint_seq: 3,
+        });
+
+        let area = Rect::new(0, 0, 140, 40);
+        let mut app = historical_app(graph, Vec::new());
+        app.view.dag = compute_workflow_dag_view(&app, area);
+        assert_eq!(app.view.dag.selected, Some(RunNodeIdx(0)));
+        let screen = render_of(&app, area);
+
+        assert!(screen.contains("restored"), "{screen}");
+        assert!(
+            screen.contains("restored from workflow_run:old · start · checkpoint 3"),
+            "{screen}"
+        );
+
+        // Selecting a node that was not restored shows no provenance at all.
+        app.view.dag.selected = Some(RunNodeIdx(1));
+        let screen = render_of(&app, area);
+        assert!(!screen.contains("checkpoint 3"), "{screen}");
+    }
+
+    /// §4 D1's post-`RunFinished` contract, on screen: a succeeded run with a
+    /// still-working summariser reads truthfully, and it costs no band.
+    #[test]
+    fn the_header_reports_the_summarisers_state_without_a_band() {
+        use crate::workflow::model::EpilogueState;
+
+        let area = Rect::new(0, 0, 140, 40);
+        let with_phase = |phase: EpiloguePhase| {
+            let mut graph = finished_graph();
+            graph.epilogue = Some(EpilogueState {
+                node: RunNodeIdx(0),
+                phase,
+                runner: crate::workflow::model::Runner::Agent,
+            });
+            let mut app = live_app(graph);
+            app.view.dag = compute_workflow_dag_view(&app, area);
+            (app.view.dag.banner_rect.height, render_of(&app, area))
+        };
+
+        for phase in [EpiloguePhase::Pending, EpiloguePhase::Running] {
+            let (banner_rows, screen) = with_phase(phase);
+            assert_eq!(banner_rows, 0, "the epilogue must not claim a band");
+            assert!(screen.contains("summarising…"), "{phase:?}\n{screen}");
+            assert!(screen.contains("succeeded"), "{phase:?}\n{screen}");
+        }
+
+        let (_, screen) = with_phase(EpiloguePhase::GaveUp);
+        assert!(screen.contains("summary failed"), "{screen}");
+
+        let (_, screen) = with_phase(EpiloguePhase::Done);
+        assert!(!screen.contains("summarising"), "{screen}");
+        assert!(!screen.contains("summary failed"), "{screen}");
+    }
+
+    /// The lane draws its own vocabulary: `⌕`, the source path, and — for the
+    /// degraded path — the word that stops it being mistaken for the original
+    /// session (§4 D7).
+    #[test]
+    fn the_lane_draws_live_and_ended_interrogations_differently() {
+        let area = Rect::new(0, 0, 140, 40);
+        let mut reconstructed = interrogation("i2", "left", None);
+        reconstructed.reconstructed = true;
+        let mut app = historical_app(
+            finished_graph(),
+            vec![interrogation("i1", "start", Some("pane-7")), reconstructed],
+        );
+        app.view.dag = compute_workflow_dag_view(&app, area);
+
+        assert_eq!(
+            app.view.dag.interrogation_nodes[0].label,
+            "interrogate · start"
+        );
+        assert_eq!(
+            app.view.dag.interrogation_nodes[1].label,
+            "reconstructed · left"
+        );
+
+        // The kind is readable off the label, which is the only place the
+        // landed `DagInterrogationView` records it.
+        assert_eq!(
+            interrogation_kind(&app.view.dag.interrogation_nodes[0]),
+            "interrogate"
+        );
+        assert_eq!(
+            interrogation_kind(&app.view.dag.interrogation_nodes[1]),
+            "reconstructed"
+        );
+
+        let screen = render_of(&app, area);
+        assert!(screen.contains('⌕'), "{screen}");
+        // The identifying path survives in the title; the kind gets its own
+        // row, so neither is truncated away by the other.
+        assert!(screen.contains("⌕ start"), "{screen}");
+        assert!(screen.contains("⌕ left"), "{screen}");
+        assert!(screen.contains("interrogate"), "{screen}");
+        assert!(screen.contains("reconstructed"), "{screen}");
+        assert!(screen.contains("ended"), "{screen}");
+    }
+
+    /// Closing the historical run must put the overlay back on the live one —
+    /// the projection is chosen per frame, so a stale snapshot left behind
+    /// would keep showing a past run over a live one.
+    #[test]
+    fn clearing_the_snapshot_returns_the_overlay_to_the_live_run() {
+        let area = Rect::new(0, 0, 120, 40);
+        let mut app = live_app(finished_graph());
+        app.set_historical_run(Some(crate::app::state::HistoricalRunSnapshot {
+            graph: Box::new(finished_graph()),
+            workflow_name: "past".to_string(),
+            interrogations: vec![interrogation("i1", "start", None)],
+        }));
+        let view = compute_workflow_dag_view(&app, area);
+        assert!(view.historical);
+        assert_eq!(view.workflow_name, "past");
+        assert_eq!(view.interrogation_nodes.len(), 1);
+
+        app.set_historical_run(None);
+        let view = compute_workflow_dag_view(&app, area);
+        assert!(!view.historical);
+        assert!(view.interrogation_nodes.is_empty());
     }
 
     /// Selection is carried by instance path (`carried_selection`), which is

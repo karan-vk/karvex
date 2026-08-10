@@ -419,14 +419,49 @@ fn args_before_separator(args: &[String]) -> &[String] {
     }
 }
 
+/// The trailing shell-command argument, in either of tmux's two legal forms:
+/// explicit `-- <command>` (what Claude's own backend always sends for
+/// `respawn-pane`), or the plain positional form real tmux also accepts,
+/// e.g. `respawn-pane [-k] [-t target-pane] [shell-command]`. Without the
+/// positional fallback, that second form parsed as "no command" and the
+/// caller silently reported success without running anything.
 fn trailing_command(args: &[String]) -> Option<String> {
-    let position = args.iter().position(|arg| arg == "--")?;
-    let command = args[position + 1..].join(" ");
+    let command = match args.iter().position(|arg| arg == "--") {
+        Some(position) => args[position + 1..].join(" "),
+        None => respawn_positional_command(args).join(" "),
+    };
     if command.is_empty() {
         None
     } else {
         Some(command)
     }
+}
+
+/// The positional (non-`--`) shell-command for `respawn-pane`: everything
+/// after its two known leading flags, `-k` and `-t <target-pane>`. Unlike
+/// [`positional_args_excluding_target`], this stops treating `-`-prefixed
+/// words as flags the moment the command begins — real tmux's own parser
+/// only recognises `-k`/`-t` as *leading* options, so a command word like
+/// `--agent-name` must be taken literally rather than skipped as an unknown
+/// flag.
+fn respawn_positional_command(args: &[String]) -> &[String] {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            // A dangling `-t` with no value is malformed input, not the
+            // start of a command; consume it and stop rather than treating
+            // the bare flag itself as the shell-command.
+            "-t" => {
+                index += 1;
+                if index < args.len() {
+                    index += 1;
+                }
+            }
+            "-k" => index += 1,
+            _ => break,
+        }
+    }
+    &args[index..]
 }
 
 // ---------------------------------------------------------------------------
@@ -551,19 +586,185 @@ fn plan_kill_pane(args: &[String]) -> KillPanePlan {
     }
 }
 
+/// A run of `send-keys` arguments of one kind, in the order they were given.
+/// Adjacent literal words coalesce into one `Text` (space-joined, matching
+/// tmux's own single-line-at-a-time typing); adjacent key specs coalesce into
+/// one `Keys` run (they all reach `pane.send_input`'s `keys` array in one
+/// request, which already preserves their order). The segment boundary is
+/// what lets a mixed sequence like `foo C-a bar Enter` reach the pane in the
+/// order tmux would deliver it, rather than collapsing to "all text, then all
+/// keys" as a single `{text, keys}` pair would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SendKeysSegment {
+    Text(String),
+    Keys(Vec<String>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SendKeysPlan {
     target: Option<String>,
-    text: String,
-    keys: Vec<String>,
+    segments: Vec<SendKeysSegment>,
 }
 
-fn plan_send_keys(args: &[String]) -> SendKeysPlan {
+/// Classification of one `send-keys` positional argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SendKeysToken {
+    /// Not tmux key-spec syntax: typed as literal text.
+    Literal(String),
+    /// A tmux key spec with a karvex key-name equivalent.
+    Key(String),
+}
+
+/// Splits a leading `C-`, `M-`, or `S-` modifier prefix off `s`, returning
+/// the karvex modifier token it corresponds to. tmux allows chaining these
+/// (`C-M-a`), so callers loop until this returns `None`.
+fn split_known_modifier_prefix(s: &str) -> Option<(&'static str, &str)> {
+    if let Some(rest) = s.strip_prefix("C-") {
+        Some(("ctrl", rest))
+    } else if let Some(rest) = s.strip_prefix("M-") {
+        Some(("alt", rest))
+    } else if let Some(rest) = s.strip_prefix("S-") {
+        Some(("shift", rest))
+    } else {
+        None
+    }
+}
+
+fn single_char(s: &str) -> Option<char> {
+    let mut chars = s.chars();
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
+}
+
+/// `^X` control shorthand: only defined for a following ASCII letter (tmux's
+/// own grammar), which this maps onto `ctrl+<letter>`. Punctuation forms
+/// (`^\`, `^]`, `^?`, ...) have no clear karvex equivalent, so they are
+/// reported as unsupported rather than guessed at.
+fn caret_control_key(ch: char) -> Result<String, ()> {
+    if ch.is_ascii_alphabetic() {
+        Ok(format!("ctrl+{}", ch.to_ascii_lowercase()))
+    } else {
+        Err(())
+    }
+}
+
+/// tmux's named-key table, restricted to karvex's own key vocabulary
+/// (`parse_key_combo`, `src/config/keybinds.rs`). `Some(Err(()))` marks a
+/// real tmux key name that karvex's key parser has no code path for at all
+/// (Home/End/PageUp/PageDown/Insert/Delete) — the caller must fail loudly on
+/// these rather than silently falling back to literal text.
+fn named_tmux_key(name: &str) -> Option<Result<String, ()>> {
+    let lower = name.to_ascii_lowercase();
+    let mapped = match lower.as_str() {
+        "enter" => "enter",
+        "escape" => "escape",
+        "space" => "space",
+        "tab" => "tab",
+        // tmux's back-tab; karvex has no bare "backtab" key name, but
+        // `parse_key_combo` turns `shift+tab` into `KeyCode::BackTab` itself.
+        "btab" => "shift+tab",
+        "bspace" => "backspace",
+        "up" => "up",
+        "down" => "down",
+        "left" => "left",
+        "right" => "right",
+        "home" | "end" | "ppage" | "pageup" | "npage" | "pagedown" | "ic" | "insert" | "dc"
+        | "delete" => return Some(Err(())),
+        _ if is_function_key(&lower) => return Some(Ok(lower)),
+        _ => return None,
+    };
+    Some(Ok(mapped.to_string()))
+}
+
+fn is_function_key(lower: &str) -> bool {
+    lower
+        .strip_prefix('f')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Translates one tmux `send-keys` argument into a karvex key-combo string.
+/// `None` means `token` is not tmux key-spec syntax at all (plain text);
+/// `Some(Err(_))` means it clearly *is* key-spec syntax but karvex's key
+/// parser has no equivalent for it, carrying the original spec back for the
+/// caller's error message.
+fn tmux_key_to_karvex(token: &str) -> Option<Result<String, String>> {
+    if let Some(ch) = token.strip_prefix('^').and_then(single_char) {
+        return Some(caret_control_key(ch).map_err(|()| token.to_string()));
+    }
+
+    let mut modifiers: Vec<&'static str> = Vec::new();
+    let mut rest = token;
+    while let Some((prefix, stripped)) = split_known_modifier_prefix(rest) {
+        modifiers.push(prefix);
+        rest = stripped;
+    }
+
+    if modifiers.is_empty() {
+        // No modifier prefix: this is a key spec only if the whole token is
+        // one of tmux's named keys. Anything else — a plain word, a single
+        // ordinary character — is literal text.
+        return named_tmux_key(rest).map(|outcome| outcome.map_err(|()| token.to_string()));
+    }
+    if rest.is_empty() {
+        // A dangling prefix ("C-" with nothing after it) is malformed but
+        // unambiguously key-spec syntax, not literal text.
+        return Some(Err(token.to_string()));
+    }
+
+    let base = match named_tmux_key(rest) {
+        Some(Ok(name)) => name,
+        Some(Err(())) => return Some(Err(token.to_string())),
+        None => match single_char(rest) {
+            Some(ch) => ch.to_lowercase().to_string(),
+            None => return Some(Err(token.to_string())),
+        },
+    };
+    Some(Ok(format!("{}+{base}", modifiers.join("+"))))
+}
+
+fn classify_send_keys_token(token: &str) -> Result<SendKeysToken, String> {
+    match tmux_key_to_karvex(token) {
+        None => Ok(SendKeysToken::Literal(token.to_string())),
+        Some(Ok(key)) => Ok(SendKeysToken::Key(key)),
+        Some(Err(spec)) => Err(spec),
+    }
+}
+
+fn push_literal_segment(segments: &mut Vec<SendKeysSegment>, text: &str) {
+    if let Some(SendKeysSegment::Text(existing)) = segments.last_mut() {
+        existing.push(' ');
+        existing.push_str(text);
+    } else {
+        segments.push(SendKeysSegment::Text(text.to_string()));
+    }
+}
+
+fn push_key_segment(segments: &mut Vec<SendKeysSegment>, key: String) {
+    if let Some(SendKeysSegment::Keys(existing)) = segments.last_mut() {
+        existing.push(key);
+    } else {
+        segments.push(SendKeysSegment::Keys(vec![key]));
+    }
+}
+
+/// `-l` (`send-keys -l ...`) disables key-spec translation entirely: every
+/// argument, however key-spec-shaped, is typed as literal text. Everything
+/// else is classified through [`classify_send_keys_token`], which fails
+/// loudly (`Err`) on a recognised-but-unmappable key spec instead of
+/// silently typing it as text — that silent fallback is the defect this
+/// translation exists to fix.
+fn plan_send_keys(args: &[String]) -> Result<SendKeysPlan, ShimError> {
+    let target = flag_value(args, "-t").map(str::to_string);
     let mut positional: Vec<String> = Vec::new();
+    let mut literal_mode = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "-t" => index += 2,
+            "-l" => {
+                literal_mode = true;
+                index += 1;
+            }
             arg if arg.starts_with('-') => index += 1,
             arg => {
                 positional.push(arg.to_string());
@@ -571,16 +772,24 @@ fn plan_send_keys(args: &[String]) -> SendKeysPlan {
             }
         }
     }
-    let mut keys = Vec::new();
-    if positional.last().map(String::as_str) == Some("Enter") {
-        positional.pop();
-        keys.push("Enter".to_string());
+
+    let mut segments: Vec<SendKeysSegment> = Vec::new();
+    for token in positional {
+        if literal_mode {
+            push_literal_segment(&mut segments, &token);
+            continue;
+        }
+        match classify_send_keys_token(&token).map_err(|spec| {
+            ShimError(format!(
+                "{ERROR_PREFIX}send-keys: no karvex key mapping for tmux key spec {spec:?}"
+            ))
+        })? {
+            SendKeysToken::Literal(text) => push_literal_segment(&mut segments, &text),
+            SendKeysToken::Key(key) => push_key_segment(&mut segments, key),
+        }
     }
-    SendKeysPlan {
-        target: flag_value(args, "-t").map(str::to_string),
-        text: positional.join(" "),
-        keys,
-    }
+
+    Ok(SendKeysPlan { target, segments })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -948,16 +1157,20 @@ impl Shim {
 
     fn select_pane(&self, args: &[String]) -> Result<i32, ShimError> {
         let plan = plan_select_pane(args);
-        let (Some(target), Some(title)) = (plan.target, plan.title) else {
+        let Some(title) = plan.title else {
             // Plain focus select: accepted but not acted on (Claude splits with
             // `-d` and never moves focus itself; leaving focus with the leader
             // matches the intent).
             return accept_ok();
         };
+        // `-t` is optional in real tmux (defaults to the current pane); a
+        // `-T <title>` invocation without it must still rename, not silently
+        // no-op.
+        let pane_id = self.resolve_pane(plan.target.as_deref())?;
         self.request(
             "tmux-compat:pane:rename",
             Method::PaneRename(PaneRenameParams {
-                pane_id: decode_pane_id(&target),
+                pane_id,
                 label: Some(title),
             }),
         )?;
@@ -974,17 +1187,41 @@ impl Shim {
         Ok(0)
     }
 
+    /// Sends each [`SendKeysSegment`] in order. A `Text` segment immediately
+    /// followed by a `Keys` segment is merged into one request — matching
+    /// `pane.send_input`'s own `{text, keys}` shape, which already sends the
+    /// text before the keys — so the common "type this, then Enter" case
+    /// costs one request exactly as it did before this method understood key
+    /// specs. Any other segment ordering (a `Keys` run followed by more
+    /// text, for instance) needs one request per segment to keep the pane's
+    /// input in the order tmux would have delivered it.
     fn send_keys(&self, args: &[String]) -> Result<i32, ShimError> {
-        let plan = plan_send_keys(args);
+        let plan = plan_send_keys(args)?;
         let pane_id = self.resolve_pane(plan.target.as_deref())?;
-        self.request(
-            "tmux-compat:pane:send",
-            Method::PaneSendInput(PaneSendInputParams {
-                pane_id,
-                text: plan.text,
-                keys: plan.keys,
-            }),
-        )?;
+        let mut index = 0;
+        while index < plan.segments.len() {
+            let (text, keys) = match &plan.segments[index] {
+                SendKeysSegment::Text(text) => {
+                    let text = text.clone();
+                    if let Some(SendKeysSegment::Keys(keys)) = plan.segments.get(index + 1) {
+                        index += 1;
+                        (text, keys.clone())
+                    } else {
+                        (text, Vec::new())
+                    }
+                }
+                SendKeysSegment::Keys(keys) => (String::new(), keys.clone()),
+            };
+            index += 1;
+            self.request(
+                "tmux-compat:pane:send",
+                Method::PaneSendInput(PaneSendInputParams {
+                    pane_id: pane_id.clone(),
+                    text,
+                    keys,
+                }),
+            )?;
+        }
         Ok(0)
     }
 
@@ -1600,6 +1837,81 @@ mod tests {
         assert_eq!(plan_respawn_pane(&strings(&["-t", "w1:p2"])).command, None);
     }
 
+    /// The regression this guards: real tmux's positional form,
+    /// `respawn-pane [-k] [-t target-pane] [shell-command]` (no `--`), used
+    /// to parse as "no command" and silently succeed without running
+    /// anything. Covers single-word and quoted-multi-word commands, with and
+    /// without `-k`/`-t`, and confirms the explicit `--` form is unchanged.
+    #[test]
+    fn respawn_plan_extracts_positional_command_without_separator() {
+        // Single-word command, both flags present.
+        let plan = plan_respawn_pane(&strings(&["-k", "-t", "w1:p2", "claude"]));
+        assert_eq!(plan.target.as_deref(), Some("w1:p2"));
+        assert_eq!(plan.command.as_deref(), Some("claude"));
+
+        // Single-word command, no flags at all.
+        let plan = plan_respawn_pane(&strings(&["claude"]));
+        assert_eq!(plan.target, None);
+        assert_eq!(plan.command.as_deref(), Some("claude"));
+
+        // Quoted multi-word command (arrives as one argv element) with `-t`
+        // but no `-k`.
+        let plan = plan_respawn_pane(&strings(&["-t", "w1:p2", "claude --agent-name teammate-a"]));
+        assert_eq!(plan.target.as_deref(), Some("w1:p2"));
+        assert_eq!(
+            plan.command.as_deref(),
+            Some("claude --agent-name teammate-a")
+        );
+
+        // Unquoted multi-word command (separate argv elements), including a
+        // word that looks like a flag (`--agent-name`): real tmux only
+        // recognises `-k`/`-t` as *leading* options, so everything from the
+        // first non-flag word on is the literal command, dashes and all.
+        let plan = plan_respawn_pane(&strings(&[
+            "-k",
+            "-t",
+            "w1:p2",
+            "claude",
+            "--agent-name",
+            "teammate-a",
+        ]));
+        assert_eq!(plan.target.as_deref(), Some("w1:p2"));
+        assert_eq!(
+            plan.command.as_deref(),
+            Some("claude --agent-name teammate-a")
+        );
+
+        // `-k` with no `-t`: resolves to the current pane, command still runs.
+        let plan = plan_respawn_pane(&strings(&["-k", "claude", "--agent-name", "teammate-a"]));
+        assert_eq!(plan.target, None);
+        assert_eq!(
+            plan.command.as_deref(),
+            Some("claude --agent-name teammate-a")
+        );
+
+        // The explicit `--` form must still work exactly as before.
+        let plan = plan_respawn_pane(&strings(&[
+            "-k",
+            "-t",
+            "w1:p2",
+            "--",
+            "claude --agent-name teammate-a",
+        ]));
+        assert_eq!(plan.target.as_deref(), Some("w1:p2"));
+        assert_eq!(
+            plan.command.as_deref(),
+            Some("claude --agent-name teammate-a")
+        );
+
+        // Flags only, no command at all: still a bare respawn.
+        assert_eq!(
+            plan_respawn_pane(&strings(&["-k", "-t", "w1:p2"])).command,
+            None
+        );
+        // A dangling `-t` with no value must not be mistaken for a command.
+        assert_eq!(plan_respawn_pane(&strings(&["-t"])).command, None);
+    }
+
     #[test]
     fn shell_readiness_requires_two_stable_non_empty_samples() {
         assert!(!shell_looks_ready("", ""));
@@ -1613,22 +1925,141 @@ mod tests {
 
     #[test]
     fn send_keys_detects_trailing_enter() {
-        let plan = plan_send_keys(&strings(&["-t", "w1:p2", "echo", "hi", "Enter"]));
+        let plan = plan_send_keys(&strings(&["-t", "w1:p2", "echo", "hi", "Enter"])).unwrap();
         assert_eq!(plan.target.as_deref(), Some("w1:p2"));
-        assert_eq!(plan.text, "echo hi");
-        assert_eq!(plan.keys, strings(&["Enter"]));
+        assert_eq!(
+            plan.segments,
+            vec![
+                SendKeysSegment::Text("echo hi".to_string()),
+                SendKeysSegment::Keys(vec!["enter".to_string()]),
+            ]
+        );
 
-        let plan = plan_send_keys(&strings(&["-t", "w1:p2", "echo", "hi"]));
-        assert_eq!(plan.text, "echo hi");
-        assert!(plan.keys.is_empty());
+        let plan = plan_send_keys(&strings(&["-t", "w1:p2", "echo", "hi"])).unwrap();
+        assert_eq!(
+            plan.segments,
+            vec![SendKeysSegment::Text("echo hi".to_string())]
+        );
     }
 
+    /// The `-R` value ("payload") must land as literal text, not be dropped
+    /// as if it were a flag of its own.
     #[test]
     fn send_keys_strips_flag_values() {
-        let plan = plan_send_keys(&strings(&["-l", "-t", "w1:p2", "-R", "payload", "Enter"]));
+        let plan = plan_send_keys(&strings(&["-t", "w1:p2", "-R", "payload", "Enter"])).unwrap();
         assert_eq!(plan.target.as_deref(), Some("w1:p2"));
-        assert_eq!(plan.text, "payload");
-        assert_eq!(plan.keys, strings(&["Enter"]));
+        assert_eq!(
+            plan.segments,
+            vec![
+                SendKeysSegment::Text("payload".to_string()),
+                SendKeysSegment::Keys(vec!["enter".to_string()]),
+            ]
+        );
+    }
+
+    /// `-l` disables key-spec translation entirely, even for tokens ("C-c",
+    /// "Enter") that would otherwise be recognised key specs.
+    #[test]
+    fn send_keys_literal_flag_disables_key_translation() {
+        let plan = plan_send_keys(&strings(&["-l", "-t", "w1:p2", "C-c", "Enter"])).unwrap();
+        assert_eq!(plan.target.as_deref(), Some("w1:p2"));
+        assert_eq!(
+            plan.segments,
+            vec![SendKeysSegment::Text("C-c Enter".to_string())]
+        );
+    }
+
+    /// Each spec class the shim is expected to support maps onto the karvex
+    /// key-combo string `parse_key_combo` (`src/config/keybinds.rs`) accepts.
+    #[test]
+    fn send_keys_maps_control_meta_and_named_specs() {
+        let cases: &[(&str, &str)] = &[
+            ("C-c", "ctrl+c"),
+            ("^C", "ctrl+c"),
+            ("^c", "ctrl+c"),
+            ("M-x", "alt+x"),
+            ("C-M-a", "ctrl+alt+a"),
+            ("Enter", "enter"),
+            ("Escape", "escape"),
+            ("Space", "space"),
+            ("Tab", "tab"),
+            ("BTab", "shift+tab"),
+            ("BSpace", "backspace"),
+            ("Up", "up"),
+            ("Down", "down"),
+            ("Left", "left"),
+            ("Right", "right"),
+            ("F5", "f5"),
+            ("F12", "f12"),
+        ];
+        for (spec, expected) in cases {
+            let plan = plan_send_keys(&strings(&["-t", "w1:p2", spec])).unwrap();
+            assert_eq!(
+                plan.segments,
+                vec![SendKeysSegment::Keys(vec![expected.to_string()])],
+                "spec {spec} should map to key {expected}"
+            );
+        }
+    }
+
+    /// A tmux key spec that karvex's key parser has no code path for at all
+    /// (Home/End/PageUp/PageDown/...) must fail loudly rather than silently
+    /// falling through to literal text — that silent fallback is the exact
+    /// defect this translation exists to fix.
+    #[test]
+    fn send_keys_unmapped_key_spec_errors_instead_of_falling_through_to_text() {
+        for spec in [
+            "Home", "End", "PageUp", "PageDown", "PPage", "NPage", "IC", "DC",
+        ] {
+            let err = plan_send_keys(&strings(&["-t", "w1:p2", spec]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(spec), "error for {spec} was {err:?}");
+        }
+
+        // A modifier combined with an unsupported base is still unsupported.
+        let err = plan_send_keys(&strings(&["-t", "w1:p2", "C-Home"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("C-Home"), "unexpected error: {err}");
+
+        // A dangling modifier prefix is malformed key-spec syntax, not text.
+        let err = plan_send_keys(&strings(&["-t", "w1:p2", "C-"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("C-"), "unexpected error: {err}");
+    }
+
+    /// A sequence that alternates literal text and key specs must reach the
+    /// pane in that same order, not collapse to "all text, then all keys".
+    #[test]
+    fn send_keys_mixed_literal_and_key_sequences_preserve_order() {
+        let plan =
+            plan_send_keys(&strings(&["-t", "w1:p2", "foo", "C-a", "bar", "Enter"])).unwrap();
+        assert_eq!(
+            plan.segments,
+            vec![
+                SendKeysSegment::Text("foo".to_string()),
+                SendKeysSegment::Keys(vec!["ctrl+a".to_string()]),
+                SendKeysSegment::Text("bar".to_string()),
+                SendKeysSegment::Keys(vec!["enter".to_string()]),
+            ]
+        );
+    }
+
+    /// Consecutive key specs coalesce into a single `Keys` run, matching how
+    /// `pane.send_input` sends a `keys` array in one request.
+    #[test]
+    fn send_keys_consecutive_key_specs_coalesce_into_one_keys_segment() {
+        let plan = plan_send_keys(&strings(&["-t", "w1:p2", "C-a", "C-e", "Enter"])).unwrap();
+        assert_eq!(
+            plan.segments,
+            vec![SendKeysSegment::Keys(vec![
+                "ctrl+a".to_string(),
+                "ctrl+e".to_string(),
+                "enter".to_string(),
+            ])]
+        );
     }
 
     // -- display-message ---------------------------------------------------

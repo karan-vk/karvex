@@ -49,6 +49,12 @@ pub const RESULT_FILE: &str = "result.json";
 pub const INPUTS_DIR: &str = "inputs";
 pub const ARTIFACTS_DIR: &str = "artifacts";
 
+/// Run-level context, a sibling of the node directories: `<run dir>/context/`
+/// (`07-phase3-plan.md` §4 D21).
+pub const CONTEXT_DIR: &str = "context";
+/// The prior-runs digest every node's `task.md` points at.
+pub const PRIOR_RUNS_FILE: &str = "prior-runs.md";
+
 /// The `claude` argv's trailing positional, and the same text when it has to be
 /// re-delivered through `agent.prompt`. `SpawnSpec::seed_prompt` overrides it;
 /// this is the fallback so an empty spec still produces a working spawn.
@@ -156,7 +162,12 @@ pub fn node_dir(run_dir: &Path, path: &InstancePath) -> PathBuf {
     dir
 }
 
-fn path_segment(raw: &str) -> String {
+/// One filesystem-safe path segment from arbitrary caller text.
+///
+/// Shared with `binding::interrogate`, which sanitises a record id the same way
+/// — the `interrogation:` colon must never reach the filesystem — so the
+/// traversal rules below are written once rather than approximated twice.
+pub fn path_segment(raw: &str) -> String {
     let mut segment = String::with_capacity(raw.len());
     for ch in raw.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
@@ -406,6 +417,91 @@ fn write_port_inputs(
     write_json(&layout.input_file(port), &serde_json::Value::Array(index))
 }
 
+// ── run context (§4 D21) ────────────────────────────────────────────────────
+
+/// One past run's summary, as `context/prior-runs.md` renders it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PriorRunSection<'a> {
+    /// The source run's id. Rendered short — the section heading is a label,
+    /// and the full record id is noise in a document an agent reads.
+    pub run: &'a str,
+    pub outcome: &'a str,
+    pub text: &'a str,
+    pub highlights: &'a [String],
+    pub open_gaps: &'a [String],
+}
+
+/// `<run dir>/context/prior-runs.md`.
+pub fn run_context_file(run_dir: &Path) -> PathBuf {
+    run_dir.join(CONTEXT_DIR).join(PRIOR_RUNS_FILE)
+}
+
+/// The digest of what past runs of this workflow left behind (§4 D21).
+///
+/// **One file per run, not N×4,000 characters per node.** Injecting every
+/// summary into every node's prompt would be a token tax on exactly the runs
+/// history is supposed to make cheaper; the node's `task.md` gets a two-line
+/// pointer at this instead, and an agent reads it when the task warrants.
+pub fn render_prior_runs(workflow_name: &str, sections: &[PriorRunSection<'_>]) -> String {
+    let mut out = String::new();
+    out.push_str("# Prior runs\n\n");
+    let workflow = workflow_name.trim();
+    if workflow.is_empty() {
+        out.push_str("What earlier runs of this workflow left behind, newest first.\n\n");
+    } else {
+        out.push_str(&format!(
+            "What earlier runs of `{workflow}` left behind, newest first.\n\n"
+        ));
+    }
+    for section in sections {
+        out.push_str(&format!(
+            "## Run {} — {}\n\n",
+            short_run_id(section.run),
+            section.outcome.trim()
+        ));
+        if !section.text.trim().is_empty() {
+            out.push_str(section.text.trim());
+            out.push_str("\n\n");
+        }
+        if !section.highlights.is_empty() {
+            out.push_str("### Highlights\n\n");
+            for highlight in section.highlights {
+                out.push_str(&format!("- {}\n", highlight.trim()));
+            }
+            out.push('\n');
+        }
+        if !section.open_gaps.is_empty() {
+            out.push_str("### Open gaps\n\n");
+            for gap in section.open_gaps {
+                out.push_str(&format!("- {}\n", gap.trim()));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The readable half of a `workflow_run:abc123…` record id.
+fn short_run_id(run: &str) -> &str {
+    let key = run.split_once(':').map_or(run, |(_, key)| key);
+    let end = key
+        .char_indices()
+        .nth(8)
+        .map_or(key.len(), |(offset, _)| offset);
+    &key[..end]
+}
+
+/// Creates `<run dir>/context/` and writes the prior-runs digest, returning its
+/// path so the caller can point every node's `task.md` at it.
+pub fn write_run_context(run_dir: &Path, body: &str) -> io::Result<PathBuf> {
+    let file = run_context_file(run_dir);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&file, body)?;
+    Ok(file)
+}
+
 fn write_json(file: &Path, value: &serde_json::Value) -> io::Result<()> {
     let body = serde_json::to_string_pretty(value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -429,6 +525,14 @@ pub struct TaskDocument<'a> {
     /// Inbound edge ports that have an `inputs/<port>.json` file, with the
     /// per-contributor files of a fanned-in port beside them.
     pub input_ports: &'a [TaskInputPort],
+    /// Absolute path of `context/prior-runs.md`, when this run was given prior
+    /// summaries (`07-phase3-plan.md` §3 rule 9, §4 D21).
+    ///
+    /// **Absent when absent**: a run with no history — or one started with
+    /// `include_prior_summaries: false` — renders byte-identically to every
+    /// Phase 1–2 `task.md`, which is what keeps this frozen-contract change from
+    /// invalidating existing prompt expectations (§7 R-7).
+    pub prior_runs: Option<&'a str>,
 }
 
 /// One inbound port as `task.md` describes it (§4.1, 2026-08-08 amendment).
@@ -487,6 +591,15 @@ impl TaskDocument<'_> {
             out.push('\n');
         }
 
+        // Two lines, deliberately (§4 D21): the path and permission to ignore
+        // it. The summaries themselves live in the file, so a node that does not
+        // need history pays two lines of prompt rather than N×4,000 characters.
+        if let Some(prior_runs) = self.prior_runs.map(str::trim).filter(|p| !p.is_empty()) {
+            out.push_str("## Prior runs\n\n");
+            out.push_str(&format!("- `{prior_runs}`\n"));
+            out.push_str("- Read it if the task benefits from history.\n\n");
+        }
+
         if !self.contract.trim().is_empty() {
             out.push_str("## Contract\n\n");
             out.push_str(self.contract.trim());
@@ -543,7 +656,7 @@ pub fn fill_slots(template: &str, slots: &BTreeMap<String, String>) -> String {
 /// How wide a node pane's title is allowed to get. A run fans out over several
 /// splits, so a title that does not fit the pane header is worse than a shorter
 /// one that does.
-const PANE_TITLE_BUDGET: usize = 40;
+pub const PANE_TITLE_BUDGET: usize = 40;
 
 /// The pane title a node's split carries.
 ///
@@ -680,7 +793,12 @@ pub fn derive_agent_session_id(run: &RunId, path: &InstancePath, attempt: u8) ->
     format_uuid(hasher.finalize().as_slice())
 }
 
-fn format_uuid(bytes: &[u8]) -> String {
+/// The first 16 bytes of a digest, formatted as a v4-tagged uuid.
+///
+/// Shared with `binding::interrogate`'s forked-session mint for the reason the
+/// caller above documents: `claude --session-id` validates against the common
+/// v1–v5 shape, so both mints have to tag the same nibble.
+pub fn format_uuid(bytes: &[u8]) -> String {
     let mut octets = [0u8; 16];
     for (slot, byte) in octets.iter_mut().zip(bytes.iter()) {
         *slot = *byte;
@@ -1318,6 +1436,7 @@ mod tests {
             contract: "Reply only through result.json.",
             prompt: "Implement this plan.",
             input_ports: &ports,
+            prior_runs: None,
         }
         .render();
 
@@ -1502,6 +1621,7 @@ mod tests {
             contract: "",
             prompt: "Collect them.",
             input_ports: &ports,
+            prior_runs: None,
         }
         .render();
 
@@ -1522,12 +1642,101 @@ mod tests {
             contract: "",
             prompt: "Do the thing.",
             input_ports: &[],
+            prior_runs: None,
         }
         .render();
         assert!(!rendered.contains("## Role"));
         assert!(!rendered.contains("## Contract"));
         assert!(!rendered.contains("## Inputs"));
         assert!(rendered.contains("## Task"));
+    }
+
+    /// §7 R-7 / §3 rule 9: the `## Prior runs` section is the one
+    /// frozen-contract change Phase 3 makes to `task.md`, and it is
+    /// **absent-when-absent** — a run with no history renders byte-identically
+    /// to every Phase 1–2 task document, so no existing prompt expectation is
+    /// invalidated.
+    #[test]
+    fn the_prior_runs_section_is_absent_when_the_run_has_no_history() {
+        let document = TaskDocument {
+            label: "Plan",
+            role: "You plan.",
+            contract: "Reply only through result.json.",
+            prompt: "Do the thing.",
+            input_ports: &[],
+            prior_runs: None,
+        };
+        let without = document.render();
+        assert!(!without.contains("## Prior runs"), "{without}");
+
+        let with = TaskDocument {
+            prior_runs: Some("/runs/r1/context/prior-runs.md"),
+            ..document
+        }
+        .render();
+        assert!(with.contains("## Prior runs"), "{with}");
+        assert!(
+            with.contains("`/runs/r1/context/prior-runs.md`"),
+            "the section is a pointer, so it has to carry the path: {with}"
+        );
+        assert_eq!(
+            with.replace(
+                "## Prior runs\n\n- `/runs/r1/context/prior-runs.md`\n- Read it if the task \
+                 benefits from history.\n\n",
+                ""
+            ),
+            without,
+            "§4 D21: two lines and nothing else — the rest of the document is untouched"
+        );
+    }
+
+    /// §4 D21: the digest is one file per run, and it says which run each
+    /// section came from in a form a reader can scan.
+    #[test]
+    fn the_prior_runs_digest_renders_one_section_per_summary() {
+        let highlights = vec!["shipped the parser".to_string()];
+        let gaps = vec!["no windows coverage".to_string()];
+        let rendered = render_prior_runs(
+            "release",
+            &[
+                PriorRunSection {
+                    run: "workflow_run:abcdef0123456789",
+                    outcome: "succeeded",
+                    text: "the parser landed",
+                    highlights: &highlights,
+                    open_gaps: &gaps,
+                },
+                PriorRunSection {
+                    run: "workflow_run:0011223344",
+                    outcome: "failed",
+                    text: "the build broke",
+                    highlights: &[],
+                    open_gaps: &[],
+                },
+            ],
+        );
+        assert!(
+            rendered.contains("## Run abcdef01 — succeeded"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("## Run 00112233 — failed"), "{rendered}");
+        assert!(rendered.contains("- shipped the parser"), "{rendered}");
+        assert!(rendered.contains("- no windows coverage"), "{rendered}");
+        assert!(
+            !rendered.contains("workflow_run:"),
+            "the record-id prefix is noise in a document an agent reads: {rendered}"
+        );
+        assert!(
+            !rendered.contains("### Highlights\n\n### Open gaps"),
+            "an empty list renders no heading at all: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_short_run_id_survives_a_key_shorter_than_the_window() {
+        assert_eq!(short_run_id("workflow_run:abc"), "abc");
+        assert_eq!(short_run_id("bare"), "bare");
+        assert_eq!(short_run_id("workflow_run:"), "");
     }
 
     #[test]

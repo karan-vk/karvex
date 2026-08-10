@@ -30,6 +30,22 @@ pub fn app_dir_name() -> &'static str {
     }
 }
 
+/// Directory a spawned server keeps its *own* state in: `session.json`,
+/// `session-history.json`, the log files and the tmux shim directory.
+///
+/// A server's state lives in the directory holding its API socket, so a server
+/// started with a `KARVEX_SOCKET_PATH` override never reads or writes the
+/// default session's `session.json`. These harnesses point the socket at
+/// `runtime_dir`, so that — not `XDG_CONFIG_HOME` — is where their servers keep
+/// state. `config.toml` still comes from `XDG_CONFIG_HOME`.
+pub fn server_state_dir(api_socket_path: &Path) -> PathBuf {
+    api_socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub fn register_spawned_karvex_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;

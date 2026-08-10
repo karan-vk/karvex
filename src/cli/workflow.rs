@@ -8,8 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::api::schema::{
     Method, Request, WorkflowCreateParams, WorkflowDefinitionDocument, WorkflowDefinitionFormat,
-    WorkflowNodeExpandParams, WorkflowNodeReportParams, WorkflowNodeSteerParams,
-    WorkflowNodeTarget, WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget,
+    WorkflowInterrogationMode, WorkflowNodeExpandParams, WorkflowNodeInterrogateParams,
+    WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRestoreRequest,
+    WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget, WorkflowSummaryListParams,
     WorkflowTarget, WorkflowTier, WorkflowVersionCreateParams, WorkflowVersionTarget,
 };
 
@@ -45,6 +46,9 @@ pub(super) const VERB_PATHS: &[&[&str]] = &[
     &["node", "restart"],
     &["node", "complete"],
     &["node", "expand"],
+    &["node", "interrogate"],
+    &["summary", "show"],
+    &["summary", "list"],
 ];
 
 pub(super) fn run_workflow_command(args: &[String]) -> std::io::Result<i32> {
@@ -60,6 +64,7 @@ pub(super) fn run_workflow_command(args: &[String]) -> std::io::Result<i32> {
         "update" => workflow_update(&args[1..]),
         "run" => run_workflow_run_command(&args[1..]),
         "node" => run_workflow_node_command(&args[1..]),
+        "summary" => run_workflow_summary_command(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workflow_help();
             Ok(0)
@@ -106,6 +111,7 @@ fn run_workflow_node_command(args: &[String]) -> std::io::Result<i32> {
         "restart" => workflow_node_restart(&args[1..]),
         "complete" => workflow_node_complete(&args[1..]),
         "expand" => workflow_node_expand(&args[1..]),
+        "interrogate" => workflow_node_interrogate(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workflow_node_help();
             Ok(0)
@@ -117,11 +123,36 @@ fn run_workflow_node_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
+fn run_workflow_summary_command(args: &[String]) -> std::io::Result<i32> {
+    let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
+        print_workflow_summary_help();
+        return Ok(2);
+    };
+
+    match subcommand {
+        "show" => workflow_summary_show(&args[1..]),
+        "list" => workflow_summary_list(&args[1..]),
+        "help" | "--help" | "-h" => {
+            print_workflow_summary_help();
+            Ok(0)
+        }
+        _ => {
+            print_workflow_summary_help();
+            Ok(2)
+        }
+    }
+}
+
 // ── workflow list / show ────────────────────────────────────────────────
 
+/// §4 D17: `list` gains `--json` in the sweep alongside `run cancel`/`run
+/// list`/`node steer`/`node interrupt`/`node restart`. The response was
+/// already the raw envelope unconditionally (no human renderer exists for
+/// it), so the flag is accepted for CLI-wide consistency rather than
+/// changing what gets printed.
 fn workflow_list(args: &[String]) -> std::io::Result<i32> {
     match parse_workflow_list_args(args) {
-        Ok(()) => super::runtime::workflow_list(),
+        Ok(_json) => super::runtime::workflow_list(),
         Err(message) => {
             eprintln!("{message}");
             Ok(2)
@@ -129,11 +160,12 @@ fn workflow_list(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-fn parse_workflow_list_args(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err("usage: kvx workflow list".into());
+fn parse_workflow_list_args(args: &[String]) -> Result<bool, String> {
+    match args {
+        [] => Ok(false),
+        [flag] if flag == "--json" => Ok(true),
+        _ => Err("usage: kvx workflow list [--json]".into()),
     }
-    Ok(())
 }
 
 /// `workflow.get` alone only carries the workflow's summary and a version
@@ -571,8 +603,9 @@ fn fetch_declared_arg_names(workflow_id: &str) -> std::io::Result<Option<HashSet
 }
 
 fn parse_workflow_run_start_args(args: &[String]) -> Result<(WorkflowRunParams, bool), String> {
-    let usage =
-        "usage: kvx workflow run start <name|id> [--tier <tier>] [--arg KEY=VALUE]... [--json]";
+    let usage = "usage: kvx workflow run start <name|id> [--tier <tier>] [--arg KEY=VALUE]... \
+        [--restore-from <run-id>] [--restore <selector>]... [--restore-allow-changed] \
+        [--no-prior-summaries] [--json]";
     let Some(target) = args.first() else {
         return Err(usage.into());
     };
@@ -581,6 +614,10 @@ fn parse_workflow_run_start_args(args: &[String]) -> Result<(WorkflowRunParams, 
     let mut tier = None;
     let mut run_args = HashMap::new();
     let mut json = false;
+    let mut restore_from = None;
+    let mut restore_nodes = Vec::new();
+    let mut restore_allow_changed = false;
+    let mut no_prior_summaries = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -599,6 +636,28 @@ fn parse_workflow_run_start_args(args: &[String]) -> Result<(WorkflowRunParams, 
                 run_args.insert(key, value);
                 index += 2;
             }
+            "--restore-from" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --restore-from".into());
+                };
+                restore_from = Some(value.clone());
+                index += 2;
+            }
+            "--restore" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --restore".into());
+                };
+                restore_nodes.push(value.clone());
+                index += 2;
+            }
+            "--restore-allow-changed" => {
+                restore_allow_changed = true;
+                index += 1;
+            }
+            "--no-prior-summaries" => {
+                no_prior_summaries = true;
+                index += 1;
+            }
             "--json" => {
                 json = true;
                 index += 1;
@@ -607,20 +666,39 @@ fn parse_workflow_run_start_args(args: &[String]) -> Result<(WorkflowRunParams, 
         }
     }
 
+    let restore_from = match restore_from {
+        Some(run_id) => Some(WorkflowRestoreRequest {
+            run_id,
+            nodes: restore_nodes,
+            allow_changed: restore_allow_changed,
+        }),
+        None if !restore_nodes.is_empty() => {
+            return Err("--restore requires --restore-from".into());
+        }
+        None if restore_allow_changed => {
+            return Err("--restore-allow-changed requires --restore-from".into());
+        }
+        None => None,
+    };
+
     Ok((
         WorkflowRunParams {
             workflow_id,
             version: None,
             tier,
             args: run_args,
+            restore_from,
+            include_prior_summaries: no_prior_summaries.then_some(false),
         },
         json,
     ))
 }
 
+/// §4 D17: `--json` accepted for the same reason as [`workflow_list`] — the
+/// response is already the raw envelope unconditionally.
 fn workflow_run_list(args: &[String]) -> std::io::Result<i32> {
     match parse_workflow_run_list_args(args) {
-        Ok(params) => super::runtime::workflow_run_list(params),
+        Ok((params, _json)) => super::runtime::workflow_run_list(params),
         Err(message) => {
             eprintln!("{message}");
             Ok(2)
@@ -628,14 +706,15 @@ fn workflow_run_list(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-fn parse_workflow_run_list_args(args: &[String]) -> Result<WorkflowRunListParams, String> {
-    let usage = "usage: kvx workflow run list <name|id> [--limit N]";
+fn parse_workflow_run_list_args(args: &[String]) -> Result<(WorkflowRunListParams, bool), String> {
+    let usage = "usage: kvx workflow run list <name|id> [--limit N] [--json]";
     let Some(target) = args.first() else {
         return Err(usage.into());
     };
     let workflow_id = target.clone();
 
     let mut limit = None;
+    let mut json = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -650,11 +729,21 @@ fn parse_workflow_run_list_args(args: &[String]) -> Result<WorkflowRunListParams
                 );
                 index += 2;
             }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
 
-    Ok(WorkflowRunListParams { workflow_id, limit })
+    Ok((
+        WorkflowRunListParams {
+            workflow_id: Some(workflow_id),
+            limit,
+        },
+        json,
+    ))
 }
 
 fn workflow_run_show(args: &[String]) -> std::io::Result<i32> {
@@ -700,24 +789,32 @@ fn parse_workflow_run_show_args(args: &[String]) -> Result<(WorkflowRunTarget, b
 /// pane — arrive as a raw JSON envelope while `run show` and `node show` next
 /// to them print prose. Only the terminal rendering changes; the wire envelope
 /// these commands emit on success, and the `code` on failure, are untouched.
-fn send_workflow_mutation(id: &'static str, method: Method) -> std::io::Result<i32> {
+/// §4 D17: `json` now controls whether a refusal renders humanized
+/// (`print_workflow_error`, the pre-existing default) or as the raw envelope
+/// like every other `--json` path does — success was, and stays, the raw
+/// envelope either way, since these mutation verbs have no human success
+/// renderer.
+fn send_workflow_mutation(id: &'static str, method: Method, json: bool) -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: id.into(),
         method,
     })?;
-    if let Some(code) = print_workflow_error(&response) {
-        return Ok(code);
+    if !json {
+        if let Some(code) = print_workflow_error(&response) {
+            return Ok(code);
+        }
     }
     super::print_response(&response)
 }
 
 fn workflow_run_cancel(args: &[String]) -> std::io::Result<i32> {
     match parse_workflow_run_cancel_args(args) {
-        Ok(target) => send_workflow_mutation(
+        Ok((target, json)) => send_workflow_mutation(
             "cli:workflow:run:cancel",
             Method::WorkflowRunCancel(WorkflowRunTarget {
                 run_id: target.run_id,
             }),
+            json,
         ),
         Err(message) => {
             eprintln!("{message}");
@@ -726,12 +823,22 @@ fn workflow_run_cancel(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-fn parse_workflow_run_cancel_args(args: &[String]) -> Result<WorkflowRunTarget, String> {
+fn parse_workflow_run_cancel_args(args: &[String]) -> Result<(WorkflowRunTarget, bool), String> {
+    let usage = "usage: kvx workflow run cancel <run_id> [--json]";
     match args {
-        [run_id] => Ok(WorkflowRunTarget {
-            run_id: run_id.clone(),
-        }),
-        _ => Err("usage: kvx workflow run cancel <run_id>".into()),
+        [run_id] => Ok((
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+            false,
+        )),
+        [run_id, flag] if flag == "--json" => Ok((
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+            true,
+        )),
+        _ => Err(usage.into()),
     }
 }
 
@@ -774,9 +881,11 @@ fn parse_workflow_node_show_args(args: &[String]) -> Result<(WorkflowNodeTarget,
 
 fn workflow_node_steer(args: &[String]) -> std::io::Result<i32> {
     match parse_workflow_node_steer_args(args) {
-        Ok(params) => {
-            send_workflow_mutation("cli:workflow:node:steer", Method::WorkflowNodeSteer(params))
-        }
+        Ok((params, json)) => send_workflow_mutation(
+            "cli:workflow:node:steer",
+            Method::WorkflowNodeSteer(params),
+            json,
+        ),
         Err(message) => {
             eprintln!("{message}");
             Ok(2)
@@ -784,24 +893,41 @@ fn workflow_node_steer(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-fn parse_workflow_node_steer_args(args: &[String]) -> Result<WorkflowNodeSteerParams, String> {
-    let usage = "usage: kvx workflow node steer <run_id> <path> <text>";
+/// A trailing `--json` is only recognized as the flag when at least one text
+/// word remains without it — `node steer run-1 plan --json` (no other words)
+/// keeps `--json` as the steered text rather than silently swallowing it,
+/// since `<text>` is free-form and `--json` is itself a legal thing to say to
+/// a node.
+fn parse_workflow_node_steer_args(
+    args: &[String],
+) -> Result<(WorkflowNodeSteerParams, bool), String> {
+    let usage = "usage: kvx workflow node steer <run_id> <path> <text> [--json]";
     if args.len() < 3 {
         return Err(usage.into());
     }
-    Ok(WorkflowNodeSteerParams {
-        run_id: args[0].clone(),
-        path: args[1].clone(),
-        text: args[2..].join(" "),
-    })
+    let (json, text_args) = match args.last() {
+        Some(flag) if flag == "--json" && args.len() > 3 => (true, &args[..args.len() - 1]),
+        _ => (false, args),
+    };
+    Ok((
+        WorkflowNodeSteerParams {
+            run_id: text_args[0].clone(),
+            path: text_args[1].clone(),
+            text: text_args[2..].join(" "),
+        },
+        json,
+    ))
 }
 
 fn workflow_node_interrupt(args: &[String]) -> std::io::Result<i32> {
-    match parse_workflow_node_pair_args(args, "usage: kvx workflow node interrupt <run_id> <path>")
-    {
-        Ok(target) => send_workflow_mutation(
+    match parse_workflow_node_pair_args(
+        args,
+        "usage: kvx workflow node interrupt <run_id> <path> [--json]",
+    ) {
+        Ok((target, json)) => send_workflow_mutation(
             "cli:workflow:node:interrupt",
             Method::WorkflowNodeInterrupt(target),
+            json,
         ),
         Err(message) => {
             eprintln!("{message}");
@@ -811,10 +937,14 @@ fn workflow_node_interrupt(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn workflow_node_restart(args: &[String]) -> std::io::Result<i32> {
-    match parse_workflow_node_pair_args(args, "usage: kvx workflow node restart <run_id> <path>") {
-        Ok(target) => send_workflow_mutation(
+    match parse_workflow_node_pair_args(
+        args,
+        "usage: kvx workflow node restart <run_id> <path> [--json]",
+    ) {
+        Ok((target, json)) => send_workflow_mutation(
             "cli:workflow:node:restart",
             Method::WorkflowNodeRestart(target),
+            json,
         ),
         Err(message) => {
             eprintln!("{message}");
@@ -826,12 +956,22 @@ fn workflow_node_restart(args: &[String]) -> std::io::Result<i32> {
 fn parse_workflow_node_pair_args(
     args: &[String],
     usage: &str,
-) -> Result<WorkflowNodeTarget, String> {
+) -> Result<(WorkflowNodeTarget, bool), String> {
     match args {
-        [run_id, path] => Ok(WorkflowNodeTarget {
-            run_id: run_id.clone(),
-            path: path.clone(),
-        }),
+        [run_id, path] => Ok((
+            WorkflowNodeTarget {
+                run_id: run_id.clone(),
+                path: path.clone(),
+            },
+            false,
+        )),
+        [run_id, path, flag] if flag == "--json" => Ok((
+            WorkflowNodeTarget {
+                run_id: run_id.clone(),
+                path: path.clone(),
+            },
+            true,
+        )),
         _ => Err(usage.into()),
     }
 }
@@ -1023,6 +1163,101 @@ fn print_workflow_node_expand_response(
     Ok(0)
 }
 
+/// `07-phase3-plan.md` §WS-E / §4 D7: opens a forked Claude session on a past
+/// node's transcript (or, with `--reconstructed`, a fresh session seeded from
+/// the node's stored checkpoint) so a person can ask it questions without
+/// touching the source transcript. Unlike `node expand`/`node complete`, this
+/// is invoked by a human, not the node's own process, so there is no node
+/// token to read from the environment. A `workflow_transcript_unavailable`
+/// refusal (a missing transcript, or a command-runner node that never had
+/// one) is an ordinary error response, rendered like any other.
+fn workflow_node_interrogate(args: &[String]) -> std::io::Result<i32> {
+    let (params, json) = match parse_workflow_node_interrogate_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
+
+    let response = super::send_request(&Request {
+        id: "cli:workflow:node:interrogate".into(),
+        method: Method::WorkflowNodeInterrogate(params),
+    })?;
+    print_workflow_node_interrogate_response(&response, json)
+}
+
+fn parse_workflow_node_interrogate_args(
+    args: &[String],
+) -> Result<(WorkflowNodeInterrogateParams, bool), String> {
+    let usage = "usage: kvx workflow node interrogate <run_id> <path> [--reconstructed] [--note <text>] [--json]";
+    let (Some(run_id), Some(path)) = (args.first(), args.get(1)) else {
+        return Err(usage.into());
+    };
+    let run_id = run_id.clone();
+    let path = path.clone();
+
+    let mut mode = WorkflowInterrogationMode::Resumed;
+    let mut note = None;
+    let mut json = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--reconstructed" => {
+                mode = WorkflowInterrogationMode::Reconstructed;
+                index += 1;
+            }
+            "--note" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --note".into());
+                };
+                note = Some(value.clone());
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+
+    Ok((
+        WorkflowNodeInterrogateParams {
+            run_id,
+            path,
+            mode,
+            note,
+        },
+        json,
+    ))
+}
+
+/// §WS-E: "`node interrogate` prints the pane id and mode."
+fn print_workflow_node_interrogate_response(
+    response: &serde_json::Value,
+    json: bool,
+) -> std::io::Result<i32> {
+    if json {
+        return super::print_response(response);
+    }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
+    }
+    let interrogation = &response["result"]["interrogation"];
+    let mode = if interrogation["reconstructed"].as_bool().unwrap_or(false) {
+        "reconstructed"
+    } else {
+        "resumed"
+    };
+    println!("id:      {}", interrogation["id"].as_str().unwrap_or(""));
+    println!("mode:    {mode}");
+    if let Some(pane_id) = interrogation["pane_id"].as_str() {
+        println!("pane_id: {pane_id}");
+    }
+    Ok(0)
+}
+
 fn workflow_node_complete(args: &[String]) -> std::io::Result<i32> {
     let result_file = match parse_workflow_node_complete_args(args) {
         Ok(result_file) => result_file,
@@ -1146,6 +1381,207 @@ fn read_node_result(result_path: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(&text).map_err(|err| format!("invalid JSON in {result_path}: {err}"))
 }
 
+// ── workflow summary show / list ────────────────────────────────────────
+
+fn workflow_summary_show(args: &[String]) -> std::io::Result<i32> {
+    let (target, json) = match parse_workflow_summary_show_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
+
+    let response = super::send_request(&Request {
+        id: "cli:workflow:summary:show".into(),
+        method: Method::WorkflowSummaryGet(target),
+    })?;
+    print_workflow_summary_show_response(&response, json)
+}
+
+fn parse_workflow_summary_show_args(args: &[String]) -> Result<(WorkflowRunTarget, bool), String> {
+    let usage = "usage: kvx workflow summary show <run_id> [--json]";
+    let Some(run_id) = args.first() else {
+        return Err(usage.into());
+    };
+    let json = match args.get(1..) {
+        Some([]) => false,
+        Some([flag]) if flag == "--json" => true,
+        _ => return Err(usage.into()),
+    };
+    Ok((
+        WorkflowRunTarget {
+            run_id: run_id.clone(),
+        },
+        json,
+    ))
+}
+
+/// `None` means "no summary was written yet" (`07-phase3-plan.md` §4 D1,
+/// D10) — a normal answer, not an error, so this prints a plain message and
+/// exits `0` rather than routing through [`print_workflow_error`].
+fn print_workflow_summary_show_response(
+    response: &serde_json::Value,
+    json: bool,
+) -> std::io::Result<i32> {
+    if json {
+        return super::print_response(response);
+    }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
+    }
+    let summary = &response["result"]["summary"];
+    if summary.is_null() {
+        println!("no summary recorded for this run yet");
+        return Ok(0);
+    }
+    print_run_summary(summary);
+    Ok(0)
+}
+
+/// The shared render of a `WorkflowRunSummaryInfo`: outcome, text, highlights,
+/// open gaps, per-node lines (`07-phase3-plan.md` §WS-E).
+fn print_run_summary(summary: &serde_json::Value) {
+    println!("run_id:   {}", summary["run_id"].as_str().unwrap_or(""));
+    println!(
+        "workflow: {}",
+        summary["workflow_name"].as_str().unwrap_or("")
+    );
+    println!("outcome:  {}", summary["outcome"].as_str().unwrap_or(""));
+    if summary["run_pruned"].as_bool().unwrap_or(false) {
+        println!("pruned:   yes");
+    }
+    println!();
+    println!("{}", summary["text"].as_str().unwrap_or(""));
+
+    if let Some(highlights) = summary["highlights"].as_array() {
+        if !highlights.is_empty() {
+            println!();
+            println!("highlights:");
+            for highlight in highlights {
+                println!("  - {}", highlight.as_str().unwrap_or(""));
+            }
+        }
+    }
+    if let Some(open_gaps) = summary["open_gaps"].as_array() {
+        if !open_gaps.is_empty() {
+            println!();
+            println!("open gaps:");
+            for gap in open_gaps {
+                println!("  - {}", gap.as_str().unwrap_or(""));
+            }
+        }
+    }
+    if let Some(per_node) = summary["per_node"].as_array() {
+        if !per_node.is_empty() {
+            println!();
+            println!("nodes:");
+            for line in per_node {
+                let node_key = line["node_key"].as_str().unwrap_or("");
+                let verdict = line["verdict"].as_str().unwrap_or("");
+                let one_liner = line["one_liner"].as_str().unwrap_or("");
+                println!("  {node_key:<20} {verdict:<12} {one_liner}");
+            }
+        }
+    }
+}
+
+fn workflow_summary_list(args: &[String]) -> std::io::Result<i32> {
+    let (params, json) = match parse_workflow_summary_list_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
+
+    let response = super::send_request(&Request {
+        id: "cli:workflow:summary:list".into(),
+        method: Method::WorkflowSummaryList(params),
+    })?;
+    print_workflow_summary_list_response(&response, json)
+}
+
+fn parse_workflow_summary_list_args(
+    args: &[String],
+) -> Result<(WorkflowSummaryListParams, bool), String> {
+    let usage = "usage: kvx workflow summary list [<workflow>] [--limit N] [--json]";
+    let mut workflow_id = None;
+    let mut limit = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--limit" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("missing value for --limit".into());
+                };
+                limit = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid value for --limit: {value}"))?,
+                );
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option: {other}"));
+            }
+            other if workflow_id.is_none() => {
+                workflow_id = Some(other.to_string());
+                index += 1;
+            }
+            _ => return Err(usage.into()),
+        }
+    }
+    Ok((WorkflowSummaryListParams { workflow_id, limit }, json))
+}
+
+fn print_workflow_summary_list_response(
+    response: &serde_json::Value,
+    json: bool,
+) -> std::io::Result<i32> {
+    if json {
+        return super::print_response(response);
+    }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
+    }
+    let Some(summaries) = response["result"]["summaries"].as_array() else {
+        return Ok(0);
+    };
+    if summaries.is_empty() {
+        println!("no summaries recorded");
+        return Ok(0);
+    }
+    for summary in summaries {
+        println!("{}", format_summary_list_row(summary));
+    }
+    Ok(0)
+}
+
+/// One row of `summary list`'s output — run id, workflow name, outcome, and a
+/// `(pruned)` marker when the source run no longer exists
+/// (`07-phase3-plan.md` §WS-E, §4 D9).
+fn format_summary_list_row(summary: &serde_json::Value) -> String {
+    let run_id = summary["run_id"].as_str().unwrap_or("");
+    let workflow_name = summary["workflow_name"].as_str().unwrap_or("");
+    let outcome = summary["outcome"].as_str().unwrap_or("");
+    let created = summary["created_at_unix_ms"]
+        .as_u64()
+        .map(format_unix_ms)
+        .unwrap_or_default();
+    let pruned = if summary["run_pruned"].as_bool().unwrap_or(false) {
+        " (pruned)"
+    } else {
+        ""
+    };
+    format!("{run_id}  {workflow_name:<20} {outcome:<12} {created}{pruned}")
+}
+
 // ── shared parsing / printing helpers ───────────────────────────────────
 
 fn parse_workflow_tier(value: &str) -> Result<WorkflowTier, String> {
@@ -1208,6 +1644,9 @@ fn print_workflow_run_response(response: &serde_json::Value, json: bool) -> std:
         run["nodes_total"].as_u64().unwrap_or(0)
     );
     if let Some(line) = format_run_growth_line(run) {
+        println!("{line}");
+    }
+    if let Some(line) = format_restore_report_line(&response["result"]["restore"]) {
         println!("{line}");
     }
 
@@ -1332,6 +1771,44 @@ fn format_run_growth_line(run: &serde_json::Value) -> Option<String> {
     ))
 }
 
+/// `run start`'s restore report (`07-phase3-plan.md` §WS-E: "prints the
+/// restore report (`restored: plan, implement · skipped: review (definition
+/// changed)`)"). `None` when the response carries no `restore` field at all —
+/// a plain (non-restoring) run start, where nothing about restore should
+/// print. A present-but-empty report (a `--restore-from` run that restored
+/// nothing) still prints, since the run *was* a restore attempt and silence
+/// would look like the flag was ignored.
+fn format_restore_report_line(restore: &serde_json::Value) -> Option<String> {
+    if restore.is_null() {
+        return None;
+    }
+    let restored: Vec<&str> = restore["restored"]
+        .as_array()
+        .map(|nodes| nodes.iter().filter_map(|node| node.as_str()).collect())
+        .unwrap_or_default();
+    let skipped = restore["skipped"].as_array().cloned().unwrap_or_default();
+
+    let mut parts = Vec::new();
+    if !restored.is_empty() {
+        parts.push(format!("restored: {}", restored.join(", ")));
+    }
+    if !skipped.is_empty() {
+        let skip_strs: Vec<String> = skipped
+            .iter()
+            .map(|skip| {
+                let selector = skip["selector"].as_str().unwrap_or("");
+                let reason = skip["reason"].as_str().unwrap_or("").replace('_', " ");
+                format!("{selector} ({reason})")
+            })
+            .collect();
+        parts.push(format!("skipped: {}", skip_strs.join(", ")));
+    }
+    if parts.is_empty() {
+        return Some("restore: none restored, none skipped".to_string());
+    }
+    Some(parts.join(" · "))
+}
+
 /// The node's own last rejection as a *proposer* (`WorkflowRunNodeInfo.
 /// growth_limited`) — distinct from [`format_run_growth_line`], which reports
 /// the run's most recent limit regardless of which node hit it. `None` when
@@ -1409,7 +1886,38 @@ fn print_workflow_node_response(response: &serde_json::Value, json: bool) -> std
     if let Some(line) = format_node_delivery_failure_line(node) {
         println!("{line}");
     }
+    println!("{}", format_node_transcript_line(node));
+    if let Some(line) = format_node_restored_from_line(node) {
+        println!("{line}");
+    }
     Ok(0)
+}
+
+/// §WS-E: "`node show` gains `transcript:` (present/absent) ... lines" —
+/// present/absent rather than the raw path, since the path is filesystem
+/// detail `--json` already carries verbatim on `transcript_path`.
+fn format_node_transcript_line(node: &serde_json::Value) -> String {
+    if node["transcript_path"].as_str().is_some() {
+        "transcript: present".to_string()
+    } else {
+        "transcript: absent".to_string()
+    }
+}
+
+/// §WS-E's `restored from:` line and §4 D4's provenance triple (source run,
+/// node key, checkpoint seq). `None` for a node that was executed rather than
+/// restored.
+fn format_node_restored_from_line(node: &serde_json::Value) -> Option<String> {
+    let restored_from = node.get("restored_from")?;
+    if restored_from.is_null() {
+        return None;
+    }
+    let run_id = restored_from["run_id"].as_str().unwrap_or("");
+    let node_key = restored_from["node_key"].as_str().unwrap_or("");
+    let checkpoint_seq = restored_from["checkpoint_seq"].as_u64().unwrap_or(0);
+    Some(format!(
+        "restored from: run {run_id} · node {node_key} · checkpoint #{checkpoint_seq}"
+    ))
 }
 
 /// Renders a `workflow.*` error envelope the way a person reads it rather than
@@ -1748,7 +2256,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 fn print_workflow_help() {
     eprintln!("kvx workflow commands:");
-    eprintln!("  kvx workflow list");
+    eprintln!("  kvx workflow list [--json]");
     eprintln!("  kvx workflow show <name|id> [--json]");
     eprintln!("  kvx workflow create --file <definition.toml|json> [--name <name>] [--json]");
     eprintln!(
@@ -1756,28 +2264,40 @@ fn print_workflow_help() {
     );
     eprintln!("  kvx workflow run <subcommand> ...");
     eprintln!("  kvx workflow node <subcommand> ...");
+    eprintln!("  kvx workflow summary <subcommand> ...");
 }
 
 fn print_workflow_run_help() {
     eprintln!("kvx workflow run commands:");
-    eprintln!("  kvx workflow run start <name|id> [--tier <tier>] [--arg KEY=VALUE]... [--json]");
-    eprintln!("  kvx workflow run list <name|id> [--limit N]");
+    eprintln!(
+        "  kvx workflow run start <name|id> [--tier <tier>] [--arg KEY=VALUE]... [--restore-from <run-id>] [--restore <selector>]... [--restore-allow-changed] [--no-prior-summaries] [--json]"
+    );
+    eprintln!("  kvx workflow run list <name|id> [--limit N] [--json]");
     eprintln!("  kvx workflow run show <run_id> [--json]");
-    eprintln!("  kvx workflow run cancel <run_id>");
+    eprintln!("  kvx workflow run cancel <run_id> [--json]");
 }
 
 fn print_workflow_node_help() {
     eprintln!("kvx workflow node commands:");
     eprintln!("  kvx workflow node show <run_id> <path> [--json]");
-    eprintln!("  kvx workflow node steer <run_id> <path> <text>");
-    eprintln!("  kvx workflow node interrupt <run_id> <path>");
-    eprintln!("  kvx workflow node restart <run_id> <path>");
+    eprintln!("  kvx workflow node steer <run_id> <path> <text> [--json]");
+    eprintln!("  kvx workflow node interrupt <run_id> <path> [--json]");
+    eprintln!("  kvx workflow node restart <run_id> <path> [--json]");
     eprintln!(
         "  kvx workflow node complete [--result-file <path>]   # run by the node itself; reads KARVEX_WORKFLOW_RUN_ID/NODE_PATH/NODE_DIR/NODE_TOKEN"
     );
     eprintln!(
         "  kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]   # run by the node itself; reads KARVEX_WORKFLOW_NODE_TOKEN"
     );
+    eprintln!(
+        "  kvx workflow node interrogate <run_id> <path> [--reconstructed] [--note <text>] [--json]"
+    );
+}
+
+fn print_workflow_summary_help() {
+    eprintln!("kvx workflow summary commands:");
+    eprintln!("  kvx workflow summary show <run_id> [--json]");
+    eprintln!("  kvx workflow summary list [<workflow>] [--limit N] [--json]");
 }
 
 #[cfg(test)]
@@ -2014,6 +2534,8 @@ mod tests {
                 version: None,
                 tier: Some(WorkflowTier::High),
                 args: HashMap::from([("goal".to_string(), "add dark mode".to_string())]),
+                restore_from: None,
+                include_prior_summaries: None,
             })
         );
     }
@@ -2041,17 +2563,101 @@ mod tests {
         );
     }
 
+    // ── §4 D18/D11 restore flags ─────────────────────────────────────────
+
+    /// §4 D18: bare `--restore-from <run>` means "everything restorable" —
+    /// wire-encoded as an empty `nodes` selector list.
+    #[test]
+    fn workflow_run_start_bare_restore_from_means_everything_restorable() {
+        let (params, _json) =
+            parse_workflow_run_start_args(&args(&["ship-feature", "--restore-from", "run-1"]))
+                .unwrap();
+        assert_eq!(
+            params.restore_from,
+            Some(WorkflowRestoreRequest {
+                run_id: "run-1".to_string(),
+                nodes: vec![],
+                allow_changed: false,
+            })
+        );
+    }
+
+    /// `--restore` is repeatable, narrows the bare form, and its selector
+    /// value is taken verbatim — including one containing `=`, which must not
+    /// be mistaken for a `KEY=VALUE` assignment the way `--arg`/`--input` do.
+    #[test]
+    fn workflow_run_start_restore_selectors_are_repeatable_and_verbatim() {
+        let (params, _json) = parse_workflow_run_start_args(&args(&[
+            "ship-feature",
+            "--restore-from",
+            "run-1",
+            "--restore",
+            "plan",
+            "--restore",
+            "build=x",
+            "--restore-allow-changed",
+        ]))
+        .unwrap();
+        assert_eq!(
+            params.restore_from,
+            Some(WorkflowRestoreRequest {
+                run_id: "run-1".to_string(),
+                nodes: vec!["plan".to_string(), "build=x".to_string()],
+                allow_changed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_run_start_restore_requires_restore_from() {
+        assert!(
+            parse_workflow_run_start_args(&args(&["ship-feature", "--restore", "plan"])).is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_run_start_restore_allow_changed_requires_restore_from() {
+        assert!(
+            parse_workflow_run_start_args(&args(&["ship-feature", "--restore-allow-changed"]))
+                .is_err()
+        );
+    }
+
+    /// §4 D21: absent `--no-prior-summaries` means `include_prior_summaries:
+    /// None`, which the docs and the handler both read as "default true" —
+    /// the flag only ever narrows to `Some(false)`, never sets `Some(true)`.
+    #[test]
+    fn workflow_run_start_no_prior_summaries_sets_include_prior_summaries_false() {
+        let (params, _json) =
+            parse_workflow_run_start_args(&args(&["ship-feature", "--no-prior-summaries"]))
+                .unwrap();
+        assert_eq!(params.include_prior_summaries, Some(false));
+    }
+
+    #[test]
+    fn workflow_run_start_omits_include_prior_summaries_by_default() {
+        let (params, _json) = parse_workflow_run_start_args(&args(&["ship-feature"])).unwrap();
+        assert_eq!(params.include_prior_summaries, None);
+    }
+
     #[test]
     fn workflow_run_list_builds_workflow_run_list_with_limit() {
-        let params =
+        let (params, json) =
             parse_workflow_run_list_args(&args(&["ship-feature", "--limit", "10"])).unwrap();
+        assert!(!json);
         assert_eq!(
             Method::WorkflowRunList(params),
             Method::WorkflowRunList(WorkflowRunListParams {
-                workflow_id: "ship-feature".to_string(),
+                workflow_id: Some("ship-feature".to_string()),
                 limit: Some(10),
             })
         );
+    }
+
+    #[test]
+    fn workflow_run_list_accepts_json_flag() {
+        let (_, json) = parse_workflow_run_list_args(&args(&["ship-feature", "--json"])).unwrap();
+        assert!(json);
     }
 
     #[test]
@@ -2079,13 +2685,22 @@ mod tests {
 
     #[test]
     fn workflow_run_cancel_builds_workflow_run_cancel() {
-        let target = parse_workflow_run_cancel_args(&args(&["run-1"])).unwrap();
+        let (target, json) = parse_workflow_run_cancel_args(&args(&["run-1"])).unwrap();
+        assert!(!json);
         assert_eq!(
             Method::WorkflowRunCancel(target),
             Method::WorkflowRunCancel(WorkflowRunTarget {
                 run_id: "run-1".to_string(),
             })
         );
+    }
+
+    /// §4 D17's regression pin: `run cancel --json` used to be a parse error
+    /// (`unknown option: --json`) — the exact gap the sweep closes.
+    #[test]
+    fn workflow_run_cancel_accepts_json_flag() {
+        let (_, json) = parse_workflow_run_cancel_args(&args(&["run-1", "--json"])).unwrap();
+        assert!(json);
     }
 
     #[test]
@@ -2146,8 +2761,9 @@ mod tests {
 
     #[test]
     fn workflow_node_steer_joins_trailing_words_as_text() {
-        let params =
+        let (params, json) =
             parse_workflow_node_steer_args(&args(&["run-1", "plan", "please", "hurry"])).unwrap();
+        assert!(!json);
         assert_eq!(
             Method::WorkflowNodeSteer(params),
             Method::WorkflowNodeSteer(WorkflowNodeSteerParams {
@@ -2163,9 +2779,30 @@ mod tests {
         assert!(parse_workflow_node_steer_args(&args(&["run-1", "plan"])).is_err());
     }
 
+    /// A trailing `--json` after at least one text word is the flag, not text.
+    #[test]
+    fn workflow_node_steer_recognizes_trailing_json_flag() {
+        let (params, json) =
+            parse_workflow_node_steer_args(&args(&["run-1", "plan", "hurry", "--json"])).unwrap();
+        assert!(json);
+        assert_eq!(params.text, "hurry");
+    }
+
+    /// With no text word at all, a lone trailing `--json` is kept as the
+    /// (odd but legal) steered text rather than silently eaten as a flag.
+    #[test]
+    fn workflow_node_steer_treats_bare_json_as_text_without_other_words() {
+        let (params, json) =
+            parse_workflow_node_steer_args(&args(&["run-1", "plan", "--json"])).unwrap();
+        assert!(!json);
+        assert_eq!(params.text, "--json");
+    }
+
     #[test]
     fn workflow_node_interrupt_builds_workflow_node_interrupt() {
-        let target = parse_workflow_node_pair_args(&args(&["run-1", "plan"]), "usage").unwrap();
+        let (target, json) =
+            parse_workflow_node_pair_args(&args(&["run-1", "plan"]), "usage").unwrap();
+        assert!(!json);
         assert_eq!(
             Method::WorkflowNodeInterrupt(target),
             Method::WorkflowNodeInterrupt(WorkflowNodeTarget {
@@ -2176,8 +2813,17 @@ mod tests {
     }
 
     #[test]
+    fn workflow_node_interrupt_accepts_json_flag() {
+        let (_, json) =
+            parse_workflow_node_pair_args(&args(&["run-1", "plan", "--json"]), "usage").unwrap();
+        assert!(json);
+    }
+
+    #[test]
     fn workflow_node_restart_builds_workflow_node_restart() {
-        let target = parse_workflow_node_pair_args(&args(&["run-1", "plan"]), "usage").unwrap();
+        let (target, json) =
+            parse_workflow_node_pair_args(&args(&["run-1", "plan"]), "usage").unwrap();
+        assert!(!json);
         assert_eq!(
             Method::WorkflowNodeRestart(target),
             Method::WorkflowNodeRestart(WorkflowNodeTarget {
@@ -2346,6 +2992,153 @@ mod tests {
         let summary = summarize_expand_response(&response);
         assert_eq!(summary.accepted, vec!["plan/worker/1"]);
         assert!(summary.rejected.is_empty());
+    }
+
+    // ── node interrogate ─────────────────────────────────────────────────
+
+    #[test]
+    fn workflow_node_interrogate_defaults_to_resumed_mode() {
+        let (params, json) =
+            parse_workflow_node_interrogate_args(&args(&["run-1", "plan"])).unwrap();
+        assert!(!json);
+        assert_eq!(params.run_id, "run-1");
+        assert_eq!(params.path, "plan");
+        assert_eq!(params.mode, WorkflowInterrogationMode::Resumed);
+        assert_eq!(params.note, None);
+    }
+
+    #[test]
+    fn workflow_node_interrogate_reconstructed_flag_sets_mode() {
+        let (params, _json) =
+            parse_workflow_node_interrogate_args(&args(&["run-1", "plan", "--reconstructed"]))
+                .unwrap();
+        assert_eq!(params.mode, WorkflowInterrogationMode::Reconstructed);
+    }
+
+    #[test]
+    fn workflow_node_interrogate_parses_note_and_json() {
+        let (params, json) = parse_workflow_node_interrogate_args(&args(&[
+            "run-1",
+            "plan",
+            "--note",
+            "why did this fail",
+            "--json",
+        ]))
+        .unwrap();
+        assert!(json);
+        assert_eq!(params.note.as_deref(), Some("why did this fail"));
+    }
+
+    #[test]
+    fn workflow_node_interrogate_requires_run_id_and_path() {
+        assert!(parse_workflow_node_interrogate_args(&args(&["run-1"])).is_err());
+    }
+
+    // ── workflow summary show / list ─────────────────────────────────────
+
+    #[test]
+    fn workflow_summary_show_builds_workflow_summary_get() {
+        let (target, json) = parse_workflow_summary_show_args(&args(&["run-1", "--json"])).unwrap();
+        assert!(json);
+        assert_eq!(
+            Method::WorkflowSummaryGet(target),
+            Method::WorkflowSummaryGet(WorkflowRunTarget {
+                run_id: "run-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_summary_show_requires_run_id() {
+        assert!(parse_workflow_summary_show_args(&args(&[])).is_err());
+    }
+
+    #[test]
+    fn workflow_summary_list_workflow_is_optional() {
+        let (params, json) = parse_workflow_summary_list_args(&args(&[])).unwrap();
+        assert!(!json);
+        assert_eq!(params.workflow_id, None);
+        assert_eq!(params.limit, None);
+    }
+
+    #[test]
+    fn workflow_summary_list_parses_workflow_limit_and_json() {
+        let (params, json) =
+            parse_workflow_summary_list_args(&args(&["ship-feature", "--limit", "5", "--json"]))
+                .unwrap();
+        assert!(json);
+        assert_eq!(params.workflow_id, Some("ship-feature".to_string()));
+        assert_eq!(params.limit, Some(5));
+    }
+
+    #[test]
+    fn workflow_summary_list_rejects_a_second_positional() {
+        assert!(parse_workflow_summary_list_args(&args(&["one", "two"])).is_err());
+    }
+
+    // ── restore report / transcript / restored-from rendering ───────────
+
+    #[test]
+    fn format_restore_report_line_is_none_for_a_non_restoring_run() {
+        assert_eq!(format_restore_report_line(&serde_json::Value::Null), None);
+    }
+
+    /// The plan's own example string
+    /// (`07-phase3-plan.md` §WS-E): `restored: plan, implement · skipped:
+    /// review (definition changed)`.
+    #[test]
+    fn format_restore_report_line_matches_the_plan_example() {
+        let restore = serde_json::json!({
+            "restored": ["plan", "implement"],
+            "skipped": [
+                {"selector": "review", "reason": "definition_changed", "message": "prompt changed"},
+            ],
+        });
+        assert_eq!(
+            format_restore_report_line(&restore).unwrap(),
+            "restored: plan, implement · skipped: review (definition changed)"
+        );
+    }
+
+    #[test]
+    fn format_restore_report_line_reports_an_all_skipped_restore() {
+        let restore = serde_json::json!({
+            "restored": [],
+            "skipped": [
+                {"selector": "plan", "reason": "no_checkpoint", "message": "no checkpoint"},
+            ],
+        });
+        let line = format_restore_report_line(&restore).unwrap();
+        assert!(line.starts_with("skipped:"), "{line}");
+        assert!(!line.contains("restored:"), "{line}");
+    }
+
+    #[test]
+    fn format_node_transcript_line_reports_present_or_absent() {
+        assert_eq!(
+            format_node_transcript_line(&serde_json::json!({"transcript_path": "/tmp/x.jsonl"})),
+            "transcript: present"
+        );
+        assert_eq!(
+            format_node_transcript_line(&serde_json::json!({})),
+            "transcript: absent"
+        );
+    }
+
+    #[test]
+    fn format_node_restored_from_line_names_run_node_and_checkpoint() {
+        let node = serde_json::json!({
+            "restored_from": {
+                "run_id": "run-1",
+                "node_key": "plan",
+                "checkpoint_seq": 3,
+            }
+        });
+        assert_eq!(
+            format_node_restored_from_line(&node).unwrap(),
+            "restored from: run run-1 · node plan · checkpoint #3"
+        );
+        assert_eq!(format_node_restored_from_line(&serde_json::json!({})), None);
     }
 
     // ── growth/rejection lines (run show / node show) ───────────────────
@@ -2576,8 +3369,8 @@ mod tests {
         let (params, _json) = parse_workflow_run_start_args(&args(&["list"])).unwrap();
         assert_eq!(params.workflow_id, "list");
 
-        let params = parse_workflow_run_list_args(&args(&["list"])).unwrap();
-        assert_eq!(params.workflow_id, "list");
+        let (params, _json) = parse_workflow_run_list_args(&args(&["list"])).unwrap();
+        assert_eq!(params.workflow_id, Some("list".to_string()));
 
         let (target, _json) = parse_workflow_show_args(&args(&["list"])).unwrap();
         assert_eq!(target.workflow_id, "list");
@@ -2597,7 +3390,7 @@ mod tests {
                     "unexpected top-level verb {verb}"
                 ),
                 [group, verb] => assert!(
-                    matches!(*group, "run" | "node"),
+                    matches!(*group, "run" | "node" | "summary"),
                     "unexpected verb group {group} for verb {verb}"
                 ),
                 other => panic!("unexpected verb path shape: {other:?}"),

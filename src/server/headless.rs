@@ -4779,6 +4779,7 @@ fn should_auto_install_claude(
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
     init_logging();
+    log_resolved_state_dir();
     crate::platform::raise_server_nofile_limit();
 
     // H1: check this before anything binds. A server spawned by
@@ -5027,6 +5028,17 @@ fn print_ready_message(api_socket: &Path, client_socket: &Path) {
 /// Initialize logging for the server process.
 fn init_logging() {
     crate::logging::init_file_logging("karvex-server.log");
+}
+
+/// Records the session state directory this server resolved to, so a server
+/// started on an overridden socket makes its isolation from the default
+/// session's `session.json` visible instead of silently starting empty.
+fn log_resolved_state_dir() {
+    let api_socket = api::socket_path();
+    let state_dir = crate::session::state_dir_for_socket(&api_socket);
+    let isolated =
+        state_dir != crate::session::data_dir_for(crate::session::active_name().as_deref());
+    crate::logging::server_state_dir_resolved(&state_dir, &api_socket, isolated);
 }
 
 /// H1: both sockets the server binds derive from the same session data
@@ -6762,7 +6774,16 @@ next_tab = ""
                 clear_display_agent: false,
                 clear_state_labels: false,
                 seq: None,
-                ttl: Some(Duration::from_millis(1)),
+                // Large enough that ordinary synchronous test execution
+                // between here and the "not yet expired" assertion below can
+                // never cross it (unlike a 1ms TTL, which raced against real
+                // wall-clock time and flaked under CPU contention). Expiry
+                // itself is still driven deterministically below via an
+                // explicit `deadline + 1ms` argument to
+                // `handle_scheduled_tasks_headless`, not by waiting for this
+                // TTL to actually elapse, so its magnitude doesn't otherwise
+                // matter to what this test verifies.
+                ttl: Some(Duration::from_secs(3600)),
             })
         );
 

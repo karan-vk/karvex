@@ -462,6 +462,8 @@ pub struct KeysConfig {
     pub open_workflow_dag: BindingConfig,
     /// Open the workflow launcher: pick a workflow, fill its arguments, pick a tier, run it. Default: "prefix+f".
     pub open_workflow_launcher: BindingConfig,
+    /// Open the run browser: a list-and-detail overlay over past and pruned runs. Default: "prefix+shift+b".
+    pub open_workflow_runs: BindingConfig,
     /// Optional indexed shortcuts expanded over number keys 1-9.
     pub indexed: IndexedKeysConfig,
     /// Prefix-mode custom command bindings.
@@ -585,6 +587,8 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     open_workflow_launcher: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    open_workflow_runs: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     indexed: Option<IndexedKeysConfig>,
     #[serde(skip_serializing)]
     command: Option<Vec<CommandKeybindConfig>>,
@@ -662,6 +666,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(toggle_sidebar);
         apply_field!(open_workflow_dag);
         apply_field!(open_workflow_launcher);
+        apply_field!(open_workflow_runs);
         apply_field!(indexed);
         apply_field!(command);
 
@@ -762,6 +767,7 @@ impl KeysConfig {
         copy_effective_action_field!(toggle_sidebar, keybinds.toggle_sidebar);
         copy_effective_action_field!(open_workflow_dag, keybinds.open_workflow_dag);
         copy_effective_action_field!(open_workflow_launcher, keybinds.open_workflow_launcher);
+        copy_effective_action_field!(open_workflow_runs, keybinds.open_workflow_runs);
         copy_user_field!(indexed);
 
         profile
@@ -1008,6 +1014,14 @@ pub struct WorkflowConfig {
     /// toward the output schema before a node is re-prompted for goal drift.
     /// Default: 5.
     pub drift_threshold: usize,
+    /// How many of a workflow's most recent run summaries a new run is given as
+    /// context, written to the run's `context/prior-runs.md`. Zero disables the
+    /// injection without disabling summaries themselves. Default: 3.
+    pub history_context_runs: usize,
+    /// Whether a finished run gets an end-of-run summary written by a visible
+    /// summariser node. Off means no summariser node is created at all, not one
+    /// that runs and discards its output. Default: true.
+    pub summary_enabled: bool,
 }
 
 impl Default for KeysConfig {
@@ -1068,6 +1082,7 @@ impl Default for KeysConfig {
             toggle_sidebar: BindingConfig::one("prefix+b"),
             open_workflow_dag: BindingConfig::one("prefix+shift+f"),
             open_workflow_launcher: BindingConfig::one("prefix+f"),
+            open_workflow_runs: BindingConfig::one("prefix+shift+b"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
             user_fields: BTreeSet::new(),
@@ -1210,6 +1225,8 @@ impl Default for WorkflowConfig {
             retention_runs: 50,
             stuck_threshold: 3,
             drift_threshold: 5,
+            history_context_runs: 3,
+            summary_enabled: true,
         }
     }
 }
@@ -1217,6 +1234,101 @@ impl Default for WorkflowConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Turns A10's "collision-checked against the defaults table at build
+    /// time" from an assumption into an actual check (`07-phase3-plan.md`
+    /// erratum E-7): `keys.open_workflow_runs`'s first default,
+    /// `prefix+shift+r`, silently collided with `reload_config` — nothing
+    /// caught it until a human grepped. Every default chord in this table
+    /// must be either unset (`""`, e.g. `last_pane`) or unique; two actions
+    /// sharing a chord means only one of them ever fires.
+    #[test]
+    fn default_keybinds_have_no_duplicate_chords() {
+        let keys = KeysConfig::default();
+        macro_rules! field {
+            ($name:ident) => {
+                (stringify!($name), &keys.$name)
+            };
+        }
+        let fields: Vec<(&'static str, &BindingConfig)> = vec![
+            field!(help),
+            field!(settings),
+            field!(new_workspace),
+            field!(new_worktree),
+            field!(open_worktree),
+            field!(remove_worktree),
+            field!(rename_workspace),
+            field!(close_workspace),
+            field!(workspace_picker),
+            field!(goto),
+            field!(navigate_workspace_up),
+            field!(navigate_workspace_down),
+            field!(navigate_pane_left),
+            field!(navigate_pane_down),
+            field!(navigate_pane_up),
+            field!(navigate_pane_right),
+            field!(detach),
+            field!(reload_config),
+            field!(open_notification_target),
+            field!(previous_workspace),
+            field!(next_workspace),
+            field!(previous_agent),
+            field!(next_agent),
+            field!(focus_agent),
+            field!(new_tab),
+            field!(rename_tab),
+            field!(previous_tab),
+            field!(next_tab),
+            field!(switch_tab),
+            field!(switch_workspace),
+            field!(close_tab),
+            field!(rename_pane),
+            field!(edit_scrollback),
+            field!(copy_mode),
+            field!(focus_pane_left),
+            field!(focus_pane_down),
+            field!(focus_pane_up),
+            field!(focus_pane_right),
+            field!(swap_pane_left),
+            field!(swap_pane_down),
+            field!(swap_pane_up),
+            field!(swap_pane_right),
+            field!(cycle_pane_next),
+            field!(cycle_pane_previous),
+            field!(last_pane),
+            field!(split_vertical),
+            field!(split_horizontal),
+            field!(close_pane),
+            field!(zoom),
+            field!(resize_mode),
+            field!(toggle_sidebar),
+            field!(open_workflow_dag),
+            field!(open_workflow_launcher),
+            field!(open_workflow_runs),
+        ];
+
+        let mut seen: std::collections::HashMap<String, &'static str> =
+            std::collections::HashMap::new();
+        for (name, binding) in fields {
+            let values: Vec<&str> = match binding {
+                BindingConfig::One(value) => vec![value.as_str()],
+                BindingConfig::Many(values) => values.iter().map(String::as_str).collect(),
+            };
+            for value in values {
+                let value = value.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                if let Some(existing) = seen.insert(value.to_string(), name) {
+                    panic!(
+                        "default keybind chord {value:?} is used by both \
+                         {existing:?} and {name:?} — two actions cannot share \
+                         a default chord"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {

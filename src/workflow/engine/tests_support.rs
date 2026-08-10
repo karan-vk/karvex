@@ -6,8 +6,8 @@
 use crate::workflow::model::{
     ArgSpec, Condition, Demand, EdgeKind, EdgePayload, Evidence, GrowthLimits, InstancePath, Kvdag,
     KvdagEdge, KvdagNode, KvdagSpec, KvdagVersionId, NodeKey, NodeResult, NodeStatus, NodeUsage,
-    OutputSchema, ProgressTracker, RunEdge, RunGraph, RunId, RunNode, RunNodeIdx, RunStatus,
-    Runner, WorkflowId,
+    OutputSchema, ProgressTracker, RestoredRef, RestoredSeed, RunEdge, RunGraph, RunId, RunNode,
+    RunNodeIdx, RunStatus, Runner, WorkflowId,
 };
 use crate::workflow::tier::{self, Tier};
 
@@ -103,6 +103,7 @@ pub fn graph_of(nodes: &[TestNode], edges: &[TestEdge]) -> RunGraph {
                 progress: ProgressTracker::default(),
                 succession: None,
                 checkpoint_seq: 0,
+                restored_from: None,
             })
             .collect(),
         edges: edges
@@ -120,6 +121,7 @@ pub fn graph_of(nodes: &[TestNode], edges: &[TestEdge]) -> RunGraph {
             .collect(),
         status: RunStatus::Pending,
         seq: 0,
+        epilogue: None,
     }
 }
 
@@ -171,6 +173,27 @@ pub fn set_result(graph: &mut RunGraph, key: &str, payload: serde_json::Value) {
         evidence: Evidence::SelfReport,
         payload,
     });
+}
+
+/// A checkpoint seed for `key`, as `workflow.run --restore-from` would hand one
+/// to [`RunGraph::materialise_with_restored`].
+///
+/// The digest is the **source** run's, verbatim — that is the whole point of
+/// restore compatibility, so the fixture computes it the way the source run
+/// would rather than inventing a placeholder.
+pub fn restored_seed(key: &str, payload: serde_json::Value) -> RestoredSeed {
+    RestoredSeed {
+        node_key: NodeKey::new(key),
+        summary: format!("{key} was restored from an earlier run"),
+        artifact_paths: Vec::new(),
+        digest: crate::workflow::engine::complete::digest(&payload),
+        payload,
+        source: RestoredRef {
+            run: RunId::new("workflow_run:source"),
+            node_key: NodeKey::new(key),
+            checkpoint_seq: 1,
+        },
+    }
 }
 
 pub fn spec_node(node: &TestNode) -> KvdagNode {

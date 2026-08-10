@@ -267,6 +267,12 @@ pub enum Method {
     WorkflowNodeExpand(WorkflowNodeExpandParams),
     #[serde(rename = "workflow.node.restart")]
     WorkflowNodeRestart(WorkflowNodeTarget),
+    #[serde(rename = "workflow.node.interrogate")]
+    WorkflowNodeInterrogate(WorkflowNodeInterrogateParams),
+    #[serde(rename = "workflow.summary.get")]
+    WorkflowSummaryGet(WorkflowRunTarget),
+    #[serde(rename = "workflow.summary.list")]
+    WorkflowSummaryList(WorkflowSummaryListParams),
 }
 
 #[cfg(test)]

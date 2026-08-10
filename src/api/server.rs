@@ -452,6 +452,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorkflowNodeReport(_) => "workflow.node.report",
         Method::WorkflowNodeExpand(_) => "workflow.node.expand",
         Method::WorkflowNodeRestart(_) => "workflow.node.restart",
+        Method::WorkflowNodeInterrogate(_) => "workflow.node.interrogate",
+        Method::WorkflowSummaryGet(_) => "workflow.summary.get",
+        Method::WorkflowSummaryList(_) => "workflow.summary.list",
     }
 }
 

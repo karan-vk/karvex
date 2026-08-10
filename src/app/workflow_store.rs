@@ -225,7 +225,7 @@ impl WorkflowStoreHandle {
     /// developer's real database.
     #[cfg(test)]
     pub(crate) fn in_memory() -> Self {
-        match Self::spawn(StoreLocation::Memory) {
+        match Self::spawn(StoreLocation::Memory, unix_now_ms()) {
             Ok(worker) => Self {
                 state: HandleState::Open(worker),
             },
@@ -254,7 +254,12 @@ impl WorkflowStoreHandle {
 
     fn open(&mut self) -> Result<&StoreWorker, StoreUnavailable> {
         if let HandleState::Unopened = self.state {
-            self.state = match Self::spawn(WorkflowStore::default_location()) {
+            // §4 D13: the orphan sweep's clock is read **here**, on the app
+            // thread, and handed to the store — never `time::now()` inside the
+            // query. Minting it in the database would reintroduce the
+            // store-flush second clock that migration `0002` killed for
+            // `started_at` and that §4 D14 kills for the journal.
+            self.state = match Self::spawn(WorkflowStore::default_location(), unix_now_ms()) {
                 Ok(worker) => HandleState::Open(worker),
                 Err(unavailable) => {
                     warn!(
@@ -275,12 +280,15 @@ impl WorkflowStoreHandle {
         }
     }
 
-    fn spawn(location: StoreLocation) -> Result<StoreWorker, StoreUnavailable> {
+    fn spawn(
+        location: StoreLocation,
+        opened_at_unix_ms: u64,
+    ) -> Result<StoreWorker, StoreUnavailable> {
         let (jobs_tx, jobs_rx) = channel::<StoreJob>();
         let (ready_tx, ready_rx) = channel::<Result<(), StoreUnavailable>>();
         let thread = std::thread::Builder::new()
             .name("karvex-workflow-store".to_string())
-            .spawn(move || worker_main(location, &ready_tx, &jobs_rx))
+            .spawn(move || worker_main(location, opened_at_unix_ms, &ready_tx, &jobs_rx))
             .map_err(|error| StoreUnavailable {
                 code: crate::workflow::store::error::WORKFLOW_STORE_ERROR_CODE,
                 message: format!("the workflow store thread could not be started: {error}"),
@@ -307,8 +315,18 @@ impl WorkflowStoreHandle {
     }
 }
 
+/// Wall-clock now, in milliseconds, read on the **app** thread.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 fn worker_main(
     location: StoreLocation,
+    opened_at_unix_ms: u64,
     ready: &Sender<Result<(), StoreUnavailable>>,
     jobs: &Receiver<StoreJob>,
 ) {
@@ -334,6 +352,31 @@ fn worker_main(
         }
     };
     debug!(location = ?store.location(), "workflow store opened");
+    // §4 D13 / §7 R-5: a run left `running` by a server that died stays
+    // `running` forever — there is no engine rehydration, and Phase 3's run
+    // browser would show it as live on screen. Sweeping them to
+    // `failed { reason: "interrupted" }` here is honest, terminal, and lets
+    // retention, `node_history`, and the browser treat them consistently; the
+    // recovery on offer is checkpoint restore into a new run, which is exactly
+    // what this phase ships.
+    //
+    // **Once per open, before the ready signal** — so it is before any read,
+    // and no caller can observe the pre-sweep state. Safe because the store's
+    // exclusive `LOCK` guarantees no other server is executing those runs, and
+    // this server opens the store before it can start one.
+    match runtime.block_on(store.mark_interrupted_runs(opened_at_unix_ms)) {
+        Ok(0) => {}
+        Ok(swept) => {
+            warn!(
+                runs = swept,
+                "marked runs left non-terminal by a previous server as failed/interrupted"
+            );
+        }
+        // A failed sweep is not a failed open: the runs it would have corrected
+        // are stale rows, and refusing the whole subsystem over them would take
+        // workflows out of service for a cosmetic inconsistency.
+        Err(error) => warn!(error = %error, "the interrupted-run sweep failed"),
+    }
     if ready.send(Ok(())).is_err() {
         return;
     }

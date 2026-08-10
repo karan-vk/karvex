@@ -26,6 +26,7 @@ mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
 pub(crate) mod workflow;
+mod workflow_history;
 #[cfg(feature = "workflow")]
 pub(crate) mod workflow_store;
 mod worktrees;
@@ -608,6 +609,7 @@ impl App {
                 split_borders: Vec::new(),
                 dag: state::DagViewState::default(),
                 workflow_launch: state::WorkflowLaunchState::default(),
+                workflow_runs: state::WorkflowRunsState::default(),
             },
             drag: None,
             workspace_press: None,
@@ -707,6 +709,7 @@ impl App {
             terminal_runtime_shutdowns: Vec::new(),
             run_graph: None,
             run_presentation: state::WorkflowRunPresentation::default(),
+            historical_run: None,
         };
 
         state.terminals = restored_terminals;
@@ -803,7 +806,13 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
-            workflow: workflow::WorkflowRuntimeState::new(workflow::engine_config(config)),
+            workflow: {
+                // One reading of the environment for both halves (defect D-1,
+                // E-11): calling `engine_config` and `workflow_policy`
+                // separately would read `KARVEX_WORKFLOW_SUMMARY_COMMAND` twice.
+                let (engine, policy) = workflow::workflow_runtime_config(config);
+                workflow::WorkflowRuntimeState::new(engine, policy)
+            },
             #[cfg(feature = "workflow")]
             workflow_store: workflow_store::WorkflowStoreHandle::default(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
@@ -1933,6 +1942,9 @@ impl App {
             }
             Mode::WorkflowLaunch => {
                 self.handle_workflow_launch_key(key_event);
+            }
+            Mode::WorkflowRuns => {
+                self.handle_workflow_runs_key(key_event);
             }
             Mode::Terminal => {
                 // Should not be called in terminal mode.

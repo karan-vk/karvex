@@ -67,6 +67,17 @@ pub struct SpecDigest(pub String);
 #[serde(transparent)]
 pub struct PublicPaneId(pub String);
 
+/// Identity of one interrogation of a finished node's agent session.
+///
+/// An interrogation is **not** a run node (`07-phase3-plan.md` §4 D8): it has
+/// its own table, its own lifecycle, and no node token. This is the id the
+/// store row is created under, allocated by the app at spawn time so the
+/// `InterrogationStarted` write and the later `InterrogationUpdate` address the
+/// same record without a read-back.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InterrogationId(pub String);
+
 macro_rules! impl_string_id {
     ($($ty:ident),* $(,)?) => {
         $(
@@ -98,7 +109,30 @@ impl_string_id!(
     NodeToken,
     SpecDigest,
     PublicPaneId,
+    InterrogationId,
 );
+
+// ── reserved namespace ──────────────────────────────────────────────────────
+
+/// Instance paths beginning with this are karvex-owned, never author-owned
+/// (`07-phase3-plan.md` §3 rule 3). [`Kvdag::try_new`] rejects an authored node
+/// key that starts with it, which is what guarantees the engine's epilogue node
+/// can never collide with a user node — in a selector namespace, in a run
+/// counter, or on disk.
+pub const RESERVED_PATH_PREFIX: &str = ".";
+
+/// The engine-owned end-of-run summariser's instance path (`07-phase3-plan.md`
+/// §4 D5). It is a real `run_node` row so the summary's `generated_by` resolves
+/// and the DAG view shows it, but it is excluded from `nodes_total`/`nodes_done`
+/// and from growth accounting, and it has no kvdag node behind it.
+pub const SUMMARY_INSTANCE_PATH: &str = ".summary";
+
+/// Whether an instance path names an engine-owned node rather than a node the
+/// author declared. The one predicate every counter, selector, and sweep filters
+/// on, so the rule lives in exactly one place.
+pub fn is_reserved_path(path: &str) -> bool {
+    path.starts_with(RESERVED_PATH_PREFIX)
+}
 
 // ── definition (immutable, one per kvdag_version) ───────────────────────────
 
@@ -142,8 +176,19 @@ impl GrowthLimits {
     /// could fan out indefinitely by failing and the ceiling would stop being a
     /// ceiling. Saturates rather than wrapping, so an absurd graph reports
     /// "full" instead of "empty".
+    ///
+    /// **Engine-owned nodes do not count** (`07-phase3-plan.md` §4 D5).
+    /// `max_nodes` governs *expansion proposals* — what the run's own graph is
+    /// allowed to grow into — and the `.summary` epilogue is karvex's, not the
+    /// run's. Counting it would let the run's budget be spent by a node the
+    /// author never declared and cannot remove, and would make the wire's
+    /// `nodes_live` report one more node than the run has.
     pub fn live_node_count(nodes: &[RunNode]) -> u16 {
-        u16::try_from(nodes.len()).unwrap_or(u16::MAX)
+        let counted = nodes
+            .iter()
+            .filter(|node| !is_reserved_path(node.path.as_str()))
+            .count();
+        u16::try_from(counted).unwrap_or(u16::MAX)
     }
 
     /// Whether one more node still fits under `max_nodes`.
@@ -547,6 +592,14 @@ impl Kvdag {
 
         let mut by_key: HashMap<&str, &KvdagNode> = HashMap::with_capacity(nodes.len());
         for node in &nodes {
+            // The reserved namespace is karvex's, from Phase 3 on: engine-owned
+            // nodes live under `.`-prefixed instance paths, and an authored key
+            // that could produce one would collide with them
+            // (`07-phase3-plan.md` §3 rule 3, §6 A3). Only new definitions are
+            // checked — stored versions are read back, never re-validated.
+            if is_reserved_path(node.key.as_str()) {
+                return Err(KvdagError::ReservedNodeKey(node.key.clone()));
+            }
             if by_key.insert(node.key.as_str(), node).is_some() {
                 return Err(KvdagError::DuplicateNodeKey(node.key.clone()));
             }
@@ -849,6 +902,34 @@ impl fmt::Display for PlaceholderError {
     }
 }
 
+/// A JSON value with every object's keys in sorted order, recursively.
+///
+/// The one canonicaliser in the tree: node-result digests
+/// (`engine::complete`) and the cross-version restore compatibility digests
+/// (`07-phase3-plan.md` §3 rule 5) must agree byte for byte, so both read this
+/// function rather than each other's. It lives here because the store computes
+/// the restore digests and must not depend on `engine/` internals; `complete.rs`
+/// keeps a re-export so its own call sites read unchanged.
+pub fn canonical(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            let mut sorted = serde_json::Map::with_capacity(keys.len());
+            for key in keys {
+                if let Some(entry) = map.get(key) {
+                    sorted.insert(key.clone(), canonical(entry));
+                }
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// SHA-256 over a canonical rendering of the nodes and edges: both are sorted
 /// and every JSON object key is emitted in sorted order, so the digest depends
 /// on the graph and not on authoring order or on which serde features other
@@ -920,6 +1001,9 @@ fn canonical_value(value: &serde_json::Value, out: &mut String) {
 pub enum KvdagError {
     EmptyGraph,
     DuplicateNodeKey(NodeKey),
+    /// The key starts with [`RESERVED_PATH_PREFIX`], which names the engine's
+    /// own namespace.
+    ReservedNodeKey(NodeKey),
     DuplicateArg(String),
     UnknownEdgeEndpoint {
         from: NodeKey,
@@ -964,6 +1048,10 @@ impl fmt::Display for KvdagError {
         match self {
             Self::EmptyGraph => f.write_str("a kvdag needs at least one node"),
             Self::DuplicateNodeKey(key) => write!(f, "duplicate node key \"{key}\""),
+            Self::ReservedNodeKey(key) => write!(
+                f,
+                "node key \"{key}\" starts with \"{RESERVED_PATH_PREFIX}\", which is reserved for karvex-owned nodes"
+            ),
             Self::DuplicateArg(name) => write!(f, "duplicate run argument \"{name}\""),
             Self::UnknownEdgeEndpoint { from, to, missing } => write!(
                 f,
@@ -1102,6 +1190,88 @@ pub struct NodeResult {
     pub evidence: Evidence,
 }
 
+/// Where a restored node's result came from: the source run, the node key it
+/// ran under there, and which of that node's checkpoints was taken.
+///
+/// The pure-layer mirror of the `run_node.restored_from` column. The store maps
+/// it to the source checkpoint's record id at write time and back to this shape
+/// at read time; the engine never sees a database id
+/// (`07-phase3-plan.md` §1 WS-A, §4 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredRef {
+    pub run: RunId,
+    pub node_key: NodeKey,
+    /// Per-node checkpoint counter in the **source** run, matching
+    /// [`RunNode::checkpoint_seq`]'s semantics there.
+    pub checkpoint_seq: u64,
+}
+
+/// One node's restored result, as handed to
+/// [`RunGraph::materialise_with_restored`].
+///
+/// Restore is materialisation, never an engine input (`07-phase3-plan.md`
+/// §4 D3): a restored node is a fact about how the run *begins*, so there is no
+/// window in which it is `Pending` and no second transition path into
+/// [`NodeStatus::Restored`] for the invariants to cover.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredSeed {
+    /// The **target** version's node key this seed satisfies. Compatibility
+    /// with the source is decided by the caller (§4 D11) before the seed exists.
+    pub node_key: NodeKey,
+    pub payload: serde_json::Value,
+    pub summary: String,
+    pub artifact_paths: Vec<String>,
+    pub digest: String,
+    pub source: RestoredRef,
+}
+
+/// How far the engine-owned end-of-run summariser has got.
+///
+/// `GaveUp` is terminal and deliberately unremarkable: every failure mode of the
+/// epilogue converges on it — schema-invalid twice, spawn failure, pane death,
+/// cancel — and none of them touches the run's status (`07-phase3-plan.md`
+/// §4 D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpiloguePhase {
+    Pending,
+    Running,
+    Done,
+    GaveUp,
+}
+
+impl EpiloguePhase {
+    /// Whether the engine still needs ticks to drive the summariser. The app's
+    /// liveness disjunct reads this through `Engine::epilogue_pending`.
+    pub fn is_pending(self) -> bool {
+        matches!(self, Self::Pending | Self::Running)
+    }
+}
+
+/// The summariser node the engine appends *after* the user graph's terminal
+/// status is decided.
+///
+/// It is outside `run_terminal_ready`'s conjunction by construction: a
+/// summariser inside it wedges failed runs, because a `Failed` leaf never
+/// resolves its outbound edge (`07-phase3-plan.md` §0.7, §4 D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpilogueState {
+    pub node: RunNodeIdx,
+    pub phase: EpiloguePhase,
+    /// How the summariser is actually bound, decided once when the epilogue is
+    /// appended (`07-phase3-plan.md` §4 D2, as amended by defect D-1).
+    ///
+    /// The epilogue has no kvdag node, so the engine cannot derive this the way
+    /// it derives every other node's runner — and the default it *would* fall
+    /// back to is `Agent`, which lies whenever
+    /// `KARVEX_WORKFLOW_SUMMARY_COMMAND` binds the summariser to a script. That
+    /// lie is not cosmetic: it decides whether sustained-idle detection is an
+    /// admissible completion signal, and therefore whether karvex would type a
+    /// seed prompt into what is really a shell pane. Recording the truth here
+    /// is what keeps `Engine::runner_of` honest for the reserved path.
+    pub runner: Runner,
+}
+
 /// `total_tokens` and `tool_uses` only ever advance through
 /// `EngineInput::ProgressObserved`, which is documented (`04-kvdag-and-execution.md`
 /// §6.1) to be fed by a tail of the node's transcript JSONL. That transcript-tail
@@ -1226,6 +1396,14 @@ pub struct RunNode {
     /// (`03-storage-schema.md` §4.3), so this is deliberately *not* the run's
     /// journal cursor — two nodes' first checkpoints are both `seq = 1`.
     pub checkpoint_seq: u64,
+    /// Set only on a node seeded by [`RunGraph::materialise_with_restored`];
+    /// `None` for every node this run actually executed.
+    ///
+    /// A restored node's own timestamps are the **restore instant**, not the
+    /// source run's (`07-phase3-plan.md` §4 D4) — copying them would make the
+    /// new run's timeline claim a node finished before its run started — so
+    /// this is the only place its provenance lives.
+    pub restored_from: Option<RestoredRef>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1263,6 +1441,16 @@ pub struct RunGraph {
     pub status: RunStatus,
     /// Journal cursor.
     pub seq: u64,
+    /// The engine-owned summariser, appended by `finish` once the user graph's
+    /// terminal status is decided and `None` until then (and forever, for a
+    /// cancelled run or a run with `summary_enabled: false`).
+    ///
+    /// Deliberately not a node like any other: `RunGraph.nodes` holds its
+    /// `RunNode` so the DAG view and `run_summary.generated_by` can reach it,
+    /// but the run's status is already final when it appears, so `finish` is
+    /// never re-entered on its account and the counters exclude it
+    /// (`07-phase3-plan.md` §4 D1, D5).
+    pub epilogue: Option<EpilogueState>,
 }
 
 impl RunGraph {
@@ -1320,6 +1508,10 @@ pub enum RunEventKind {
     Checkpoint,
     Succession,
     Error,
+    /// The end-of-run summary landed. Exists for replay and audit; the read path
+    /// for summaries is the `run_summary` row, never this payload
+    /// (`07-phase3-plan.md` §4 D10).
+    Summary,
 }
 
 impl RunEventKind {
@@ -1345,6 +1537,7 @@ impl RunEventKind {
             Self::Checkpoint => "checkpoint",
             Self::Succession => "succession",
             Self::Error => "error",
+            Self::Summary => "summary",
         }
     }
 }
@@ -1396,6 +1589,16 @@ pub enum StoreWrite {
         kind: RunEventKind,
         path: Option<InstancePath>,
         payload: serde_json::Value,
+        /// When the event happened, stamped by the producer.
+        ///
+        /// Not by the store: `run_event.at` used to be minted by
+        /// `DEFAULT time::now()` when the queued write was finally applied, so
+        /// every journal-derived timestamp drifted from the live one by the
+        /// write-queue latency — unboundedly under backlog. The same
+        /// second-clock defect migration `0002` killed for
+        /// `workflow_run.started_at`, applied to the journal
+        /// (`07-phase3-plan.md` §0.6b, §4 D14).
+        at_unix_ms: u64,
     },
     RunStatus {
         run: RunId,
@@ -1419,6 +1622,10 @@ pub enum StoreWrite {
         succession: Option<Succession>,
         started_at_unix_ms: Option<u64>,
         ended_at_unix_ms: Option<u64>,
+        /// [`RunNode::restored_from`]. The store resolves it to the source
+        /// checkpoint's record id; a checkpoint pruned away between restore and
+        /// write decodes back as `None` rather than failing the write.
+        restored_from: Option<RestoredRef>,
     },
     /// A node that did not exist when the run started: an expansion child
     /// (`06-phase2-plan.md` §4 D7).
@@ -1504,6 +1711,79 @@ pub enum StoreWrite {
         artifact_paths: Vec<String>,
         digest: String,
     },
+    /// The end-of-run summary the epilogue produced, validated against
+    /// [`crate::workflow::engine::summary_output_schema`] before it is enqueued.
+    ///
+    /// `run_summary` is the one never-pruned table: a pruned run leaves its
+    /// summary behind, which is exactly the row the run browser most needs
+    /// (`03-storage-schema.md` §9, `07-phase3-plan.md` §4 D9).
+    RunSummary {
+        run: RunId,
+        /// The version the run executed. Carried explicitly because the
+        /// summary outlives its run row, and `kvdag_version` is what a
+        /// per-workflow listing can still filter on afterwards.
+        kvdag_version: KvdagVersionId,
+        text: String,
+        outcome: String,
+        highlights: Vec<String>,
+        open_gaps: Vec<String>,
+        per_node: Vec<SummaryNodeLine>,
+        token_estimate: u32,
+        /// The `.summary` node that wrote it, resolved by the store to a
+        /// `run_node` id. `None` is tolerated — a summary without a resolvable
+        /// producer is still a summary.
+        generated_by_path: Option<InstancePath>,
+    },
+    /// A past node's session was revived in a pane
+    /// (`--resume --fork-session`, or a reconstructed stand-in).
+    ///
+    /// A create, so the app's bounded `pending_writes` queue must never evict
+    /// it — the later [`StoreWrite::InterrogationUpdate`] addresses this row by
+    /// id and would have nothing to update (`07-phase3-plan.md` §3 rule 4).
+    InterrogationStarted {
+        id: InterrogationId,
+        run: RunId,
+        /// The **source** node being interrogated. An interrogation is not a
+        /// run node itself (§4 D8).
+        path: InstancePath,
+        source_session_id: String,
+        /// `None` until the fork's id is known: it is pre-assignable only if
+        /// `--session-id` combines with `--resume --fork-session`, and
+        /// otherwise arrives later through the pane's session report (§4 D7).
+        forked_session_id: Option<String>,
+        transcript_path: Option<String>,
+        cwd: String,
+        pane_id: PublicPaneId,
+        /// `true` for the degraded path: a fresh agent seeded from stored
+        /// outputs, which must never be presented as the original session.
+        reconstructed: bool,
+        /// Which checkpoint the reconstructed seed was built from; `None` for a
+        /// real fork.
+        seeded_from_seq: Option<u64>,
+        note: String,
+        started_at_unix_ms: u64,
+    },
+    /// The two things learned about an interrogation after its record exists:
+    /// the forked session id, and the moment its pane went away. One shape for
+    /// both, because either can be the only thing that ever changes (§4 D7).
+    InterrogationUpdate {
+        id: InterrogationId,
+        forked_session_id: Option<String>,
+        ended_at_unix_ms: Option<u64>,
+    },
+}
+
+/// One node's line in a run summary: what the summariser concluded about it.
+///
+/// `node_key` is a `String`, not a [`NodeKey`], on purpose: it is free text an
+/// agent wrote, and typing it as a key would imply a validation that never
+/// happens. Renderers match it against real nodes best-effort and fall back to
+/// printing it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryNodeLine {
+    pub node_key: String,
+    pub verdict: String,
+    pub one_liner: String,
 }
 
 /// The engine-side event; `src/app/api/workflows.rs` converts it to the wire
@@ -1557,6 +1837,39 @@ pub enum WorkflowEvent {
         accepted: u16,
         message: String,
     },
+    /// The epilogue's summary was accepted and enqueued.
+    ///
+    /// Carries the run and nothing else, deliberately: the app-side emitter
+    /// re-reads the stored summary and publishes the full
+    /// `workflow.run.summarized` from that one row, exactly as
+    /// [`WorkflowEvent::NodeUpdated`] works today. A `text_len`/`outcome` pair
+    /// rode here at first and was never read — the emitter always preferred the
+    /// durable row — and two descriptions of one summary is how the event and
+    /// the row drift apart. What the summariser actually wrote is journalled
+    /// under [`RunEventKind::Summary`] for replay and audit. There is no second
+    /// `RunFinished` and no `RunUpdated`: the run's status was final before the
+    /// summariser started (`07-phase3-plan.md` §4 D1).
+    RunSummarized {
+        run: RunId,
+    },
+    // No interrogation variants. Step 1a landed `InterrogationStarted`/
+    // `InterrogationEnded` here because §1 WS-A read as though the app-side
+    // emitter would re-read an interrogation projection the way it re-reads a
+    // node's — but that premise is false against the tree, so both were removed
+    // as unconstructable vocabulary.
+    //
+    // An interrogation is not a run node anywhere (§4 D8): it has no `RunGraph`
+    // entry and no engine state at all, so the engine can never produce such an
+    // effect and `emit_workflow_event` would have nothing to re-read. Nor could
+    // the variants carry the projection themselves — `WorkflowInterrogationInfo`
+    // needs the session ids, pane, cwd, transcript path and both stamps, and
+    // widening these to hold it would make this module depend on
+    // `api::schema`, which the pure-layer rule forbids. The app therefore emits
+    // both envelopes directly at its two call sites through one shared mapper.
+    //
+    // Leaving them would have been an invitation: the natural reading of a dead
+    // variant is "wire this up", and the two ways to do that are duplicate
+    // emission or a dependency this layer must not have.
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1763,6 +2076,116 @@ mod tests {
         assert!(left < join);
         assert_eq!(kvdag.spec_digest.as_str().len(), 64);
         assert_eq!(kvdag.roots().count(), 1);
+    }
+
+    /// §3 rule 3 / §6 A3: the `.` namespace is karvex's from Phase 3 on, so the
+    /// engine's `.summary` epilogue node can never collide with an authored one
+    /// — in a restore selector, in a counter, or on disk. Only new definitions
+    /// are checked; stored versions are read back unvalidated.
+    #[test]
+    fn a_node_key_in_the_reserved_namespace_is_rejected() {
+        let mut spec = diamond();
+        spec.nodes.push(node(".summary", "Summarise {{goal}}"));
+        assert_eq!(
+            Kvdag::try_new(spec),
+            Err(KvdagError::ReservedNodeKey(NodeKey::new(".summary")))
+        );
+
+        // The rule is the prefix, not the one reserved path.
+        let mut spec = diamond();
+        spec.nodes
+            .push(node(".anything", "Anything about {{goal}}"));
+        assert_eq!(
+            Kvdag::try_new(spec),
+            Err(KvdagError::ReservedNodeKey(NodeKey::new(".anything")))
+        );
+
+        // A dot anywhere but the front is still an ordinary key.
+        let mut spec = diamond();
+        spec.nodes
+            .push(node("plan.v2", "More planning for {{goal}}"));
+        spec.edges.push(edge("plan", "plan.v2", None));
+        assert!(Kvdag::try_new(spec).is_ok());
+    }
+
+    /// The engine's reserved path is inside the namespace the check defends, so
+    /// the two constants can never drift apart.
+    #[test]
+    fn the_summary_path_is_reserved() {
+        assert!(is_reserved_path(SUMMARY_INSTANCE_PATH));
+        assert!(!is_reserved_path("plan"));
+        assert!(!is_reserved_path("research/2/verify"));
+    }
+
+    /// §4 D5: `max_nodes` governs what the *run's* graph may grow into, and the
+    /// epilogue is karvex's node, not the run's. Counting it would spend the
+    /// author's budget on a node they never declared and cannot remove.
+    #[test]
+    fn the_growth_budget_does_not_count_engine_owned_nodes() {
+        let authored = |path: &str| RunNode {
+            idx: RunNodeIdx(0),
+            key: NodeKey::new(path),
+            path: InstancePath::new(path),
+            label: String::new(),
+            inputs: BTreeMap::new(),
+            parent: None,
+            depth: 0,
+            status: NodeStatus::Succeeded,
+            assignment: Assignment {
+                model: ModelAlias::Sonnet,
+                effort: Effort::Low,
+            },
+            assignment_reason: String::new(),
+            attempt: 1,
+            binding: None,
+            result: None,
+            usage: NodeUsage::default(),
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+            progress: ProgressTracker::default(),
+            succession: None,
+            checkpoint_seq: 0,
+            restored_from: None,
+        };
+        let nodes = vec![
+            authored("plan"),
+            authored("implement"),
+            authored(SUMMARY_INSTANCE_PATH),
+        ];
+
+        assert_eq!(
+            GrowthLimits::live_node_count(&nodes),
+            2,
+            "the summariser is not one of the run's declared nodes"
+        );
+        let limits = GrowthLimits {
+            max_depth: 3,
+            max_nodes: 3,
+        };
+        assert!(
+            limits.has_node_budget(&nodes),
+            "a run at its ceiling is not pushed over it by its own epilogue"
+        );
+    }
+
+    /// `canonical` is the single canonicaliser both the result digest and the
+    /// cross-version restore digests read (§3 rule 5), so key order in the input
+    /// must never reach the output.
+    #[test]
+    fn canonical_sorts_object_keys_at_every_depth() {
+        let left = serde_json::json!({
+            "b": 1,
+            "a": { "z": [ { "y": 2, "x": 3 } ], "w": 4 },
+        });
+        let right = serde_json::json!({
+            "a": { "w": 4, "z": [ { "x": 3, "y": 2 } ] },
+            "b": 1,
+        });
+        assert_eq!(canonical(&left).to_string(), canonical(&right).to_string());
+        assert_eq!(
+            canonical(&left).to_string(),
+            r#"{"a":{"w":4,"z":[{"x":3,"y":2}]},"b":1}"#
+        );
     }
 
     #[test]

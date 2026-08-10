@@ -48,6 +48,7 @@ mod settings;
 mod sidebar;
 mod terminal;
 mod workflow_launch;
+mod workflow_runs;
 
 pub(crate) use self::{
     lease::{ConsumedInputLease, ForwardedInputLease, InputLeaseKey, InputLeaseTable, RepeatPlan},
@@ -71,6 +72,7 @@ use self::{
 };
 use super::state::{AppState, Mode};
 use super::App;
+use crate::api::schema::WorkflowInterrogationMode;
 use crate::ui::DagNavDirection;
 
 // ---------------------------------------------------------------------------
@@ -122,6 +124,7 @@ impl App {
                 }
                 Mode::WorkflowDag => self.handle_workflow_dag_key(key_event),
                 Mode::WorkflowLaunch => self.handle_workflow_launch_key(key_event),
+                Mode::WorkflowRuns => self.handle_workflow_runs_key(key_event),
                 Mode::Terminal => unreachable!(),
             },
         }
@@ -258,6 +261,7 @@ impl App {
             Mode::WorkflowLaunch => {
                 workflow_launch::insert_workflow_launch_text(&mut self.state, text)
             }
+            Mode::WorkflowRuns => workflow_runs::insert_workflow_runs_text(&mut self.state, text),
             Mode::Copy => {
                 let Some(prompt) = self
                     .state
@@ -300,10 +304,20 @@ impl App {
             }
             KeyCode::Enter => self.focus_workflow_dag_node(),
             KeyCode::Char('s') => self.open_workflow_dag_steer(),
+            // `i` resumes the source session; `Shift+I` reconstructs one from
+            // the stored checkpoint. Two keys, not one key twice: escalation
+            // into a session that is *not* the original teammate is always an
+            // explicit choice (`00-overview.md` Feature 3).
+            KeyCode::Char('i') => {
+                self.interrogate_workflow_dag_node(WorkflowInterrogationMode::Resumed)
+            }
+            KeyCode::Char('I') => {
+                self.interrogate_workflow_dag_node(WorkflowInterrogationMode::Reconstructed)
+            }
             _ => {
                 if let Some(ModalAction::Close) = modal_action_from_key(&key, WORKFLOW_DAG_ACTIONS)
                 {
-                    leave_modal(&mut self.state);
+                    self.leave_workflow_dag();
                 }
             }
         }
@@ -344,6 +358,22 @@ impl App {
 
     fn open_workflow_dag_steer(&mut self) {
         if self.state.view.dag.run_id.is_empty() {
+            return;
+        }
+        // A past run is not the active run, so the server would answer the
+        // not-the-active-run guard (`workflow_run_not_active`) — *not*
+        // `workflow_run_closed`, which covers only the just-finished run that
+        // is still active (`07-phase3-plan.md` §1 WS-H). Saying so here spends
+        // no round trip and gets the reason right; opening a line that can
+        // only ever be refused is the same swallowed-text failure the
+        // no-pane check below exists to prevent.
+        if self.state.view.dag.historical {
+            self.show_workflow_notice(crate::workflow::model::UserNotice {
+                level: crate::workflow::model::NoticeLevel::Warning,
+                run: None,
+                path: None,
+                message: crate::app::workflow_history::historical_steer_refusal(),
+            });
             return;
         }
         let Some(node) = self.state.view.dag.selected_node() else {
@@ -407,6 +437,74 @@ impl App {
         }
     }
 
+    /// Interrogates the selected node: `workflow.node.interrogate` in-process,
+    /// in the mode the pressed key chose (`07-phase3-plan.md` §1 WS-H, as
+    /// amended: `i` resumes, `Shift+I` reconstructs).
+    ///
+    /// The decision and the answer-classification are pure functions in
+    /// `app/workflow_history.rs`; this is only the dispatch and the notice.
+    fn interrogate_workflow_dag_node(&mut self, mode: WorkflowInterrogationMode) {
+        use crate::app::workflow_history::{
+            interrogate_intent, interrogate_outcome, InterrogateIntent, InterrogateOutcome,
+        };
+
+        let intent = interrogate_intent(&self.state.view.dag, mode);
+        let InterrogateIntent::Send { run_id, path, mode } = intent else {
+            return;
+        };
+        let response = self.dispatch_runtime_mutation(
+            "tui.workflow.node.interrogate",
+            crate::api::schema::Method::WorkflowNodeInterrogate(
+                crate::api::schema::WorkflowNodeInterrogateParams {
+                    run_id,
+                    path: path.clone(),
+                    mode,
+                    note: None,
+                },
+            ),
+        );
+        // The pane is its own feedback on success; the two refusal shapes
+        // differ only in whether there is a next step to name.
+        let (level, message) = match interrogate_outcome(&path, mode, &response) {
+            InterrogateOutcome::Opened => return,
+            InterrogateOutcome::OfferReconstructed(message) => {
+                (crate::workflow::model::NoticeLevel::Warning, message)
+            }
+            InterrogateOutcome::Refused(message) => {
+                (crate::workflow::model::NoticeLevel::Error, message)
+            }
+        };
+        self.show_workflow_notice(crate::workflow::model::UserNotice {
+            level,
+            run: None,
+            path: Some(crate::workflow::model::InstancePath::new(path)),
+            message,
+        });
+    }
+
+    /// The DAG overlay's single exit.
+    ///
+    /// The historical snapshot dies with it, and is cleared **here** rather
+    /// than inside the generic `leave_modal`: the overlay prefers a `Some`
+    /// snapshot over the live run, so one left behind hijacks the next DAG
+    /// open and shows a past run to a user who asked for the live one — and
+    /// pushing DAG semantics into the shared leave-modal path would leak them
+    /// into every other mode.
+    fn leave_workflow_dag(&mut self) {
+        self.close_historical_run();
+        leave_modal(&mut self.state);
+    }
+
+    /// Opens an interrogation box's forked-session pane. The overlay is
+    /// full-bleed, so this leaves it.
+    pub(super) fn focus_workflow_dag_interrogation(&mut self, pane: &str) {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
+            return;
+        };
+        self.focus_pane_internal_via_api(ws_idx, pane_id);
+        self.leave_workflow_dag();
+    }
+
     /// Opens the selected node's teammate. The overlay is full-bleed, so
     /// focusing a pane means leaving the overlay behind it.
     pub(super) fn focus_workflow_dag_node(&mut self) {
@@ -417,13 +515,32 @@ impl App {
             .selected_node()
             .and_then(|node| node.pane_id.clone())
         else {
+            // A past run's panes are gone, so this is the common case there
+            // rather than a glitch — and a key that does nothing at all is the
+            // one thing a read-only view must not do. The footer already drops
+            // the `focus` hint for a historical run; this covers the press that
+            // happens anyway.
+            if self.state.view.dag.historical {
+                self.show_workflow_notice(crate::workflow::model::UserNotice {
+                    level: crate::workflow::model::NoticeLevel::Info,
+                    run: None,
+                    path: self
+                        .state
+                        .view
+                        .dag
+                        .selected_node()
+                        .map(|node| crate::workflow::model::InstancePath::new(node.path.clone())),
+                    message: "this node's pane is gone — press i to interrogate it instead"
+                        .to_string(),
+                });
+            }
             return;
         };
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&pane) else {
             return;
         };
         self.focus_pane_internal_via_api(ws_idx, pane_id);
-        leave_modal(&mut self.state);
+        self.leave_workflow_dag();
     }
 
     pub(crate) fn handle_onboarding_key(&mut self, key: KeyEvent) {
@@ -889,6 +1006,8 @@ pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
             state.view.workflow_launch.focus,
             crate::app::state::WorkflowLaunchFocus::Arg(_)
         ),
+        // See the matching arm in `paste_into_active_text_input`.
+        Mode::WorkflowRuns => false,
         Mode::Copy => state
             .copy_mode
             .as_ref()
@@ -1049,19 +1168,132 @@ fn unique_temp_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("karvex-{name}-{}-{nanos}", std::process::id()))
 }
 
+// A poll interval that takes far longer than requested is local evidence of
+// scheduler contention, so stretch the remaining budget by that drift rather
+// than assuming a constant is always enough, clamped to a hard ceiling so a
+// command that never writes the file (a real failure or hang) still fails in
+// bounded time. When sleeps land on time (no contention), this is a no-op.
+//
+// This is a supplementary signal, not the primary defense: a sleeping thread
+// is off the run queue and gets woken promptly by the OS timer even under
+// heavy load, so its wake-up drift understates the slowdown a CPU-bound
+// producer process actually experiences (it needs many scheduling turns to
+// finish real work, so its completion time scales closer to the
+// oversubscription ratio itself). `wait_for_file`'s base budget carries the
+// primary defense; this only adds headroom for contention that worsens
+// mid-wait.
+#[cfg(test)]
+#[cfg(unix)]
+fn extend_wait_budget(
+    budget: std::time::Duration,
+    poll_interval: std::time::Duration,
+    slept: std::time::Duration,
+    max_budget: std::time::Duration,
+) -> std::time::Duration {
+    match slept.checked_sub(poll_interval) {
+        Some(drift) => (budget + drift).min(max_budget),
+        None => budget,
+    }
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 fn wait_for_file(path: &std::path::Path) -> String {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
+    // BASE_BUDGET is the original 2s scaled by a 3x factor: a reproduction at
+    // 48 test threads on a 16-core box (a measured 3x oversubscription ratio)
+    // showed that 2s plus drift-only extension still misses occasionally
+    // (observed panic at ~2.19s elapsed, i.e. sleeps mostly landed on time
+    // while the spawned shell was still starved), because sleep-wake drift
+    // undercounts CPU-bound producer slowdown (see `extend_wait_budget`).
+    // Scaling the budget by the oversubscription ratio directly, instead of
+    // only reacting to the weaker drift proxy, matches the mechanism causing
+    // the delay: drift-extension stays supplementary headroom for contention
+    // that worsens mid-wait, not the primary defense. MAX_BUDGET is scaled
+    // the same way so a genuine hang still fails in bounded time. The larger
+    // base only costs wall-clock time on the failure/timeout path — a
+    // passing wait still returns the moment the file appears, so this does
+    // not slow down normal (uncontended) test runs.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+    const BASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+    const MAX_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let start = std::time::Instant::now();
+    let mut budget = BASE_BUDGET;
+    loop {
         if let Ok(content) = std::fs::read_to_string(path) {
             if !content.is_empty() {
                 return content;
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        if start.elapsed() >= budget {
+            break;
+        }
+        let before_sleep = std::time::Instant::now();
+        std::thread::sleep(POLL_INTERVAL);
+        let slept = before_sleep.elapsed();
+        budget = extend_wait_budget(budget, POLL_INTERVAL, slept, MAX_BUDGET);
     }
-    panic!("timed out waiting for {}", path.display());
+    panic!(
+        "timed out waiting for {} after {:?}",
+        path.display(),
+        start.elapsed()
+    );
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+#[test]
+fn extend_wait_budget_is_a_no_op_when_the_poll_lands_on_time() {
+    let budget = std::time::Duration::from_secs(2);
+    let extended = extend_wait_budget(
+        budget,
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_secs(20),
+    );
+    assert_eq!(extended, budget);
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+#[test]
+fn extend_wait_budget_is_a_no_op_when_the_poll_wakes_early() {
+    let budget = std::time::Duration::from_secs(2);
+    let extended = extend_wait_budget(
+        budget,
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_secs(20),
+    );
+    assert_eq!(extended, budget);
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+#[test]
+fn extend_wait_budget_grows_by_the_observed_scheduling_drift() {
+    let budget = std::time::Duration::from_secs(2);
+    let extended = extend_wait_budget(
+        budget,
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(60),
+        std::time::Duration::from_secs(20),
+    );
+    assert_eq!(extended, budget + std::time::Duration::from_millis(40));
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+#[test]
+fn extend_wait_budget_clamps_to_the_hard_ceiling() {
+    let budget = std::time::Duration::from_secs(19);
+    let extended = extend_wait_budget(
+        budget,
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(20),
+    );
+    assert_eq!(extended, std::time::Duration::from_secs(20));
 }
 
 #[cfg(test)]
@@ -1254,6 +1486,105 @@ mod tests {
             selected: Some(RunNodeIdx(0)),
             ..crate::app::state::DagViewState::default()
         }
+    }
+
+    /// A `DagViewState` projecting a past run, plus the snapshot behind it.
+    fn historical_app() -> App {
+        let mut app = test_app();
+        app.state.mode = Mode::WorkflowDag;
+        app.state.view.dag = crate::app::state::DagViewState {
+            historical: true,
+            ..dag_view()
+        };
+        app.state
+            .set_historical_run(Some(crate::app::state::HistoricalRunSnapshot {
+                graph: Box::new(crate::workflow::model::RunGraph {
+                    run_id: crate::workflow::model::RunId::new("workflow_run:past"),
+                    version_id: crate::workflow::model::KvdagVersionId::new("v1"),
+                    tier: crate::workflow::tier::Tier::Auto,
+                    growth: crate::workflow::model::GrowthLimits::default(),
+                    assignments: std::collections::BTreeMap::new(),
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                    status: crate::workflow::model::RunStatus::Succeeded,
+                    seq: 0,
+                    epilogue: None,
+                }),
+                workflow_name: "past".to_string(),
+                interrogations: Vec::new(),
+            }));
+        app
+    }
+
+    /// m7: a past run is not the active run, so a steer would answer the
+    /// not-the-active-run guard. The line must not open at all — a steer line
+    /// that takes text and then swallows it is exactly the 2.15 failure the
+    /// no-pane check already guards against.
+    #[test]
+    fn steering_a_historical_run_is_refused_instead_of_opening_the_line() {
+        let mut app = historical_app();
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(
+            app.state.view.dag.steer, None,
+            "the steer line must not open"
+        );
+
+        // And the live projection of the same view still opens it.
+        let mut live = test_app();
+        live.state.mode = Mode::WorkflowDag;
+        live.state.view.dag = dag_view();
+        live.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(live.state.view.dag.steer.as_deref(), Some(""));
+    }
+
+    /// Closing the overlay closes the historical projection with it. A
+    /// snapshot left behind hijacks the next DAG open, which would put a past
+    /// run on screen for a user who asked for the live one.
+    #[test]
+    fn closing_the_dag_view_clears_the_historical_snapshot() {
+        let mut app = historical_app();
+        assert!(app.state.historical_run().is_some());
+
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert!(
+            app.state.historical_run().is_none(),
+            "a past run must not survive the overlay that showed it"
+        );
+    }
+
+    /// Both interrogate keys are handled by the DAG's own arm. Before they
+    /// existed, `I` fell through to the modal-action lookup — and any binding
+    /// that resolved to `Close` there would have torn the overlay down instead
+    /// of interrogating. Neither key may close it, whatever the request answers.
+    #[test]
+    fn neither_interrogate_key_falls_through_to_close() {
+        for key in ['i', 'I'] {
+            let mut app = historical_app();
+            app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert_eq!(
+                app.state.mode,
+                Mode::WorkflowDag,
+                "{key} must not close the overlay"
+            );
+            assert!(app.state.historical_run().is_some(), "{key}");
+            assert_eq!(app.state.view.dag.steer, None, "{key} is not a steer");
+        }
+        // Shift-reported as a modifier as well as a capital, which is what
+        // crossterm sends for Shift+I on most terminals.
+        let mut app = historical_app();
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT));
+        assert_eq!(app.state.mode, Mode::WorkflowDag);
+    }
+
+    /// `Enter` on a past node whose pane is gone says so rather than doing
+    /// nothing, and does not leave the overlay.
+    #[test]
+    fn focusing_a_historical_node_with_no_pane_says_why() {
+        let mut app = historical_app();
+        app.handle_workflow_dag_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.state.mode, Mode::WorkflowDag, "the overlay stays open");
+        assert!(app.state.historical_run().is_some());
     }
 
     #[test]

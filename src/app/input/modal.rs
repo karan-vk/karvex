@@ -516,6 +516,22 @@ pub(super) const WORKFLOW_LAUNCH_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
     },
 ];
 
+/// The run browser's action row: `Enter` opens the selected run in the DAG
+/// view, `Esc` closes through the same `leave_modal` path
+/// (`07-phase3-plan.md` §WS-F). `R` (restore-all) is not a `ModalActionSpec`
+/// binding — WS-F wires it directly, the way the DAG overlay's steer key is
+/// wired, since it opens a confirm sub-state rather than firing once.
+pub(super) const WORKFLOW_RUNS_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
+    ModalActionSpec {
+        action: ModalAction::Confirm,
+        bindings: &[ModalKeyBinding::Enter],
+    },
+    ModalActionSpec {
+        action: ModalAction::Close,
+        bindings: &[ModalKeyBinding::Esc],
+    },
+];
+
 pub(super) const RENAME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
     ModalActionSpec {
         action: ModalAction::Save,
@@ -1588,6 +1604,7 @@ mod tests {
             edges: Vec::new(),
             status: crate::workflow::model::RunStatus::Running,
             seq: 0,
+            epilogue: None,
         }));
 
         let actions = global_menu_actions(&state);

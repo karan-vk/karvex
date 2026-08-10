@@ -15,7 +15,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::Deserialize;
 use serde_json::Value;
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_karvex_pid,
+    cleanup_test_base, register_runtime_dir, register_spawned_karvex_pid, server_state_dir,
     unregister_spawned_karvex_pid, CURRENT_PROTOCOL,
 };
 
@@ -175,13 +175,10 @@ fn spawn_client_process(
     }
 }
 
-fn server_log_path(config_home: &Path) -> PathBuf {
-    let app_dir = if cfg!(debug_assertions) {
-        "karvex-dev"
-    } else {
-        "karvex"
-    };
-    config_home.join(app_dir).join("karvex-server.log")
+/// A server keeps its log beside its API socket, so a socket override never
+/// interleaves two servers' lines into one shared file.
+fn server_log_path(api_socket: &Path) -> PathBuf {
+    server_state_dir(api_socket).join("karvex-server.log")
 }
 
 fn count_log_occurrences(path: &Path, needle: &str) -> usize {
@@ -955,7 +952,7 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
         panic!(
             "pane output should include client A marker so broadcast reflects a real state change. pane output:\n{}\nserver log tail:\n{}",
             pane_read_recent(&api_socket, &pane_id, 200),
-            log_tail(&server_log_path(&config_home), 80)
+            log_tail(&server_log_path(&api_socket), 80)
         );
     }
     let (received, client_b_frames) =
@@ -969,7 +966,7 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
         "client B should receive a broadcast frame containing client A marker. pane output:\n{}\nclient B frame snapshots:\n{}\nserver log tail:\n{}",
         pane_read_recent(&api_socket, &pane_id, 200),
         client_b_frames.join("\n--- frame ---\n"),
-        log_tail(&server_log_path(&config_home), 80)
+        log_tail(&server_log_path(&api_socket), 80)
     );
 
     cleanup_spawned_karvex(server, base);
@@ -1098,7 +1095,7 @@ fn multi_client_client_crash_sigkill_does_not_affect_server() {
     let mut survivor = connect_raw_client(&client_socket, 100, 30);
     assert!(wait_for_frame(&mut survivor, Duration::from_secs(2)));
 
-    let log_path = server_log_path(&config_home);
+    let log_path = server_log_path(&api_socket);
     let connected_before = count_log_occurrences(&log_path, "client connected");
 
     let crashing_client = spawn_client_process(&config_home, &runtime_dir, &api_socket);

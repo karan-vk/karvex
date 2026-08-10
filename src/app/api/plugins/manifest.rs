@@ -227,6 +227,20 @@ pub(crate) fn load_plugin_manifest(
 }
 
 fn validate_min_karvex_version(value: Option<&str>) -> Result<String, (&'static str, String)> {
+    validate_min_karvex_version_against(value, crate::update::Version::current())
+}
+
+/// Split out from [`validate_min_karvex_version`] so the "current Karvex
+/// build version is unparseable" path is directly testable without relying
+/// on `CARGO_PKG_VERSION` (a compile-time constant) actually being invalid.
+/// This is the exact path that used to `.expect()`-panic a request handler
+/// (plugin link/install) when a locally built binary's version carried a
+/// prerelease suffix; it must now fail the compatibility check instead of
+/// panicking.
+fn validate_min_karvex_version_against(
+    value: Option<&str>,
+    current: Option<crate::update::Version>,
+) -> Result<String, (&'static str, String)> {
     let Some(value) = value else {
         return Err((
             "invalid_plugin_min_karvex_version",
@@ -247,7 +261,15 @@ fn validate_min_karvex_version(value: Option<&str>) -> Result<String, (&'static 
             ),
         )
     })?;
-    let current = crate::update::Version::current();
+    let current = current.ok_or_else(|| {
+        (
+            "invalid_current_karvex_version",
+            format!(
+                "karvex build version {} is not a valid semantic version; cannot verify plugin compatibility",
+                crate::build_info::BASE_VERSION
+            ),
+        )
+    })?;
     if required > current {
         return Err((
             "plugin_requires_newer_karvex",
@@ -607,4 +629,55 @@ fn normalize_local_identifier(value: &str, max_chars: usize) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')))
     .then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::validate_min_karvex_version_against;
+    use crate::update::Version;
+
+    #[test]
+    fn accepts_prerelease_min_karvex_version_against_newer_release_current() {
+        let current = Version::parse("0.11.1").unwrap();
+        let result = validate_min_karvex_version_against(Some("0.11.1-dev"), Some(current));
+        assert_eq!(result, Ok("0.11.1-dev".to_string()));
+    }
+
+    /// Regression test for the request-handler panic: a build whose own
+    /// `CARGO_PKG_VERSION` is unparseable (e.g. carries a malformed suffix)
+    /// used to make `Version::current()` panic via `.expect()` inside this
+    /// exact compatibility check, which ran on the `plugin link`/`plugin
+    /// install` request-handling path and crashed the handler. It must now
+    /// fail the check gracefully instead of panicking — pass `None` for
+    /// `current` here to simulate that unparseable-build-version state,
+    /// since `CARGO_PKG_VERSION` itself is always valid in this repo.
+    #[test]
+    fn unparseable_current_refuses_instead_of_panicking() {
+        let result = validate_min_karvex_version_against(Some("0.6.10"), None);
+        assert_eq!(
+            result,
+            Err((
+                "invalid_current_karvex_version",
+                format!(
+                    "karvex build version {} is not a valid semantic version; cannot verify plugin compatibility",
+                    crate::build_info::BASE_VERSION
+                )
+            ))
+        );
+    }
+
+    #[test]
+    fn required_newer_than_current_is_rejected_with_prerelease_current() {
+        // A -dev current build must still correctly report itself as older
+        // than a higher required release (prerelease sorts before release).
+        let current = Version::parse("0.11.1-dev").unwrap();
+        let result = validate_min_karvex_version_against(Some("0.11.1"), Some(current));
+        assert_eq!(
+            result,
+            Err((
+                "plugin_requires_newer_karvex",
+                "plugin requires Karvex 0.11.1 or newer; current Karvex is 0.11.1-dev".to_string()
+            ))
+        );
+    }
 }

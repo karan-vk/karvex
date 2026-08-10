@@ -117,6 +117,17 @@ pub enum ExpandRejection {
         requested: u16,
         accepted: u16,
         limit: ExpandLimit,
+        /// The proposing node's `expand_max`, carried so `limit_value` is
+        /// derivable for **every** rejection kind.
+        ///
+        /// `07-phase3-plan.md` §0.6a: a `Truncated { limit: ExpandMax }` used to
+        /// journal no `limit_value` at all, because the ceiling is per-node and
+        /// the commit path only had the run's [`GrowthLimits`] in scope. The
+        /// durable read path then reported `limit_value: 0` — a plausible,
+        /// wrong number — for exactly the truncations a user is most likely to
+        /// hit. The number lives here because this is the only place that knows
+        /// it (§4 D14).
+        expand_max: u16,
     },
     /// An `inputs` key that names no `{{slot}}` in the template's
     /// `prompt_template`. `inputs` is an override channel over the one
@@ -180,10 +191,12 @@ impl ExpandRejection {
 
     /// The ceiling's value when the variant carries it.
     ///
-    /// `None` for [`Self::Truncated`], whose frozen shape names the limit but
-    /// not its value — a caller that needs the number reads it from the run's
-    /// [`GrowthLimits`] and the proposing node's `expand_max` through
-    /// [`ExpandLimit::value_in`].
+    /// `None` for [`Self::Truncated`], which names the limit but not its value:
+    /// a truncation can be against the run's [`GrowthLimits`] *or* the proposing
+    /// node's `expand_max`, so the number is resolved through
+    /// [`ExpandLimit::value_in`] with [`Self::expand_max`] supplying the
+    /// per-node half. Every rejection therefore has a `limit_value` the journal
+    /// can carry (`07-phase3-plan.md` §0.6a).
     pub fn limit_value(&self) -> Option<u16> {
         match self {
             Self::ExpandMaxReached { limit }
@@ -194,6 +207,15 @@ impl ExpandRejection {
             | Self::UnknownTemplate { .. }
             | Self::NotATemplate { .. }
             | Self::UnknownInput { .. } => None,
+        }
+    }
+
+    /// The proposing node's `expand_max`, for the one variant whose limit can be
+    /// the per-node ceiling. Feeds [`ExpandLimit::value_in`]'s second argument.
+    pub fn expand_max(&self) -> Option<u16> {
+        match self {
+            Self::Truncated { expand_max, .. } => Some(*expand_max),
+            _ => None,
         }
     }
 
@@ -460,6 +482,7 @@ pub fn evaluate(
             requested,
             accepted,
             limit,
+            expand_max,
         });
     }
 
@@ -596,6 +619,9 @@ pub fn commit_with_proposal_id(
             progress: ProgressTracker::default(),
             succession: None,
             checkpoint_seq: 0,
+            // An expansion child is created by this run, not carried in from
+            // another one.
+            restored_from: None,
         });
 
         effects.push(RunEffect::Persist(Box::new(StoreWrite::RunNodeCreated {
@@ -693,14 +719,18 @@ pub fn commit_with_proposal_id(
 
     let growth = graph.growth;
     for rejection in &outcome.rejected {
-        // `expand_max`'s value is on the rejection when it is the one that
-        // fired; a truncation against it reports the ceiling the caller knows.
-        let limit_value = rejection
-            .limit_value()
-            .or_else(|| match rejection.limit()? {
-                ExpandLimit::ExpandMax => None,
-                other => Some(other.value_in(growth, 0)),
-            });
+        // Every limited rejection resolves to a number. `Truncated` carries the
+        // proposing node's `expand_max` (§0.6a), so the `ExpandMax => None` arm
+        // that used to journal no `limit_value` — and therefore made the durable
+        // read path report `0` — is gone: there is no rejection kind left whose
+        // ceiling this cannot name.
+        let limit_value = rejection.limit_value().or_else(|| {
+            Some(
+                rejection
+                    .limit()?
+                    .value_in(growth, rejection.expand_max().unwrap_or(0)),
+            )
+        });
         let message = rejection.message(limit_value);
         let mut payload = json!({
             "reason": rejection.reason_code(),
@@ -1098,6 +1128,7 @@ mod tests {
                 requested: 4,
                 accepted: 2,
                 limit: ExpandLimit::ExpandMax,
+                expand_max: 2,
             }],
             "never reject-all, and never silently: the shortfall is reported"
         );
@@ -1120,6 +1151,7 @@ mod tests {
                 requested: 4,
                 accepted: 1,
                 limit: ExpandLimit::MaxNodes,
+                expand_max: 8,
             }]
         );
     }
@@ -1144,6 +1176,7 @@ mod tests {
                 requested: 4,
                 accepted: 2,
                 limit: ExpandLimit::MaxNodes,
+                expand_max: 4,
             },
             ExpandRejection::UnknownInput {
                 template: NodeKey::new(TEMPLATE),
@@ -1175,7 +1208,8 @@ mod tests {
         assert_eq!(
             rejections[6].message(Some(12)),
             "max_nodes 12 reached; 2 of 4 requested nodes created",
-            "Truncated carries no ceiling of its own, so the caller supplies it"
+            "Truncated names its limit but not the resolved ceiling — it carries only \
+             the per-node `expand_max` half, so the caller supplies the number"
         );
         let limits: Vec<Option<ExpandLimit>> =
             rejections.iter().map(ExpandRejection::limit).collect();
@@ -1218,6 +1252,7 @@ mod tests {
                 requested: 2,
                 accepted: 1,
                 limit: ExpandLimit::ExpandMax,
+                expand_max: 3,
             }]
         );
 
@@ -1743,6 +1778,55 @@ mod tests {
         assert_eq!(
             payload["message"],
             "max_nodes 3 reached; 1 of 4 requested nodes created"
+        );
+    }
+
+    /// **§0.6a regression** (`07-phase3-plan.md` §4 D14, the 0.10.2 P1 class).
+    /// A truncation against the node's own `expand_max` used to journal no
+    /// `limit_value` at all, because the ceiling is per-node and `commit` only
+    /// had the run's `GrowthLimits` in scope. The durable read path's
+    /// `unwrap_or(0)` then reported `limit_value: 0` — a number that looks like
+    /// a real ceiling and is not.
+    #[test]
+    fn a_truncation_against_expand_max_journals_the_nodes_own_ceiling() {
+        // expand_max 2 is tighter than the run's max_nodes, so the truncation is
+        // against the per-node ceiling.
+        let kvdag = workflow(2, growth(3, 24));
+        let mut graph = run(&kvdag);
+        let parent = idx(&graph, PARENT);
+
+        let outcome = evaluate(&graph, &kvdag, parent, &proposal(Some(4)));
+        assert_eq!(
+            outcome.rejected,
+            vec![ExpandRejection::Truncated {
+                template: NodeKey::new(TEMPLATE),
+                requested: 4,
+                accepted: 2,
+                limit: ExpandLimit::ExpandMax,
+                expand_max: 2,
+            }]
+        );
+
+        let effects = commit(&mut graph, parent, &outcome);
+        let payload = store_writes(&effects)
+            .into_iter()
+            .find_map(|write| match write {
+                StoreWrite::RunEvent {
+                    kind: RunEventKind::GrowthLimited,
+                    payload,
+                    ..
+                } => Some(payload.clone()),
+                _ => None,
+            })
+            .expect("a growth_limited journal entry");
+        assert_eq!(payload["limit"], "expand_max");
+        assert_eq!(
+            payload["limit_value"], 2,
+            "the node's expand_max, not the 0 the read path used to invent"
+        );
+        assert_eq!(
+            payload["message"], "expand_max 2 reached; 2 of 4 requested nodes created",
+            "and the user-facing line names the same number"
         );
     }
 

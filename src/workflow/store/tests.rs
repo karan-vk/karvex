@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use super::records::{self, parse_record_id, record_id_to_string};
 use super::*;
-use crate::workflow::model::{ArgSpec, InstancePath, KvdagError, Runner};
+use crate::workflow::model::{ArgSpec, InstancePath, KvdagError, Runner, SUMMARY_INSTANCE_PATH};
 // The derive macro's generated `impl SurrealValue for ...` references the
 // trait name unqualified regardless of how the derive itself is invoked, so
 // it must be in scope wherever `#[derive(SurrealValue)]` is used (below, for
@@ -172,6 +172,8 @@ fn new_run(workflow: &WorkflowId, kvdag: &Kvdag) -> NewRun {
         assignments: assignments_for(kvdag, Tier::Auto),
         context_runs: Vec::new(),
         workspace_id: None,
+        restore_from: None,
+        restored: Vec::new(),
     }
 }
 
@@ -330,6 +332,7 @@ async fn migrations_apply_cleanly_and_reapplying_is_a_noop() {
             "0001_init".to_string(),
             "0002_growth_and_history".to_string(),
             "0003_node_identity".to_string(),
+            "0004_journal_time_and_interrogation".to_string(),
         ])
     );
 
@@ -735,6 +738,7 @@ fn node_status_write(run: &RunId, path: &str, status: NodeStatus) -> StoreWrite 
         succession: None,
         started_at_unix_ms: None,
         ended_at_unix_ms: None,
+        restored_from: None,
     }
 }
 
@@ -960,6 +964,7 @@ async fn run_node_binding_reloads_its_filesystem_paths() {
             succession: None,
             started_at_unix_ms: None,
             ended_at_unix_ms: None,
+            restored_from: None,
         })
         .await
         .expect("bind plan");
@@ -972,6 +977,12 @@ async fn run_node_binding_reloads_its_filesystem_paths() {
     assert_eq!(plan.node_dir.as_deref(), Some("/tmp/runs/r1/plan"));
     assert_eq!(plan.cwd.as_deref(), Some("/tmp/work"));
     assert_eq!(plan.pane_id.as_deref(), Some("w1:p2"));
+    // M2 (`07-phase3-plan.md` §0.5, §1 WS-B): the writer has always persisted
+    // this; the gap was `RunNodeRecord`/`run_node_record` dropping it on read.
+    assert_eq!(
+        plan.transcript_path.as_deref(),
+        Some("/tmp/runs/r1/plan.jsonl")
+    );
 
     let unbound = nodes
         .iter()
@@ -979,6 +990,7 @@ async fn run_node_binding_reloads_its_filesystem_paths() {
         .expect("the join node");
     assert_eq!(unbound.node_dir, None, "an unbound node has no node dir");
     assert_eq!(unbound.cwd, None);
+    assert_eq!(unbound.transcript_path, None);
 }
 
 /// C6: `depth` disagreed between the live graph (always 0) and the store
@@ -1063,6 +1075,7 @@ async fn run_event_seq_is_unique_and_survives_concurrent_appends() {
             kind: RunEventKind::NodeStatus,
             path: None,
             payload: serde_json::json!({}),
+            at_unix_ms: 1,
         }
     }
 
@@ -1456,6 +1469,7 @@ async fn a_restarted_store_reports_the_same_growth_limited_and_parent_path() {
                     "requested": 1,
                     "accepted": 0,
                 }),
+                at_unix_ms: 1,
             })
             .await
             .expect("growth_limited event");
@@ -1618,7 +1632,7 @@ async fn create_run_binds_started_at_verbatim_so_a_reload_reports_the_apps_stamp
     assert_eq!(reloaded.started_at_unix_ms, stamp);
 
     let listed = store
-        .list_runs(&workflow, 10)
+        .list_runs(Some(&workflow), 10)
         .await
         .expect("list_runs")
         .into_iter()
@@ -1867,6 +1881,7 @@ async fn a_growth_limited_journal_entry_projects_back_as_a_run_and_node_fact() {
                 "requested": 1,
                 "accepted": 0,
             }),
+            at_unix_ms: 1,
         })
         .await
         .expect("first growth_limited event");
@@ -1885,6 +1900,7 @@ async fn a_growth_limited_journal_entry_projects_back_as_a_run_and_node_fact() {
                 "requested": 1,
                 "accepted": 0,
             }),
+            at_unix_ms: 1,
         })
         .await
         .expect("second growth_limited event");
@@ -1943,6 +1959,7 @@ async fn listed_runs_report_the_same_last_growth_limit_that_run_get_does() {
                     "requested": 1,
                     "accepted": 0,
                 }),
+                at_unix_ms: 1,
             })
             .await
             .expect("growth_limited event");
@@ -2208,6 +2225,7 @@ async fn record_solo_run(
             succession: None,
             started_at_unix_ms: None,
             ended_at_unix_ms: None,
+            restored_from: None,
         })
         .await
         .expect("close the node");
@@ -2391,13 +2409,14 @@ async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_colu
     store
         .migrate()
         .await
-        .expect("0002 and 0003 apply on top of 0001");
+        .expect("0002, 0003, and 0004 apply on top of 0001");
     assert_eq!(
         store.applied_migrations().await.expect("read schema_meta"),
         std::collections::BTreeSet::from([
             "0001_init".to_string(),
             "0002_growth_and_history".to_string(),
             "0003_node_identity".to_string(),
+            "0004_journal_time_and_interrogation".to_string(),
         ])
     );
 
@@ -2532,4 +2551,1004 @@ async fn a_created_run_node_without_a_parent_writes_no_spawned_relation() {
         .expect("select spawned");
     let rows: Vec<SpawnedRow> = response.take(0).expect("decode spawned");
     assert!(rows.is_empty(), "no parent, no provenance edge");
+}
+
+// ── Phase 3, WS-B: migration 0004 ───────────────────────────────────────
+
+#[tokio::test]
+async fn migration_0004_applies_over_a_0001_to_0003_database() {
+    let store = WorkflowStore::open_with_migrations(StoreLocation::Memory, 3)
+        .await
+        .expect("a 0001..0003 database opens");
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
+        ])
+    );
+
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    store
+        .migrate()
+        .await
+        .expect("0004 applies on top of 0001..0003, including over existing rows");
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
+            "0004_journal_time_and_interrogation".to_string(),
+        ])
+    );
+
+    // A pre-0004 row still reads back: the OVERWRITE statements touched
+    // `run_event.at`/`run_node.kvdag_node`/`interrogation.forked_session_id`,
+    // none of which this run has rows for yet, but the migration itself must
+    // not choke applying `OVERWRITE` over a schemafull table with rows.
+    let reloaded = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(reloaded.id, run);
+
+    // `workflow.pruned_runs` (D15 point 5) is now writable.
+    let pruned = store
+        .prune_run_history(&workflow, 0)
+        .await
+        .expect("prune_run_history");
+    assert_eq!(pruned, 1);
+
+    #[derive(Debug, Clone, SurrealValue)]
+    struct PrunedRuns {
+        pruned_runs: i64,
+    }
+    let mut response = store
+        .db
+        .query("SELECT pruned_runs FROM $workflow")
+        .bind((
+            "workflow",
+            parse_record_id(TABLE_WORKFLOW, workflow.as_str()).expect("workflow id"),
+        ))
+        .await
+        .expect("select workflow");
+    let rows: Vec<PrunedRuns> = response.take(0).expect("decode workflow");
+    assert_eq!(rows.first().expect("workflow row exists").pruned_runs, 1);
+}
+
+// ── Phase 3, WS-B: the epilogue's reserved-path create (§4 D5, D15) ────────
+
+#[tokio::test]
+async fn epilogue_node_created_with_no_kvdag_node_and_excluded_from_counters() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run(&store).await;
+
+    let before = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(before.nodes_total, 1);
+
+    store
+        .write(StoreWrite::RunNodeCreated {
+            run: run.clone(),
+            key: NodeKey::new(SUMMARY_INSTANCE_PATH),
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            label: "summary".to_string(),
+            inputs: BTreeMap::new(),
+            parent: None,
+            depth: 0,
+            status: NodeStatus::Ready,
+            demand: Demand::Light,
+            assignment: crate::workflow::tier::Assignment {
+                model: crate::workflow::tier::ModelAlias::Sonnet,
+                effort: crate::workflow::tier::Effort::Xhigh,
+            },
+            assignment_reason: "the end-of-run summariser".to_string(),
+            attempt: 1,
+            proposal_id: String::new(),
+        })
+        .await
+        .expect("the reserved path is the one create allowed to bind kvdag_node: NONE");
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    let epilogue = nodes
+        .iter()
+        .find(|record| record.instance_path.as_str() == SUMMARY_INSTANCE_PATH)
+        .expect("the epilogue row exists");
+    assert_eq!(epilogue.status, NodeStatus::Ready);
+
+    let after_create = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(
+        after_create.nodes_total, 1,
+        "the epilogue must never inflate nodes_total (§4 D5)"
+    );
+
+    store
+        .write(StoreWrite::RunNode {
+            run: run.clone(),
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            status: NodeStatus::Succeeded,
+            attempt: 1,
+            binding: None,
+            usage: NodeUsage::default(),
+            evidence: Some(Evidence::SelfReport),
+            succession: Some(Succession::Satisfied),
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+            restored_from: None,
+        })
+        .await
+        .expect("epilogue status update");
+
+    let after_finish = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(
+        after_finish.nodes_done, 0,
+        "the epilogue reaching a terminal status must not move nodes_done (§4 D5)"
+    );
+}
+
+#[tokio::test]
+async fn write_epilogue_node_created_rejects_a_non_reserved_path() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run(&store).await;
+
+    let create = RunNodeCreate {
+        run: run.clone(),
+        key: NodeKey::new("solo"),
+        path: InstancePath::new("solo"),
+        label: String::new(),
+        inputs: BTreeMap::new(),
+        parent: None,
+        depth: 0,
+        status: NodeStatus::Ready,
+        demand: Demand::Light,
+        assignment: crate::workflow::tier::Assignment {
+            model: crate::workflow::tier::ModelAlias::Sonnet,
+            effort: crate::workflow::tier::Effort::Xhigh,
+        },
+        assignment_reason: String::new(),
+        attempt: 1,
+        proposal_id: String::new(),
+    };
+
+    let error = store
+        .write_epilogue_node_created(create)
+        .await
+        .expect_err("a non-reserved path must never write a NULL kvdag_node");
+    assert!(
+        matches!(error, StoreError::Invariant(_)),
+        "got {error:?}, want StoreError::Invariant — the loosened column must stay unreachable \
+         for ordinary node writes"
+    );
+}
+
+// ── Phase 3, WS-B: RunSummary (D16 field-for-field) ─────────────────────
+
+#[tokio::test]
+async fn a_run_summary_round_trips_every_field_through_the_production_read_path() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag, run) = setup_run(&store).await;
+
+    store
+        .write(StoreWrite::RunSummary {
+            run: run.clone(),
+            kvdag_version: kvdag.version_id.clone(),
+            text: "the run succeeded".to_string(),
+            outcome: "succeeded".to_string(),
+            highlights: vec!["did the thing".to_string()],
+            open_gaps: vec!["nothing left".to_string()],
+            per_node: vec![SummaryNodeLine {
+                node_key: "solo".to_string(),
+                verdict: "good".to_string(),
+                one_liner: "solved it".to_string(),
+            }],
+            token_estimate: 42,
+            generated_by_path: Some(InstancePath::new("solo")),
+        })
+        .await
+        .expect("write_run_summary");
+
+    let record = store
+        .get_run_summary(&run)
+        .await
+        .expect("get_run_summary")
+        .expect("the summary exists");
+    assert_eq!(record.run, run);
+    assert_eq!(record.workflow, workflow);
+    assert_eq!(record.workflow_name, "demo");
+    assert_eq!(record.version, kvdag.version_id);
+    assert_eq!(record.text, "the run succeeded");
+    assert_eq!(record.outcome, "succeeded");
+    assert_eq!(record.highlights, vec!["did the thing".to_string()]);
+    assert_eq!(record.open_gaps, vec!["nothing left".to_string()]);
+    assert_eq!(record.per_node.len(), 1);
+    assert_eq!(record.per_node[0].node_key, "solo");
+    assert_eq!(record.per_node[0].verdict, "good");
+    assert_eq!(record.per_node[0].one_liner, "solved it");
+    assert_eq!(record.token_estimate, 42);
+    assert_eq!(record.generated_by_path, Some(InstancePath::new("solo")));
+    assert!(!record.run_pruned);
+}
+
+#[tokio::test]
+async fn a_second_run_summary_write_for_the_same_run_is_rejected_not_panicked() {
+    let store = open_mem_store().await;
+    let (_, kvdag, run) = setup_run(&store).await;
+    let write = || StoreWrite::RunSummary {
+        run: run.clone(),
+        kvdag_version: kvdag.version_id.clone(),
+        text: "t".to_string(),
+        outcome: "o".to_string(),
+        highlights: Vec::new(),
+        open_gaps: Vec::new(),
+        per_node: Vec::new(),
+        token_estimate: 0,
+        generated_by_path: None,
+    };
+    store
+        .write(write())
+        .await
+        .expect("the first write succeeds");
+    let second = store.write(write()).await;
+    assert!(
+        second.is_err(),
+        "run_summary_run is UNIQUE; a second write for the same run must error, not panic"
+    );
+}
+
+#[tokio::test]
+async fn list_run_summaries_orders_newest_first_respects_limit_and_flags_pruned() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+
+    let mut runs = Vec::new();
+    for index in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let run = create_run(&store, &workflow, &kvdag).await;
+        store
+            .write(StoreWrite::RunSummary {
+                run: run.clone(),
+                kvdag_version: kvdag.version_id.clone(),
+                text: format!("run {index}"),
+                outcome: "succeeded".to_string(),
+                highlights: Vec::new(),
+                open_gaps: Vec::new(),
+                per_node: Vec::new(),
+                token_estimate: 0,
+                generated_by_path: None,
+            })
+            .await
+            .expect("write_run_summary");
+        runs.push(run);
+    }
+
+    // Prune the oldest run outright; its summary must survive (M9 — the
+    // dangling `run_summary.run` route would silently drop exactly this row).
+    let pruned_id = parse_record_id(TABLE_WORKFLOW_RUN, runs[0].as_str()).expect("pruned run id");
+    store
+        .prune_one_run(&pruned_id)
+        .await
+        .expect("prune_one_run");
+
+    let summaries = store
+        .list_run_summaries(Some(&workflow), 10)
+        .await
+        .expect("list_run_summaries");
+    assert_eq!(
+        summaries.len(),
+        3,
+        "kvdag_version.workflow finds a pruned run's summary too"
+    );
+    assert_eq!(summaries[0].text, "run 2", "newest first");
+    assert!(
+        summaries
+            .iter()
+            .any(|record| record.run == runs[0] && record.run_pruned),
+        "the pruned run's summary is flagged"
+    );
+    assert!(summaries
+        .iter()
+        .filter(|record| record.run != runs[0])
+        .all(|record| !record.run_pruned));
+
+    let limited = store
+        .list_run_summaries(Some(&workflow), 2)
+        .await
+        .expect("list_run_summaries limited");
+    assert_eq!(limited.len(), 2);
+}
+
+// ── Phase 3, WS-B: interrogation (D16 field-for-field) ──────────────────
+
+#[tokio::test]
+async fn an_interrogation_round_trips_every_field_through_the_production_read_path() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run(&store).await;
+
+    let id = InterrogationId::new("interrogation:test-1");
+    store
+        .write(StoreWrite::InterrogationStarted {
+            id: id.clone(),
+            run: run.clone(),
+            path: InstancePath::new("solo"),
+            source_session_id: "sess-source".to_string(),
+            forked_session_id: None,
+            transcript_path: Some("/tmp/sess.jsonl".to_string()),
+            cwd: "/tmp/work".to_string(),
+            pane_id: crate::workflow::model::PublicPaneId::new("pane-1"),
+            reconstructed: false,
+            seeded_from_seq: None,
+            note: "checking on it".to_string(),
+            started_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("write_interrogation_started");
+
+    let started = store
+        .list_interrogations(&run)
+        .await
+        .expect("list_interrogations");
+    assert_eq!(started.len(), 1);
+    let record = &started[0];
+    assert_eq!(record.id, id);
+    assert_eq!(record.path, InstancePath::new("solo"));
+    assert_eq!(record.source_session_id, "sess-source");
+    assert_eq!(
+        record.forked_session_id, None,
+        "not pre-assigned: None until the fork's id is learned (§4 D7)"
+    );
+    assert_eq!(record.transcript_path, Some("/tmp/sess.jsonl".to_string()));
+    assert_eq!(record.cwd, "/tmp/work");
+    assert_eq!(record.pane_id.as_deref(), Some("pane-1"));
+    assert!(!record.reconstructed);
+    assert_eq!(record.note, "checking on it");
+    assert_eq!(record.started_at_unix_ms, 1_700_000_000_000);
+    assert_eq!(record.ended_at_unix_ms, None);
+
+    store
+        .write(StoreWrite::InterrogationUpdate {
+            id: id.clone(),
+            forked_session_id: Some("sess-fork-1".to_string()),
+            ended_at_unix_ms: Some(1_700_000_060_000),
+        })
+        .await
+        .expect("write_interrogation_update");
+
+    let updated = store
+        .list_interrogations(&run)
+        .await
+        .expect("list_interrogations");
+    let record = &updated[0];
+    assert_eq!(
+        record.forked_session_id,
+        Some("sess-fork-1".to_string()),
+        "learned later from the pane's session report"
+    );
+    assert_eq!(record.ended_at_unix_ms, Some(1_700_000_060_000));
+    assert_eq!(
+        record.started_at_unix_ms, 1_700_000_000_000,
+        "an update never rewrites the start stamp"
+    );
+}
+
+#[tokio::test]
+async fn prune_run_history_leaves_no_dangling_references_for_rows_from_the_new_writers() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+
+    let pruned_run = create_run(&store, &workflow, &kvdag).await;
+    store
+        .write(StoreWrite::RunSummary {
+            run: pruned_run.clone(),
+            kvdag_version: kvdag.version_id.clone(),
+            text: "t".to_string(),
+            outcome: "o".to_string(),
+            highlights: Vec::new(),
+            open_gaps: Vec::new(),
+            per_node: Vec::new(),
+            token_estimate: 0,
+            generated_by_path: Some(InstancePath::new("solo")),
+        })
+        .await
+        .expect("write_run_summary");
+
+    let interrogation_id = InterrogationId::new("interrogation:prune-test");
+    store
+        .write(StoreWrite::InterrogationStarted {
+            id: interrogation_id.clone(),
+            run: pruned_run.clone(),
+            path: InstancePath::new("solo"),
+            source_session_id: "sess-source".to_string(),
+            forked_session_id: Some("sess-fork".to_string()),
+            transcript_path: None,
+            cwd: "/tmp".to_string(),
+            pane_id: crate::workflow::model::PublicPaneId::new("pane-1"),
+            reconstructed: false,
+            seeded_from_seq: None,
+            note: String::new(),
+            started_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("write_interrogation_started");
+
+    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    let kept_run = create_run(&store, &workflow, &kvdag).await;
+    store
+        .write(StoreWrite::RunSummary {
+            run: kept_run.clone(),
+            kvdag_version: kvdag.version_id.clone(),
+            text: "kept".to_string(),
+            outcome: "o".to_string(),
+            highlights: Vec::new(),
+            open_gaps: Vec::new(),
+            per_node: Vec::new(),
+            token_estimate: 0,
+            generated_by_path: None,
+        })
+        .await
+        .expect("write_run_summary for the kept run");
+
+    let pruned = store
+        .prune_run_history(&workflow, 1)
+        .await
+        .expect("prune_run_history");
+    assert_eq!(pruned, 1);
+
+    let summary = store
+        .get_run_summary(&pruned_run)
+        .await
+        .expect("get_run_summary")
+        .expect("the summary survives");
+    assert!(summary.run_pruned);
+    assert_eq!(
+        summary.generated_by_path, None,
+        "generated_by is nulled on prune, not left dangling"
+    );
+
+    let mut response = store
+        .db
+        .query("SELECT * FROM interrogation WHERE id = $id")
+        .bind((
+            "id",
+            parse_record_id(TABLE_INTERROGATION, interrogation_id.as_str())
+                .expect("interrogation id"),
+        ))
+        .await
+        .expect("select interrogation");
+    let rows: Vec<IdOnly> = response.take(0).expect("decode");
+    assert!(
+        rows.is_empty(),
+        "prune deletes interrogations for the pruned run's nodes"
+    );
+}
+
+// ── Phase 3, WS-B: RunEvent.at_unix_ms (§4 D14) ─────────────────────────
+
+#[tokio::test]
+async fn a_run_event_stamps_the_producers_at_unix_ms_not_a_store_flush_clock() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run(&store).await;
+    let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id");
+
+    let stamp = 1_700_000_555_123u64;
+    store
+        .write(StoreWrite::RunEvent {
+            run: run.clone(),
+            seq: 1,
+            kind: RunEventKind::RunStarted,
+            path: None,
+            payload: serde_json::json!({}),
+            at_unix_ms: stamp,
+        })
+        .await
+        .expect("write_run_event");
+
+    let mut response = store
+        .db
+        .query("SELECT * FROM run_event WHERE run = $run LIMIT 1")
+        .bind(("run", run_id))
+        .await
+        .expect("select run_event");
+    let rows: Vec<records::RunEventRow> = response.take(0).expect("decode run_event");
+    let row = rows.into_iter().next().expect("the event row exists");
+    assert_eq!(
+        row.at.timestamp_millis() as u64,
+        stamp,
+        "run_event.at is the producer's own stamp, not a store-flush time::now() (§4 D14)"
+    );
+}
+
+#[tokio::test]
+async fn run_event_kind_summary_round_trips_through_list_run_events() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run(&store).await;
+
+    store
+        .write(StoreWrite::RunEvent {
+            run: run.clone(),
+            seq: 1,
+            kind: RunEventKind::Summary,
+            path: None,
+            payload: serde_json::json!({"reason": "summary_failed"}),
+            at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("write_run_event");
+
+    let events = store.list_run_events(&run).await.expect("list_run_events");
+    assert_eq!(
+        events.first().expect("the event exists").kind,
+        RunEventKind::Summary
+    );
+}
+
+// ── Phase 3, WS-B: orphan sweep (§4 D13) ────────────────────────────────
+
+#[tokio::test]
+async fn mark_interrupted_runs_sweeps_non_terminal_runs_and_their_nodes_once() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run(&store, &workflow, &kvdag).await;
+
+    // `create_run` leaves the row "pending" and the root node "ready" — both
+    // non-terminal, exactly what a server restart finds mid-run.
+    let swept = store
+        .mark_interrupted_runs(1_700_000_900_000)
+        .await
+        .expect("mark_interrupted_runs");
+    assert_eq!(swept, 1);
+
+    let reloaded = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(reloaded.status, RunStatus::Failed);
+    assert_eq!(
+        reloaded
+            .failure
+            .as_ref()
+            .and_then(|failure| failure.get("reason"))
+            .and_then(serde_json::Value::as_str),
+        Some("interrupted")
+    );
+    assert_eq!(reloaded.ended_at_unix_ms, Some(1_700_000_900_000));
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    let solo = nodes
+        .iter()
+        .find(|node| node.instance_path.as_str() == "solo")
+        .expect("the node exists");
+    assert_eq!(solo.status, NodeStatus::Cancelled);
+    assert_eq!(
+        solo.evidence, None,
+        "the node didn't fail, the server left — evidence stays untouched"
+    );
+
+    let second = store
+        .mark_interrupted_runs(1_700_000_999_000)
+        .await
+        .expect("a second sweep is a no-op");
+    assert_eq!(second, 0);
+    let reloaded_again = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(
+        reloaded_again.ended_at_unix_ms,
+        Some(1_700_000_900_000),
+        "a terminal run's ended_at is not touched again"
+    );
+}
+
+#[tokio::test]
+async fn mark_interrupted_runs_leaves_terminal_runs_untouched() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run(&store, &workflow, &kvdag).await;
+    store
+        .write(StoreWrite::RunStatus {
+            run: run.clone(),
+            status: RunStatus::Succeeded,
+            ended_at_unix_ms: Some(1_700_000_500_000),
+        })
+        .await
+        .expect("write_run_status");
+
+    let swept = store
+        .mark_interrupted_runs(1_700_000_900_000)
+        .await
+        .expect("mark_interrupted_runs");
+    assert_eq!(swept, 0);
+
+    let reloaded = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(reloaded.status, RunStatus::Succeeded);
+    assert_eq!(reloaded.ended_at_unix_ms, Some(1_700_000_500_000));
+}
+
+// ── Phase 3, WS-B: restore (§1 WS-B, §4 D4, D11) ────────────────────────
+
+#[tokio::test]
+async fn a_restored_node_persists_its_full_terminal_shape_and_reseeds_its_checkpoint() {
+    let store = open_mem_store().await;
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let source_run = create_run(&store, &workflow, &kvdag).await;
+
+    store
+        .write(StoreWrite::Checkpoint {
+            run: source_run.clone(),
+            path: InstancePath::new("solo"),
+            seq: 1,
+            kind: CheckpointKind::Result,
+            schema_valid: true,
+            payload: serde_json::json!({"report": "done"}),
+            summary: "solved it".to_string(),
+            artifact_paths: vec!["artifacts/out.md".to_string()],
+            digest: "abc123".to_string(),
+        })
+        .await
+        .expect("write the source run's checkpoint");
+
+    let seed = RestoredSeed {
+        node_key: NodeKey::new("solo"),
+        payload: serde_json::json!({"report": "done"}),
+        summary: "solved it".to_string(),
+        artifact_paths: vec!["artifacts/out.md".to_string()],
+        digest: "abc123".to_string(),
+        source: RestoredRef {
+            run: source_run.clone(),
+            node_key: NodeKey::new("solo"),
+            checkpoint_seq: 1,
+        },
+    };
+
+    let restore_stamp = next_run_start_unix_ms();
+    let restored_run = store
+        .create_run(NewRun {
+            started_at_unix_ms: restore_stamp,
+            restore_from: Some(RestoreFromRequest {
+                run: source_run.clone(),
+                nodes: vec!["solo".to_string()],
+                allow_changed: false,
+            }),
+            restored: vec![seed],
+            ..new_run(&workflow, &kvdag)
+        })
+        .await
+        .expect("create_run with a restored seed");
+
+    let nodes = store
+        .list_run_nodes(&restored_run)
+        .await
+        .expect("list_run_nodes");
+    let solo = nodes
+        .iter()
+        .find(|record| record.instance_path.as_str() == "solo")
+        .expect("the restored node exists");
+    assert_eq!(solo.status, NodeStatus::Restored);
+    assert_eq!(solo.evidence, Some(Evidence::Restored));
+    assert_eq!(solo.succession, Some(Succession::Satisfied));
+    assert_eq!(solo.started_at_unix_ms, Some(restore_stamp));
+    assert_eq!(
+        solo.ended_at_unix_ms,
+        Some(restore_stamp),
+        "the restore instant, not the source run's (§4 D4)"
+    );
+    assert_eq!(
+        solo.restored_from,
+        Some(RestoredRef {
+            run: source_run.clone(),
+            node_key: NodeKey::new("solo"),
+            checkpoint_seq: 1,
+        })
+    );
+
+    let checkpoints = store
+        .list_checkpoints(&restored_run, &InstancePath::new("solo"))
+        .await
+        .expect("list_checkpoints");
+    let checkpoint = checkpoints
+        .first()
+        .expect("the re-persisted checkpoint exists");
+    assert_eq!(checkpoint.seq, 1);
+    assert_eq!(checkpoint.kind, CheckpointKind::Result);
+    assert!(
+        checkpoint.schema_valid,
+        "a digest-equal restore validates against the target version's schema"
+    );
+    assert_eq!(checkpoint.payload, serde_json::json!({"report": "done"}));
+    assert_eq!(checkpoint.summary, "solved it");
+    assert_eq!(checkpoint.digest, "abc123");
+
+    let reloaded = store
+        .get_run(&restored_run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(reloaded.restore_from_run, Some(source_run.clone()));
+
+    // The full request is persisted, not just the source id: a selector that
+    // was asked for and skipped has no other durable trace once the
+    // transient API response is gone (judgment call approved by
+    // phase3-planner-f).
+    let restored_run_id =
+        parse_record_id(TABLE_WORKFLOW_RUN, restored_run.as_str()).expect("run id");
+    let mut response = store
+        .db
+        .query("SELECT * FROM $id")
+        .bind(("id", restored_run_id))
+        .await
+        .expect("select workflow_run");
+    let rows: Vec<records::RunRow> = response.take(0).expect("decode workflow_run");
+    let restore_from = rows
+        .into_iter()
+        .next()
+        .expect("the run row exists")
+        .restore_from
+        .expect("restore_from is set");
+    assert_eq!(
+        restore_from.get("run").and_then(|v| v.as_str()),
+        Some(source_run.as_str())
+    );
+    assert_eq!(
+        restore_from.get("nodes"),
+        Some(&serde_json::json!(["solo"]))
+    );
+    assert_eq!(
+        restore_from.get("allow_changed"),
+        Some(&serde_json::json!(false))
+    );
+}
+
+#[tokio::test]
+async fn a_restored_node_across_a_changed_definition_reseeds_with_schema_valid_false() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("cross-version", "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let v1 = store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", single_node_spec())
+        .await
+        .expect("create_version v1");
+    store
+        .set_head_version(&workflow, &v1.version_id)
+        .await
+        .expect("set_head_version");
+    let source_run = create_run(&store, &workflow, &v1).await;
+
+    store
+        .write(StoreWrite::Checkpoint {
+            run: source_run.clone(),
+            path: InstancePath::new("solo"),
+            seq: 1,
+            kind: CheckpointKind::Result,
+            schema_valid: true,
+            payload: serde_json::json!({"report": "done"}),
+            summary: "solved it".to_string(),
+            artifact_paths: Vec::new(),
+            digest: "abc123".to_string(),
+        })
+        .await
+        .expect("write the source run's checkpoint");
+
+    let mut changed = single_node_spec();
+    changed.nodes[0].prompt_template = "Solve {{goal}} differently".to_string();
+    let v2 = store
+        .create_version(&workflow, VersionOrigin::Authored, "v2", changed)
+        .await
+        .expect("create_version v2");
+    store
+        .set_head_version(&workflow, &v2.version_id)
+        .await
+        .expect("set_head_version");
+
+    let seed = RestoredSeed {
+        node_key: NodeKey::new("solo"),
+        payload: serde_json::json!({"report": "done"}),
+        summary: "solved it".to_string(),
+        artifact_paths: Vec::new(),
+        digest: "abc123".to_string(),
+        source: RestoredRef {
+            run: source_run.clone(),
+            node_key: NodeKey::new("solo"),
+            checkpoint_seq: 1,
+        },
+    };
+
+    let restored_run = store
+        .create_run(NewRun {
+            restore_from: Some(RestoreFromRequest {
+                run: source_run.clone(),
+                nodes: vec!["solo".to_string()],
+                allow_changed: true,
+            }),
+            restored: vec![seed],
+            ..new_run(&workflow, &v2)
+        })
+        .await
+        .expect("create_run restoring across versions (allow_changed)");
+
+    let checkpoints = store
+        .list_checkpoints(&restored_run, &InstancePath::new("solo"))
+        .await
+        .expect("list_checkpoints");
+    let checkpoint = checkpoints.first().expect("the checkpoint exists");
+    assert!(
+        !checkpoint.schema_valid,
+        "an allow_changed cross-version restore was never validated against the target \
+         schema, and must not validate onward restore of unvalidated data"
+    );
+}
+
+#[tokio::test]
+async fn node_compat_digests_for_differs_when_the_prompt_template_changes() {
+    let store = open_mem_store().await;
+    let workflow = store
+        .create_workflow("digests", "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let v1 = store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", single_node_spec())
+        .await
+        .expect("create_version v1");
+
+    let mut changed = single_node_spec();
+    changed.nodes[0].prompt_template = "a different prompt".to_string();
+    let v2 = store
+        .create_version(&workflow, VersionOrigin::Authored, "v2", changed)
+        .await
+        .expect("create_version v2");
+
+    let d1 = store
+        .node_compat_digests_for(&v1.version_id, &NodeKey::new("solo"))
+        .await
+        .expect("digests v1")
+        .expect("the node exists");
+    let d2 = store
+        .node_compat_digests_for(&v2.version_id, &NodeKey::new("solo"))
+        .await
+        .expect("digests v2")
+        .expect("the node exists");
+    assert_ne!(
+        d1.0, d2.0,
+        "the prompt digest changes with the prompt template"
+    );
+    assert_eq!(
+        d1.1, d2.1,
+        "the schema digest is unaffected by a prompt-only change"
+    );
+
+    let unknown = store
+        .node_compat_digests_for(&v1.version_id, &NodeKey::new("ghost"))
+        .await
+        .expect("an unknown key is a plain comparison input, not an error");
+    assert!(unknown.is_none());
+}
+
+#[tokio::test]
+async fn restore_source_returns_only_valid_result_checkpoints_with_source_digests() {
+    let store = open_mem_store().await;
+    let (_, kvdag, run) = setup_run(&store).await;
+
+    store
+        .write(StoreWrite::Checkpoint {
+            run: run.clone(),
+            path: InstancePath::new("solo"),
+            seq: 1,
+            kind: CheckpointKind::Result,
+            schema_valid: true,
+            payload: serde_json::json!({"report": "v1"}),
+            summary: "s1".to_string(),
+            artifact_paths: Vec::new(),
+            digest: "d1".to_string(),
+        })
+        .await
+        .expect("write checkpoint 1");
+    store
+        .write(StoreWrite::Checkpoint {
+            run: run.clone(),
+            path: InstancePath::new("solo"),
+            seq: 2,
+            kind: CheckpointKind::Result,
+            schema_valid: false,
+            payload: serde_json::json!({"report": "v2-invalid"}),
+            summary: "s2".to_string(),
+            artifact_paths: Vec::new(),
+            digest: "d2".to_string(),
+        })
+        .await
+        .expect("write checkpoint 2 (schema-invalid)");
+    store
+        .write(StoreWrite::Checkpoint {
+            run: run.clone(),
+            path: InstancePath::new("solo"),
+            seq: 3,
+            kind: CheckpointKind::Partial,
+            schema_valid: true,
+            payload: serde_json::json!({"progress": "half"}),
+            summary: "s3".to_string(),
+            artifact_paths: Vec::new(),
+            digest: "d3".to_string(),
+        })
+        .await
+        .expect("write checkpoint 3 (partial)");
+
+    let restorable = store
+        .restore_source(&run, &[NodeKey::new("solo")])
+        .await
+        .expect("restore_source");
+    assert_eq!(
+        restorable.len(),
+        1,
+        "only the schema-valid result checkpoint is restorable"
+    );
+    assert_eq!(restorable[0].checkpoint.seq, 1);
+    assert_eq!(restorable[0].checkpoint.digest, "d1");
+    let (expected_prompt, expected_schema) = store
+        .node_compat_digests_for(&kvdag.version_id, &NodeKey::new("solo"))
+        .await
+        .expect("digests")
+        .expect("the node exists");
+    assert_eq!(restorable[0].prompt_digest, expected_prompt);
+    assert_eq!(restorable[0].schema_digest, expected_schema);
+}
+
+// ── Phase 3, WS-B: cross-workflow run listing (§4 D9) ───────────────────
+
+#[tokio::test]
+async fn list_runs_with_no_workflow_filter_lists_across_every_workflow() {
+    let store = open_mem_store().await;
+    let (workflow_a, kvdag_a) = setup_workflow(&store).await;
+    let run_a = create_run(&store, &workflow_a, &kvdag_a).await;
+
+    let workflow_b = store
+        .create_workflow("second", "", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let kvdag_b = store
+        .create_version(
+            &workflow_b,
+            VersionOrigin::Authored,
+            "v1",
+            single_node_spec(),
+        )
+        .await
+        .expect("create_version");
+    store
+        .set_head_version(&workflow_b, &kvdag_b.version_id)
+        .await
+        .expect("set_head_version");
+    let run_b = create_run(&store, &workflow_b, &kvdag_b).await;
+
+    let all = store
+        .list_runs(None, 10)
+        .await
+        .expect("list_runs across every workflow");
+    assert!(all
+        .iter()
+        .any(|record| record.id == run_a && record.workflow_name == "demo"));
+    assert!(all
+        .iter()
+        .any(|record| record.id == run_b && record.workflow_name == "second"));
 }

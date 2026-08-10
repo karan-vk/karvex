@@ -436,6 +436,12 @@ impl App {
                     leave_navigate_mode(&mut self.state);
                 }
             }
+            NavigateAction::OpenWorkflowRuns => {
+                if !self.open_workflow_runs() {
+                    self.notify_workflow_runs_unavailable();
+                    leave_navigate_mode(&mut self.state);
+                }
+            }
         }
 
         finish_action_context(&mut self.state, context, previous_mode);
@@ -1396,6 +1402,7 @@ pub(crate) enum NavigateAction {
     OpenNavigator,
     OpenWorkflowDag,
     OpenWorkflowLauncher,
+    OpenWorkflowRuns,
 }
 
 fn copy_mode_survives_prefix_action(action: NavigateAction) -> bool {
@@ -1543,6 +1550,7 @@ fn non_indexed_action_for_key(
             &kb.open_workflow_launcher,
             NavigateAction::OpenWorkflowLauncher,
         ),
+        (&kb.open_workflow_runs, NavigateAction::OpenWorkflowRuns),
     ] {
         if action_matches(bindings, key, dispatch) {
             return Some(action);
@@ -1808,6 +1816,10 @@ pub(super) fn execute_navigate_action_in_context(
         // this `&mut AppState` path does not have; the `App` arm above is the
         // one that opens it.
         NavigateAction::OpenWorkflowLauncher => leave_navigate_mode(state),
+        // Same reason: the browser is seeded from `workflow.run.list` /
+        // `workflow.summary.list`, which need the runtime this `&mut
+        // AppState`-only path does not have.
+        NavigateAction::OpenWorkflowRuns => leave_navigate_mode(state),
     }
 
     finish_action_context(state, context, previous_mode);
@@ -2733,6 +2745,7 @@ last_pane = "prefix+tab"
             edges: Vec::new(),
             status: crate::workflow::model::RunStatus::Running,
             seq: 0,
+            epilogue: None,
         }));
         execute_navigate_action(&mut state, NavigateAction::OpenWorkflowDag);
         assert_eq!(state.mode, Mode::WorkflowDag);

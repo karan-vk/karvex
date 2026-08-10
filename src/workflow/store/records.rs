@@ -144,7 +144,10 @@ pub struct RunRow {
 pub struct RunNodeRow {
     pub id: RecordId,
     pub run: RecordId,
-    pub kvdag_node: RecordId,
+    /// `option` since migration `0004`: the engine-owned `.summary` epilogue
+    /// node is a `run_node` row with no kvdag definition behind it (`07-phase3-plan.md`
+    /// §4 D5, B1).
+    pub kvdag_node: Option<RecordId>,
     pub node_key: String,
     pub instance_path: String,
     pub parent: Option<RecordId>,
@@ -242,14 +245,17 @@ pub struct RunSummaryRow {
     pub created_at: Datetime,
 }
 
-// ── interrogation / review (schema present; Phase 1 has no writer) ─────────
+// ── interrogation (writer since Phase 3) / review (schema present; no writer) ──
 
 #[derive(Debug, Clone, PartialEq, SurrealValue)]
 pub struct InterrogationRow {
     pub id: RecordId,
     pub run_node: RecordId,
     pub source_session_id: String,
-    pub forked_session_id: String,
+    /// `option` since migration `0004`: only pre-assignable when
+    /// `--session-id` combines with `--resume --fork-session` (`07-phase3-plan.md`
+    /// §4 D7); otherwise learned later from the pane's session report.
+    pub forked_session_id: Option<String>,
     pub transcript_path: Option<String>,
     pub cwd: String,
     pub pane_id: Option<String>,

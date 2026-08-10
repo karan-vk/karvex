@@ -19,6 +19,8 @@
 
 #[cfg(feature = "workflow")]
 use std::collections::BTreeMap;
+#[cfg(feature = "workflow")]
+use std::path::PathBuf;
 
 #[cfg(feature = "workflow")]
 use crate::api::schema::{
@@ -30,14 +32,21 @@ use crate::api::schema::{
     WorkflowTier, WorkflowVersionOrigin,
 };
 use crate::api::schema::{
-    WorkflowCreateParams, WorkflowNodeExpandParams, WorkflowNodeReportParams,
-    WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRunListParams, WorkflowRunParams,
-    WorkflowRunTarget, WorkflowTarget, WorkflowVersionCreateParams, WorkflowVersionTarget,
+    WorkflowCreateParams, WorkflowNodeExpandParams, WorkflowNodeInterrogateParams,
+    WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRunListParams,
+    WorkflowRunParams, WorkflowRunTarget, WorkflowSummaryListParams, WorkflowTarget,
+    WorkflowVersionCreateParams, WorkflowVersionTarget,
+};
+#[cfg(feature = "workflow")]
+use crate::api::schema::{
+    WorkflowInterrogationMode, WorkflowRestoreReport, WorkflowRestoreSkip,
+    WorkflowRestoreSkipReason, WorkflowRestoredFrom,
 };
 #[cfg(feature = "workflow")]
 use crate::app::workflow::{
     wire_blocker, wire_demand, wire_edge_kind, wire_evidence, wire_node_status, wire_run_status,
-    wire_succession, wire_tier, ActiveRun,
+    wire_run_summary_record, wire_succession, wire_tier, ActiveRun, InterrogationRequest,
+    InterrogationSeed,
 };
 #[cfg(feature = "workflow")]
 use crate::app::workflow_store::StoreUnavailable;
@@ -56,9 +65,9 @@ use crate::workflow::engine::graph::{narrow_growth, resolve_assignments};
 use crate::workflow::engine::{is_closed_run, ReportOutcome, ReportVerdict};
 #[cfg(feature = "workflow")]
 use crate::workflow::model::{
-    EdgePayload, EngineInput, GrowthLimits, InstancePath, Isolation, Kvdag, KvdagEdge, KvdagNode,
-    KvdagVersionId, NodeKey, NodeKind, NodeStatus, NodeToken, RunGraph, RunId, RunStatus, Runner,
-    WorkflowId,
+    is_reserved_path, CheckpointKind, EdgePayload, EngineInput, GrowthLimits, InstancePath,
+    Isolation, Kvdag, KvdagEdge, KvdagNode, KvdagVersionId, NodeKey, NodeKind, NodeStatus,
+    NodeToken, RestoredRef, RestoredSeed, RunGraph, RunId, RunStatus, Runner, WorkflowId,
 };
 #[cfg(feature = "workflow")]
 use crate::workflow::store::{
@@ -131,6 +140,59 @@ const RESULT_INVALID_CODE: &str = "workflow_node_result_invalid";
 /// (`06-phase2-plan.md` H2).
 #[cfg(feature = "workflow")]
 const RUN_CLOSED_CODE: &str = "workflow_run_closed";
+/// The transcript an interrogation would resume is not reachable
+/// (`07-phase3-plan.md` §3 rule 8). One code for every reason — a node that ran
+/// as a command and never had a session, a transcript file that is gone, a
+/// recorded cwd that no longer exists, a reconstruction with no checkpoint to
+/// seed from — with the *reason* in the message text, matching the existing
+/// single-code style. `03-storage-schema.md` §4.4's stat-first rule is what
+/// makes this a structured answer instead of a pane that silently fails to
+/// start.
+///
+/// `src/app/workflow_history.rs` carries its own copy of this literal rather
+/// than importing this constant: that module's `interrogate_intent`/
+/// `interrogate_outcome` compile unconditionally (its own module doc: only
+/// `historical_interrogations` is `#[cfg(feature = "workflow")]`), and this
+/// constant is not — it is gated off entirely in a `--no-default-features`
+/// build, where an unconditional `use` of it would not compile. The two
+/// literals' equality is asserted in
+/// `all_workflow_error_codes_are_a_well_formed_disjoint_family` below so they
+/// cannot silently diverge.
+#[cfg(feature = "workflow")]
+const TRANSCRIPT_UNAVAILABLE_CODE: &str = "workflow_transcript_unavailable";
+/// The run's history has been pruned: only its `run_summary` row survives
+/// (`03-storage-schema.md` §9, `07-phase3-plan.md` §4 D12). Restore and
+/// interrogation are impossible, and `workflow.run.get` answers this rather
+/// than a bare not-found so the surviving surface is *named*.
+#[cfg(feature = "workflow")]
+const RUN_PRUNED_CODE: &str = "workflow_run_pruned";
+/// A `restore_from.nodes` selector matched no node in the **target** version.
+/// A typo must not silently re-run a node the caller believed restored, which
+/// is why this is a hard error while a selector that matches a node with no
+/// usable checkpoint is only a reported skip (§4 D11).
+#[cfg(feature = "workflow")]
+const RESTORE_UNKNOWN_SELECTOR_CODE: &str = "workflow_restore_unknown_selector";
+/// This node already has a live interrogation pane (§4 D7). Forking one
+/// session twice concurrently is a footgun with no use case; sequential
+/// re-interrogation is fine and each is its own record.
+#[cfg(feature = "workflow")]
+const INTERROGATION_ACTIVE_CODE: &str = "workflow_interrogation_active";
+/// Every precondition passed but the interrogation's **pane** could not be
+/// created (E-15).
+///
+/// Deliberately not `workflow_transcript_unavailable`: by the time this is
+/// reachable the transcript and the recorded cwd have both been stat'd and
+/// found, so telling the caller the transcript is unavailable would send them
+/// to check a file that is sitting right there.
+///
+/// Deliberately not the node-spawn codes either, even though the underlying
+/// failure is the same pane machinery: an interrogation is **not** a run node
+/// anywhere (§4 D8), and answering `workflow.node.interrogate` with
+/// `workflow_node_spawn_failed` would tell a client one of the run's nodes had
+/// failed to start. One code with the reason in the message, matching the
+/// single-code style the rest of this file uses.
+#[cfg(feature = "workflow")]
+const INTERROGATION_SPAWN_FAILED_CODE: &str = "workflow_interrogation_spawn_failed";
 
 /// Default page size for `workflow.run.list`.
 #[cfg(feature = "workflow")]
@@ -221,11 +283,11 @@ impl App {
     pub(super) fn handle_workflow_run_list(
         &mut self,
         id: String,
-        params: WorkflowRunListParams,
+        _params: WorkflowRunListParams,
     ) -> String {
-        if let Some(error) = require_non_empty(&id, "workflow_id", &params.workflow_id) {
-            return error;
-        }
+        // Both fields are optional from Phase 3 on (§4 D9: `workflow_id: None`
+        // lists across every workflow), so there is nothing to validate before
+        // the subsystem's own answer.
         self.workflow_unavailable(id)
     }
 
@@ -303,6 +365,42 @@ impl App {
         if let Some(error) = require_expand_params(&id, &params) {
             return error;
         }
+        self.workflow_unavailable(id)
+    }
+
+    pub(super) fn handle_workflow_node_interrogate(
+        &mut self,
+        id: String,
+        params: WorkflowNodeInterrogateParams,
+    ) -> String {
+        if let Some(error) = require_non_empty(&id, "run_id", &params.run_id) {
+            return error;
+        }
+        if let Some(error) = require_non_empty(&id, "path", &params.path) {
+            return error;
+        }
+        self.workflow_unavailable(id)
+    }
+
+    pub(super) fn handle_workflow_summary_get(
+        &mut self,
+        id: String,
+        target: WorkflowRunTarget,
+    ) -> String {
+        if let Some(error) = require_non_empty(&id, "run_id", &target.run_id) {
+            return error;
+        }
+        self.workflow_unavailable(id)
+    }
+
+    pub(super) fn handle_workflow_summary_list(
+        &mut self,
+        id: String,
+        _params: WorkflowSummaryListParams,
+    ) -> String {
+        // Both fields are optional (§4 D9: `workflow_id: None` lists across
+        // every workflow), so there is nothing to validate before the
+        // subsystem's own answer.
         self.workflow_unavailable(id)
     }
 }
@@ -582,9 +680,21 @@ impl App {
         // Phase 1 executes one run at a time. Refusing here rather than after
         // `create_run` is what keeps a refused start from leaving an orphan
         // `workflow_run` row that no engine will ever advance.
-        if self.workflow.is_live() {
+        //
+        // **The epilogue disjunct is not cosmetic** (`07-phase3-plan.md` M7). A
+        // `Succeeded` run is not `is_live()`, so without it a `workflow.run`
+        // arriving while the summariser is still working would pass this check,
+        // `start()` a fresh engine, clear `node_tokens`, and silently orphan the
+        // summariser's report — the summary lost with no surface at all.
+        if self.workflow.is_live() || self.workflow.epilogue_pending() {
             let refused = crate::app::workflow::WorkflowStartError::RunInFlight;
-            let message = self.workflow_run_in_flight_message();
+            let message = if self.workflow.is_live() {
+                self.workflow_run_in_flight_message()
+            } else {
+                "the previous run's end-of-run summary is still being written; \
+                 it finishes or gives up on its own, and the next run can start then"
+                    .to_string()
+            };
             return encode_error(id, refused.code(), message);
         }
         let selector = params.workflow_id.trim().to_string();
@@ -683,9 +793,47 @@ impl App {
             Err(response) => return response(id),
         };
         let assignments = resolve_assignments(&kvdag, tier, &history);
+
+        // §4 D11: restore is resolved **before** `create_run`, for the same
+        // reason the definition is. An unknown selector is a hard error, and a
+        // hard error after the row exists would leave an orphan `workflow_run`
+        // no engine will ever advance.
+        let restore = match params.restore_from.as_ref() {
+            Some(request) => match self.resolve_restore(request, &kvdag) {
+                Ok(plan) => Some(plan),
+                Err(response) => return response(id),
+            },
+            None => None,
+        };
+        // §4 D21: absent means true. The default lives here, in the handler, and
+        // exactly here — the wire type carries `Option<bool>` precisely so the
+        // policy is not duplicated into every client.
+        let include_prior_summaries = params.include_prior_summaries.unwrap_or(true);
+        let prior_summaries = if include_prior_summaries {
+            match self.prior_run_summaries(&kvdag.workflow_id) {
+                Ok(summaries) => summaries,
+                Err(response) => return response(id),
+            }
+        } else {
+            Vec::new()
+        };
+        let context_runs: Vec<RunId> = prior_summaries
+            .iter()
+            .map(|summary| RunId::new(summary.run_id.clone()))
+            .collect();
+        let restore_from_run = restore.as_ref().map(|plan| plan.source.clone());
+        let restore_request = restore.as_ref().map(|plan| plan.request.clone());
+        let seeds = restore
+            .as_ref()
+            .map(|plan| plan.seeds.clone())
+            .unwrap_or_default();
+
         let created = self.workflow_store.call({
             let workspace_id = workspace_id.clone();
             let assignments = assignments.clone();
+            let context_runs = context_runs.clone();
+            let restore_from = restore_request;
+            let restored = seeds.clone();
             move |cx| {
                 cx.block_on(cx.store().create_run(NewRun {
                     workflow: workflow_id,
@@ -695,8 +843,10 @@ impl App {
                     growth,
                     started_at_unix_ms,
                     assignments,
-                    context_runs: Vec::new(),
+                    context_runs,
                     workspace_id,
+                    restore_from,
+                    restored,
                 }))
             }
         });
@@ -708,9 +858,30 @@ impl App {
 
         // The DAG overlay heads the run with the name the author gave the
         // workflow; the run graph itself only carries record ids.
-        self.state.set_workflow_run_name(workflow_name);
+        self.state.set_workflow_run_name(workflow_name.clone());
 
-        let graph = RunGraph::materialise_with(&kvdag, run_id.clone(), tier, &assignments);
+        // §4 D21 / §6 A8: one file in the run dir, written before the first node
+        // spawns so its `task.md` pointer can never name a file that is not
+        // there yet. A write failure is a warning, not a failed run — the run's
+        // work does not depend on its history, and refusing to start over a
+        // missing context file would be a worse answer than starting without it.
+        let prior_runs_path = if prior_summaries.is_empty() {
+            None
+        } else {
+            self.write_prior_runs_context(&run_id, &workflow_name, &prior_summaries)
+        };
+
+        // The restore instant is the run's own `started_at` (defect D-B): the
+        // store persists a restored node's stamps from the same value, so the
+        // engine must not read a clock of its own or live and durable drift.
+        let graph = RunGraph::materialise_with_restored(
+            &kvdag,
+            run_id.clone(),
+            tier,
+            &assignments,
+            &seeds,
+            started_at_unix_ms,
+        );
         let mut active = ActiveRun::new(
             run_id.clone(),
             kvdag.workflow_id.clone(),
@@ -718,7 +889,9 @@ impl App {
             tier,
         )
         .with_args(args)
-        .with_placement(workspace_id, None);
+        .with_placement(workspace_id, None)
+        .with_history(context_runs, restore_from_run)
+        .with_prior_runs_path(prior_runs_path);
         // The last of the three clocks H1 describes. `ActiveRun::new` stamps
         // its own `now`, which is a second reading of the same instant; the run
         // row was bound from `started_at_unix_ms`, so the live projection is
@@ -735,7 +908,17 @@ impl App {
             return encode_error(id, error.code(), message);
         }
         match self.workflow_run_info(&run_id) {
-            Some(run) => encode_success(id, ResponseResult::WorkflowRunStarted { run }),
+            // §4 D11: an all-skipped restore is a **successful** run start
+            // carrying a fully populated `skipped` list, mirroring how a
+            // rejected expand proposal is a success carrying the rejection. The
+            // report is the surface; the run started either way.
+            Some(run) => encode_success(
+                id,
+                ResponseResult::WorkflowRunStarted {
+                    run,
+                    restore: restore.map(|plan| plan.report),
+                },
+            ),
             None => encode_error(
                 id,
                 NO_ACTIVE_RUN_CODE,
@@ -759,7 +942,10 @@ impl App {
         ) {
             return encode_success(id, ResponseResult::WorkflowRunGet { run, graph });
         }
-        match self.stored_run(&run_id) {
+        // m9: a pruned run whose summary survives answers `workflow_run_pruned`
+        // naming `workflow.summary.get`, not the bare not-found — the surviving
+        // surface is stated rather than implied.
+        match self.stored_run_or_pruned(&run_id) {
             Ok(Some((run, graph))) => {
                 encode_success(id, ResponseResult::WorkflowRunGet { run, graph })
             }
@@ -777,22 +963,32 @@ impl App {
         id: String,
         params: WorkflowRunListParams,
     ) -> String {
-        if let Some(error) = require_non_empty(&id, "workflow_id", &params.workflow_id) {
-            return error;
-        }
-        let selector = params.workflow_id.trim().to_string();
+        // §4 D9: `None` — and, for the callers that have always sent it, an
+        // empty string — lists across every workflow, newest first. Every
+        // published client sends a workflow id, so widening the *request* field
+        // is compatible in the direction clients actually use.
+        let selector = params
+            .workflow_id
+            .map(|workflow_id| workflow_id.trim().to_string())
+            .filter(|workflow_id| !workflow_id.is_empty());
         let limit = params.limit.unwrap_or(DEFAULT_RUN_LIST_LIMIT).max(1);
         // `kvx workflow run list <name|id>` takes the same selector as `show`,
         // `update`, and `run start`, so it resolves it the same way; listing a
         // workflow's runs by the name the user gave it must not be the one
         // verb that only speaks record ids.
+        let unresolved = selector.clone().unwrap_or_default();
         let listed = self.workflow_store.call(move |cx| {
-            let workflow_id = match resolve_workflow_selector(cx, &selector)? {
-                WorkflowSelector::Found(workflow_id) => workflow_id,
-                WorkflowSelector::NotFound => return Ok::<_, StoreError>(LookupResult::NotFound),
-                WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
+            let workflow_id = match selector {
+                Some(selector) => match resolve_workflow_selector(cx, &selector)? {
+                    WorkflowSelector::Found(workflow_id) => Some(workflow_id),
+                    WorkflowSelector::NotFound => {
+                        return Ok::<_, StoreError>(LookupResult::NotFound)
+                    }
+                    WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
+                },
+                None => None,
             };
-            let records = cx.block_on(cx.store().list_runs(&workflow_id, limit))?;
+            let records = cx.block_on(cx.store().list_runs(workflow_id.as_ref(), limit))?;
             // One batched query for the whole page rather than one per run:
             // `limit` is caller-supplied and uncapped, so a per-run call would
             // be an unbounded N+1. Without it `run.list` would report
@@ -823,12 +1019,12 @@ impl App {
             Ok(Ok(LookupResult::NotFound)) => encode_error(
                 id,
                 NOT_FOUND_CODE,
-                format!("no workflow with id {}", params.workflow_id),
+                format!("no workflow with id {unresolved}"),
             ),
             Ok(Ok(LookupResult::Ambiguous)) => encode_error(
                 id,
                 AMBIGUOUS_NAME_CODE,
-                format!("multiple workflows matched name {}", params.workflow_id),
+                format!("multiple workflows matched name {unresolved}"),
             ),
             Ok(Err(error)) => self.store_error(id, &error),
             Err(unavailable) => unavailable_response(id, &unavailable),
@@ -1129,6 +1325,235 @@ impl App {
         )
     }
 
+    /// `workflow.node.interrogate` (`07-phase3-plan.md` §WS-D, §4 D7).
+    ///
+    /// Revives a **finished** node's Claude session in a pane, forked so the
+    /// source transcript is never mutated. The whole point of the precondition
+    /// ladder below is `00-overview.md` Feature 3's guarantee: the caller
+    /// either gets a working pane or a structured refusal that says which fact
+    /// was missing — **never** a pane that silently fails to start. Every
+    /// refusal path returns before anything is created, so a refused call
+    /// leaves the workspace with exactly as many panes as it had.
+    pub(super) fn handle_workflow_node_interrogate(
+        &mut self,
+        id: String,
+        params: WorkflowNodeInterrogateParams,
+    ) -> String {
+        if let Some(error) = require_non_empty(&id, "run_id", &params.run_id) {
+            return error;
+        }
+        if let Some(error) = require_non_empty(&id, "path", &params.path) {
+            return error;
+        }
+        let run_id = RunId::new(params.run_id.trim().to_string());
+        let path = InstancePath::new(params.path.trim().to_string());
+        let reconstructed = matches!(params.mode, WorkflowInterrogationMode::Reconstructed);
+        let note = params.note.unwrap_or_default();
+
+        // 1. The run. A pruned run has no `workflow_run` row at all, so this is
+        //    also where "summary-only" is distinguished from "never existed":
+        //    the caller is pointed at the surface that survived rather than
+        //    told the run is unknown.
+        let (run, node) = match self.interrogation_target(&run_id, &path) {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                return node_not_found(
+                    id,
+                    &WorkflowNodeTarget {
+                        run_id: params.run_id.clone(),
+                        path: params.path.clone(),
+                    },
+                )
+            }
+            Err(response) => return response(id),
+        };
+
+        // 2. A session to fork.
+        //
+        //    The gate is the node's **runner**, not the presence of an
+        //    `agent_session_id`. `07-phase3-plan.md` §WS-D says "a `runner:
+        //    command` node does not [have one]", and that premise does not hold
+        //    against the tree: `workflow_spawn_plan` derives
+        //    `SpawnSpec::agent_session_id` for *every* node it plans,
+        //    `Runner::Command` included, `spawn_workflow_node` copies it onto
+        //    the binding, and `write_run_node` persists it. So a command node's
+        //    binding carries an id for a Claude session that was never created.
+        //    Gating on the id would let a command node through to the stat and,
+        //    if any file happened to sit at the estimated path, hand `--resume`
+        //    a session id `claude` has never heard of.
+        //
+        //    The message says which of the two things is true, because "the
+        //    transcript is unavailable" alone sends the caller looking for a
+        //    file that was never going to be there.
+        match self.interrogation_runner(&run, &node) {
+            Some(Runner::Command) => {
+                return encode_error(
+                    id,
+                    TRANSCRIPT_UNAVAILABLE_CODE,
+                    format!(
+                        "node {path} ran as a command, not an agent, so it has no session \
+                         transcript to resume"
+                    ),
+                )
+            }
+            // An unresolvable runner falls through to the stat, which is the
+            // arbiter anyway (`03-storage-schema.md` §4.4). Refusing on a lookup
+            // miss would block a perfectly forkable node over a definition row
+            // that has since been pruned.
+            Some(Runner::Agent) | None => {}
+        }
+        let Some(source_session_id) = node.agent_session_id.clone() else {
+            return encode_error(
+                id,
+                TRANSCRIPT_UNAVAILABLE_CODE,
+                format!(
+                    "node {path} never started a session — it has no pane binding to \
+                     resume from"
+                ),
+            );
+        };
+
+        // 3. One live interrogation per source node (§4 D7). Keyed on the live
+        //    tracker rather than on `interrogation` rows with no `ended_at`: a
+        //    row left open by a server that died names a pane that is long gone,
+        //    and treating it as live would refuse this node forever.
+        if let Some(active) = self.workflow.live_interrogation(&run_id, &path) {
+            return encode_error(
+                id,
+                INTERROGATION_ACTIVE_CODE,
+                format!(
+                    "node {path} is already being interrogated in pane {}; close it before \
+                     starting another",
+                    active.pane
+                ),
+            );
+        }
+
+        // 4. The mode's own precondition. Stat-first (`03-storage-schema.md`
+        //    §4.4): a wrong path is discovered here, as an answer, rather than
+        //    by a pane that starts and dies.
+        let seed =
+            match self.interrogation_seed(&run_id, &path, &node, &source_session_id, reconstructed)
+            {
+                Ok(seed) => seed,
+                Err(InterrogationRefusal::Unavailable(message)) => {
+                    return encode_error(id, TRANSCRIPT_UNAVAILABLE_CODE, message)
+                }
+                Err(InterrogationRefusal::Store(response)) => return response(id),
+            };
+
+        // Everything below creates. Nothing above did.
+        match self.spawn_interrogation(InterrogationRequest {
+            run: run_id,
+            path,
+            workflow_name: run.workflow_name,
+            workspace_id: run.workspace_id,
+            source_session_id,
+            note,
+            seed,
+        }) {
+            Ok(info) => encode_success(
+                id,
+                ResponseResult::WorkflowNodeInterrogated {
+                    interrogation: info,
+                },
+            ),
+            // Not `workflow_transcript_unavailable`, and not a node-spawn code
+            // either — see [`INTERROGATION_SPAWN_FAILED_CODE`]. The specific
+            // reason rides in the message.
+            Err(failed) => encode_error(
+                id,
+                INTERROGATION_SPAWN_FAILED_CODE,
+                format!("the interrogation's pane could not be created: {failed}"),
+            ),
+        }
+    }
+
+    /// `workflow.summary.get` — the run's end-of-run summary, or `None`.
+    ///
+    /// `None` is a normal answer and never an error (§4 D1): a run whose
+    /// epilogue was disabled, cancelled, or gave up simply has no summary, and
+    /// every consumer treats that as "no summary". The summary outlives its run,
+    /// so this answers for a pruned run too — which is exactly what
+    /// `workflow.run.get`'s `workflow_run_pruned` message points at.
+    pub(super) fn handle_workflow_summary_get(
+        &mut self,
+        id: String,
+        target: WorkflowRunTarget,
+    ) -> String {
+        if let Some(error) = require_non_empty(&id, "run_id", &target.run_id) {
+            return error;
+        }
+        let run_id = RunId::new(target.run_id.trim().to_string());
+        let loaded = self
+            .workflow_store
+            .call(move |cx| cx.block_on(cx.store().get_run_summary(&run_id)));
+        match loaded {
+            Ok(Ok(summary)) => encode_success(
+                id,
+                ResponseResult::WorkflowSummaryGet {
+                    summary: summary.map(wire_run_summary_record),
+                },
+            ),
+            Ok(Err(error)) => self.store_error(id, &error),
+            Err(unavailable) => unavailable_response(id, &unavailable),
+        }
+    }
+
+    /// `workflow.summary.list` — summaries newest-first, across one workflow or
+    /// all of them (§4 D9).
+    ///
+    /// `run_summary` is the one never-pruned table, so this is the only listing
+    /// that still returns a pruned run's history; each row says so through
+    /// `run_pruned`.
+    pub(super) fn handle_workflow_summary_list(
+        &mut self,
+        id: String,
+        params: WorkflowSummaryListParams,
+    ) -> String {
+        let limit = params.limit.unwrap_or(DEFAULT_RUN_LIST_LIMIT).max(1);
+        let selector = params
+            .workflow_id
+            .map(|workflow_id| workflow_id.trim().to_string())
+            .filter(|workflow_id| !workflow_id.is_empty());
+        let listed = self.workflow_store.call(move |cx| {
+            let workflow_id = match selector {
+                // The same `<name|id>` selector every other workflow verb takes:
+                // listing summaries by the name the user gave the workflow must
+                // not be the one verb that only speaks record ids.
+                Some(selector) => match resolve_workflow_selector(cx, &selector)? {
+                    WorkflowSelector::Found(workflow_id) => Some(workflow_id),
+                    WorkflowSelector::NotFound => {
+                        return Ok::<_, StoreError>(LookupResult::NotFound)
+                    }
+                    WorkflowSelector::Ambiguous => return Ok(LookupResult::Ambiguous),
+                },
+                None => None,
+            };
+            let summaries =
+                cx.block_on(cx.store().list_run_summaries(workflow_id.as_ref(), limit))?;
+            Ok(LookupResult::Found(summaries))
+        });
+        match listed {
+            Ok(Ok(LookupResult::Found(summaries))) => encode_success(
+                id,
+                ResponseResult::WorkflowSummaryList {
+                    summaries: summaries.into_iter().map(wire_run_summary_record).collect(),
+                },
+            ),
+            Ok(Ok(LookupResult::NotFound)) => {
+                encode_error(id, NOT_FOUND_CODE, "no workflow with that id".to_string())
+            }
+            Ok(Ok(LookupResult::Ambiguous)) => encode_error(
+                id,
+                AMBIGUOUS_NAME_CODE,
+                "multiple workflows matched that name".to_string(),
+            ),
+            Ok(Err(error)) => self.store_error(id, &error),
+            Err(unavailable) => unavailable_response(id, &unavailable),
+        }
+    }
+
     /// Authenticates a node-token-bearing call that is not a report, returning
     /// the minted token the engine input has to carry.
     ///
@@ -1380,6 +1805,528 @@ impl App {
         }
     }
 
+    /// Resolves a `restore_from` request into seeds and a report (§4 D11).
+    ///
+    /// The one hard error is an **unknown selector**: a selector naming no node
+    /// in the *target* version is a typo, and silently re-running a node the
+    /// caller believed restored is precisely what that error exists to prevent.
+    /// Every other outcome is a reported skip, because "you asked for something
+    /// that doesn't exist" and "it exists but can't be restored" are different
+    /// answers and only the first is the caller's mistake.
+    ///
+    /// Runs entirely before `create_run`, so a hard error leaves no run row.
+    #[allow(clippy::type_complexity)]
+    fn resolve_restore(
+        &mut self,
+        request: &crate::api::schema::WorkflowRestoreRequest,
+        kvdag: &Kvdag,
+    ) -> Result<RestorePlan, Box<dyn FnOnce(String) -> String>> {
+        let source = RunId::new(request.run_id.trim().to_string());
+        // A pruned source is `workflow_run_pruned`, not "not found": its
+        // checkpoints are gone with the run, but its summary is not, and the
+        // caller deserves to be told which of those two things happened.
+        if self.stored_run_or_pruned(&source)?.is_none() {
+            let named = source.clone();
+            return Err(Box::new(move |id| {
+                encode_error(id, NOT_FOUND_CODE, format!("no run with id {named}"))
+            }));
+        }
+
+        // Templates are never materialised at run start (§3.4), so they are not
+        // in the selector namespace: a template has no instance to restore into.
+        let target_keys: Vec<NodeKey> = kvdag
+            .nodes
+            .iter()
+            .filter(|node| !node.is_template)
+            .map(|node| node.key.clone())
+            .collect();
+
+        // D18: the bare form means "everything restorable". Forcing an explicit
+        // selector list for the common case — re-run this, keeping what
+        // succeeded — would make the short spelling useless, and the report
+        // lists both sets either way, so it is never silent about what it
+        // skipped.
+        let selectors: Vec<NodeKey> = if request.nodes.is_empty() {
+            target_keys.clone()
+        } else {
+            let mut selectors = Vec::with_capacity(request.nodes.len());
+            for selector in &request.nodes {
+                let key = NodeKey::new(selector.trim().to_string());
+                if !target_keys.contains(&key) {
+                    let selector = selector.clone();
+                    let version = kvdag.version_id.clone();
+                    return Err(Box::new(move |id| {
+                        encode_error(
+                            id,
+                            RESTORE_UNKNOWN_SELECTOR_CODE,
+                            format!(
+                                "version {version} has no restorable node named {selector}; \
+                                 restore selectors name nodes of the version being started, \
+                                 not of the run being restored from"
+                            ),
+                        )
+                    }));
+                }
+                selectors.push(key);
+            }
+            selectors
+        };
+
+        let version = kvdag.version_id.clone();
+        let wanted = source.clone();
+        let wanted_selectors = selectors.clone();
+        // One store job for the whole resolution: the source checkpoints and the
+        // target version's digests together, rather than a round trip per
+        // selector.
+        let loaded = self.workflow_store.call(move |cx| {
+            let restorable = cx.block_on(cx.store().restore_source(&wanted, &wanted_selectors))?;
+            let mut target_digests: BTreeMap<NodeKey, (String, String)> = BTreeMap::new();
+            for key in &wanted_selectors {
+                if let Some(digests) =
+                    cx.block_on(cx.store().node_compat_digests_for(&version, key))?
+                {
+                    target_digests.insert(key.clone(), digests);
+                }
+            }
+            Ok::<_, StoreError>((restorable, target_digests))
+        });
+        let (restorable, target_digests) = match loaded {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(error)) => {
+                let code = error.api_code();
+                let message = error.to_string();
+                return Err(Box::new(move |id| encode_error(id, code, message)));
+            }
+            Err(unavailable) => {
+                return Err(Box::new(move |id| unavailable_response(id, &unavailable)))
+            }
+        };
+
+        // Newest checkpoint per node key: `restore_source` orders by seq, and a
+        // node that checkpointed twice restores from what it ended with.
+        let mut newest: BTreeMap<NodeKey, crate::workflow::store::RestorableCheckpoint> =
+            BTreeMap::new();
+        for candidate in restorable {
+            let key = candidate.checkpoint.node_key.clone();
+            match newest.get(&key) {
+                Some(existing) if existing.checkpoint.seq >= candidate.checkpoint.seq => {}
+                _ => {
+                    newest.insert(key, candidate);
+                }
+            }
+        }
+
+        let mut plan = RestorePlan {
+            request: crate::workflow::store::RestoreFromRequest {
+                run: source.clone(),
+                nodes: request.nodes.clone(),
+                allow_changed: request.allow_changed,
+            },
+            source,
+            seeds: Vec::new(),
+            report: WorkflowRestoreReport {
+                restored: Vec::new(),
+                skipped: Vec::new(),
+            },
+        };
+        for key in selectors {
+            let Some(candidate) = newest.remove(&key) else {
+                plan.report.skipped.push(WorkflowRestoreSkip {
+                    selector: key.to_string(),
+                    reason: WorkflowRestoreSkipReason::NoCheckpoint,
+                    message: format!("the source run has no validated result checkpoint for {key}"),
+                });
+                continue;
+            };
+            // D19: the store discards over-budget payloads and keeps a
+            // `{"truncated": true}` stub. Restoring the stub would hand
+            // downstream nodes a lie labelled as data, so this is skipped even
+            // with `allow_changed` — the payload is not "changed", it is absent.
+            if is_truncated_payload(&candidate.checkpoint.payload) {
+                plan.report.skipped.push(WorkflowRestoreSkip {
+                    selector: key.to_string(),
+                    reason: WorkflowRestoreSkipReason::PayloadTruncated,
+                    message: format!(
+                        "{key}'s checkpoint payload exceeded the store's size budget and was \
+                         not kept; there is nothing to restore even with allow_changed"
+                    ),
+                });
+                continue;
+            }
+            let target = target_digests.get(&key);
+            let compatible = target.is_some_and(|(prompt, schema)| {
+                prompt == &candidate.prompt_digest && schema == &candidate.schema_digest
+            });
+            if !compatible && !request.allow_changed {
+                plan.report.skipped.push(WorkflowRestoreSkip {
+                    selector: key.to_string(),
+                    reason: WorkflowRestoreSkipReason::DefinitionChanged,
+                    message: format!(
+                        "{key}'s prompt or output schema differs from the version it ran under, \
+                         so its stored result may not answer the question this version asks; \
+                         re-run it, or pass allow_changed to restore it anyway"
+                    ),
+                });
+                continue;
+            }
+            plan.report.restored.push(key.to_string());
+            plan.seeds.push(RestoredSeed {
+                node_key: key,
+                payload: candidate.checkpoint.payload,
+                summary: candidate.checkpoint.summary,
+                artifact_paths: candidate.checkpoint.artifact_paths,
+                digest: candidate.checkpoint.digest,
+                source: RestoredRef {
+                    run: plan.source.clone(),
+                    node_key: candidate.checkpoint.node_key,
+                    checkpoint_seq: candidate.checkpoint.seq,
+                },
+            });
+        }
+        Ok(plan)
+    }
+
+    /// The injection feed: this workflow's most recent summaries (§4 D21).
+    #[allow(clippy::type_complexity)]
+    fn prior_run_summaries(
+        &mut self,
+        workflow: &WorkflowId,
+    ) -> Result<Vec<crate::api::schema::WorkflowRunSummaryInfo>, Box<dyn FnOnce(String) -> String>>
+    {
+        let limit = u32::try_from(self.workflow.policy().history_context_runs).unwrap_or(u32::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let workflow = workflow.clone();
+        let loaded = self.workflow_store.call(move |cx| {
+            cx.block_on(cx.store().run_summaries_for_context(
+                &workflow,
+                // The run being started does not exist yet — it is created from
+                // what this returns — so there is nothing of its own to exclude.
+                // The parameter is for callers re-deriving context for a run
+                // that already has an id.
+                &RunId::new(String::new()),
+                limit,
+            ))
+        });
+        match loaded {
+            Ok(Ok(summaries)) => Ok(summaries.into_iter().map(wire_run_summary_record).collect()),
+            Ok(Err(error)) => {
+                let code = error.api_code();
+                let message = error.to_string();
+                Err(Box::new(move |id| encode_error(id, code, message)))
+            }
+            Err(unavailable) => Err(Box::new(move |id| unavailable_response(id, &unavailable))),
+        }
+    }
+
+    /// Writes `<run dir>/context/prior-runs.md` and returns its path.
+    ///
+    /// A failure is a warning, never a failed run: the run's work does not
+    /// depend on its history, and refusing to start over a context file the
+    /// nodes are explicitly told they may ignore would be a worse answer than
+    /// starting without one.
+    fn write_prior_runs_context(
+        &mut self,
+        run: &RunId,
+        workflow_name: &str,
+        summaries: &[crate::api::schema::WorkflowRunSummaryInfo],
+    ) -> Option<String> {
+        let sections: Vec<crate::workflow::binding::spawn::PriorRunSection<'_>> = summaries
+            .iter()
+            .map(|summary| crate::workflow::binding::spawn::PriorRunSection {
+                run: &summary.run_id,
+                outcome: &summary.outcome,
+                text: &summary.text,
+                highlights: &summary.highlights,
+                open_gaps: &summary.open_gaps,
+            })
+            .collect();
+        let body = crate::workflow::binding::spawn::render_prior_runs(workflow_name, &sections);
+        let run_dir = crate::workflow::binding::spawn::run_dir(
+            &crate::workflow::binding::spawn::runs_root(),
+            run,
+        );
+        match crate::workflow::binding::spawn::write_run_context(&run_dir, &body) {
+            Ok(path) => Some(path.display().to_string()),
+            Err(error) => {
+                tracing::warn!(
+                    run = %run,
+                    error = %error,
+                    "the run's prior-runs context could not be written; the run starts without it"
+                );
+                None
+            }
+        }
+    }
+
+    /// Everything `workflow.node.interrogate` needs about the node it was
+    /// pointed at: the run's name and workspace, and the node's own projection.
+    ///
+    /// Live run first, then the durable projection — the same precedence
+    /// `run.get`/`node.get` use, and the reason an interrogation of the
+    /// just-finished run reads the engine's `NodeBinding` rather than a row the
+    /// store task may not have applied yet.
+    ///
+    /// `Ok(None)` means the run exists but has no such node. A run that has been
+    /// *pruned* is not `Ok(None)`: it is refused with `workflow_run_pruned`
+    /// naming `workflow.summary.get`, because "no such run" would be a lie
+    /// about a run whose summary is sitting in the database.
+    #[allow(clippy::type_complexity)]
+    fn interrogation_target(
+        &mut self,
+        run: &RunId,
+        path: &InstancePath,
+    ) -> Result<Option<(WorkflowRunInfo, WorkflowRunNodeInfo)>, Box<dyn FnOnce(String) -> String>>
+    {
+        if let Some(info) = self.workflow_run_info(run) {
+            let Some(node) = self.workflow_node_info(path) else {
+                return Ok(None);
+            };
+            return Ok(Some((info, node)));
+        }
+        let Some((info, graph)) = self.stored_run_or_pruned(run)? else {
+            return Ok(None);
+        };
+        Ok(graph
+            .nodes
+            .into_iter()
+            .find(|node| node.path == path.as_str())
+            .map(|node| (info, node)))
+    }
+
+    /// How the node was bound, which is what decides whether a transcript could
+    /// ever exist for it.
+    ///
+    /// The live definition when the run is this server's, and the run's own
+    /// kvdag version otherwise — one extra store read on a user-initiated path,
+    /// not a hot loop. `None` means the version no longer resolves, which the
+    /// caller treats as "let the stat decide" rather than as a refusal.
+    ///
+    /// **A reserved path is asked about differently.** The `.summary` epilogue
+    /// has no kvdag node (§4 D5), so neither lookup below can ever resolve for
+    /// it: both would answer `None`, the caller would fall through to the stat,
+    /// and a command-bound summariser — which never had a session — would be
+    /// refused with "the transcript is not on disk" instead of "it ran as a
+    /// command". That is the wrong-answer shape the runner gate exists to
+    /// prevent, and it is the same defect as D-C
+    /// (`WorkflowRuntimeState::runner_for_pane`) reached by path instead of by
+    /// pane. `EpilogueState::runner` is the one authority, read through
+    /// `WorkflowRuntimeState::epilogue_runner`.
+    ///
+    /// It answers only for the run this server has in memory, because nothing
+    /// persists the epilogue's runner. A stored run's epilogue therefore still
+    /// resolves to `None` and is decided by the stat — the same policy this
+    /// function already applies to a node whose definition version has been
+    /// pruned, and better than re-deriving the binding from *this* server's
+    /// `KARVEX_WORKFLOW_SUMMARY_COMMAND`, which is not the configuration that
+    /// run summarised under.
+    fn interrogation_runner(
+        &mut self,
+        run: &WorkflowRunInfo,
+        node: &WorkflowRunNodeInfo,
+    ) -> Option<Runner> {
+        if is_reserved_path(node.path.as_str()) {
+            return self
+                .workflow
+                .epilogue_runner(&RunId::new(run.run_id.clone()));
+        }
+        let key = NodeKey::new(node.node_key.clone());
+        if let Some(definition) = self.workflow.definition() {
+            if definition.version_id.as_str() == run.version_id {
+                return definition.node(&key).map(|node| node.runner);
+            }
+        }
+        let version = KvdagVersionId::new(run.version_id.clone());
+        let loaded = self
+            .workflow_store
+            .call(move |cx| cx.block_on(cx.store().load_version(&version)));
+        match loaded {
+            Ok(Ok(kvdag)) => kvdag.node(&key).map(|node| node.runner),
+            _ => None,
+        }
+    }
+
+    /// [`Self::stored_run`] plus m9's pruned-run distinction.
+    ///
+    /// A pruned run has no `workflow_run` row at all — `prune_one_run` deletes
+    /// it and keeps only `run_summary` — so the bare not-found the store hands
+    /// back is indistinguishable from a run id that never existed. Checking for
+    /// the surviving summary is what turns those two into different answers,
+    /// and the error message names `workflow.summary.get` rather than implying
+    /// it.
+    #[allow(clippy::type_complexity)]
+    fn stored_run_or_pruned(
+        &mut self,
+        run: &RunId,
+    ) -> Result<Option<(WorkflowRunInfo, WorkflowRunGraph)>, Box<dyn FnOnce(String) -> String>>
+    {
+        if let Some(found) = self.stored_run(run)? {
+            return Ok(Some(found));
+        }
+        let wanted = run.clone();
+        let summarised = self
+            .workflow_store
+            .call(move |cx| cx.block_on(cx.store().get_run_summary(&wanted)));
+        match summarised {
+            Ok(Ok(Some(_))) => {
+                let run = run.clone();
+                Err(Box::new(move |id| {
+                    encode_error(
+                        id,
+                        RUN_PRUNED_CODE,
+                        format!(
+                            "run {run} has been pruned from the run history; its summary \
+                             survives and is readable with workflow.summary.get"
+                        ),
+                    )
+                }))
+            }
+            Ok(Ok(None)) => Ok(None),
+            Ok(Err(error)) => {
+                let code = error.api_code();
+                let message = error.to_string();
+                Err(Box::new(move |id| encode_error(id, code, message)))
+            }
+            Err(unavailable) => Err(Box::new(move |id| unavailable_response(id, &unavailable))),
+        }
+    }
+
+    /// The mode's own precondition, resolved into what the spawn needs.
+    ///
+    /// `resumed` stats **both** the transcript and the recorded cwd and names
+    /// whichever is missing: a fork whose cwd is gone starts in the wrong
+    /// project directory and silently fails to find the session, which is the
+    /// failure `03-storage-schema.md` §4.4's stat-first rule exists to convert
+    /// into an answer. `reconstructed` needs no transcript by definition — it
+    /// needs a stored `result` checkpoint, and with none there is nothing to
+    /// stand in for.
+    fn interrogation_seed(
+        &mut self,
+        run: &RunId,
+        path: &InstancePath,
+        node: &WorkflowRunNodeInfo,
+        source_session_id: &str,
+        reconstructed: bool,
+    ) -> Result<InterrogationSeed, InterrogationRefusal> {
+        let recorded_cwd = node
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+            .map(PathBuf::from);
+
+        if reconstructed {
+            let checkpoint = self.latest_result_checkpoint(run, path)?.ok_or_else(|| {
+                InterrogationRefusal::Unavailable(format!(
+                    "node {path} has no stored result checkpoint to reconstruct from, and its \
+                     transcript is not being resumed"
+                ))
+            })?;
+            // The recorded cwd is preferred but not required here: a
+            // reconstruction reads a karvex-authored file and does not depend
+            // on the project directory the original ran in. Falling back keeps
+            // the degraded path available when the workspace has moved.
+            let cwd = recorded_cwd
+                .filter(|cwd| cwd.is_dir())
+                .or_else(|| self.interrogation_fallback_cwd())
+                .ok_or_else(|| {
+                    InterrogationRefusal::Unavailable(
+                        "there is no directory to start the reconstructed session in".to_string(),
+                    )
+                })?;
+            let original_task = node
+                .node_dir
+                .as_deref()
+                .map(|dir| PathBuf::from(dir).join(crate::workflow::binding::spawn::TASK_FILE))
+                .and_then(|task| std::fs::read_to_string(task).ok());
+            return Ok(InterrogationSeed::Reconstructed {
+                cwd,
+                checkpoint_seq: checkpoint.seq,
+                summary: checkpoint.summary,
+                payload: serde_json::to_string_pretty(&checkpoint.payload)
+                    .unwrap_or_else(|_| checkpoint.payload.to_string()),
+                original_task,
+                label: node.label.clone(),
+            });
+        }
+
+        let cwd = recorded_cwd.ok_or_else(|| {
+            InterrogationRefusal::Unavailable(format!(
+                "node {path} has no recorded working directory, so its session cannot be \
+                 resumed from where it ran"
+            ))
+        })?;
+        if !cwd.is_dir() {
+            return Err(InterrogationRefusal::Unavailable(format!(
+                "the directory node {path} ran in no longer exists: {}",
+                cwd.display()
+            )));
+        }
+        // §4 D6: the hook-reported path when one was recorded, else the
+        // pre-launch estimate. The estimate is recomputed rather than assumed
+        // absent, so a node whose row predates the read-back still resolves.
+        let transcript = node
+            .transcript_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map_or_else(
+                || {
+                    crate::workflow::binding::spawn::transcript_path(&cwd, source_session_id)
+                        .map_err(|err| {
+                            InterrogationRefusal::Unavailable(format!(
+                                "the transcript path for node {path} is unknown: {err}"
+                            ))
+                        })
+                },
+                Ok,
+            )?;
+        if !transcript.is_file() {
+            return Err(InterrogationRefusal::Unavailable(format!(
+                "the transcript for node {path} is not on disk: {}",
+                transcript.display()
+            )));
+        }
+        Ok(InterrogationSeed::Resumed {
+            cwd,
+            transcript_path: transcript.display().to_string(),
+        })
+    }
+
+    /// The node's newest schema-valid `result` checkpoint, which is what a
+    /// reconstruction stands in for.
+    fn latest_result_checkpoint(
+        &mut self,
+        run: &RunId,
+        path: &InstancePath,
+    ) -> Result<Option<crate::workflow::store::CheckpointRecord>, InterrogationRefusal> {
+        let wanted_run = run.clone();
+        let wanted_path = path.clone();
+        let loaded = self
+            .workflow_store
+            .call(move |cx| cx.block_on(cx.store().list_checkpoints(&wanted_run, &wanted_path)));
+        match loaded {
+            Ok(Ok(checkpoints)) => Ok(checkpoints
+                .into_iter()
+                .filter(|checkpoint| {
+                    checkpoint.kind == CheckpointKind::Result && checkpoint.schema_valid
+                })
+                .max_by_key(|checkpoint| checkpoint.seq)),
+            Ok(Err(error)) => {
+                let code = error.api_code();
+                let message = error.to_string();
+                Err(InterrogationRefusal::Store(Box::new(move |id| {
+                    encode_error(id, code, message)
+                })))
+            }
+            Err(unavailable) => Err(InterrogationRefusal::Store(Box::new(move |id| {
+                unavailable_response(id, &unavailable)
+            }))),
+        }
+    }
+
     fn store_error(&mut self, id: String, error: &StoreError) -> String {
         encode_error(id, error.api_code(), error.to_string())
     }
@@ -1429,12 +2376,67 @@ impl App {
         }
     }
 
+    /// Where a reconstructed interrogation starts when the node's own recorded
+    /// directory is gone: the active workspace's directory.
+    ///
+    /// Only the reconstructed path falls back. A *resumed* fork must start in
+    /// the directory the session ran in, because that is what decides which
+    /// `~/.claude/projects/<slug>/` Claude looks in — starting it elsewhere
+    /// would find no transcript and fail silently, which is the whole failure
+    /// the stat-first rule exists to prevent.
+    fn interrogation_fallback_cwd(&self) -> Option<PathBuf> {
+        let ws_idx = self.state.active?;
+        Some(self.workflow_node_cwd_for(ws_idx))
+    }
+
     /// `ActiveRun.workspace_id` is what pins a run's panes to one workspace, so
     /// a run started over the API records the workspace it was started from.
     fn active_workspace_public_id(&self) -> Option<String> {
         let ws_idx = self.state.active?;
         Some(self.public_workspace_id(ws_idx))
     }
+}
+
+/// What a resolved `restore_from` request decided (§4 D11).
+#[cfg(feature = "workflow")]
+struct RestorePlan {
+    source: RunId,
+    /// What the caller asked for, verbatim, recorded on the run row beside what
+    /// actually happened. An unknown selector never reaches here — that is a
+    /// hard error — but a *skipped* one does, and the row is the only durable
+    /// trace of it once the response is gone.
+    request: crate::workflow::store::RestoreFromRequest,
+    seeds: Vec<RestoredSeed>,
+    report: WorkflowRestoreReport,
+}
+
+/// Whether a checkpoint payload is the store's over-budget stub rather than
+/// real data (§4 D19).
+///
+/// `enforce_payload_budget` replaces a payload above 256 KB with
+/// `{"truncated": true}`. Handing that to a downstream node would be a lie
+/// labelled as data, so it is matched here and skipped — deliberately by
+/// *shape*, because the stub is what the store writes and there is no separate
+/// column saying it did.
+#[cfg(feature = "workflow")]
+fn is_truncated_payload(payload: &serde_json::Value) -> bool {
+    payload
+        .as_object()
+        .is_some_and(|object| object.get("truncated") == Some(&serde_json::Value::Bool(true)))
+}
+
+/// Why an interrogation was refused before anything was created.
+///
+/// The two arms are genuinely different answers: the caller can act on
+/// `Unavailable` (delete nothing, ask for `mode: reconstructed` instead), while
+/// `Store` is the subsystem failing and carries the store's own code.
+#[cfg(feature = "workflow")]
+enum InterrogationRefusal {
+    /// `workflow_transcript_unavailable`, with the reason in the message.
+    Unavailable(String),
+    /// The store answered with an error or is unavailable; its response,
+    /// deferred so the caller keeps ownership of the request id.
+    Store(Box<dyn FnOnce(String) -> String>),
 }
 
 #[cfg(feature = "workflow")]
@@ -1978,6 +2980,14 @@ fn wire_run_record(
         // whichever node's rejection landed last), not from a `workflow_run`
         // column — the run row still carries none.
         growth_limited: limits.last.as_ref().and_then(wire_stored_growth_limit),
+        // §4 D9: denormalised onto the row by one batched lookup server-side, so
+        // a cross-workflow listing labels every run without N client calls.
+        workflow_name: record.workflow_name,
+        // §4 D21: which past runs' summaries this run was given. Recorded per
+        // run rather than derived, because `history_context_runs` and the
+        // workflow's summary set both change afterwards.
+        context_runs: record.context_runs.iter().map(RunId::to_string).collect(),
+        restore_from_run: record.restore_from_run.as_ref().map(RunId::to_string),
     }
 }
 
@@ -2029,6 +3039,25 @@ fn wire_run_node_record(
             .by_path
             .get(&record.instance_path)
             .and_then(wire_stored_growth_limit),
+        // M2: written by `write_run_node` since Phase 1 and dropped by the
+        // reader until now, which is why historical interrogation after a
+        // restart always answered `transcript_unavailable` no matter what was
+        // on disk (§4 D6).
+        transcript_path: record.transcript_path,
+        // §4 D4: provenance, not timestamps — a restored node's own stamps are
+        // the restore instant, and this is what says where its result came
+        // from.
+        restored_from: record.restored_from.as_ref().map(wire_restored_from),
+    }
+}
+
+/// A restored node's provenance, on the wire (§4 D4).
+#[cfg(feature = "workflow")]
+fn wire_restored_from(source: &RestoredRef) -> WorkflowRestoredFrom {
+    WorkflowRestoredFrom {
+        run_id: source.run.to_string(),
+        node_key: source.node_key.to_string(),
+        checkpoint_seq: source.checkpoint_seq,
     }
 }
 
@@ -2209,12 +3238,14 @@ mod tests {
                 version: None,
                 tier: None,
                 args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
             }),
             Method::WorkflowRunGet(WorkflowRunTarget {
                 run_id: "workflow_run:1".into(),
             }),
             Method::WorkflowRunList(WorkflowRunListParams {
-                workflow_id: "workflow:1".into(),
+                workflow_id: Some("workflow:1".into()),
                 limit: None,
             }),
             Method::WorkflowRunCancel(WorkflowRunTarget {
@@ -2251,6 +3282,20 @@ mod tests {
                 label: String::new(),
                 inputs: HashMap::new(),
                 count: None,
+            }),
+            // Phase 3 additions (`07-phase3-plan.md` §WS-C, §WS-D).
+            Method::WorkflowNodeInterrogate(WorkflowNodeInterrogateParams {
+                run_id: "workflow_run:1".into(),
+                path: "plan".into(),
+                mode: crate::api::schema::WorkflowInterrogationMode::Resumed,
+                note: None,
+            }),
+            Method::WorkflowSummaryGet(WorkflowRunTarget {
+                run_id: "workflow_run:1".into(),
+            }),
+            Method::WorkflowSummaryList(WorkflowSummaryListParams {
+                workflow_id: None,
+                limit: None,
             }),
         ];
 
@@ -2290,9 +3335,11 @@ mod tests {
                 version: None,
                 tier: None,
                 args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
             }),
             Method::WorkflowRunList(WorkflowRunListParams {
-                workflow_id: "workflow:1".into(),
+                workflow_id: Some("workflow:1".into()),
                 limit: None,
             }),
             Method::WorkflowNodeSteer(WorkflowNodeSteerParams {
@@ -2308,6 +3355,22 @@ mod tests {
                 label: String::new(),
                 inputs: HashMap::new(),
                 count: None,
+            }),
+            // Phase 3 additions (`07-phase3-plan.md` §WS-D "Tested"): a
+            // feature-off build must answer these with the documented code too,
+            // not with the catch-all the sweep above only rules out.
+            Method::WorkflowNodeInterrogate(WorkflowNodeInterrogateParams {
+                run_id: "workflow_run:1".into(),
+                path: "plan".into(),
+                mode: crate::api::schema::WorkflowInterrogationMode::Resumed,
+                note: None,
+            }),
+            Method::WorkflowSummaryGet(WorkflowRunTarget {
+                run_id: "workflow_run:1".into(),
+            }),
+            Method::WorkflowSummaryList(WorkflowSummaryListParams {
+                workflow_id: None,
+                limit: None,
             }),
         ];
 
@@ -2444,6 +3507,8 @@ output_schema = { type = "object" }
                 version: None,
                 tier: None,
                 args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
             },
         );
         assert_eq!(error_code(&response), MISSING_ARG_CODE);
@@ -2768,6 +3833,8 @@ output_schema = {{ type = "object" }}
                 version: None,
                 tier: None,
                 args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
             },
         );
         assert_eq!(error_code(&response), MISSING_ARG_CODE, "{response}");
@@ -2784,6 +3851,8 @@ output_schema = {{ type = "object" }}
                 version: None,
                 tier: None,
                 args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
             },
         );
         assert_eq!(error_code(&response), NOT_FOUND_CODE, "{response}");
@@ -2807,7 +3876,7 @@ output_schema = {{ type = "object" }}
         let response = app.handle_workflow_run_list(
             "req".into(),
             WorkflowRunListParams {
-                workflow_id: "ship-feature".into(),
+                workflow_id: Some("ship-feature".into()),
                 limit: None,
             },
         );
@@ -2830,7 +3899,7 @@ output_schema = {{ type = "object" }}
         let response = app.handle_workflow_run_list(
             "req".into(),
             WorkflowRunListParams {
-                workflow_id: "does-not-exist".into(),
+                workflow_id: Some("does-not-exist".into()),
                 limit: None,
             },
         );
@@ -2879,6 +3948,8 @@ output_schema = { type = "object", required = ["done"] }
                 version: None,
                 tier: None,
                 args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
             },
         );
         let started: serde_json::Value = serde_json::from_str(&started).unwrap();
@@ -3173,6 +4244,8 @@ output_schema = { type = "object", required = ["done"] }
                 version: None,
                 tier: None,
                 args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
             },
         );
 
@@ -3289,6 +4362,8 @@ port = "summary"
                 version: None,
                 tier,
                 args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
             },
         );
         let started: serde_json::Value = serde_json::from_str(&started).unwrap();
@@ -3692,6 +4767,8 @@ port = "summary"
                     version: None,
                     tier: Some(tier),
                     args: HashMap::new(),
+                    restore_from: None,
+                    include_prior_summaries: None,
                 },
             );
             let started: serde_json::Value = serde_json::from_str(&started).unwrap();
@@ -3871,6 +4948,10 @@ port = "summary"
             parent_path: Some(InstancePath::new("root")),
             depth: 1,
             status: NodeStatus::Succeeded,
+            // Phase 3 (M2/§4 D4): both are read back by the production reader
+            // now, so the projection has to carry them.
+            transcript_path: Some("/home/u/.claude/projects/-repo/s1.jsonl".into()),
+            restored_from: None,
             model: "sonnet".into(),
             effort: "high".into(),
             demand: Demand::Standard,
@@ -3921,11 +5002,13 @@ port = "summary"
         let run = RunRecord {
             id: RunId::new("workflow_run:t4"),
             workflow: WorkflowId::new("workflow:t4"),
+            workflow_name: "t4".into(),
             version: KvdagVersionId::new("kvdag_version:t4"),
             tier: Tier::Auto,
             status: RunStatus::Succeeded,
             args: BTreeMap::new(),
             context_runs: Vec::new(),
+            restore_from_run: None,
             max_depth: 3,
             max_nodes: 12,
             workspace_id: None,
@@ -3943,5 +5026,674 @@ port = "summary"
             "the run's most recent journalled growth limit survives the durable projection",
         );
         assert_eq!(run_limit.kind, WorkflowGrowthLimitKind::MaxNodes);
+    }
+
+    // ── Phase 3: interrogation, restore, summaries ─────────────────────────
+
+    #[cfg(feature = "workflow")]
+    fn pane_count(app: &App) -> usize {
+        app.state
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                workspace
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.layout.pane_count())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// The agent-runner twin of [`app_with_a_bound_command_node`].
+    ///
+    /// The interrogation ladder gates on the node's **runner**, so the command
+    /// fixture can only ever exercise the first refusal; everything past it
+    /// needs a node the definition declares as an agent.
+    #[cfg(feature = "workflow")]
+    fn app_with_a_bound_agent_node(pane: &str, cwd: PathBuf, transcript: PathBuf) -> (App, String) {
+        let mut app = app();
+        let created = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: WorkflowDefinitionDocument {
+                    format: WorkflowDefinitionFormat::Toml,
+                    text: r#"
+name = "interrogable"
+[[node]]
+key = "only"
+label = "Only"
+runner = "agent"
+prompt_template = "do it"
+output_schema = { type = "object", required = ["done"] }
+"#
+                    .to_string(),
+                },
+            },
+        );
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let workflow_id = created["result"]["workflow"]["workflow_id"]
+            .as_str()
+            .expect("the workflow was created")
+            .to_string();
+
+        let started = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id,
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+                restore_from: None,
+                include_prior_summaries: None,
+            },
+        );
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let run_id = started["result"]["run"]["run_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the run started: {started}"))
+            .to_string();
+
+        app.bind_workflow_node(
+            &InstancePath::new("only"),
+            crate::workflow::model::NodeBinding {
+                pane_id: crate::workflow::model::PublicPaneId::new(pane),
+                terminal_id: crate::terminal::TerminalId::alloc(),
+                agent_session_id: "00000000-0000-4000-8000-000000000001".to_string(),
+                transcript_path: transcript,
+                node_dir: PathBuf::from("/runs/test/only"),
+                cwd,
+            },
+        );
+        (app, run_id)
+    }
+
+    #[cfg(feature = "workflow")]
+    fn interrogate(app: &mut App, run_id: &str, path: &str, reconstructed: bool) -> String {
+        app.handle_workflow_node_interrogate(
+            "req".into(),
+            WorkflowNodeInterrogateParams {
+                run_id: run_id.to_string(),
+                path: path.to_string(),
+                mode: if reconstructed {
+                    WorkflowInterrogationMode::Reconstructed
+                } else {
+                    WorkflowInterrogationMode::Resumed
+                },
+                note: None,
+            },
+        )
+    }
+
+    /// The "never a silent pane" pin (`00-overview.md` Feature 3,
+    /// `07-phase3-plan.md` §WS-D "Tested").
+    ///
+    /// A `runner: command` node never had a Claude session, so its transcript
+    /// can never exist. The refusal has to be structured *and* has to happen
+    /// before anything is created — a pane that starts and dies would be the
+    /// exact failure the stat-first rule exists to prevent, so the pane count
+    /// is asserted, not just the error code.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn interrogating_a_command_node_is_refused_and_creates_no_pane() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        let before = pane_count(&app);
+
+        let response = interrogate(&mut app, &run_id, "only", false);
+
+        assert_eq!(error_code(&response), "workflow_transcript_unavailable");
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("command"),
+            "the message has to say *why* there is no transcript, or the caller \
+             goes looking for a file that was never going to exist: {message}"
+        );
+        assert_eq!(
+            pane_count(&app),
+            before,
+            "a refused interrogation must leave the workspace exactly as it was"
+        );
+    }
+
+    /// A node that *does* have a session but whose transcript is not on disk
+    /// takes the same code with a different reason, and still creates nothing.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn interrogating_a_node_whose_transcript_is_gone_names_the_missing_file() {
+        let (mut app, run_id) = app_with_a_bound_agent_node(
+            "w9:p9",
+            std::env::temp_dir(),
+            PathBuf::from("/nonexistent/transcript.jsonl"),
+        );
+        let before = pane_count(&app);
+
+        let response = interrogate(&mut app, &run_id, "only", false);
+
+        assert_eq!(error_code(&response), "workflow_transcript_unavailable");
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("/nonexistent/transcript.jsonl"),
+            "the refusal names the path it stat'd, so the caller can check it: {message}"
+        );
+        assert_eq!(pane_count(&app), before);
+    }
+
+    /// A reconstruction with nothing to reconstruct from is refused too: the
+    /// degraded path is a stand-in for a stored result, and with no checkpoint
+    /// there is nothing to stand in for.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_reconstruction_with_no_checkpoint_is_refused() {
+        let (mut app, run_id) = app_with_a_bound_agent_node(
+            "w9:p9",
+            std::env::temp_dir(),
+            PathBuf::from("/nonexistent/transcript.jsonl"),
+        );
+        let before = pane_count(&app);
+
+        let response = interrogate(&mut app, &run_id, "only", true);
+
+        assert_eq!(error_code(&response), "workflow_transcript_unavailable");
+        assert_eq!(pane_count(&app), before);
+    }
+
+    /// §WS-D "Tested": with the transcript actually on disk the ladder gets all
+    /// the way through, and the two things CI can check about a real fork are
+    /// checked — the argv is exactly the frozen six tokens, and the source
+    /// transcript's bytes are untouched by the call.
+    ///
+    /// The spawn itself fails here (a headless `AppState` has no pane to split),
+    /// which is the point: the failure is *after* every precondition passed, so
+    /// what is asserted is the argv the binder built and the file it did not
+    /// write to. The real-fork non-mutation check is in the manual list (§5).
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_resumable_node_builds_the_frozen_fork_argv_and_never_writes_the_source() {
+        use crate::workflow::binding::interrogate;
+
+        let dir = std::env::temp_dir().join(format!(
+            "karvex-interrogate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("the fixture directory");
+        let transcript = dir.join("source.jsonl");
+        let contents = b"{\"type\":\"user\"}\n";
+        std::fs::write(&transcript, contents).expect("the fixture transcript");
+
+        let (mut app, run_id) =
+            app_with_a_bound_agent_node("w9:p9", dir.clone(), transcript.clone());
+        let before = pane_count(&app);
+
+        let response = interrogate(&mut app, &run_id, "only", false);
+
+        // Every precondition passed, so the failure is the pane and it says so
+        // (E-15) — not "there was nothing to fork", which would send the caller
+        // to check a file that is sitting right there.
+        assert_eq!(
+            error_code(&response),
+            INTERROGATION_SPAWN_FAILED_CODE,
+            "the transcript and cwd both stat; the ladder must be past them: {response}"
+        );
+        assert_eq!(
+            std::fs::read(&transcript).expect("the source transcript survives"),
+            contents,
+            "`--fork-session` is what makes this non-mutating; nothing on the \
+             interrogate path may write the source transcript"
+        );
+        assert_eq!(
+            pane_count(&app),
+            before,
+            "this fixture has no pane to split, so the spawn fails and leaves nothing"
+        );
+
+        // The frozen argv itself (§3 rule 7), asserted at the binder rather than
+        // through a pane CI cannot create.
+        let argv = interrogate::resumed_argv("source-sid", "forked-sid");
+        assert_eq!(
+            argv[1..],
+            [
+                "--session-id".to_string(),
+                "forked-sid".to_string(),
+                "--resume".to_string(),
+                "source-sid".to_string(),
+                "--fork-session".to_string(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unknown run is a plain not-found, and — the m9 half — is answered
+    /// before any node lookup, since a run that does not exist has no nodes.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn interrogating_an_unknown_run_is_not_found() {
+        let mut app = app();
+        let response = interrogate(&mut app, "workflow_run:missing", "plan", false);
+        assert_eq!(error_code(&response), "workflow_not_found");
+    }
+
+    /// `workflow.summary.get` on a run with no summary is a **success** with
+    /// `summary: null`, never an error (§4 D1): a run whose epilogue was
+    /// disabled, cancelled, or gave up simply has none.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_run_with_no_summary_answers_null_rather_than_an_error() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        let response = app.handle_workflow_summary_get(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+        );
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            body["error"].is_null(),
+            "an absent summary is a normal answer: {body}"
+        );
+        assert!(
+            body["result"]["summary"].is_null(),
+            "and it is spelled `null`, not an empty object: {body}"
+        );
+    }
+
+    /// `workflow.summary.list` with no `workflow_id` lists across every
+    /// workflow (§4 D9) rather than rejecting the absent selector.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn summary_list_without_a_workflow_id_is_a_cross_workflow_read() {
+        let mut app = app();
+        let response = app.handle_workflow_summary_list(
+            "req".into(),
+            WorkflowSummaryListParams {
+                workflow_id: None,
+                limit: None,
+            },
+        );
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(body["error"].is_null(), "{body}");
+        assert_eq!(
+            body["result"]["summaries"].as_array().map(Vec::len),
+            Some(0),
+            "an empty database lists nothing, and that is not an error: {body}"
+        );
+    }
+
+    /// The same back-compat pin one layer down from WS-C's serde test:
+    /// `workflow.run.list` with no `workflow_id` must not be rejected as a
+    /// missing parameter, which is what the pre-Phase-3 handler did.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn run_list_without_a_workflow_id_lists_across_workflows() {
+        let mut app = app();
+        let response = app.handle_workflow_run_list(
+            "req".into(),
+            WorkflowRunListParams {
+                workflow_id: None,
+                limit: None,
+            },
+        );
+        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(
+            body["error"].is_null(),
+            "an absent workflow_id is `all workflows`, not invalid params: {body}"
+        );
+    }
+
+    /// §4 D11's typo protection: a selector naming no node of the **target**
+    /// version is a hard error, and — the half that matters — the run is not
+    /// created, so a refused restore leaves no orphan `workflow_run` row.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn an_unknown_restore_selector_is_refused_and_starts_no_run() {
+        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        // Close the first run so the in-flight guard is not what refuses this.
+        app.cancel_workflow_run();
+        let workflow_id = {
+            let listed = app.handle_workflow_list("req".into());
+            let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+            listed["result"]["workflows"][0]["workflow_id"]
+                .as_str()
+                .expect("the workflow exists")
+                .to_string()
+        };
+        let runs_before = run_row_count(&mut app, &workflow_id);
+
+        let response = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id: workflow_id.clone(),
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+                restore_from: Some(crate::api::schema::WorkflowRestoreRequest {
+                    run_id: run_id.clone(),
+                    nodes: vec!["typo".into()],
+                    allow_changed: false,
+                }),
+                include_prior_summaries: None,
+            },
+        );
+
+        assert_eq!(
+            error_code(&response),
+            "workflow_restore_unknown_selector",
+            "{response}"
+        );
+        assert_eq!(
+            run_row_count(&mut app, &workflow_id),
+            runs_before,
+            "a hard restore error must be raised before create_run, or it leaves \
+             an orphan run row no engine will ever advance"
+        );
+    }
+
+    /// Restoring from a run that has been pruned answers `workflow_run_pruned`
+    /// — its checkpoints went with the run, and the caller is told which of
+    /// "gone" and "never existed" happened.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn restoring_from_an_unknown_run_is_not_found_not_pruned() {
+        let (mut app, _) = app_with_a_bound_command_node("w9:p9");
+        app.cancel_workflow_run();
+        let workflow_id = {
+            let listed = app.handle_workflow_list("req".into());
+            let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+            listed["result"]["workflows"][0]["workflow_id"]
+                .as_str()
+                .expect("the workflow exists")
+                .to_string()
+        };
+
+        let response = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id,
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+                restore_from: Some(crate::api::schema::WorkflowRestoreRequest {
+                    run_id: "workflow_run:nosuchrun".into(),
+                    nodes: Vec::new(),
+                    allow_changed: false,
+                }),
+                include_prior_summaries: None,
+            },
+        );
+
+        assert_eq!(
+            error_code(&response),
+            "workflow_not_found",
+            "a run with neither a row nor a summary never existed: {response}"
+        );
+    }
+
+    /// How many `workflow_run` rows a workflow has, read through the
+    /// production listing path.
+    #[cfg(feature = "workflow")]
+    fn run_row_count(app: &mut App, workflow_id: &str) -> usize {
+        let listed = app.handle_workflow_run_list(
+            "req".into(),
+            WorkflowRunListParams {
+                workflow_id: Some(workflow_id.to_string()),
+                limit: None,
+            },
+        );
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        listed["result"]["runs"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default()
+    }
+
+    /// Every `workflow_*` error code the crate can hand back over the wire —
+    /// the cross-phase inventory this exists to build. Error codes are
+    /// contract: scripts match on them, the CLI renders them, and the docs
+    /// list them. But until now they lived as scattered string constants and
+    /// match-arm literals across six files with no naming guard and no
+    /// collision check anywhere — the naming guard in
+    /// `src/api/schema/workflows.rs` has only ever covered method names,
+    /// event names, enum variants, and struct fields, never error codes. Two
+    /// "absent check" incidents already came out of that gap: Phase 3 nearly
+    /// shipped `workflow_interrogation_spawn_failed` reusing a node-spawn
+    /// code (E-15, formerly pinned locally in
+    /// `the_interrogation_spawn_code_follows_the_family_convention`, now
+    /// subsumed by the general check below), and a keybind collision of the
+    /// same shape (E-7) shipped and had to be fixed later.
+    ///
+    /// Values are pulled from the handlers themselves — the `_CODE` constants
+    /// and the `SpawnError`/`ReportRejected`/`WorkflowStartError` `code()`
+    /// methods — never hand-copied, so a changed constant changes this list
+    /// for free. Only the *domain* label per entry is hand-maintained, and
+    /// `every_workflow_error_code_literal_in_source_is_inventoried` below
+    /// greps the source tree so a brand-new code (or constant) left off this
+    /// list fails loudly instead of silently going unchecked the way all of
+    /// these did before.
+    #[cfg(feature = "workflow")]
+    fn all_workflow_error_codes() -> Vec<(&'static str, &'static str)> {
+        use crate::app::workflow::WorkflowStartError;
+        use crate::workflow::binding::spawn::SpawnError;
+        use crate::workflow::store::error::{
+            WORKFLOW_INVALID_DEFINITION_CODE, WORKFLOW_STORE_ERROR_CODE, WORKFLOW_UNAVAILABLE_CODE,
+        };
+
+        vec![
+            // `Definition::check` and `Kvdag::try_new` are two validators for
+            // the same "the document you authored did not validate" fact
+            // (`src/workflow/store/error.rs`'s own doc comment), so they
+            // deliberately share both a domain label and a code.
+            ("definition_invalid", INVALID_DEFINITION_CODE),
+            ("definition_invalid", WORKFLOW_INVALID_DEFINITION_CODE),
+            ("subsystem_unavailable", WORKFLOW_UNAVAILABLE_CODE),
+            ("not_found", NOT_FOUND_CODE),
+            ("target_ambiguous", AMBIGUOUS_NAME_CODE),
+            ("run_not_active", NO_ACTIVE_RUN_CODE),
+            ("missing_arg", MISSING_ARG_CODE),
+            ("node_not_running", NODE_NOT_RUNNING_CODE),
+            ("node_delivery_failed", DELIVERY_FAILED_CODE),
+            ("node_result_invalid", RESULT_INVALID_CODE),
+            ("run_closed", RUN_CLOSED_CODE),
+            ("transcript_unavailable", TRANSCRIPT_UNAVAILABLE_CODE),
+            ("run_pruned", RUN_PRUNED_CODE),
+            ("restore_unknown_selector", RESTORE_UNKNOWN_SELECTOR_CODE),
+            ("interrogation_active", INTERROGATION_ACTIVE_CODE),
+            (
+                "interrogation_spawn_failed",
+                INTERROGATION_SPAWN_FAILED_CODE,
+            ),
+            ("store_error", WORKFLOW_STORE_ERROR_CODE),
+            (
+                "node_report_unknown_node",
+                ReportRejected::UnknownNode.code(),
+            ),
+            (
+                "node_report_invalid_token",
+                ReportRejected::InvalidToken.code(),
+            ),
+            (
+                "node_report_missing_result",
+                ReportRejected::MissingResult.code(),
+            ),
+            (
+                "node_spawn_missing_command",
+                SpawnError::MissingCommand(InstancePath::new(String::new())).code(),
+            ),
+            (
+                "node_spawn_invalid_argument",
+                SpawnError::InvalidArgument(String::new()).code(),
+            ),
+            (
+                "node_spawn_target_pane_not_found",
+                SpawnError::TargetPaneNotFound.code(),
+            ),
+            (
+                "node_spawn_failed",
+                SpawnError::PaneLaunchFailed(String::new()).code(),
+            ),
+            ("run_in_flight", WorkflowStartError::RunInFlight.code()),
+        ]
+    }
+
+    /// The contract check: every code is well-formed, and no two *distinct*
+    /// failure domains share a code. This is the general form of E-15 (an
+    /// interrogation-pane spawn failure is not a run-node spawn failure) and
+    /// would have caught it, or the E-7 keybind collision's "absent check"
+    /// shape in general, before either shipped.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn all_workflow_error_codes_are_a_well_formed_disjoint_family() {
+        use crate::api::schema::workflows::tests::BANNED_UI_SURFACE_WORDS;
+
+        let codes = all_workflow_error_codes();
+        assert_eq!(
+            codes.len(),
+            25,
+            "the inventory grew or shrank; update this count alongside the list itself"
+        );
+
+        for (domain, code) in &codes {
+            assert!(code.starts_with("workflow_"), "{domain}: {code}");
+            assert_eq!(
+                *code,
+                code.to_ascii_lowercase(),
+                "{domain}: snake_case only: {code}"
+            );
+            assert!(
+                !code.contains(' ') && !code.contains('-'),
+                "{domain}: snake_case only: {code}"
+            );
+            for word in code.split('_') {
+                assert!(
+                    !BANNED_UI_SURFACE_WORDS.contains(&word),
+                    "{domain}: {code} uses a UI-surface word"
+                );
+            }
+        }
+
+        let mut domain_by_code: std::collections::BTreeMap<&str, &str> =
+            std::collections::BTreeMap::new();
+        for (domain, code) in &codes {
+            if let Some(existing) = domain_by_code.insert(code, domain) {
+                assert_eq!(
+                    existing, *domain,
+                    "{code} is claimed by two different failure domains \
+                     ({existing:?} and {domain:?}); either they are the same failure \
+                     (give them the same domain label above and say why) or one of \
+                     them needs its own code"
+                );
+            }
+        }
+
+        // `workflow_history.rs` cannot import `TRANSCRIPT_UNAVAILABLE_CODE`
+        // (it is `#[cfg(feature = "workflow")]`-gated here, but that module's
+        // `interrogate_outcome` compiles unconditionally) and so carries its
+        // own copy of the literal instead. That copy is not in
+        // `all_workflow_error_codes()` — it is the same value under a
+        // different name, not a second domain — so it is pinned here
+        // directly, keeping the one duplicate this file can't eliminate from
+        // silently drifting the way a duplicated literal already has before
+        // in this phase.
+        assert_eq!(
+            TRANSCRIPT_UNAVAILABLE_CODE,
+            crate::app::workflow_history::TRANSCRIPT_UNAVAILABLE_CODE
+        );
+    }
+
+    /// [`all_workflow_error_codes`] is hand-maintained — the values come from
+    /// the handlers, but a *new* code (or a whole new file defining one)
+    /// still has to be added to that list by a human. This closes that gap by
+    /// grepping the tree for the two literal shapes every existing code is
+    /// written in — a `..._CODE: &str = "workflow_..."` constant, or a
+    /// `Self::Variant => "workflow_...",` match arm — and failing if either
+    /// side has something the other does not.
+    ///
+    /// Deliberately not a blanket `"workflow_` search: that also matches wire
+    /// type tags (`workflow_get`), event names (`workflow_run_started`),
+    /// field names (`workflow_id`), and the `workflow_run` table name, none
+    /// of which are error codes, and hand-allowlisting every one of those
+    /// would be its own unbounded maintenance burden with no payoff.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn every_workflow_error_code_literal_in_source_is_inventoried() {
+        use std::collections::BTreeSet;
+        use std::path::{Path, PathBuf};
+
+        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src_dir, &mut files);
+        assert!(
+            !files.is_empty(),
+            "sanity: found no source files under {src_dir:?}"
+        );
+
+        let const_re = regex::Regex::new(r#"_CODE:\s*&str\s*=\s*"(workflow_[a-z_]+)""#).unwrap();
+        let match_arm_re = regex::Regex::new(r#"=>\s*"(workflow_[a-z_]+)""#).unwrap();
+
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        for file in &files {
+            let Ok(text) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            for re in [&const_re, &match_arm_re] {
+                for capture in re.captures_iter(&text) {
+                    found.insert(capture[1].to_string());
+                }
+            }
+        }
+
+        let known: BTreeSet<String> = all_workflow_error_codes()
+            .into_iter()
+            .map(|(_, code)| code.to_string())
+            .collect();
+
+        let missing_from_inventory: Vec<&String> = found.difference(&known).collect();
+        assert!(
+            missing_from_inventory.is_empty(),
+            "source defines workflow error code(s) not in all_workflow_error_codes(): \
+             {missing_from_inventory:?}"
+        );
+        let stale_in_inventory: Vec<&String> = known.difference(&found).collect();
+        assert!(
+            stale_in_inventory.is_empty(),
+            "all_workflow_error_codes() lists code(s) no longer defined anywhere in source: \
+             {stale_in_inventory:?}"
+        );
+    }
+
+    /// §4 D19: the store's over-budget stub is not data, and restoring it
+    /// would hand a downstream node a lie labelled as data. Recognised by
+    /// shape, because the shape is all the store writes.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn the_truncated_payload_stub_is_recognised_and_nothing_else_is() {
+        assert!(is_truncated_payload(
+            &serde_json::json!({"truncated": true})
+        ));
+        assert!(!is_truncated_payload(&serde_json::json!({
+            "truncated": false
+        })));
+        assert!(
+            !is_truncated_payload(&serde_json::json!({"truncated": "yes"})),
+            "only the literal boolean stub the store writes counts"
+        );
+        assert!(!is_truncated_payload(&serde_json::json!({"steps": 3})));
+        assert!(!is_truncated_payload(&serde_json::json!(null)));
     }
 }

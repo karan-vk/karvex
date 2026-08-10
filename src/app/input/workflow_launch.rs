@@ -250,6 +250,8 @@ pub(super) fn launch_run_params(
         version: None,
         tier: tier.map(crate::app::workflow::wire_tier),
         args,
+        restore_from: None,
+        include_prior_summaries: None,
     })
 }
 
@@ -959,7 +961,7 @@ output_schema = {{ type = "object" }}
         let listed = app.dispatch_api_request(
             "test.workflow.run.list",
             Method::WorkflowRunList(crate::api::schema::WorkflowRunListParams {
-                workflow_id,
+                workflow_id: Some(workflow_id),
                 limit: None,
             }),
         );

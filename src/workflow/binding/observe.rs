@@ -11,6 +11,7 @@
 //! file reads runtime state, so the whole observe direction is testable over
 //! synthetic events.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
@@ -91,6 +92,34 @@ pub fn turn_ended(pane: PublicPaneId, report: HookStateReport<'_>) -> Option<Eng
         return None;
     }
     Some(EngineInput::TurnEnded { pane })
+}
+
+// ── transcript path read-back (§4 D6) ───────────────────────────────────────
+
+/// The transcript path a pane's session report carried, if it carried a usable
+/// one (`07-phase3-plan.md` §4 D6, closing §0.5).
+///
+/// `spawn::transcript_path` derives a **pre-launch estimate** from
+/// `(claude_dir, slug(cwd), session_id)`, and its own docstring says to prefer
+/// the path the `SessionStart` hook reports once it arrives. Nothing read that
+/// value back, so a node whose real transcript sat somewhere else answered
+/// `transcript_unavailable` no matter what was on disk.
+///
+/// Only the Claude hook is honoured, matching [`turn_ended`]: the report is a
+/// workflow-binder input, not a general-purpose channel, and a path from an
+/// agent whose transcript layout karvex does not know would be a worse target
+/// than the estimate. Relative paths are refused for the same reason — the stat
+/// happens in the server's cwd, not the pane's.
+pub fn reported_transcript_path(
+    source: &str,
+    agent_label: &str,
+    agent_session_path: Option<&str>,
+) -> Option<PathBuf> {
+    if source != CLAUDE_HOOK_SOURCE || agent_label != CLAUDE_AGENT_LABEL {
+        return None;
+    }
+    let path = PathBuf::from(agent_session_path?.trim());
+    (path.is_absolute() && path.extension().is_some()).then_some(path)
 }
 
 // ── pane exit ───────────────────────────────────────────────────────────────

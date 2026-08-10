@@ -229,9 +229,99 @@ kvx workflow node complete --result-file <path>   # defaults to ./result.json in
 
 不正な結果には、スキーマエラーを引用した自動的な是正の再プロンプトが1回だけ送られます。それでも不正なままであれば、ノードは同じように `needs_attention` に移行します。
 
+:::caution[0.12.0 から `maxLength` は強制されます]
+Karvex が `result.json` を検証するスキーマのサブセット ── `type`、`required`、`properties`、`items` ── に、文字列の `maxLength` が加わりました。`output_schema` が宣言した `maxLength` を超える文字列を含む結果は、これまでの版では受理されていましたが、今後は検証に失敗し、是正の再プロンプトを1回受けたうえで `needs_attention` に移行します。ノードが本来意図していない `maxLength` を宣言している場合は、そこで失敗させるのではなく、スキーマから外してください。
+:::
+
+## 実行履歴と要約
+
+完了したすべての実行は ── 成功でも失敗でも ── **要約 (summary)** を残します。要約は、実行が何をしたかを予算内の分量で記録したもので、実際に目で見られる要約ノードが書き、実行のペインが消えたあともずっと読めます。
+
+要約ノードはグラフの一部ではなく **エピローグ** です。実行の終端ステータスが決まったあとにだけ開始するため、その結果を変えることは決してありません。`workflow.run.finished` はこれまでと同じタイミングで発火し、続いて要約ノードが予約済みインスタンスパス `.summary` の可視ペインとして実行され、要約が確定した時点で `workflow.run.summarized` が届きます。要約ノードが失敗しうるすべての経路 ── 出力が2回続けてスキーマに適合しない、起動に失敗する、ペインが死ぬ、実行がキャンセルされる、要約自体が無効化されている ── はすべて同じ結末に収束します: 失敗はジャーナルに記録され、通知は1回だけ出て、ペインは閉じられ、**実行自身のステータスには手が触れられません**。要約のない実行は正常な実行であり、`kvx workflow summary show` が「要約はありません」と答えるのも正常な応答であって、エラーではありません。
+
+`.summary` ノードは `nodes_total` と `nodes_done` から除外されます。この2つは実行が宣言した作業を数えるものなので、実行が finished を報告した瞬間にカウントは完了として読め、それでも要約ノードはグラフ上でその隣に見えています。
+
+:::note[クライアントが前提にしてよいこと]
+`workflow.run.finished` が永続的な終端シグナルです ── 「実行は終わり、その結果はもう変わらない」という判定をスクリプトから行うなら、これを使ってください。`workflow.run.summarized` を待つのは、要約の内容そのものが必要なときだけです。イベントストリームを読む側にとっての帰結は2つあります: クライアントは `run.finished` のあとに予約ノード (`.` で始まるパス) のイベントが届くことを許容しなければならず、そして実行レベルの後続イベントは `workflow.run.summarized` だけです ── 2度目の `run.finished` も、要約のための `run.updated` もありません。
+
+Karvex は同時に1つの実行しか進めず、エピローグもその実行の一部です。したがって `run.finished` から要約の決着までの間、次の実行の開始は `workflow_run_in_flight` で拒否されることがあります。この拒否は再試行可能です ── メッセージは保留中の要約を名指しし、要約ノードが完了するか諦めた時点で次の実行を開始できます。
+:::
+
+同じワークフローの新しい実行には、直近の要約が **コンテキスト** として渡されます。直前の実行が何を積み残したかを起点にできます:
+
+```bash
+kvx workflow run start ship-feature --arg goal="add dark mode"                     # reads prior summaries
+kvx workflow run start ship-feature --arg goal="add dark mode" --no-prior-summaries # ignores them
+```
+
+渡されるのはペイロードではなくポインターです。実行には1つのファイル ── `<run dir>/context/prior-runs.md`。過去の実行ごとに、結果・本文・ハイライト・積み残しを1セクションずつ収めたもの ── が置かれ、各ノードの `task.md` にはそのパスを示し「履歴が役立つタスクなら読むこと」と伝えるだけの2行の `## Prior runs` セクションが追加されます。履歴を必要としないノードが払う代償は数千文字ではなく2行で済み、履歴のない実行の `task.md` はこの機能が存在しなかった頃とまったく同じにレンダリングされます。どの実行が渡されたかは実行自身に記録されます (JSON API の `context_runs`)。
+
+要約は次のコマンドで読めます:
+
+```bash
+kvx workflow summary show <run_id> [--json]
+kvx workflow summary list [<name|id>] [--limit N] [--json]
+```
+
+`summary show` は、結果・要約本文・ハイライト・積み残し、そしてノードごとの1行を表示します。`summary list` は、ワークフロー単位 ── 対象を指定しなければ全ワークフロー横断 ── で新しい順に並べ、要約だけが残っている行には `(pruned)` の印を付けます (後述)。
+
+これらを制御する `[workflow]` の設定キーは3つです: `summary_enabled` (既定 `true`) は要約ノードそのものを止めます ── オフとは、走らせて出力を捨てることではなく、要約ノードを一切作らないことです。`history_context_runs` (既定 `3`) は新しい実行に渡す過去の要約の数で、`0` にすると要約自体は残したまま注入だけを止められます。`retention_runs` (既定 `50`) はワークフローごとに保持する実行の数です。
+
+**間引かれた実行。** ワークフローの実行数が `retention_runs` を超えると、古いものから丸ごと間引かれます: 実行・そのノード・チェックポイント・ジャーナルは消え、**要約は残ります**。そのため間引かれた実行も `kvx workflow summary list` に `run_pruned` の印付きで現れ、実行ブラウザにも並びますが、`kvx workflow run show` と復元はどちらも `workflow_run_pruned` で拒否し、そのメッセージは生き残った窓口として `kvx workflow summary show` を指し示します。間引きは実行が閉じて要約が決着したあとに走り、読み取り経路では決して走りません: 実行ブラウザを開いても何も消えません。
+
+:::note[テストとスクリプト]
+`KARVEX_WORKFLOW_SUMMARY_COMMAND` は、要約ノードを `claude` ではなく任意のコマンドに束縛します。値は argv 文字列の JSON 配列です (`["/usr/bin/env","python3","summarise.py"]`)。これはデバッグ用の隠し口ではなく、宣言された束縛の上書きです: 要約ノードは `command` ノードとまったく同じように振る舞い、`task.md` を読み、`result.json` を書き、`kvx workflow node complete` を呼びます。文字列の JSON 配列でない値が設定された場合、そのサーバーでは要約が無効化され、その旨が最初に要約されるはずだった実行で伝えられます ── 黙って `claude` を走らせることはありません。`KARVEX_WORKFLOW_DB_PATH` はワークフローデータベースの位置を既定から変更するもので、テストの実行を本物の履歴に混ぜないための仕組みです。
+:::
+
+## 過去の実行からの復元
+
+実行は、一部のノードをすでに完了した状態で ── 再実行する代わりに過去の実行のチェックポイントから種を与えられた状態で ── 開始できます:
+
+```bash
+kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id>
+kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id> --restore plan
+kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id> --restore plan --restore-allow-changed
+```
+
+`--restore-from` だけを渡すと、その実行の *復元可能なすべてのノード* が対象になります ── 「成功した分はそのままに、これをもう一度走らせる」という最も多い使い方です。`--restore` を繰り返せば、名指ししたノードだけに絞れます。
+
+復元されたノードは `restored` です: 元の実行の結果を持ち、成功したノードとまったく同じように出力エッジを発火させるため、下流のノードは元の実行のペイロードを受け取ります。そして **ペインは決して割り当てられません**。何も実行されないからです。タイムスタンプは元の実行のものではなく復元した瞬間なので、新しい実行のタイムラインは正直なままです。その出所 (元の実行・ノードキー・チェックポイント) は `kvx workflow node show`、JSON API、DAG ビューの詳細ストリップに表示されます。
+
+あるノードを復元 *できる* かどうかは、元のバージョンのノードと対象バージョンのノードを2点 ── `prompt_template` と `output_schema` ── で比較して、ノードごとに決まります。両方が一致すればチェックポイントは同じ作業を指しており、違えば指していません。だからこそ編集後のワークフローへの復元が成立し、実際に変更したノードだけが再実行されます。
+
+`--restore-from` 付きの開始は **報告を伴う成功した開始** であってエラーではありません ── すべてのノードは復元されるか、理由付きでスキップされます:
+
+| スキップ理由 | 意味 | 回避 |
+| --- | --- | --- |
+| `definition_changed` | ノードの `prompt_template` か `output_schema` が元のバージョンと異なる | `--restore-allow-changed` |
+| `no_checkpoint` | 元の実行に、検証済みの結果チェックポイントがない | なし |
+| `payload_truncated` | チェックポイントのペイロードがストアの容量予算を超えており保持されていない | なし |
+
+人間向け出力は両方の集合を表示します ── `restored: plan, implement · skipped: review (definition changed)` ── ので、`--restore-from` だけを渡した場合でも、何を復元しなかったかが黙殺されることはありません。
+
+報告ではなく拒否になるものが2つあります: 対象バージョンのどのノードにも一致しない `--restore` セレクタは `workflow_restore_unknown_selector` で失敗し、実行自体が作られません。打ち間違いのせいで、復元したつもりのノードが黙って再実行されてはならないからです。そして間引かれた実行を元に指定した場合は `workflow_run_pruned` で失敗します。残っているのは要約だけであり、要約はチェックポイントではないからです。
+
+## 過去のノードへの問いかけ
+
+ノードが終わったとき、その成果は結果に残りますが、そこに至る思考は Claude のセッションの中にあります。問いかけ (interrogation) は、そのセッションを蘇らせて質問できるようにします:
+
+```bash
+kvx workflow node interrogate <run_id> <path> [--reconstructed] [--note <text>] [--json]
+```
+
+これはノードのセッションを fork し (`claude --resume <session> --fork-session`)、そのノードが動いていたディレクトリで新しいペインとして開きます。**元のトランスクリプトは決して変更されません** ── fork は自分の分を書きます ── ので、実行の記録はそのまま残り、同じノードにあとからもう一度問いかけられます。ペインのタイトルは `interrogate · <workflow> · <path>` で、ノードトークンは持ちません: 問いかけが元のノードになりすまして report や complete や expand を行うことはできません。
+
+問いかけは実行ノードではありません。グラフには現れず、どの合計にも数えられず、実行を変えません ── 独自の記録であり、DAG ビューの専用レーンに、独自の開始時刻と終了時刻とともに並びます。
+
+セッションを蘇らせられないとき ── ノードが `command` として動いていてセッションが存在しない、トランスクリプトのファイルが消えている、作業ディレクトリがもう存在しない ── は、そのどれであるかを名指しした `workflow_transcript_unavailable` が返り、**ペインは作られません**。拒否が「静かに何もしないペイン」になることはありません。そこから先の劣化した経路は明示的です: `--reconstructed` (DAG ビューでは `Shift+I`) は、ノードの保存済みチェックポイントと元のタスクから *新しい* セッションに種を与え、`reconstructed` と表示されたペインで開きます。そのペインへの最初の指示は、これが保存済みの出力からの再構成であって元のチームメイトではない、と明言します。提示はされますが、置き換えられることはありません。
+
+返りうるその他の応答: `workflow_interrogation_active` ── 1つのノードにつき同時に1つの問いかけだけなので、開いているものを先に閉じてください (順番に問いかけ直すのは問題なく、それぞれが独自の記録になります)。`workflow_interrogation_spawn_failed` ── セッションは再開可能だったがペインを作れなかった場合で、何も記録されません。`workflow_run_pruned` ── 実行の履歴が消えており、要約に問いかけることはできません。
+
+履歴から表示している実行のノードに問いかけると、その実行の保存済み記録には直ちに追加されます。DAG ビューの問いかけレーンに現れるのは、履歴のスナップショットが読み込み直されたあとです。
+
 ## コマンド
 
-`kvx workflow` は `kvx --help` のコマンド一覧にも表示されます。`show`、`create`、`update`、`run start`、`run show`、`node show` はすべてデフォルトで人間が読めるテキストを出力します。機械可読なエンベロープが必要な場合は `--json` を付けてください。
+`kvx workflow` は `kvx --help` のコマンド一覧にも表示されます。`kvx workflow` のすべてのコマンドは、デフォルトで人間が読めるテキストを出力し、機械可読なエンベロープが必要な場合は `--json` を受け付けます ── 0.12.0 より前はこのフラグを解釈しなかった `run cancel`、`run list`、`node steer`、`node interrupt`、`node restart`、`workflow list` も含みます。`--json` を付けると、拒否は人間向けの文章ではなく生のエラーエンベロープとして出力されます。終了コードはどちらでも同じです。唯一の例外は `node complete` です。これはノード側の報告用コマンドであり、その契約は出力エンベロープではなく終了コードと環境変数です。
 
 ```bash
 kvx workflow list
@@ -243,10 +333,14 @@ kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <t
 `create` と `update` は、前述の定義ドキュメントを `--file` から読み込みます。拡張子で TOML か JSON かが決まります。`update` は現在のバージョンを編集するのではなく、新しい kvdag バージョンを作成します ── ただし、定義が現在のヘッドバージョンとバイト単位で一致する場合は何も新しく作成されず、人間向け出力にはバージョンが作成されたという表示の代わりに `(unchanged — this definition matches the current version; no new version was created)` と表示されます。`--json` なしの `show` は、ワークフローの概要、フォーマット済みタイムスタンプ付きのバージョン履歴、そしてヘッドバージョンのノード (key、label、runner、demand)、エッジ (from/to/kind/port)、宣言済み引数を表示します ── `node show`/`steer`/`restart` 用のノード `<path>` や `run start` 用の `--arg` 名を、元の定義ファイルに戻らずに見つけられます。
 
 ```bash
-kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
-kvx workflow run list <name|id> [--limit N]
+kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]...
+                                 [--restore-from <run_id>] [--restore <selector>]...
+                                 [--restore-allow-changed] [--no-prior-summaries] [--json]
+kvx workflow run list <name|id> [--limit N] [--json]
 kvx workflow run show <run_id> [--json]
-kvx workflow run cancel <run_id>
+kvx workflow run cancel <run_id> [--json]
+kvx workflow summary show <run_id> [--json]
+kvx workflow summary list [<name|id>] [--limit N] [--json]
 ```
 
 Karvex の TUI からは、代わりに `prefix+f` で **ワークフローランチャー** が開きます: 保存済みワークフローの一覧、選択中のワークフローの必須引数ごとの入力行、そしてそのワークフロー自身の `default_tier` を初期値とするティア行を持つモーダルです。`Enter` で実行を開始、`Esc` で閉じ、どの行もクリックできます。`keys.open_workflow_launcher` で割り当てを変更できます。
@@ -257,14 +351,15 @@ Karvex の TUI からは、代わりに `prefix+f` で **ワークフローラ�
 
 ```bash
 kvx workflow node show <run_id> <path> [--json]
-kvx workflow node steer <run_id> <path> <text>
-kvx workflow node interrupt <run_id> <path>
-kvx workflow node restart <run_id> <path>
+kvx workflow node steer <run_id> <path> <text> [--json]
+kvx workflow node interrupt <run_id> <path> [--json]
+kvx workflow node restart <run_id> <path> [--json]
 kvx workflow node complete [--result-file <path>]
 kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]
+kvx workflow node interrogate <run_id> <path> [--reconstructed] [--note <text>] [--json]
 ```
 
-`<path>` は、`plan` や `fanout/worker/2` のような、ノードのインスタンスパスです ── `run show`、`workflow show`、DAG ビューに表示されます。`steer` は、後述する DAG ビューでのステアリングと同じ方法で、実行中のノードにテキストを注入します。`interrupt` はエスケープを送り、ノードを終了させずに現在のターンを止めます。`restart` はノードのペインを閉じ、試行回数を増やし、`task.md` から再起動します。`node complete` と `node expand` は、ノード自身が自分に対して実行する2つのコマンドで、どちらも環境変数にすでに入っているノードトークンで認証されます ── 前述のノードの契約とテンプレートと拡張を参照してください。`--json` なしの `node show` は、`path`/`label`/`status`/`model`/`effort`/`pane_id` に加えてノードの blocker (理由と再開条件) を表示し、このノードがガードレールに達する提案をしたことがある場合は、ガードレール・その値・要求数と受理数を示す `growth_limited:` 行も表示します。
+`<path>` は、`plan` や `fanout/worker/2` のような、ノードのインスタンスパスです ── `run show`、`workflow show`、DAG ビューに表示されます。`steer` は、後述する DAG ビューでのステアリングと同じ方法で、実行中のノードにテキストを注入します。`interrupt` はエスケープを送り、ノードを終了させずに現在のターンを止めます。`restart` はノードのペインを閉じ、試行回数を増やし、`task.md` から再起動します。`node complete` と `node expand` は、ノード自身が自分に対して実行する2つのコマンドで、どちらも環境変数にすでに入っているノードトークンで認証されます ── 前述のノードの契約とテンプレートと拡張を参照してください。`--json` なしの `node show` は、`path`/`label`/`status`/`model`/`effort`/`pane_id` に加えてノードの blocker (理由と再開条件) を表示し、このノードがガードレールに達する提案をしたことがある場合は、ガードレール・その値・要求数と受理数を示す `growth_limited:` 行も表示します。さらに、ノードのセッションのトランスクリプトがまだディスク上にあるかを示す `transcript:` 行と、そのノードが過去の実行から種を与えられている場合の `restored from:` 行も表示します。`node interrogate` は、作られた問いかけのペイン ID と、元のセッションを再開したのか再構成したのかを表示します ── 前述の過去のノードへの問いかけを参照してください。
 
 ## DAG ビュー
 
@@ -278,10 +373,33 @@ Karvex の TUI から実行の DAG ビューを開くと、実行の様子をラ
 | ノードをクリック | ビューを離れずにそのノードを選択する |
 | `Enter`、またはノードをダブルクリック | そのノードのペインにフォーカスし、DAG ビューを離れる |
 | `s` | 選択中のノード用のステア入力行を開く。入力してから `Enter` を押すと `kvx workflow node steer` として送信される |
+| `i` | 選択中のノードに問いかける ── その Claude セッションを fork して新しいペインで開く |
+| `Shift+I` | 元のセッションが失われている場合に、保存済みチェックポイントから選択中のノードのセッションを再構成する |
 | `Esc` (ステア入力行が開いている間) | 送信せずにステア入力行を閉じる |
 | `Esc` (それ以外) | DAG ビューを離れる |
 | マウスを動かす | 選択がポインターに追従する |
 
+`i` と `Shift+I` が別のキーなのは、同じキーを2回押させないためです: 元のチームメイトでは *ない* セッションを開くことは常に明示的な選択であるべきなので、`i` が transcript unavailable を返したときは `Shift+I` で再構成できると通知が伝えるだけで、こちらが求めるまで何も起きません。問いかけのペインは、実行の一部ではないためノードとしてではなく、グラフの下の専用レーンに描かれます ── 問いかけ1つにつき `⌕` のボックスが1つ、動作中はティール、終了すると暗く表示されます。選択するとそのペインにフォーカスします。
+
+履歴から開いた実行は読み取り専用です: フッターはできない操作のヒントを落とし、`s` は「過去の実行はアクティブな実行ではない」と伝え、`Enter` はまだペインが残っているノードにだけフォーカスします。復元されたノードは構造上ペインを持たず、要約ノードも閉じたあとは同じです。
+
 受理された拡張提案で作られたノードは、作成されるそばからグラフに現れ、世代番号ではなく継承したエッジに従って配置されます。提案が拒否または切り捨てられると、ビュー上部を横切るバナーがガードレールと要求数/受理数を示し、提案したノードのボックスにも同じ注記が付きます ── 実行は、何をしたかだけでなく、何を許されなかったかも語ります。
 
+実行終了時の要約ノードも、他のノードと同じように `summary` というラベルでグラフに現れ、実行のステータス行がその状態を伝えます: 作業中は `· summarising…`、諦めた場合は `· summary failed`。その隣にある実行自身のステータスは、どちらの場合も変わりません。
+
 このビューは、実行の読み取り専用の投影です: ノードのステータス、位置、エッジはすべて、CLI と JSON API が報告するのと同じ実行グラフに由来します。ノードのペインへフォーカスする操作は、Karvex の他のペインにフォーカスする場合と同じ経路を通るため、DAG ビューを離れても、選択したチームメイトを見ている状態のままです。
+
+### 実行ブラウザ
+
+`prefix+shift+B` で **実行ブラウザ** が開きます: このサーバーが把握しているすべての実行が、いま動いているワークフローのものに限らず、全ワークフロー横断で新しい順に並びます。`keys.open_workflow_runs` で割り当てを変更できます。
+
+各行には、実行のステータスグリフ、ワークフロー名、ティア、開始時刻、`done/total` が並び、要約がある場合はその印も付きます。履歴が間引かれた実行も、生き残った要約から組み立てられて、暗く `pruned` のタグ付きで並びます。一覧の下の詳細ストリップには、選択中の実行の引数・上限・失敗やブロッカーの行に加えて、要約の結果と最初のハイライトが表示されます。間引かれた実行では、要約本文と固定の一文 `history pruned — restore and interrogation unavailable` が表示されるので、操作できない行はその理由を自分で語ります。
+
+| 操作 | 動作 |
+| --- | --- |
+| `↑` / `↓` (または `j` / `k`) | 選択を移動する |
+| `Enter` | 選択中の実行を DAG ビューで開く ── まだ実行中ならライブ、そうでなければ履歴から読み取り専用で |
+| `r` | その実行を新しい実行として復元する: 復元可能なすべてのノードを、確認を挟んで (`Enter` で開始、`Esc` で取り消し) |
+| `Esc` | ブラウザを閉じる |
+
+`r` は確認付きの全ノード復元です。ノード単位の復元は CLI の `--restore` です。間引かれた実行に対して、また別の実行が進行中のあいだは ── Karvex は同時に1つの実行しか進めないため ── 使えず、その理由が画面に表示されます。ノード単位の問いかけは、ここではなく、その対象であるノードのある DAG ビューに意図的に置かれています。

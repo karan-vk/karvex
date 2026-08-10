@@ -898,6 +898,38 @@ pub struct DagViewState {
     /// Last left click on a node, so the next one can be recognised as a
     /// double click. Carried across frames like `selected`.
     pub last_click: Option<DagClick>,
+    /// Whether this frame is projecting a past run
+    /// ([`AppState::historical_run`]) rather than the active one
+    /// (`07-phase3-plan.md` §WS-H). `false` renders exactly as today; `true`
+    /// disables steer (`s` answers a notice) and `Enter` only focuses a pane
+    /// when the selected node still has a live one.
+    // Read by WS-H's DAG compute path, step 2f; nothing sets it `true` yet.
+    #[allow(dead_code)]
+    pub historical: bool,
+    /// Detached interrogation panes, laid out in their own lane below the
+    /// deepest graph layer (`07-phase3-plan.md` §WS-H). A deliberately
+    /// separate vec and hit-test namespace from [`Self::nodes`] — an
+    /// interrogation is not a `RunGraph` node at all, so it must never be
+    /// confused with one.
+    // Populated by WS-H's DAG compute path, step 2f; empty allocates zero rows.
+    #[allow(dead_code)]
+    pub interrogation_nodes: Vec<DagInterrogationView>,
+}
+
+/// One detached interrogation box in the DAG overlay's interrogation lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // constructed by WS-H's DAG compute path, step 2f
+pub struct DagInterrogationView {
+    pub id: String,
+    /// The source node's instance path, shown as `interrogate · <path>`.
+    pub path: String,
+    pub label: String,
+    /// Present while the forked session's pane is live; `None` once the pane
+    /// has closed (the box still renders, dimmed, so the history stays
+    /// visible).
+    pub pane_id: Option<String>,
+    pub rect: Rect,
+    pub ended: bool,
 }
 
 /// Whole-graph status tallies for the overlay header.
@@ -1022,6 +1054,100 @@ pub struct ViewState {
     pub split_borders: Vec<SplitBorder>,
     pub dag: DagViewState,
     pub workflow_launch: WorkflowLaunchState,
+    pub workflow_runs: WorkflowRunsState,
+}
+
+/// The run browser overlay's state: a list of a workflow's runs — plus
+/// pruned runs whose summary survives — and a detail strip for the
+/// selection (`07-phase3-plan.md` §WS-F).
+///
+/// It lives beside [`DagViewState`] and [`WorkflowLaunchState`] on
+/// [`ViewState`] for the same reason: selection, scroll, and hit geometry are
+/// client concerns, carried across frames because `ViewState` is rebuilt
+/// wholesale every pass. The data itself comes from the wire API
+/// (`workflow.run.list`/`workflow.summary.list`), never a private store read
+/// (`07-phase3-plan.md` §3 frozen interface 10).
+// Populated by WS-F's browser at Phase 3 step 2e; nothing constructs a
+// non-default value yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkflowRunsState {
+    /// Newest-first: one row per run (live or closed), plus one row per
+    /// pruned run whose summary survives. Loaded on open via
+    /// `tui.workflow.run.list` (`workflow_id: None`) and
+    /// `tui.workflow.summary.list`, refreshed on
+    /// `workflow.run.*`/`workflow.run.summarized` event arrivals while open.
+    pub entries: Vec<WorkflowRunsEntry>,
+    /// Index into [`Self::entries`].
+    pub selected: usize,
+    pub scroll: usize,
+    /// `Some` while the restore-all confirmation is open for
+    /// `entries[selected]`, reusing the `ConfirmClose` modal's shape.
+    pub confirm_restore: Option<WorkflowRunsConfirmRestore>,
+    // ── geometry, stored by the layout pass and read by both the renderer
+    // and the mouse hit-test, so what is clickable can never disagree with
+    // what was drawn.
+    pub modal_rect: Rect,
+    pub list_rect: Rect,
+    pub row_rects: Vec<Rect>,
+    pub detail_rect: Rect,
+    pub footer_rect: Rect,
+}
+
+/// One row in the run browser: either a run that still has a `workflow_run`
+/// row, or a pruned run kept only as a summary (`07-phase3-plan.md` §0.3,
+/// §WS-F).
+// Constructed by WS-F's browser loader at Phase 3 step 2e; no variant is
+// built yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowRunsEntry {
+    Run(WorkflowRunsRunEntry),
+    /// The `workflow_run` row is gone; only `run_summary` survives. Rendered
+    /// dimmed with a `pruned` tag; `Enter`/`R` never target it.
+    PrunedSummary(WorkflowRunsPrunedEntry),
+}
+
+/// A run that still has a `workflow_run` row — live or closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunsRunEntry {
+    pub run_id: String,
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub tier: Option<crate::workflow::tier::Tier>,
+    pub status: crate::workflow::model::RunStatus,
+    pub started_at_unix_ms: u64,
+    pub nodes_done: usize,
+    pub nodes_total: usize,
+    /// Detail strip: run args as authored, `name = value`.
+    pub args: Vec<String>,
+    /// Detail strip: the run's growth/other limits line, empty when none
+    /// applied.
+    pub limits: String,
+    /// Detail strip: the run's failure or blocker line, when one exists.
+    pub blocker: Option<String>,
+    /// Detail strip, and the list row's `summary` marker (`Some` ⇒ shown):
+    /// the summary's outcome, when `workflow.summary.get` has one.
+    pub summary_outcome: Option<String>,
+    pub summary_first_highlight: Option<String>,
+}
+
+/// A pruned run kept only as a summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunsPrunedEntry {
+    pub run_id: String,
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub summary_outcome: String,
+    pub summary_text: String,
+}
+
+/// The run browser's restore-all confirmation, reusing the `ConfirmClose`
+/// modal's shape (`07-phase3-plan.md` §WS-F).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunsConfirmRestore {
+    pub run_id: String,
+    pub workflow_name: String,
 }
 
 /// The workflow launcher modal's state: pick a workflow, fill its required
@@ -1132,6 +1258,12 @@ pub enum Mode {
     // the mode-dispatch arms it needs are already in place.
     #[allow(dead_code)]
     WorkflowLaunch,
+    /// The run browser: a list-and-detail overlay over past and pruned runs
+    /// (`07-phase3-plan.md` §WS-F). Opened by `keys.open_workflow_runs`.
+    // Entered by WS-F's browser at Phase 3 step 2e; landed here in step 1b so
+    // the mode-dispatch arms it needs are already in place.
+    #[allow(dead_code)]
+    WorkflowRuns,
 }
 
 impl Mode {
@@ -1143,6 +1275,7 @@ impl Mode {
                 | Self::Navigator
                 | Self::WorkflowDag
                 | Self::WorkflowLaunch
+                | Self::WorkflowRuns
         )
     }
 
@@ -1172,6 +1305,7 @@ impl Mode {
                 | Mode::KeybindHelp
                 | Mode::WorkflowDag
                 | Mode::WorkflowLaunch
+                | Mode::WorkflowRuns
         )
     }
 }
@@ -1924,6 +2058,48 @@ pub struct AppState {
     /// `label`. Mirrored alongside `run_graph` so the overlay can name what the
     /// author named rather than a record id and a node key.
     pub(crate) run_presentation: WorkflowRunPresentation,
+    /// A read-only run snapshot opened from the run browser
+    /// (`07-phase3-plan.md` §WS-H), distinct from [`Self::run_graph`] (the
+    /// live/active run mirror). `Some` only while the DAG view is showing a
+    /// past run rather than the active one; landed here in step 1b because
+    /// `historical_run` is a `RunGraph`-carrying `AppState` field and
+    /// `state.rs` cannot be touched again once step 1b closes.
+    // Loaded by WS-H's `app/workflow_history.rs` (step 2f) and consumed by
+    // the DAG compute path; nothing constructs a non-`None` value yet.
+    #[allow(dead_code)]
+    pub(crate) historical_run: Option<HistoricalRunSnapshot>,
+}
+
+/// A past run's DAG, rehydrated read-only from the durable projection for the
+/// run browser's "open in DAG view" action (`07-phase3-plan.md` §WS-F/§WS-H).
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // constructed by WS-H's historical-run loader, step 2f
+pub(crate) struct HistoricalRunSnapshot {
+    /// Rehydrated `model::RunGraph`, boxed so an `AppState` with no open
+    /// historical run pays nothing (mirrors [`AppState::run_graph`]).
+    pub graph: Box<crate::workflow::model::RunGraph>,
+    /// `RunGraph` carries no name; the DAG header needs one.
+    pub workflow_name: String,
+    /// This run's interrogation rows, independent of
+    /// [`DagViewState::interrogation_nodes`] (the render-facing rects/hit-test
+    /// half). Live-run interrogation data lives on `WorkflowRuntimeState`
+    /// instead — this field exists only for runs that are not the active run.
+    pub interrogations: Vec<HistoricalInterrogation>,
+}
+
+/// One interrogation row on a [`HistoricalRunSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // constructed by WS-H's historical-run loader, step 2f
+pub(crate) struct HistoricalInterrogation {
+    pub id: String,
+    /// The source node's instance path.
+    pub path: String,
+    /// The forked session's pane, when its pane is still live in the current
+    /// server — a historical run's interrogation pane can outlive the run
+    /// itself (`07-phase3-plan.md` §4 D7).
+    pub pane_id: Option<String>,
+    pub reconstructed: bool,
+    pub ended: bool,
 }
 
 /// Authored names for the active run, mirrored into `AppState` for the DAG
@@ -2106,6 +2282,21 @@ impl AppState {
     /// The authored names for the active run, read by the DAG overlay.
     pub(crate) fn workflow_run_presentation(&self) -> &WorkflowRunPresentation {
         &self.run_presentation
+    }
+
+    /// The historical run snapshot the DAG view should project, or `None`
+    /// when it is showing the active run instead. `Some` only while the run
+    /// browser has opened a past run (`07-phase3-plan.md` §WS-H).
+    #[allow(dead_code)] // read by WS-H's DAG compute path, step 2f
+    pub(crate) fn historical_run(&self) -> Option<&HistoricalRunSnapshot> {
+        self.historical_run.as_ref()
+    }
+
+    /// Opens (or closes, with `None`) a historical run snapshot. Only the run
+    /// browser's "open in DAG view" action and its close path call this.
+    #[allow(dead_code)] // called by WS-H's run-browser/DAG glue, step 2f
+    pub(crate) fn set_historical_run(&mut self, snapshot: Option<HistoricalRunSnapshot>) {
+        self.historical_run = snapshot;
     }
 
     /// Records the workflow's authored name. Called when a run starts, so the
@@ -2314,6 +2505,7 @@ impl AppState {
                 split_borders: Vec::new(),
                 dag: DagViewState::default(),
                 workflow_launch: WorkflowLaunchState::default(),
+                workflow_runs: WorkflowRunsState::default(),
             },
             drag: None,
             workspace_press: None,
@@ -2422,6 +2614,7 @@ impl AppState {
             terminal_runtime_shutdowns: Vec::new(),
             run_graph: None,
             run_presentation: WorkflowRunPresentation::default(),
+            historical_run: None,
         }
     }
 
@@ -2852,6 +3045,71 @@ mod tests {
 
         state.mode = initial;
         assert_eq!(state.mode, initial);
+    }
+
+    /// Step 1b's gate: the run browser mode exists and round-trips, is a
+    /// member of the two `Mode` predicates it depends on, and starts with an
+    /// empty state and no historical run open (`07-phase3-plan.md` §WS-G).
+    #[test]
+    fn workflow_runs_mode_round_trips() {
+        let mut state = AppState::test_new();
+        let initial = state.mode;
+
+        state.mode = Mode::WorkflowRuns;
+        assert_eq!(state.mode, Mode::WorkflowRuns);
+        assert!(Mode::WorkflowRuns.mouse_motion_changes_view());
+        assert!(Mode::WorkflowRuns.wants_ascii_input());
+        assert_eq!(
+            state.view.workflow_runs,
+            WorkflowRunsState::default(),
+            "the browser starts empty"
+        );
+        assert!(
+            state.historical_run().is_none(),
+            "nothing opens a historical run yet"
+        );
+
+        state.mode = initial;
+        assert_eq!(state.mode, initial);
+    }
+
+    /// `AppState::set_historical_run` is the only way [`AppState::historical_run`]
+    /// changes; both directions round-trip (`07-phase3-plan.md` §WS-G — landed
+    /// for WS-H, whose loader/DAG-compute path is the eventual caller).
+    #[test]
+    fn historical_run_snapshot_round_trips() {
+        let mut state = AppState::test_new();
+        assert!(state.historical_run().is_none());
+
+        let snapshot = HistoricalRunSnapshot {
+            graph: Box::new(crate::workflow::model::RunGraph {
+                run_id: crate::workflow::model::RunId::new("workflow_run:1"),
+                version_id: crate::workflow::model::KvdagVersionId::new("kvdag_version:1"),
+                tier: crate::workflow::tier::Tier::Auto,
+                growth: crate::workflow::model::GrowthLimits::default(),
+                assignments: std::collections::BTreeMap::new(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                status: crate::workflow::model::RunStatus::Succeeded,
+                seq: 0,
+                epilogue: None,
+            }),
+            workflow_name: "demo".to_string(),
+            interrogations: vec![HistoricalInterrogation {
+                id: "interrogation-1".to_string(),
+                path: "root".to_string(),
+                pane_id: None,
+                reconstructed: false,
+                ended: true,
+            }],
+        };
+        state.set_historical_run(Some(snapshot));
+        let stored = state.historical_run().expect("just set");
+        assert_eq!(stored.workflow_name, "demo");
+        assert_eq!(stored.interrogations.len(), 1);
+
+        state.set_historical_run(None);
+        assert!(state.historical_run().is_none());
     }
 
     #[test]

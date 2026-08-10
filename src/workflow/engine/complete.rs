@@ -11,6 +11,11 @@ use sha2::{Digest, Sha256};
 
 use crate::detect::AgentState;
 use crate::workflow::engine::expand::ExpandProposal;
+/// Re-export shim: `canonical` moved to `model.rs` so the store can compute the
+/// cross-version restore digests without depending on `engine/` internals
+/// (`07-phase3-plan.md` §3 rule 5). Every call site here reads unchanged, and
+/// there is still exactly one canonicaliser.
+pub(crate) use crate::workflow::model::canonical;
 use crate::workflow::model::{
     Evidence, InstancePath, NodeKey, NodeResult, NodeStatus, OutputSchema, RawJson, RunGraph,
     RunNodeIdx, Runner, Succession,
@@ -190,8 +195,9 @@ impl SignalLedger {
 /// Validates a reported result against the node's output schema.
 ///
 /// Evaluates the same JSON Schema subset `OutputSchema::parse` accepts —
-/// `type`, `required`, `properties`, `items` — and reports every violation, not
-/// just the first, so one corrective re-prompt can quote them all.
+/// `type`, `required`, `properties`, `items`, `maxLength` — and reports every
+/// violation, not just the first, so one corrective re-prompt can quote them
+/// all.
 pub fn validate(schema: &OutputSchema, result: &RawJson) -> Result<(), Vec<SchemaViolation>> {
     let mut violations = Vec::new();
     check(schema.as_value(), &result.0, "", &mut violations);
@@ -594,29 +600,6 @@ pub fn digest(payload: &serde_json::Value) -> String {
     format!("{:x}", Sha256::digest(canonical(payload).to_string()))
 }
 
-/// Rebuilds a value with object keys in sorted order. `serde_json::Map` is a
-/// `BTreeMap` unless `preserve_order` is enabled somewhere in the dependency
-/// graph, so the sort is done explicitly rather than assumed.
-fn canonical(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable();
-            let mut sorted = serde_json::Map::with_capacity(keys.len());
-            for key in keys {
-                if let Some(entry) = map.get(key) {
-                    sorted.insert(key.clone(), canonical(entry));
-                }
-            }
-            serde_json::Value::Object(sorted)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(canonical).collect())
-        }
-        other => other.clone(),
-    }
-}
-
 fn describe(errors: &[SchemaViolation]) -> String {
     errors
         .iter()
@@ -651,6 +634,29 @@ fn check(
             // Reporting every child of a wrong-typed value would bury the one
             // violation the node actually has to fix.
             return;
+        }
+    }
+
+    // `maxLength` over strings (`07-phase3-plan.md` §1 WS-A). Without it the
+    // end-of-run summary's 4,000-character budget would be a request in the
+    // prompt rather than a property of the contract, and `03-storage-schema.md`
+    // §7 requires over-budget output to fail validation and be retried once.
+    // A non-integer `maxLength` is ignored exactly like any other keyword this
+    // subset does not evaluate — the evaluator never invents a violation from a
+    // schema it cannot read.
+    if let (Some(limit), Some(text)) = (
+        object.get("maxLength").and_then(serde_json::Value::as_u64),
+        value.as_str(),
+    ) {
+        // Code points, not bytes: that is what JSON Schema's `maxLength`
+        // counts, and a byte count would reject a within-budget summary for
+        // containing non-ASCII.
+        let length = text.chars().count() as u64;
+        if length > limit {
+            out.push(SchemaViolation::new(
+                at,
+                format!("is {length} characters, over the maxLength of {limit}"),
+            ));
         }
     }
 
@@ -785,6 +791,44 @@ mod tests {
         assert_eq!(accepted.artifact_paths, vec!["out/a.md".to_string()]);
         assert_eq!(accepted.evidence, Evidence::SelfReport);
         assert_eq!(accepted.digest.len(), 64);
+    }
+
+    /// `maxLength` (`07-phase3-plan.md` §1 WS-A). Counted in code points, not
+    /// bytes, so a within-budget summary is not rejected for containing
+    /// non-ASCII — and the violation names the field and the limit, because it
+    /// is quoted straight back to the node in the corrective re-prompt.
+    #[test]
+    fn max_length_is_enforced_over_code_points_and_names_the_limit() {
+        let bounded = schema(
+            r#"{"type":"object","required":["text"],"properties":{"text":{"type":"string","maxLength":4}}}"#,
+        );
+
+        assert!(validate(&bounded, &report(r#"{"text":"abcd"}"#)).is_ok());
+        assert!(
+            validate(&bounded, &report(r#"{"text":"日本語です"}"#)).is_err(),
+            "five code points is over a limit of four"
+        );
+        assert!(
+            validate(&bounded, &report(r#"{"text":"日本語"}"#)).is_ok(),
+            "three code points is nine bytes; a byte count would wrongly reject it"
+        );
+
+        let errors = validate(&bounded, &report(r#"{"text":"abcde"}"#))
+            .expect_err("an over-length string is a violation");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].at, "text");
+        assert_eq!(
+            errors[0].message,
+            "is 5 characters, over the maxLength of 4"
+        );
+
+        // A malformed `maxLength`, and a `maxLength` over a non-string, are both
+        // ignored — the way every keyword this subset does not evaluate is. The
+        // evaluator never invents a violation from a schema it cannot read.
+        let malformed = schema(r#"{"type":"object","properties":{"text":{"maxLength":"four"}}}"#);
+        assert!(validate(&malformed, &report(r#"{"text":"abcdefgh"}"#)).is_ok());
+        let mistyped = schema(r#"{"type":"object","properties":{"count":{"maxLength":1}}}"#);
+        assert!(validate(&mistyped, &report(r#"{"count":123456}"#)).is_ok());
     }
 
     #[test]

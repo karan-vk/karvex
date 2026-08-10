@@ -154,8 +154,39 @@ pub(crate) fn clear_explicit_session_for_test() {
     EXPLICIT_SESSION_REQUESTED.store(false, Ordering::Relaxed);
 }
 
+/// Directory holding the running server's own state: `session.json`,
+/// `session-history.json`, log files, the handoff socket and the tmux shim
+/// directory.
+///
+/// The rule is "a server's state lives in the directory that holds its API
+/// socket". That already holds for the default session
+/// (`<config dir>/karvex.sock`) and for named sessions
+/// (`<config dir>/sessions/<name>/karvex.sock`), because both socket paths are
+/// built by [`api_socket_path_for`] from [`data_dir_for`]. Deriving the state
+/// directory back from the *resolved* socket path extends the same rule to a
+/// server whose socket was overridden with `KARVEX_SOCKET_PATH`.
+///
+/// Without that, an overridden server fell through to `data_dir_for(None)` and
+/// shared the default `session.json`: it restored the user's default-session
+/// workspaces into itself at boot (respawning their agent processes) and
+/// overwrote that file with its own throwaway state on every save.
 pub fn data_dir() -> PathBuf {
-    data_dir_for(active_name().as_deref())
+    state_dir_for_socket(&active_api_socket_path())
+}
+
+/// Maps an API socket path to the state directory that belongs with it.
+///
+/// Both platforms treat the socket path as a real filesystem path — Unix binds
+/// it directly, Windows writes a marker file there next to the named pipe — so
+/// its parent directory is always a usable location and needs no platform
+/// branch.
+pub fn state_dir_for_socket(api_socket_path: &Path) -> PathBuf {
+    match api_socket_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        // A bare relative socket name (`KARVEX_SOCKET_PATH=karvex.sock`) binds
+        // in the working directory, so the state belongs beside it there.
+        _ => PathBuf::from("."),
+    }
 }
 
 pub fn data_dir_for(name: Option<&str>) -> PathBuf {
@@ -948,6 +979,121 @@ mod tests {
         std::env::remove_var(SESSION_ENV_VAR);
         clear_explicit_session_for_test();
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    }
+
+    /// The read half of the shared-state defect: a server started with only a
+    /// `KARVEX_SOCKET_PATH` override used to resolve its state directory to the
+    /// default config directory, so it loaded the default session's
+    /// `session.json` at boot and respawned that session's panes into itself.
+    #[test]
+    fn socket_override_moves_state_dir_off_the_default_session() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("karvex-state-override-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        std::env::set_var(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            "/tmp/throwaway/karvex.sock",
+        );
+
+        let state_dir = data_dir();
+
+        assert_eq!(state_dir, PathBuf::from("/tmp/throwaway"));
+        assert_ne!(state_dir, data_dir_for(None));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    }
+
+    /// The default single-server workflow must be untouched: no override, no
+    /// session name, state still in the config directory.
+    #[test]
+    fn default_server_state_dir_is_the_config_dir() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("karvex-state-default-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(SESSION_ENV_VAR);
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        clear_explicit_session_for_test();
+
+        assert_eq!(data_dir(), config_home.join(crate::config::app_dir_name()));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    /// A pane of the default server inherits `KARVEX_SOCKET_PATH` pointing at
+    /// that server's own socket (`integration::env::apply_pane_base_env`), so
+    /// nested CLI invocations must still resolve the default state directory.
+    #[test]
+    fn inherited_default_socket_override_keeps_the_default_state_dir() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("karvex-state-inherited-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        std::env::set_var(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            api_socket_path_for(None).as_os_str(),
+        );
+
+        assert_eq!(data_dir(), data_dir_for(None));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    }
+
+    /// Named sessions keep isolating exactly as before, and an inherited socket
+    /// override from the named server resolves to the same directory.
+    #[test]
+    fn named_session_state_dir_is_unchanged_by_an_inherited_override() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("karvex-state-named-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::set_var(SESSION_ENV_VAR, "work");
+        clear_explicit_session_for_test();
+        std::env::set_var(
+            crate::api::SOCKET_PATH_ENV_VAR,
+            api_socket_path_for(Some("work")).as_os_str(),
+        );
+
+        assert_eq!(data_dir(), data_dir_for(Some("work")));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var(SESSION_ENV_VAR);
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    }
+
+    /// Every socket path a session can resolve to already sits inside that
+    /// session's own state directory, so the mapping is total, not a special
+    /// case bolted onto the override.
+    #[test]
+    fn state_dir_for_socket_inverts_the_session_socket_layout() {
+        let _guard = env_lock().lock().unwrap();
+        let config_home =
+            std::env::temp_dir().join(format!("karvex-state-invert-{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
+        for name in [None, Some("work")] {
+            assert_eq!(
+                state_dir_for_socket(&api_socket_path_for(name)),
+                data_dir_for(name)
+            );
+        }
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn state_dir_for_a_bare_relative_socket_name_is_the_working_directory() {
+        assert_eq!(
+            state_dir_for_socket(Path::new("karvex.sock")),
+            PathBuf::from(".")
+        );
     }
 
     #[test]

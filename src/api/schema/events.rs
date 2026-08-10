@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use super::common::{AgentStatus, ReadSource};
 use super::panes::{PaneInfo, PaneReadResult, PaneScrollInfo};
 use super::tabs::TabInfo;
-use super::workflows::{WorkflowGrowthLimitKind, WorkflowRunInfo, WorkflowRunNodeInfo};
+use super::workflows::{
+    WorkflowGrowthLimitKind, WorkflowInterrogationInfo, WorkflowRunInfo, WorkflowRunNodeInfo,
+    WorkflowRunSummaryInfo,
+};
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::WorktreeInfo;
 
@@ -97,6 +100,12 @@ pub enum Subscription {
     WorkflowNodeOutputCheckpoint {},
     #[serde(rename = "workflow.growth.limited")]
     WorkflowGrowthLimited {},
+    #[serde(rename = "workflow.run.summarized")]
+    WorkflowRunSummarized {},
+    #[serde(rename = "workflow.interrogation.started")]
+    WorkflowInterrogationStarted {},
+    #[serde(rename = "workflow.interrogation.ended")]
+    WorkflowInterrogationEnded {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -240,6 +249,9 @@ pub enum EventKind {
     WorkflowNodeUpdated,
     WorkflowNodeOutputCheckpoint,
     WorkflowGrowthLimited,
+    WorkflowRunSummarized,
+    WorkflowInterrogationStarted,
+    WorkflowInterrogationEnded,
 }
 
 impl EventKind {
@@ -278,6 +290,9 @@ impl EventKind {
             EventKind::WorkflowNodeUpdated => "workflow.node.updated",
             EventKind::WorkflowNodeOutputCheckpoint => "workflow.node.output_checkpoint",
             EventKind::WorkflowGrowthLimited => "workflow.growth.limited",
+            EventKind::WorkflowRunSummarized => "workflow.run.summarized",
+            EventKind::WorkflowInterrogationStarted => "workflow.interrogation.started",
+            EventKind::WorkflowInterrogationEnded => "workflow.interrogation.ended",
         }
     }
 }
@@ -317,6 +332,9 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::WorkflowNodeUpdated,
     EventKind::WorkflowNodeOutputCheckpoint,
     EventKind::WorkflowGrowthLimited,
+    EventKind::WorkflowRunSummarized,
+    EventKind::WorkflowInterrogationStarted,
+    EventKind::WorkflowInterrogationEnded,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -423,6 +441,9 @@ mod workflow_event_tests {
             max_nodes: 24,
             nodes_live: 1,
             growth_limited: None,
+            workflow_name: String::new(),
+            context_runs: Vec::new(),
+            restore_from_run: None,
         }
     }
 
@@ -455,6 +476,43 @@ mod workflow_event_tests {
             assignment_reason: String::new(),
             delivery_failure: None,
             growth_limited: None,
+            transcript_path: None,
+            restored_from: None,
+        }
+    }
+
+    fn interrogation() -> WorkflowInterrogationInfo {
+        WorkflowInterrogationInfo {
+            id: "interrogation:1".into(),
+            run_id: "workflow_run:1".into(),
+            path: "plan".into(),
+            source_session_id: "11111111-1111-1111-1111-111111111111".into(),
+            forked_session_id: Some("22222222-2222-2222-2222-222222222222".into()),
+            pane_id: Some("w_1-3".into()),
+            reconstructed: false,
+            transcript_path: Some("/home/user/.claude/projects/p/11111111.jsonl".into()),
+            cwd: "/repo".into(),
+            started_at_unix_ms: 10,
+            ended_at_unix_ms: None,
+            note: String::new(),
+        }
+    }
+
+    fn run_summary() -> WorkflowRunSummaryInfo {
+        WorkflowRunSummaryInfo {
+            run_id: "workflow_run:1".into(),
+            workflow_id: "workflow:1".into(),
+            workflow_name: "ship-feature".into(),
+            version_id: "kvdag_version:1".into(),
+            text: "Implemented dark mode.".into(),
+            outcome: "succeeded".into(),
+            highlights: Vec::new(),
+            open_gaps: Vec::new(),
+            per_node: Vec::new(),
+            token_estimate: 400,
+            generated_by_path: Some(".summary".into()),
+            created_at_unix_ms: 20,
+            run_pruned: false,
         }
     }
 
@@ -535,6 +593,34 @@ mod workflow_event_tests {
                 },
                 "workflow.growth.limited",
             ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowRunSummarized,
+                    data: EventData::WorkflowRunSummarized {
+                        run_id: "workflow_run:1".into(),
+                        summary: run_summary(),
+                    },
+                },
+                "workflow.run.summarized",
+            ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowInterrogationStarted,
+                    data: EventData::WorkflowInterrogationStarted {
+                        interrogation: interrogation(),
+                    },
+                },
+                "workflow.interrogation.started",
+            ),
+            (
+                EventEnvelope {
+                    event: EventKind::WorkflowInterrogationEnded,
+                    data: EventData::WorkflowInterrogationEnded {
+                        interrogation: interrogation(),
+                    },
+                },
+                "workflow.interrogation.ended",
+            ),
         ] {
             assert_eq!(event.event.dot_name(), dot_name);
             let json = serde_json::to_value(&event).unwrap();
@@ -556,6 +642,9 @@ mod workflow_event_tests {
                     Subscription::WorkflowNodeUpdated {},
                     Subscription::WorkflowNodeOutputCheckpoint {},
                     Subscription::WorkflowGrowthLimited {},
+                    Subscription::WorkflowRunSummarized {},
+                    Subscription::WorkflowInterrogationStarted {},
+                    Subscription::WorkflowInterrogationEnded {},
                 ],
             }),
         };
@@ -568,6 +657,9 @@ mod workflow_event_tests {
             "workflow.node.updated",
             "workflow.node.output_checkpoint",
             "workflow.growth.limited",
+            "workflow.run.summarized",
+            "workflow.interrogation.started",
+            "workflow.interrogation.ended",
         ] {
             assert!(
                 json.contains(&format!("\"type\":\"{dot_name}\"")),
@@ -814,5 +906,18 @@ pub enum EventData {
         requested: u32,
         accepted: u32,
         message: String,
+    },
+    /// The epilogue's summary was accepted and enqueued
+    /// (`07-phase3-plan.md` §4 D1). There is no second `workflow.run.finished`
+    /// and no `workflow.run.updated` — the run's status was already final.
+    WorkflowRunSummarized {
+        run_id: String,
+        summary: WorkflowRunSummaryInfo,
+    },
+    WorkflowInterrogationStarted {
+        interrogation: WorkflowInterrogationInfo,
+    },
+    WorkflowInterrogationEnded {
+        interrogation: WorkflowInterrogationInfo,
     },
 }

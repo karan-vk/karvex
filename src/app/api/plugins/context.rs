@@ -207,7 +207,14 @@ impl App {
                 .and_then(|pane_id| self.plugin_context_for_public_pane_id(pane_id, correlation_id))
                 .unwrap_or_else(|| empty_plugin_context(correlation_id)),
             EventData::WorkflowNodeOutputCheckpoint { .. }
-            | EventData::WorkflowGrowthLimited { .. } => empty_plugin_context(correlation_id),
+            | EventData::WorkflowGrowthLimited { .. }
+            | EventData::WorkflowRunSummarized { .. } => empty_plugin_context(correlation_id),
+            EventData::WorkflowInterrogationStarted { interrogation }
+            | EventData::WorkflowInterrogationEnded { interrogation } => interrogation
+                .pane_id
+                .as_deref()
+                .and_then(|pane_id| self.plugin_context_for_public_pane_id(pane_id, correlation_id))
+                .unwrap_or_else(|| empty_plugin_context(correlation_id)),
         }
     }
 

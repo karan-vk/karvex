@@ -238,9 +238,99 @@ A node whose pane goes idle without ever producing a `result.json` that validate
 
 An invalid result gets one automatic corrective re-prompt quoting the schema errors; still invalid, and the node moves to `needs_attention` the same way.
 
+:::caution[`maxLength` is enforced from 0.12.0]
+The schema subset Karvex validates `result.json` against — `type`, `required`, `properties`, `items` — now also enforces `maxLength` on strings. A result whose string field is longer than the `maxLength` its `output_schema` declares now fails validation, gets the one corrective re-prompt, and then moves to `needs_attention`, where earlier releases accepted it. If one of your nodes declares a `maxLength` it never really meant, drop it from the schema rather than letting the node fail on it.
+:::
+
+## Run history and summaries
+
+Every finished run — succeeded **or** failed — gets an end-of-run **summary**: a short, budgeted account of what the run did, written by a real summariser node you can watch, and readable long after the run's panes are gone.
+
+The summariser is an **epilogue**, not part of the graph. It starts only once the run's terminal status has already been decided, so it can never change it. `workflow.run.finished` fires exactly when it always did; the summariser then runs as a visible pane under the reserved instance path `.summary`; and `workflow.run.summarized` follows when the summary lands. Every way the summariser can fail — output that fails its schema twice, a spawn failure, a pane that died, a cancelled run, summaries switched off — converges on the same outcome: the failure is journalled, you get one notice, the pane closes, and **the run's own status is untouched**. A run with no summary is a normal run, and `kvx workflow summary show` saying there is none is a normal answer, not an error.
+
+The `.summary` node is excluded from `nodes_total` and `nodes_done`, which count the run's declared work: those counts read complete at the instant the run reports finished, and the summariser is still visible in the graph beside them.
+
+:::note[What clients may assume]
+`workflow.run.finished` is the durable terminal signal — safe to script against for "the run is over and its outcome will not change". Wait for `workflow.run.summarized` only when you want the summary's content. Two consequences for anything reading the event stream: clients must tolerate reserved-node (`.`-prefixed) events arriving after `run.finished`, and `workflow.run.summarized` remains the only run-level follow-up — there is no second `run.finished` and no `run.updated` for the summary.
+
+Karvex executes one run at a time, and the epilogue is part of that run: between `run.finished` and the summary resolving, starting the next run may answer `workflow_run_in_flight`. That refusal is retryable — the message names the pending summary, and the next run starts once the summariser has finished or given up.
+:::
+
+A new run of the same workflow is given the most recent summaries as **context**, so it can start from what the last runs left open:
+
+```bash
+kvx workflow run start ship-feature --arg goal="add dark mode"                     # reads prior summaries
+kvx workflow run start ship-feature --arg goal="add dark mode" --no-prior-summaries # ignores them
+```
+
+The summaries are a pointer, not a payload. The run gets one file — `<run dir>/context/prior-runs.md`, one section per prior run with its outcome, text, highlights, and open gaps — and every node's `task.md` gets a two-line `## Prior runs` section naming that path and saying to read it if the task benefits from history. A node that does not need history pays two lines of prompt rather than several thousand characters, and a run with no history renders its `task.md` exactly as it did before this existed. Which runs a run was given is recorded on the run itself (`context_runs` on the JSON API).
+
+Read summaries back with:
+
+```bash
+kvx workflow summary show <run_id> [--json]
+kvx workflow summary list [<name|id>] [--limit N] [--json]
+```
+
+`summary show` prints the outcome, the summary text, highlights, open gaps, and one line per node. `summary list` is newest-first across a workflow, or across every workflow when given no target, and marks a row `(pruned)` when only the summary survives — see below.
+
+Three `[workflow]` config keys govern all of this: `summary_enabled` (default `true`) turns the summariser off entirely — off means no summariser node is created at all, not one that runs and discards its output; `history_context_runs` (default `3`) is how many prior summaries a run is offered, where `0` disables the injection without disabling summaries; and `retention_runs` (default `50`) is how many runs are kept per workflow.
+
+**Pruned runs.** Once a workflow has more than `retention_runs` runs, the oldest are pruned whole: the run, its nodes, its checkpoints, and its journal go, and **the summary stays**. A pruned run therefore still appears in `kvx workflow summary list` — flagged `run_pruned` — and in the run browser, while `kvx workflow run show` and restore both refuse it with `workflow_run_pruned`, whose message points at `kvx workflow summary show` as the surface that survived. Pruning happens after a run closes and its summary resolves, never on a read path: opening the run browser never deletes anything.
+
+:::note[Testing and scripting]
+`KARVEX_WORKFLOW_SUMMARY_COMMAND` binds the summariser to a command of your own instead of `claude`, as a JSON array of argv strings (`["/usr/bin/env","python3","summarise.py"]`). It is a declared binding override, not a debug hook: the summariser then behaves like any `command` node — it reads its `task.md`, writes `result.json`, and calls `kvx workflow node complete`. A value that is not a JSON array of strings switches summaries off for that server and says so on the first run that would have summarised, rather than silently running `claude` instead. `KARVEX_WORKFLOW_DB_PATH` points the workflow database somewhere other than the default, which is what keeps a test's runs out of your real history.
+:::
+
+## Restoring from a past run
+
+A run can start with some of its nodes already done, seeded from a past run's checkpoints instead of executed again:
+
+```bash
+kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id>
+kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id> --restore plan
+kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id> --restore plan --restore-allow-changed
+```
+
+Bare `--restore-from` means *every restorable node* of that run — the common case, "re-run this, keeping what succeeded". Repeat `--restore` to narrow it to named nodes.
+
+A restored node is `restored`: it has the source run's result, it fires its outbound edges exactly like a succeeded node — so downstream nodes receive the source run's payload — and **it never gets a pane**, because nothing runs. Its timestamps are the restore instant, not the source run's, so the new run's timeline stays honest; its provenance (source run, node key, checkpoint) is on `kvx workflow node show`, the JSON API, and the DAG view's detail strip.
+
+Whether a node *can* be restored is decided per node, by comparing the source version's node against the target version's on two things: its `prompt_template` and its `output_schema`. Equal on both, and the checkpoint still describes the same work; different, and it does not. So restoring into an edited workflow works, and only the nodes you actually changed re-run.
+
+Starting a run with `--restore-from` is a **successful start that carries a report**, never an error — every node is either restored or skipped with a reason:
+
+| Skip reason | Meaning | Bypass |
+| --- | --- | --- |
+| `definition_changed` | the node's `prompt_template` or `output_schema` differs from the source version's | `--restore-allow-changed` |
+| `no_checkpoint` | the node has no validated result checkpoint in the source run | none |
+| `payload_truncated` | the checkpoint's payload was over the store's size budget and was not kept | none |
+
+The human output prints both sets — `restored: plan, implement · skipped: review (definition changed)` — so a bare `--restore-from` is never silent about what it did not restore.
+
+Two things are refused rather than reported: a `--restore` selector naming no node in the target version fails with `workflow_restore_unknown_selector` and creates no run at all, since a typo must not quietly re-run a node you believed restored; and a source run that has been pruned fails with `workflow_run_pruned`, since only its summary survives and a summary is not a checkpoint.
+
+## Interrogating a past node
+
+When a node has finished, its work is in its result — but the reasoning behind it is in its Claude session. Interrogation revives that session so you can ask:
+
+```bash
+kvx workflow node interrogate <run_id> <path> [--reconstructed] [--note <text>] [--json]
+```
+
+This forks the node's session (`claude --resume <session> --fork-session`) into a new pane, in the directory the node ran in. **The source transcript is never modified** — a fork writes its own — so the run's record stays exactly as it was, and you can interrogate the same node again later. The pane is titled `interrogate · <workflow> · <path>`, and it holds no node token: an interrogation cannot report, complete, or expand anything on the original node's behalf.
+
+Interrogations are not run nodes. They do not appear in the graph, do not count toward any total, and do not change the run — they are their own record, listed in the DAG view's own lane, with their own start and end times.
+
+When the session cannot be revived — the node ran as a `command` and never had one, the transcript file is gone, or its working directory no longer exists — you get `workflow_transcript_unavailable` naming which of those it was, and **no pane is created**. A refusal is never a pane that quietly does nothing. From there the degraded path is explicit: `--reconstructed` (`Shift+I` in the DAG view) seeds a *fresh* session from the node's stored checkpoint and its original task, in a pane labelled `reconstructed`, whose first instruction says it is a reconstruction from stored outputs and not the original teammate. It is offered, never substituted.
+
+The other answers you can get: `workflow_interrogation_active` — one live interrogation per node at a time, so close the open one first (sequential re-interrogation is fine, and each is its own record); `workflow_interrogation_spawn_failed` — the session was resumable but the pane could not be created, so nothing was recorded; and `workflow_run_pruned` — the run's history is gone, and a summary cannot be interrogated.
+
+Interrogating a node of a run you are viewing from history adds it to that run's stored record immediately; the DAG view's interrogation lane shows it once the historical snapshot is reloaded.
+
 ## Commands
 
-`kvx workflow` also appears in `kvx --help`'s command list. All of `show`, `create`, `update`, `run start`, `run show`, and `node show` print human-readable text by default; pass `--json` on any of them for the machine-readable envelope instead.
+`kvx workflow` also appears in `kvx --help`'s command list. Every `kvx workflow` command prints human-readable text by default and takes `--json` for the machine-readable envelope instead — including `run cancel`, `run list`, `node steer`, `node interrupt`, `node restart`, and `workflow list`, which did not accept the flag before 0.12.0. Under `--json` a refusal prints the raw error envelope rather than the humanized message; the exit code is the same either way. The one exception is `node complete`, the node-side reporting verb, whose contract is its exit code and its environment rather than an output envelope.
 
 ```bash
 kvx workflow list
@@ -252,10 +342,14 @@ kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <t
 `create` and `update` read the definition document described above from `--file`; the extension selects TOML or JSON. `update` authors a new kvdag version rather than editing the current one — unless the definition is byte-for-byte equivalent to the current head version, in which case nothing new is created and the human output says `(unchanged — this definition matches the current version; no new version was created)` instead of claiming a version was created. The human default for `show` renders the workflow summary, its version history with formatted timestamps, and the head version's nodes (key, label, runner, demand), edges (from/to/kind/port), and declared args — everything you need to find a node's `<path>` for `node show`/`steer`/`restart` or an `--arg` name for `run start`, without going back to the original definition file.
 
 ```bash
-kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
-kvx workflow run list <name|id> [--limit N]
+kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]...
+                                 [--restore-from <run_id>] [--restore <selector>]...
+                                 [--restore-allow-changed] [--no-prior-summaries] [--json]
+kvx workflow run list <name|id> [--limit N] [--json]
 kvx workflow run show <run_id> [--json]
-kvx workflow run cancel <run_id>
+kvx workflow run cancel <run_id> [--json]
+kvx workflow summary show <run_id> [--json]
+kvx workflow summary list [<name|id>] [--limit N] [--json]
 ```
 
 From the Karvex TUI, `prefix+f` opens the **workflow launcher** instead: a modal listing the saved workflows, one input line per required argument of the selected one, and a tier row seeded from that workflow's own `default_tier`. `Enter` starts the run, `Esc` closes it, and every row is clickable. Rebind it with `keys.open_workflow_launcher`.
@@ -266,14 +360,15 @@ The human default for `run show` always prints a `limits:` line naming the run's
 
 ```bash
 kvx workflow node show <run_id> <path> [--json]
-kvx workflow node steer <run_id> <path> <text>
-kvx workflow node interrupt <run_id> <path>
-kvx workflow node restart <run_id> <path>
+kvx workflow node steer <run_id> <path> <text> [--json]
+kvx workflow node interrupt <run_id> <path> [--json]
+kvx workflow node restart <run_id> <path> [--json]
 kvx workflow node complete [--result-file <path>]
 kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]
+kvx workflow node interrogate <run_id> <path> [--reconstructed] [--note <text>] [--json]
 ```
 
-`<path>` is the node's instance path, such as `plan` or `fanout/worker/2` — shown by `run show` and `workflow show`, and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` and `node expand` are the two commands a node runs on itself, both authenticated by the node token already in its environment; see The node contract and Templates and expansion, above. The human default for `node show` includes the node's blocker as `blocker:`/`resume:` lines — reason and resume condition — for a node that has entered `needs_attention`, and, when this node has proposed into a guardrail, a `growth_limited:` line naming the guardrail, its value, and the requested/accepted counts (`growth_limited: max_nodes reached at 14:22 UTC (2 of 4 accepted)`), alongside `path`/`label`/`status`/`model`/`effort`/`pane_id`.
+`<path>` is the node's instance path, such as `plan` or `fanout/worker/2` — shown by `run show` and `workflow show`, and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` and `node expand` are the two commands a node runs on itself, both authenticated by the node token already in its environment; see The node contract and Templates and expansion, above. The human default for `node show` includes the node's blocker as `blocker:`/`resume:` lines — reason and resume condition — for a node that has entered `needs_attention`, and, when this node has proposed into a guardrail, a `growth_limited:` line naming the guardrail, its value, and the requested/accepted counts (`growth_limited: max_nodes reached at 14:22 UTC (2 of 4 accepted)`), alongside `path`/`label`/`status`/`model`/`effort`/`pane_id`, plus a `transcript:` line saying whether the node's session transcript is still on disk and a `restored from:` line when the node was seeded from a past run. `node interrogate` prints the interrogation's pane id and whether it resumed the original session or reconstructed one — see Interrogating a past node, above.
 
 ## The DAG view
 
@@ -287,10 +382,33 @@ Open it with `prefix+shift+F`, or from the global menu — the launcher at the b
 | Click a node | select it, without leaving the view |
 | `Enter`, or double-click a node | focus that node's pane, leaving the DAG view |
 | `s` | open a steer line for the selected node; type, then `Enter` to send it as `kvx workflow node steer` |
+| `i` | interrogate the selected node — fork its Claude session into a new pane |
+| `Shift+I` | reconstruct a session for the selected node from its stored checkpoint, for when the original is gone |
 | `Esc` (with the steer line open) | close the steer line without sending |
 | `Esc` (otherwise) | leave the DAG view |
 | Move the mouse | selection follows the pointer |
 
+`i` and `Shift+I` are two keys rather than one key pressed twice: opening a session that is *not* the original teammate is always an explicit choice, so when `i` answers `transcript unavailable` the notice tells you `Shift+I` will reconstruct one, and nothing happens until you ask. Interrogation panes are drawn in their own lane below the graph — a `⌕` box per interrogation, teal while live and dimmed once it ends — rather than as nodes, because an interrogation is not part of the run. Selecting one focuses its pane.
+
+A run opened from history is read-only: the footer drops the hints for what it cannot do, `s` reports that a past run is not the active run, and `Enter` focuses a pane only for nodes that still have one. Restored nodes have none by construction, and so does the summariser once it has closed.
+
 Nodes created by an accepted expand proposal appear in the graph as they are created, laid out by the edges they inherited rather than by their generation number. When a proposal is refused or truncated, a banner across the top of the view names the guardrail and the requested/accepted counts, and the node that proposed carries the same notice in its box — so the run says what it was not allowed to do, not only what it did.
 
+The end-of-run summariser appears in the graph like any other node, labelled `summary`, and the run's status line says where it is: `· summarising…` while it works, `· summary failed` if it gave up. The run's own status beside it does not change either way.
+
 The view is a read-only projection of the run: node status, position, and edges all come from the same run graph the CLI and JSON API report. Focusing a node's pane goes through the same path as focusing any other pane in Karvex, so leaving the DAG view leaves you looking at the teammate you selected.
+
+### The run browser
+
+`prefix+shift+B` opens the **run browser**: every run this server knows about, newest first, across every workflow — not only the one executing now. Rebind it with `keys.open_workflow_runs`.
+
+Each row carries the run's status glyph, its workflow's name, its tier, when it started, and its `done/total`, plus a marker when it has a summary. Runs whose history has been pruned still appear, dimmed and tagged `pruned`, built from the summary that outlived them. The detail strip below the list shows the selected run's args, limits, and failure or blocker line, together with its summary's outcome and first highlight; for a pruned run it shows the summary text and the fixed line `history pruned — restore and interrogation unavailable`, so a row that cannot be acted on says why.
+
+| Input | Action |
+| --- | --- |
+| `↑` / `↓` (or `j` / `k`) | move the selection |
+| `Enter` | open the selected run in the DAG view — live if it is still running, read-only from history otherwise |
+| `r` | restore that run into a new run: every restorable node, behind a confirmation (`Enter` starts it, `Esc` backs out) |
+| `Esc` | close the browser |
+
+`r` is restore-all with a confirm; per-node restore is `--restore` on the CLI. It is unavailable — with the reason on screen — for a pruned run, and while another run is in flight, since Karvex executes one run at a time. Per-node interrogation deliberately lives in the DAG view rather than here, on the node it is about.

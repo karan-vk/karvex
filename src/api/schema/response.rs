@@ -20,7 +20,8 @@ use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workflows::{
     KvdagVersionDetail, KvdagVersionSummary, WorkflowDetail, WorkflowExpandRejection,
-    WorkflowRunGraph, WorkflowRunInfo, WorkflowRunNodeInfo, WorkflowSummary,
+    WorkflowInterrogationInfo, WorkflowRestoreReport, WorkflowRunGraph, WorkflowRunInfo,
+    WorkflowRunNodeInfo, WorkflowRunSummaryInfo, WorkflowSummary,
 };
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
@@ -274,6 +275,8 @@ pub enum ResponseResult {
     },
     WorkflowRunStarted {
         run: WorkflowRunInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore: Option<WorkflowRestoreReport>,
     },
     WorkflowRunGet {
         run: WorkflowRunInfo,
@@ -307,6 +310,18 @@ pub enum ResponseResult {
         /// Instance paths of the children the proposal created.
         accepted: Vec<String>,
         rejected: Vec<WorkflowExpandRejection>,
+    },
+    WorkflowNodeInterrogated {
+        interrogation: WorkflowInterrogationInfo,
+    },
+    /// `None` means "no summary was written" — a normal answer, not an error
+    /// (`07-phase3-plan.md` §4 D1, D10).
+    WorkflowSummaryGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<WorkflowRunSummaryInfo>,
+    },
+    WorkflowSummaryList {
+        summaries: Vec<WorkflowRunSummaryInfo>,
     },
     Ok {},
 }

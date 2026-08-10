@@ -7,7 +7,7 @@ pub(super) use std::thread;
 pub(super) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(super) use crate::support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_karvex_pid,
+    cleanup_test_base, register_runtime_dir, register_spawned_karvex_pid, server_state_dir,
     unregister_spawned_karvex_pid, CURRENT_PROTOCOL,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};

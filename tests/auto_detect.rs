@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde_json::Value;
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_karvex_pid,
+    cleanup_test_base, register_runtime_dir, register_spawned_karvex_pid, server_state_dir,
     unregister_spawned_karvex_pid,
 };
 
@@ -670,12 +670,7 @@ fn auto_detect_writes_client_and_server_logs_to_separate_files() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    let app_dir_name = if cfg!(debug_assertions) {
-        "karvex-dev"
-    } else {
-        "karvex"
-    };
-    let log_dir = config_home.join(app_dir_name);
+    let log_dir = server_state_dir(&api_socket);
     let client_log = log_dir.join("karvex-client.log");
     let server_log = log_dir.join("karvex-server.log");
     let monolith_log = log_dir.join("karvex.log");
@@ -711,13 +706,7 @@ fn no_session_writes_startup_logs_to_monolith_file() {
     let spawned = spawn_karvex_no_session(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
-    let app_dir_name = if cfg!(debug_assertions) {
-        "karvex-dev"
-    } else {
-        "karvex"
-    };
-    let log_dir = config_home.join(app_dir_name);
-    let monolith_log = log_dir.join("karvex.log");
+    let monolith_log = server_state_dir(&api_socket).join("karvex.log");
 
     wait_for_log_contains(
         &monolith_log,

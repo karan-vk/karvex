@@ -218,6 +218,22 @@ impl App {
                         if doubled {
                             self.focus_workflow_dag_node();
                         }
+                    } else if let Some(pane) = crate::ui::workflow_dag_interrogation_at(
+                        &self.state.view.dag,
+                        mouse.column,
+                        mouse.row,
+                    )
+                    .and_then(|item| item.pane_id.clone())
+                    {
+                        // The interrogation lane is its own hit-test namespace
+                        // (`07-phase3-plan.md` §4 D8): a detached box is not a
+                        // `RunNode`, so it never resolves to a `RunNodeIdx` and
+                        // never becomes the DAG's selection. It also takes a
+                        // *single* click — the double-click rule protects the
+                        // graph's selection gesture, and a lane box has no
+                        // selection to protect. An ended interrogation has no
+                        // pane and simply does nothing.
+                        self.focus_workflow_dag_interrogation(&pane);
                     } else {
                         self.state.view.dag.last_click = None;
                     }
@@ -232,6 +248,12 @@ impl App {
             // the view-computation pass stored, so there is no second geometry
             // to keep in sync (`06-phase2-plan.md` §4 D18).
             return self.handle_workflow_launch_mouse(mouse);
+        }
+
+        if self.state.mode == Mode::WorkflowRuns {
+            // Same rule as the DAG/launcher overlays; delegates to WS-F's
+            // handler (`07-phase3-plan.md` §WS-F, step 2e).
+            return self.handle_workflow_runs_mouse(mouse);
         }
 
         if self.state.mode == Mode::KeybindHelp {

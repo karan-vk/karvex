@@ -12,7 +12,8 @@ pub mod graph;
 pub mod schedule;
 pub mod watchdog;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use serde_json::json;
@@ -21,20 +22,53 @@ use tracing::{debug, info};
 use crate::detect::AgentState;
 use crate::workflow::engine::complete::{Completion, SchemaViolation, Signal, SignalLedger};
 use crate::workflow::engine::expand::ExpandProposal;
+use crate::workflow::engine::graph::FIRST_ATTEMPT;
 use crate::workflow::engine::schedule::TerminalBlocker;
 use crate::workflow::model::{
-    CheckpointKind, EngineInput, InstancePath, Kvdag, NodeBinding, NodeKey, NodeResult, NodeStatus,
-    NodeToken, NoticeLevel, OutputSchema, ProgressDelta, PublicPaneId, RawJson, RunEffect,
-    RunEventKind, RunGraph, RunNodeIdx, RunStatus, Runner, StoreWrite, Succession, UserNotice,
-    WorkflowEvent,
+    is_reserved_path, CheckpointKind, Demand, EngineInput, EpiloguePhase, EpilogueState,
+    InstancePath, Kvdag, NodeBinding, NodeKey, NodeResult, NodeStatus, NodeToken, NodeUsage,
+    NoticeLevel, OutputSchema, ProgressDelta, ProgressTracker, PublicPaneId, RawJson, RunEffect,
+    RunEventKind, RunGraph, RunNode, RunNodeIdx, RunStatus, Runner, StoreWrite, Succession,
+    SummaryNodeLine, UserNotice, WorkflowEvent, SUMMARY_INSTANCE_PATH,
 };
+use crate::workflow::tier;
 
 /// Runtime knobs, sourced from the `[workflow]` config block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Clone` rather than `Copy` since [`Self::summary_command`] carries an argv.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
     pub max_parallel_nodes: usize,
     pub stuck_threshold: u16,
     pub drift_threshold: u16,
+    /// Whether a finished run gets an end-of-run summary
+    /// (`workflow.summary_enabled`, `07-phase3-plan.md` §4 D22).
+    ///
+    /// Off means no epilogue node is ever appended — not a summariser that runs
+    /// and discards its output — so a run with summaries disabled is byte-for-
+    /// byte the run Phase 2 produced.
+    pub summary_enabled: bool,
+    /// The declared argv override that binds the summariser to a command
+    /// instead of `claude` (`KARVEX_WORKFLOW_SUMMARY_COMMAND`, §4 D2 / §6 A4).
+    ///
+    /// `None` is the production path: the epilogue runs as an agent. `Some`
+    /// swaps it to [`Runner::Command`] — and the **engine** has to know, not
+    /// just the spawn plan, because the runner decides which completion signals
+    /// are admissible (defect D-1). WS-D populates this from the environment
+    /// and rejects invalid argv loudly rather than falling back silently.
+    pub summary_command: Option<Vec<String>>,
+}
+
+impl EngineConfig {
+    /// How the epilogue is bound under this configuration. The single place the
+    /// override becomes a [`Runner`], so the spawn plan and the engine's signal
+    /// gating can never disagree about what the summariser is.
+    fn epilogue_runner(&self) -> Runner {
+        match self.summary_command {
+            Some(_) => Runner::Command,
+            None => Runner::Agent,
+        }
+    }
 }
 
 impl Default for EngineConfig {
@@ -43,8 +77,73 @@ impl Default for EngineConfig {
             max_parallel_nodes: 4,
             stuck_threshold: 3,
             drift_threshold: 5,
+            summary_enabled: true,
+            summary_command: None,
         }
     }
+}
+
+/// The end-of-run summary's `text` budget, in characters
+/// (`03-storage-schema.md` §7). Stated in the prompt and enforced by
+/// [`summary_output_schema`]'s `maxLength`, so an over-budget summary fails
+/// validation and spends the one corrective re-prompt rather than being
+/// silently truncated into the store.
+pub const SUMMARY_TEXT_BUDGET: usize = 4_000;
+
+/// The summary's one-line `outcome` budget, in characters.
+pub const SUMMARY_OUTCOME_BUDGET: usize = 200;
+
+/// The epilogue's demand, fixed by `07-phase3-plan.md` §4 D2 so a `--tier low`
+/// run summarises cheaply by construction.
+///
+/// A constant rather than a field: unlike the epilogue's runner — which depends
+/// on configuration and therefore has to be *recorded* per run
+/// ([`EpilogueState::runner`]) — this never varies. It is `pub` because the
+/// epilogue has **no kvdag node**, so every reader that would normally derive a
+/// node's demand from the definition has to read it here instead. A reader that
+/// falls back to `Demand::Standard` for a definition-less node is not wrong by a
+/// little: it silently disagrees with the row the store holds, which is the
+/// live-vs-durable field-loss class §4 D16 exists to catch.
+pub const EPILOGUE_DEMAND: Demand = Demand::Light;
+
+/// Why the epilogue's `model`/`effort` read what they read — the same
+/// explanation every other node carries in `assignment_reason`.
+///
+/// A constant for the same reason [`EPILOGUE_DEMAND`] is one: `begin_epilogue`
+/// writes it twice, once onto the live [`RunNode`] and once onto the
+/// [`StoreWrite::RunNodeCreated`] row, and the two are compared field for field
+/// across a restart (§4 D16). One value with two spellings is a live-vs-durable
+/// disagreement waiting for someone to edit one of them.
+const EPILOGUE_ASSIGNMENT_REASON: &str =
+    "the end-of-run summariser runs at the run's tier on light demand";
+
+/// Everything the binder needs to put the epilogue's summariser in a pane.
+///
+/// The epilogue has no kvdag node behind it, so its task text and output schema
+/// come from here rather than from a definition lookup
+/// (`07-phase3-plan.md` §3 rule 2). Pure and deterministic given a run graph, so
+/// it is testable without a pane, a store, or a clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpilogueTaskSpec {
+    /// Always [`SUMMARY_INSTANCE_PATH`].
+    pub path: InstancePath,
+    /// What the DAG view and the pane title call it.
+    pub label: String,
+    /// The rendered `task.md` body: what to cover, the budget, and one evidence
+    /// line per user node.
+    pub task_markdown: String,
+    /// [`summary_output_schema`], carried so the caller writes one file from one
+    /// source.
+    pub output_schema: serde_json::Value,
+    /// The argv when [`EngineConfig::summary_command`] binds the summariser to a
+    /// command, `None` when it runs as an agent.
+    ///
+    /// Carried here so the spawn plan reads the override from **one** authority
+    /// rather than re-reading the environment itself. Two readers of the same
+    /// environment variable is how the engine and the binder end up disagreeing
+    /// about what the summariser is — which is precisely the defect this field
+    /// closes (D-1).
+    pub command: Option<Vec<String>>,
 }
 
 /// What the completion gate did with one reported result (§4.3).
@@ -177,7 +276,7 @@ impl Engine {
     }
 
     pub fn config(&self) -> EngineConfig {
-        self.config
+        self.config.clone()
     }
 
     /// What this run has measured about `path` so far (§4 D8). An unknown node
@@ -311,11 +410,295 @@ impl Engine {
     /// Nodes admitted to run now (§3.1). The caller turns these into spawns:
     /// building a `SpawnSpec` needs the run directory, the node token, and the
     /// agent session id, none of which the engine mints.
+    ///
+    /// **Deliberately not gated on the run's status.** The epilogue node is
+    /// appended after `finish` has already set a terminal status, and it has to
+    /// be admitted anyway — `settle`'s early return for a non-`Running`/`Paused`
+    /// run is exactly why admission cannot ask the run whether it is live
+    /// (`07-phase3-plan.md` §3 rule 2). Admission is a per-node question:
+    /// `ready_set` reports the nodes whose status is `Ready`, and after a run
+    /// finishes the only node that can be is the summariser.
     pub fn admissions(&self) -> Vec<RunNodeIdx> {
         self.graph
             .as_ref()
             .map(|graph| schedule::ready_set(graph, self.config.max_parallel_nodes))
             .unwrap_or_default()
+    }
+
+    /// Whether the engine still needs ticks to drive the end-of-run summariser.
+    ///
+    /// The app's only new liveness input (§7 R-1): a run whose epilogue is
+    /// `Done`, `GaveUp`, or absent lets the workflow tick deadline lapse exactly
+    /// as it did before Phase 3.
+    pub fn epilogue_pending(&self) -> bool {
+        self.graph
+            .as_ref()
+            .and_then(|graph| graph.epilogue)
+            .is_some_and(|state| state.phase.is_pending())
+    }
+
+    /// The summariser's task and schema, or `None` when this run has no
+    /// epilogue. The caller renders it into the epilogue node's directory the
+    /// same way it renders an authored node's `task.md`.
+    pub fn summary_task_spec(&self) -> Option<EpilogueTaskSpec> {
+        let graph = self.graph.as_ref()?;
+        graph.epilogue?;
+        let definition = self.definition.as_ref()?;
+        Some(summary_task_spec(
+            graph,
+            definition,
+            self.config.summary_command.as_deref(),
+        ))
+    }
+
+    /// The epilogue node's index while it still needs driving, or `None`.
+    fn pending_epilogue_idx(&self) -> Option<RunNodeIdx> {
+        self.graph
+            .as_ref()
+            .and_then(|graph| graph.epilogue)
+            .filter(|state| state.phase.is_pending())
+            .map(|state| state.node)
+    }
+
+    /// Whether `idx` is this run's epilogue node, whatever phase it is in.
+    fn is_epilogue(&self, idx: RunNodeIdx) -> bool {
+        self.graph
+            .as_ref()
+            .and_then(|graph| graph.epilogue)
+            .is_some_and(|state| state.node == idx)
+    }
+
+    /// Appends the engine-owned summariser after the user graph's terminal
+    /// status is decided (§4 D1).
+    ///
+    /// Runs *after* [`finish`], never inside it: a summariser inside
+    /// `run_terminal_ready`'s conjunction wedges every failed run, because a
+    /// `Failed` leaf never resolves its outbound edge and the summariser would
+    /// sit `Pending` forever while the run paused instead of failing (§0.7).
+    /// Appending it here means the run's status is already final and this
+    /// function cannot change it.
+    ///
+    /// The node is created `Ready` with no inbound edges, so the very next
+    /// [`Engine::admissions`] yields it. It is persisted through
+    /// [`StoreWrite::RunNodeCreated`] with the reserved `.summary` path, which
+    /// the store recognises as the one create allowed to carry no kvdag node
+    /// behind it.
+    fn begin_epilogue(&mut self, effects: &mut Vec<RunEffect>) {
+        if !self.config.summary_enabled {
+            return;
+        }
+        let Some(graph) = self.graph.as_mut() else {
+            return;
+        };
+        // `Cancelled` never summarises (§4 D2), and an epilogue is appended at
+        // most once per run.
+        if graph.epilogue.is_some()
+            || !matches!(graph.status, RunStatus::Succeeded | RunStatus::Failed)
+        {
+            return;
+        }
+
+        let idx = RunNodeIdx(graph.nodes.len());
+        let path = InstancePath::new(SUMMARY_INSTANCE_PATH);
+        let key = NodeKey::new(SUMMARY_INSTANCE_PATH);
+        // Decided once, here, and recorded on the epilogue state: the engine
+        // cannot re-derive it later because there is no kvdag node to ask, and
+        // the `Agent` default it would fall back to lies whenever the summariser
+        // is bound to a command (defect D-1).
+        let runner = self.config.epilogue_runner();
+        // Light demand through the run's own tier, so a `--tier low` run
+        // summarises cheaply by construction (§4 D2).
+        let assignment = tier::resolve(graph.tier, EPILOGUE_DEMAND, None);
+        graph.nodes.push(RunNode {
+            idx,
+            key: key.clone(),
+            path: path.clone(),
+            label: EPILOGUE_LABEL.to_string(),
+            inputs: BTreeMap::new(),
+            parent: None,
+            depth: 0,
+            status: NodeStatus::Ready,
+            assignment,
+            assignment_reason: EPILOGUE_ASSIGNMENT_REASON.to_string(),
+            attempt: FIRST_ATTEMPT,
+            binding: None,
+            result: None,
+            usage: NodeUsage::default(),
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+            progress: ProgressTracker::default(),
+            succession: None,
+            checkpoint_seq: 0,
+            restored_from: None,
+        });
+        graph.epilogue = Some(EpilogueState {
+            node: idx,
+            phase: EpiloguePhase::Pending,
+            runner,
+        });
+
+        effects.push(RunEffect::Persist(Box::new(StoreWrite::RunNodeCreated {
+            run: graph.run_id.clone(),
+            key,
+            path: path.clone(),
+            label: EPILOGUE_LABEL.to_string(),
+            inputs: BTreeMap::new(),
+            parent: None,
+            depth: 0,
+            status: NodeStatus::Ready,
+            demand: EPILOGUE_DEMAND,
+            assignment,
+            assignment_reason: EPILOGUE_ASSIGNMENT_REASON.to_string(),
+            attempt: FIRST_ATTEMPT,
+            // `proposal_id: ""` and `parent: None` above are **unread on the
+            // reserved-path branch** — the store's epilogue create ignores both,
+            // because the epilogue is engine-owned and has neither a proposing
+            // parent nor an `expand_proposed` entry to link back to. They are
+            // the variant's required fields carrying "nothing", not values with
+            // meaning; do not later assign either one a purpose here.
+            proposal_id: String::new(),
+        })));
+        let payload = json!({ "epilogue": true });
+        effects.push(journal(
+            graph,
+            RunEventKind::NodeCreated,
+            Some(path.clone()),
+            payload,
+        ));
+        // The DAG view learns about the summariser the same way it learns about
+        // an expansion child, so it appears live rather than at the next reload.
+        effects.push(RunEffect::Emit(WorkflowEvent::NodeCreated {
+            run: graph.run_id.clone(),
+            path,
+        }));
+        info!(run = %graph.run_id, "workflow run finished; the end-of-run summariser was appended");
+    }
+
+    /// The epilogue's happy path: a summary that validated against
+    /// [`summary_output_schema`].
+    ///
+    /// Takes the place of [`Engine::succeed`] for the summariser, because none
+    /// of what `succeed` does applies: there is no succession to resolve from
+    /// outbound edges the epilogue does not have, no downstream to propagate to,
+    /// and the durable artifact is a `run_summary` row rather than a node
+    /// checkpoint.
+    fn accept_summary(&mut self, idx: RunNodeIdx, result: NodeResult) -> Vec<RunEffect> {
+        let mut effects = Vec::new();
+        let Some(graph) = self.graph.as_mut() else {
+            return effects;
+        };
+        let (text, outcome, highlights, open_gaps) = summary_fields(&result.payload);
+        let per_node = summary_per_node(&result.payload);
+        let estimate = token_estimate(&result.payload);
+        let text_len = text.chars().count();
+
+        let Some(node) = graph.node_mut(idx) else {
+            return effects;
+        };
+        node.status = NodeStatus::Succeeded;
+        node.succession = Some(Succession::NoFollowup {
+            evidence: "the run summary was written".to_string(),
+        });
+        node.result = Some(result);
+        let Some(node) = graph.node(idx) else {
+            return effects;
+        };
+        let path = node.path.clone();
+        let pane = pane_of(graph, idx);
+
+        effects.push(RunEffect::Persist(Box::new(StoreWrite::RunSummary {
+            run: graph.run_id.clone(),
+            kvdag_version: graph.version_id.clone(),
+            text,
+            outcome: outcome.clone(),
+            highlights,
+            open_gaps,
+            per_node,
+            token_estimate: estimate,
+            generated_by_path: Some(path.clone()),
+        })));
+        let payload = json!({ "outcome": outcome, "text_len": text_len });
+        effects.push(journal(
+            graph,
+            RunEventKind::Summary,
+            Some(path.clone()),
+            payload,
+        ));
+        record_status(graph, idx, &mut effects);
+        effects.push(RunEffect::Emit(WorkflowEvent::RunSummarized {
+            run: graph.run_id.clone(),
+        }));
+        // The summariser's pane has nothing left to do and the run is over; a
+        // pane left open here would outlive every other pane the run created.
+        if let Some(pane) = pane {
+            effects.push(RunEffect::ClosePane { pane });
+        }
+        // The phase advances; the runner recorded at `begin_epilogue` is
+        // preserved, because how the summariser was bound is a fact about this
+        // epilogue and does not change as it resolves.
+        if let Some(state) = graph.epilogue.as_mut() {
+            state.phase = EpiloguePhase::Done;
+        }
+        effects
+    }
+
+    /// The bottom of the epilogue's bounded failure ladder (§4 D1).
+    ///
+    /// Every way the summariser can fail — schema-invalid after its one
+    /// corrective re-prompt, a self-report with no artifact, a spawn failure, a
+    /// pane that died, a cancel — converges here: journalled once, notified
+    /// once, pane closed, **run status untouched**. `summary.get` answering
+    /// `None` afterwards is a normal answer, not an error.
+    ///
+    /// Idempotent: a resolved epilogue gives up no further, so the notice
+    /// cannot be delivered twice by two failure signals racing each other.
+    fn give_up_epilogue(&mut self, idx: RunNodeIdx, reason: &str) -> Vec<RunEffect> {
+        let mut effects = Vec::new();
+        if self.pending_epilogue_idx() != Some(idx) {
+            return effects;
+        }
+        let Some(graph) = self.graph.as_mut() else {
+            return effects;
+        };
+        let pane = pane_of(graph, idx);
+        if let Some(node) = graph.node_mut(idx) {
+            node.status = NodeStatus::Failed;
+            // A recorded succession, so the epilogue node is not a
+            // `SuccessionGap` waiting to be found by anything that walks the
+            // graph later — even though `run_terminal_ready` already skips it.
+            node.succession = Some(Succession::NoFollowup {
+                evidence: reason.to_string(),
+            });
+        }
+        let path = graph
+            .node(idx)
+            .map(|node| node.path.clone())
+            .unwrap_or_else(|| InstancePath::new(SUMMARY_INSTANCE_PATH));
+        let payload = json!({ "reason": "summary_failed", "detail": reason });
+        effects.push(journal(
+            graph,
+            RunEventKind::Error,
+            Some(path.clone()),
+            payload,
+        ));
+        record_status(graph, idx, &mut effects);
+        effects.push(RunEffect::Notify(UserNotice {
+            level: NoticeLevel::Warning,
+            run: Some(graph.run_id.clone()),
+            path: Some(path),
+            message: format!("the run summary could not be written: {reason}"),
+        }));
+        if let Some(pane) = pane {
+            effects.push(RunEffect::ClosePane { pane });
+        }
+        // The phase advances; the runner recorded at `begin_epilogue` is
+        // preserved, because how the summariser was bound is a fact about this
+        // epilogue and does not change as it resolves.
+        if let Some(state) = graph.epilogue.as_mut() {
+            state.phase = EpiloguePhase::GaveUp;
+        }
+        info!(reason = %reason, "the end-of-run summariser gave up; the run's status is unchanged");
+        effects
     }
 
     /// Records the pane binding of a node the caller has spawned and moves it to
@@ -333,6 +716,14 @@ impl Engine {
             node.binding = Some(binding);
             node.status = NodeStatus::Running;
         }
+        // The epilogue's own phase follows its node into the pane, so
+        // `epilogue_pending` distinguishes "waiting to be spawned" from
+        // "working" without a second source of truth.
+        if graph.epilogue.is_some_and(|state| state.node == idx) {
+            if let Some(state) = graph.epilogue.as_mut() {
+                state.phase = EpiloguePhase::Running;
+            }
+        }
         // A fresh pane is a fresh delivery channel, so whatever the previous one
         // refused is no longer outstanding.
         self.delivery_failures.remove(path);
@@ -345,6 +736,75 @@ impl Engine {
         ));
         record_status(graph, idx, &mut effects);
         effects
+    }
+
+    /// Records the transcript path a node's pane actually reported, replacing
+    /// the pre-launch estimate (`07-phase3-plan.md` §4 D6, §0.5). Returns
+    /// whether it changed anything. Touches `binding.transcript_path` and
+    /// nothing else — unlike `bind_node`, which replaces the whole binding and
+    /// moves the node to `Running`.
+    ///
+    /// The `bind_node` hazard in full: it also journals `NodeStarted` and clears
+    /// the node's delivery-failure marker, because it exists for the moment a
+    /// node *acquires* a pane. Learning a transcript path is none of those
+    /// things — it happens to a node whose binding is already correct in every
+    /// other respect — so routing it through `bind_node` would re-announce a
+    /// start that already happened, resurrect a node that has since closed, and
+    /// silently drop a refused delivery the user has not seen yet.
+    ///
+    /// Works on a node in **any** status, including a closed one: a session
+    /// report can arrive after the node finished, and the stored path is what a
+    /// *later* interrogation stats (§4 D6's stat-first rule). Refusing a late
+    /// correction would preserve the stale estimate in exactly the historical-
+    /// interrogation case §0.5 exists to fix.
+    ///
+    /// Returning `false` on an unchanged path lets the caller skip a durable
+    /// write — the common case, since the pre-launch estimate is usually right.
+    pub fn record_transcript_path(&mut self, path: &InstancePath, transcript: PathBuf) -> bool {
+        let Some(graph) = self.graph.as_mut() else {
+            return false;
+        };
+        let Some(idx) = graph.index_of(path) else {
+            return false;
+        };
+        let Some(binding) = graph.node_mut(idx).and_then(|node| node.binding.as_mut()) else {
+            return false;
+        };
+        if binding.transcript_path == transcript {
+            return false;
+        }
+        binding.transcript_path = transcript;
+        true
+    }
+
+    /// The durable counterpart of a node's current in-memory state, with **no**
+    /// status journal and **no** `NodeUpdated` emit.
+    ///
+    /// [`record_transcript_path`](Self::record_transcript_path) changes one
+    /// field of an already-announced node, so the caller needs a way to persist
+    /// that field without re-announcing a status transition that did not
+    /// happen. `record_status` is the wrong tool for the same reason
+    /// `bind_node` is: it exists for transitions.
+    ///
+    /// Returns `None` for an unknown path. The write is the ordinary
+    /// find-then-`UPDATE` [`StoreWrite::RunNode`], so the row must already
+    /// exist — which it does for any node that has ever been bound.
+    pub fn node_persist_effect(&self, path: &InstancePath) -> Option<RunEffect> {
+        let graph = self.graph.as_ref()?;
+        let node = graph.node_by_path(path)?;
+        Some(RunEffect::Persist(Box::new(StoreWrite::RunNode {
+            run: graph.run_id.clone(),
+            path: node.path.clone(),
+            status: node.status,
+            attempt: node.attempt,
+            binding: node.binding.clone(),
+            usage: node.usage,
+            evidence: node.result.as_ref().map(|result| result.evidence),
+            succession: node.succession.clone(),
+            started_at_unix_ms: node.started_at_unix_ms,
+            ended_at_unix_ms: node.ended_at_unix_ms,
+            restored_from: node.restored_from.clone(),
+        })))
     }
 
     pub fn apply(&mut self, input: EngineInput) -> Vec<RunEffect> {
@@ -410,7 +870,33 @@ impl Engine {
                 path,
             }));
         }
-        record_edges(&graph, &changed.edges, &mut effects);
+        // Every edge that is **already settled** at Start, not just the ones
+        // this `propagate` moved.
+        //
+        // A restored node arrives from `materialise_with_restored` with its
+        // result in place, and materialisation propagates before the engine ever
+        // sees the graph — so by now its outbound edges are already fired and
+        // `changed.edges` is empty. Recording only the delta would leave the
+        // durable projection describing those edges as unfired forever, which is
+        // exactly the failure `Propagation`'s doc warns about: a caller that
+        // persists node statuses without their edges reads every restored edge
+        // back unfired, and a restarted server would re-run the branch the first
+        // run already satisfied.
+        //
+        // A no-op for a run with no restored nodes: no node can be terminal at
+        // materialisation, so no edge can be settled before this point.
+        let mut settled: Vec<usize> = changed.edges.clone();
+        settled.extend(
+            graph
+                .edges
+                .iter()
+                .enumerate()
+                .filter(|(_, edge)| edge.condition_result.is_some())
+                .map(|(index, _)| index),
+        );
+        settled.sort_unstable();
+        settled.dedup();
+        record_edges(&graph, &settled, &mut effects);
         for idx in changed.nodes {
             record_status(&mut graph, idx, &mut effects);
         }
@@ -961,6 +1447,17 @@ impl Engine {
         if done {
             return Vec::new();
         }
+        // A summariser whose pane died before it reported has nothing to retry
+        // into: its run is over, and a second attempt would only reopen a pane
+        // on a finished run. It gives up instead (§4 D1).
+        if self.is_epilogue(idx) {
+            let exit =
+                code.map_or_else(|| "no exit code".to_string(), |code| format!("code {code}"));
+            return self.give_up_epilogue(
+                idx,
+                &format!("the summariser's pane exited with {exit} before a summary was written"),
+            );
+        }
 
         let max_attempts = self.max_attempts_of(idx);
         // The retry below is a fresh attempt in a fresh pane, so it starts with
@@ -1178,13 +1675,26 @@ impl Engine {
     }
 
     fn cancel(&mut self) -> Vec<RunEffect> {
+        match self.graph.as_ref().map(|graph| is_closed_run(graph.status)) {
+            None => return Vec::new(),
+            // The user graph is already closed, but a summariser may still be
+            // sitting in a live pane. Cancelling has to reach it: the alternative
+            // is a pane working on a run the user just asked to stop, with
+            // `epilogue_pending` keeping the tick alive behind it (§4 D1).
+            Some(true) => {
+                let Some(idx) = self.pending_epilogue_idx() else {
+                    return Vec::new();
+                };
+                return self
+                    .give_up_epilogue(idx, "the run was cancelled before the summary was written");
+            }
+            Some(false) => {}
+        }
+
         let mut effects = Vec::new();
         let Some(graph) = self.graph.as_mut() else {
             return effects;
         };
-        if is_closed_run(graph.status) {
-            return effects;
-        }
 
         let live: Vec<RunNodeIdx> = graph
             .nodes
@@ -1236,6 +1746,7 @@ impl Engine {
             record_status(graph, idx, effects);
         }
 
+        let mut just_finished = false;
         match schedule::run_terminal_ready(graph) {
             Ok(()) => {
                 // §3.2 lets the conjunction hold with a `Blocked` node, because
@@ -1243,9 +1754,14 @@ impl Engine {
                 // `succeeded` would be the soft form of the false-completion
                 // bug, so an unresolved blocker fails the run just as a `Failed`
                 // node does.
+                //
+                // Engine-owned nodes are excluded for the same reason
+                // `run_terminal_ready` excludes them (§4 D1): a summariser that
+                // gave up must never turn a succeeded run into a failed one.
                 let status = if graph
                     .nodes
                     .iter()
+                    .filter(|node| !is_reserved_path(node.path.as_str()))
                     .any(|node| matches!(node.status, NodeStatus::Failed | NodeStatus::Blocked))
                 {
                     RunStatus::Failed
@@ -1253,6 +1769,7 @@ impl Engine {
                     RunStatus::Succeeded
                 };
                 finish(graph, status, effects);
+                just_finished = true;
             }
             Err(blocker) => {
                 let live = graph
@@ -1268,9 +1785,23 @@ impl Engine {
                 }
             }
         }
+
+        // Outside the borrow above, and outside `finish` itself: the epilogue is
+        // appended only after the run's terminal status is decided and written,
+        // so `workflow.run.finished` still precedes every summary effect.
+        if just_finished {
+            self.begin_epilogue(effects);
+        }
     }
 
     fn succeed(&mut self, idx: RunNodeIdx, result: NodeResult) -> Vec<RunEffect> {
+        // The summariser's accepted result is a `run_summary` row, not a node
+        // checkpoint feeding downstream edges it does not have. Branching here
+        // rather than at `report`'s call sites means no completion path can
+        // reach the ordinary success machinery with the epilogue node.
+        if self.is_epilogue(idx) {
+            return self.accept_summary(idx, result);
+        }
         let mut effects = Vec::new();
         let Some(graph) = self.graph.as_mut() else {
             return effects;
@@ -1384,6 +1915,15 @@ impl Engine {
         reason: &str,
         resume_when: &str,
     ) -> Vec<RunEffect> {
+        // `NeedsAttention` means "the run is stalled until a human acts", and
+        // the run the summariser belongs to is already over — there is nothing
+        // to unstall and no one to wait for. The epilogue's ladder ends in
+        // `GaveUp` instead (§4 D1). Branching here covers every route into this
+        // function at once: a schema failure surviving the corrective
+        // re-prompt, a self-report with no artifact, and a spawn failure.
+        if self.is_epilogue(idx) {
+            return self.give_up_epilogue(idx, reason);
+        }
         let mut effects = Vec::new();
         let Some(graph) = self.graph.as_mut() else {
             return effects;
@@ -1434,7 +1974,23 @@ impl Engine {
 
     /// Without the definition the binding is unknown, and `Runner::Agent` is
     /// the definition's own default.
+    ///
+    /// The epilogue is the one node that has **no** definition by construction,
+    /// so that default would be a guess rather than a fallback — and a wrong
+    /// one whenever the summariser is bound to a command. It answers from the
+    /// runner `begin_epilogue` recorded instead (defect D-1). This matters
+    /// because the runner decides signal admissibility in `agent_status`: a
+    /// command-bound epilogue must not accept sustained-idle as a completion
+    /// signal, or karvex would re-deliver a seed prompt into a shell pane.
     fn runner_of(&self, idx: RunNodeIdx) -> Runner {
+        if let Some(state) = self
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.epilogue)
+            .filter(|state| state.node == idx)
+        {
+            return state.runner;
+        }
         self.definition_node(idx)
             .map_or(Runner::Agent, |node| node.runner)
     }
@@ -1445,6 +2001,13 @@ impl Engine {
     }
 
     fn schema_for(&self, key: &NodeKey) -> Option<OutputSchema> {
+        // The epilogue has no kvdag node behind it, so its contract is the
+        // engine's own [`summary_output_schema`]. Without this the completion
+        // gate would find no schema for `.summary` and surface the summariser
+        // as unvalidatable on its very first report.
+        if is_reserved_path(key.as_str()) {
+            return OutputSchema::parse(summary_output_schema()).ok();
+        }
         self.definition
             .as_ref()
             .and_then(|kvdag| kvdag.node(key))
@@ -1477,7 +2040,7 @@ fn next_seq(graph: &mut RunGraph) -> u64 {
 /// itself the same way, directly from the wall clock rather than a threaded
 /// parameter — this mirrors that existing, accepted precedent for node-level
 /// timestamps instead of introducing a second clock-injection mechanism.
-fn current_unix_ms() -> u64 {
+pub(crate) fn current_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -1497,6 +2060,10 @@ fn journal(
         kind,
         path,
         payload,
+        // Stamped here, not at store-flush time: the journal's timestamps are
+        // the engine's facts, and a queued write applied minutes later must not
+        // rewrite when the event happened (§4 D14).
+        at_unix_ms: current_unix_ms(),
     }))
 }
 
@@ -1542,6 +2109,7 @@ fn record_status(graph: &mut RunGraph, idx: RunNodeIdx, effects: &mut Vec<RunEff
         succession: node.succession.clone(),
         started_at_unix_ms: node.started_at_unix_ms,
         ended_at_unix_ms: node.ended_at_unix_ms,
+        restored_from: node.restored_from.clone(),
     })));
     let payload = json!({ "status": status });
     effects.push(journal(
@@ -1637,6 +2205,212 @@ fn pause(graph: &mut RunGraph, blocker: &TerminalBlocker, effects: &mut Vec<RunE
         path: None,
         message: format!("the run cannot report success: {blocker}"),
     }));
+}
+
+// ── the end-of-run epilogue (`07-phase3-plan.md` §4 D1) ─────────────────────
+
+/// The summariser's output contract.
+///
+/// Declared here rather than authored per workflow because the summary is
+/// karvex's artifact, not the user's: `run_summary`'s columns, the wire's
+/// `WorkflowRunSummaryInfo`, and this schema are one shape, and a workflow
+/// author cannot change it. The `maxLength` entries are what make the token
+/// budget a property of the contract instead of a request in the prompt —
+/// `complete::check` evaluates them, so an over-budget summary is a schema
+/// violation like any other.
+pub(crate) fn summary_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "required": ["text", "outcome", "highlights", "open_gaps", "per_node"],
+        "properties": {
+            "text": { "type": "string", "maxLength": SUMMARY_TEXT_BUDGET },
+            "outcome": { "type": "string", "maxLength": SUMMARY_OUTCOME_BUDGET },
+            "highlights": { "type": "array", "items": { "type": "string" } },
+            "open_gaps": { "type": "array", "items": { "type": "string" } },
+            "per_node": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["node_key", "verdict", "one_liner"],
+                    "properties": {
+                        "node_key": { "type": "string" },
+                        "verdict": { "type": "string" },
+                        "one_liner": { "type": "string" }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// The karvex-authored prompt the summariser runs against: the fixed
+/// what-to-cover text plus one evidence line per user node.
+///
+/// The evidence block is deliberately built from what the run already holds —
+/// status, attempts, succession, and each node's checkpoint `summary`, which
+/// `complete::SUMMARY_BUDGET` already caps at 1,200 characters — rather than
+/// from transcripts or payloads. A summariser that had to read every node's full
+/// output would cost more than the run it is summarising.
+///
+/// `kvdag` supplies each node's authored `role`, which is the one thing the run
+/// graph does not carry and the only thing that explains *why* a node was in the
+/// graph at all. A node with no definition behind it (an epilogue node, or a key
+/// the version no longer has) simply contributes no role line.
+pub fn summary_task_spec(
+    graph: &RunGraph,
+    kvdag: &Kvdag,
+    command: Option<&[String]>,
+) -> EpilogueTaskSpec {
+    let mut task = String::new();
+    task.push_str("# Write this run's summary\n\n");
+    task.push_str(
+        "You are karvex's end-of-run summariser. The run below has already finished; \
+         its outcome is final and nothing you write can change it. Your job is to \
+         leave behind something the next run of this workflow — and the person \
+         reading the run history weeks from now — can actually use.\n\n",
+    );
+    task.push_str("Cover, in `text`:\n\n");
+    task.push_str("- what the run set out to do and what it actually produced;\n");
+    task.push_str("- what worked, and what had to be corrected or retried;\n");
+    task.push_str("- what is still open, wrong, or unverified;\n");
+    task.push_str("- anything a later run should know before repeating this work.\n\n");
+    task.push_str(&format!(
+        "Write `text` as prose, at most {SUMMARY_TEXT_BUDGET} characters — this is a \
+         hard limit enforced by the output schema, not a suggestion, and an \
+         over-budget summary is rejected. Keep `outcome` to a single line of at \
+         most {SUMMARY_OUTCOME_BUDGET} characters. `highlights` and `open_gaps` are \
+         short bullet strings. `per_node` needs one entry per node listed below, \
+         with its `node_key`, a one-word `verdict`, and a `one_liner`.\n\n",
+    ));
+    task.push_str("Do not speculate about work you have no evidence for.\n\n");
+
+    task.push_str("## The run\n\n");
+    task.push_str(&format!(
+        "- run: `{}`\n- workflow version: `{}`\n- status: `{:?}`\n- tier: `{:?}`\n\n",
+        graph.run_id, graph.version_id, graph.status, graph.tier
+    ));
+
+    task.push_str("## Nodes\n\n");
+    for node in graph
+        .nodes
+        .iter()
+        .filter(|node| !is_reserved_path(node.path.as_str()))
+    {
+        task.push_str(&format!(
+            "### `{}`\n\n- status: `{:?}`\n- attempts: {}\n",
+            node.path, node.status, node.attempt
+        ));
+        if let Some(role) = kvdag
+            .node(&node.key)
+            .map(|definition| definition.role.trim())
+            .filter(|role| !role.is_empty())
+        {
+            task.push_str(&format!("- role: {role}\n"));
+        }
+        match &node.succession {
+            Some(Succession::Satisfied) => task.push_str("- succession: satisfied\n"),
+            Some(Succession::Blocked {
+                reason,
+                resume_when,
+            }) => task.push_str(&format!(
+                "- blocked: {reason}\n- resume when: {resume_when}\n"
+            )),
+            Some(Succession::NoFollowup { evidence }) => {
+                task.push_str(&format!("- no follow-up: {evidence}\n"));
+            }
+            None => task.push_str("- succession: none recorded\n"),
+        }
+        if let Some(result) = &node.result {
+            task.push_str(&format!("- output summary: {}\n", result.summary));
+        } else {
+            task.push_str("- output summary: none — the node produced no validated result\n");
+        }
+        task.push('\n');
+    }
+
+    EpilogueTaskSpec {
+        path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+        label: EPILOGUE_LABEL.to_string(),
+        task_markdown: task,
+        output_schema: summary_output_schema(),
+        command: command.map(<[String]>::to_vec),
+    }
+}
+
+/// The epilogue node's instance label. Short on purpose: it is what the DAG box
+/// and the pane title read.
+const EPILOGUE_LABEL: &str = "summary";
+
+/// A rough token count for a written summary, for `run_summary.token_estimate`.
+///
+/// Four characters per token is the usual English approximation. It is an
+/// estimate and named as one — no tokeniser runs in the engine, and the column
+/// exists so a reader can see the order of magnitude of what history costs, not
+/// to bill anybody.
+fn token_estimate(payload: &serde_json::Value) -> u32 {
+    let characters = payload.to_string().chars().count();
+    u32::try_from(characters.div_ceil(4)).unwrap_or(u32::MAX)
+}
+
+/// Pulls the summary's fields out of a payload the built-in schema has already
+/// validated.
+///
+/// Total by construction: the schema guarantees the shape, and every read here
+/// still falls back rather than unwrapping, so a future schema relaxation
+/// degrades to an emptier summary instead of a panic.
+fn summary_fields(payload: &serde_json::Value) -> (String, String, Vec<String>, Vec<String>) {
+    let string = |key: &str| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let strings = |key: &str| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (
+        string("text"),
+        string("outcome"),
+        strings("highlights"),
+        strings("open_gaps"),
+    )
+}
+
+fn summary_per_node(payload: &serde_json::Value) -> Vec<SummaryNodeLine> {
+    payload
+        .get("per_node")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let field = |key: &str| {
+                        entry
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    SummaryNodeLine {
+                        node_key: field("node_key"),
+                        verdict: field("verdict"),
+                        one_liner: field("one_liner"),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3363,6 +4137,32 @@ mod tests {
             Some(RunStatus::Succeeded)
         );
 
+        // Phase 3: the user graph is closed, but the epilogue appended by
+        // `finish` is still pending, and cancelling has to reach it — otherwise
+        // a summariser keeps working on a run the user just asked to stop
+        // (`07-phase3-plan.md` §4 D1). What cancel must *never* do is move the
+        // run's status, which is what this test is about.
+        let effects = engine.apply(EngineInput::CancelRun);
+        assert!(
+            effects.iter().all(|effect| !matches!(
+                effect,
+                RunEffect::Emit(WorkflowEvent::RunFinished { .. })
+            )),
+            "cancelling the epilogue re-decides nothing about the run: {effects:?}"
+        );
+        assert_eq!(
+            engine.graph().map(|graph| graph.status),
+            Some(RunStatus::Succeeded)
+        );
+        assert_eq!(
+            engine
+                .graph()
+                .and_then(|graph| graph.epilogue)
+                .map(|state| state.phase),
+            Some(EpiloguePhase::GaveUp)
+        );
+
+        // With the epilogue resolved there is nothing left for a cancel to do.
         assert!(engine.apply(EngineInput::CancelRun).is_empty());
         assert_eq!(
             engine.graph().map(|graph| graph.status),
@@ -3648,9 +4448,19 @@ mod tests {
                 Some(closed_status),
                 "a closed run stays closed"
             );
+            // Phase 3 admits exactly one thing into a closed run — the
+            // engine-owned `.summary` node, which only exists *because* the run
+            // closed (§3 rule 2). No node the user authored comes back.
+            let readmitted: Vec<InstancePath> = engine
+                .admissions()
+                .into_iter()
+                .filter_map(|idx| engine.graph().and_then(|graph| graph.node(idx)))
+                .map(|node| node.path.clone())
+                .filter(|path| !is_reserved_path(path.as_str()))
+                .collect();
             assert!(
-                engine.admissions().is_empty(),
-                "nothing is admitted back into a closed run"
+                readmitted.is_empty(),
+                "no authored node is admitted back into a closed run: {readmitted:?}"
             );
         }
     }
@@ -3774,6 +4584,796 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, RunEffect::Notify(_))),
             "an interrupt with nowhere to go is surfaced the same way: {effects:?}"
+        );
+    }
+
+    /// §4 D6 / §0.5: the stored `transcript_path` is a pre-launch *estimate*
+    /// derived from `(claude_dir, slug(cwd), session_id)` and was never
+    /// corrected, so a historical interrogation could answer
+    /// `transcript_unavailable` for a session whose transcript exists at the
+    /// path the hook actually reported.
+    #[test]
+    fn a_reported_transcript_path_replaces_the_estimate_and_touches_nothing_else() {
+        let mut engine = started_engine();
+        let path = InstancePath::new("plan");
+
+        // Close the node first: a session report can arrive after the node
+        // finished, and the stored path is what a later interrogation stats.
+        report_plan(&mut engine, r#"{"plan":"done"}"#);
+        let before = node_of(&engine, "plan").clone();
+        assert_eq!(before.status, NodeStatus::Succeeded);
+
+        let reported = std::path::PathBuf::from("/home/u/.claude/projects/real/abc.jsonl");
+        assert!(
+            engine.record_transcript_path(&path, reported.clone()),
+            "the reported path differs from the estimate, so it is taken"
+        );
+
+        let after = node_of(&engine, "plan").clone();
+        assert_eq!(
+            after.binding.as_ref().map(|b| b.transcript_path.clone()),
+            Some(reported.clone())
+        );
+        // Exactly one field moved. Reconstructing `before` with only the
+        // transcript path swapped must reproduce the node byte for byte, which
+        // catches any status change, stamp, or cleared field the mutator might
+        // have touched on the way past.
+        let mut expected = before.clone();
+        if let Some(binding) = expected.binding.as_mut() {
+            binding.transcript_path = reported.clone();
+        }
+        assert_eq!(after, expected, "only transcript_path may change");
+        // The *run* is still `Running` — only `plan` closed, `implement` has
+        // not — and learning a transcript path must not move it either.
+        assert_eq!(engine.run_status(), Some(RunStatus::Running));
+
+        // Idempotent: the same path again is not a change, so the caller skips
+        // the durable write.
+        assert!(
+            !engine.record_transcript_path(&path, reported),
+            "recording the path already stored reports no change"
+        );
+        // And an unknown node, or one that never bound a pane, is a no-op
+        // rather than a panic.
+        assert!(!engine.record_transcript_path(
+            &InstancePath::new("nonesuch"),
+            std::path::PathBuf::from("/tmp/x.jsonl")
+        ));
+        assert!(!engine.record_transcript_path(
+            &InstancePath::new("implement"),
+            std::path::PathBuf::from("/tmp/y.jsonl")
+        ));
+    }
+
+    /// The §0.5 case, pinned on its own: the report that corrects a node's
+    /// transcript path can arrive **after** that node has closed, and that is
+    /// precisely when it matters. A historical interrogation stats the stored
+    /// path (§4 D6's stat-first rule), so refusing a late correction would leave
+    /// the wrong estimate in place for the one caller that reads it.
+    #[test]
+    fn a_late_session_report_corrects_a_closed_nodes_transcript_path() {
+        let mut engine = started_engine();
+        report_plan(&mut engine, r#"{"plan":"done"}"#);
+        assert!(
+            status_of(&engine, "plan").is_terminal(),
+            "the node is closed before the report arrives"
+        );
+
+        let reported = std::path::PathBuf::from("/home/u/.claude/projects/real/late.jsonl");
+        assert!(
+            engine.record_transcript_path(&InstancePath::new("plan"), reported.clone()),
+            "a closed node still accepts the corrected path"
+        );
+        assert_eq!(
+            node_of(&engine, "plan")
+                .binding
+                .as_ref()
+                .map(|binding| binding.transcript_path.clone()),
+            Some(reported)
+        );
+        assert!(
+            status_of(&engine, "plan").is_terminal(),
+            "and recording it did not reopen the node"
+        );
+    }
+
+    /// The durable half: the caller persists the corrected path through an
+    /// ordinary `RunNode` update carrying the node's current state, with no
+    /// status journal and no `NodeUpdated` emit — nothing transitioned.
+    #[test]
+    fn the_persist_effect_carries_the_corrected_path_and_journals_nothing() {
+        let mut engine = started_engine();
+        let path = InstancePath::new("plan");
+        let reported = std::path::PathBuf::from("/home/u/.claude/projects/real/abc.jsonl");
+        assert!(engine.record_transcript_path(&path, reported.clone()));
+
+        let effect = engine
+            .node_persist_effect(&path)
+            .expect("a bound node has a durable counterpart");
+        match &effect {
+            RunEffect::Persist(write) => match write.as_ref() {
+                StoreWrite::RunNode {
+                    path: written,
+                    binding,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(written, &path);
+                    assert_eq!(
+                        binding.as_ref().map(|b| b.transcript_path.clone()),
+                        Some(reported),
+                        "the durable row keeps pace with the live copy"
+                    );
+                    assert_eq!(*status, NodeStatus::Running, "no status was invented");
+                }
+                other => panic!("expected a RunNode write, got {other:?}"),
+            },
+            other => panic!("expected a Persist effect, got {other:?}"),
+        }
+
+        assert!(engine
+            .node_persist_effect(&InstancePath::new("nonesuch"))
+            .is_none());
+    }
+
+    // ── the end-of-run epilogue (`07-phase3-plan.md` §4 D1) ────────────────
+
+    /// Runs the two-node fixture to `Succeeded`, leaving the epilogue appended
+    /// and waiting to be spawned.
+    fn engine_at_end_of_run() -> Engine {
+        let mut engine = started_engine();
+        report_plan(&mut engine, r#"{"plan":"done"}"#);
+        engine.bind_node(&InstancePath::new("implement"), binding("pane-2"));
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("implement"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"report":"done"}"#),
+        });
+        engine
+    }
+
+    fn epilogue_phase(engine: &Engine) -> Option<EpiloguePhase> {
+        engine
+            .graph()
+            .and_then(|graph| graph.epilogue)
+            .map(|state| state.phase)
+    }
+
+    /// Binds the summariser to a pane the way the app would once `admissions`
+    /// has yielded it.
+    fn spawn_summariser(engine: &mut Engine) -> Vec<RunEffect> {
+        engine.bind_node(&InstancePath::new(SUMMARY_INSTANCE_PATH), binding("pane-s"))
+    }
+
+    fn valid_summary(text: &str) -> String {
+        json!({
+            "text": text,
+            "outcome": "the run succeeded",
+            "highlights": ["it worked"],
+            "open_gaps": [],
+            "per_node": [{ "node_key": "plan", "verdict": "ok", "one_liner": "planned" }],
+        })
+        .to_string()
+    }
+
+    fn run_finished_count(effects: &[RunEffect]) -> usize {
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, RunEffect::Emit(WorkflowEvent::RunFinished { .. })))
+            .count()
+    }
+
+    #[test]
+    fn a_finished_run_appends_exactly_one_summariser_and_keeps_its_status() {
+        let engine = engine_at_end_of_run();
+
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::Pending));
+        let graph = engine.graph().expect("a graph");
+        let epilogue: Vec<&RunNode> = graph
+            .nodes
+            .iter()
+            .filter(|node| is_reserved_path(node.path.as_str()))
+            .collect();
+        assert_eq!(epilogue.len(), 1, "exactly one engine-owned node");
+        assert_eq!(epilogue[0].path, InstancePath::new(SUMMARY_INSTANCE_PATH));
+        assert_eq!(epilogue[0].status, NodeStatus::Ready);
+        assert_eq!(epilogue[0].label, "summary");
+
+        // §4 D5: the counters mean "the run's declared work", and the epilogue
+        // is not part of it. Every user-facing count filters on the same
+        // predicate the store's counter refresh does.
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| !is_reserved_path(node.path.as_str()))
+                .count(),
+            2,
+            "the summariser is not one of the run's declared nodes"
+        );
+    }
+
+    /// §3 rule 2: `admissions` is a per-node question, so the summariser is
+    /// admitted even though the run's status is already terminal. Without this
+    /// the epilogue would never be spawned and `epilogue_pending` would stay
+    /// true forever.
+    #[test]
+    fn the_post_finish_summariser_reaches_admissions() {
+        let engine = engine_at_end_of_run();
+        let admitted: Vec<&str> = engine
+            .admissions()
+            .into_iter()
+            .filter_map(|idx| engine.graph().and_then(|graph| graph.node(idx)))
+            .map(|node| node.path.as_str())
+            .collect();
+        assert_eq!(admitted, vec![SUMMARY_INSTANCE_PATH]);
+        assert!(engine.epilogue_pending());
+    }
+
+    /// R-1: `finish` is never re-entered on the epilogue's account. A finished
+    /// run keeps ticking while the summariser works, and not one of those ticks
+    /// may emit a second `RunFinished` or move the run's status.
+    #[test]
+    fn a_pending_epilogue_never_re_enters_finish() {
+        let mut engine = engine_at_end_of_run();
+        spawn_summariser(&mut engine);
+
+        for _ in 0..5 {
+            let effects = engine.apply(EngineInput::Tick {
+                now: Instant::now(),
+            });
+            assert_eq!(
+                run_finished_count(&effects),
+                0,
+                "a tick during the epilogue re-decides nothing"
+            );
+            assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+        }
+
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            token: NodeToken::new("token"),
+            result: report(&valid_summary("the run planned and implemented")),
+        });
+        assert_eq!(
+            run_finished_count(&effects),
+            0,
+            "accepting the summary does not finish the run a second time"
+        );
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::Done));
+        assert!(!engine.epilogue_pending());
+    }
+
+    #[test]
+    fn an_accepted_summary_writes_the_row_journals_it_and_closes_the_pane() {
+        let mut engine = engine_at_end_of_run();
+        spawn_summariser(&mut engine);
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::Running));
+
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            token: NodeToken::new("token"),
+            result: report(&valid_summary("plan then implement; both landed")),
+        });
+
+        let summary = effects
+            .iter()
+            .find_map(|effect| match effect {
+                RunEffect::Persist(write) => match write.as_ref() {
+                    StoreWrite::RunSummary {
+                        text,
+                        outcome,
+                        highlights,
+                        per_node,
+                        token_estimate,
+                        generated_by_path,
+                        ..
+                    } => Some((
+                        text.clone(),
+                        outcome.clone(),
+                        highlights.clone(),
+                        per_node.clone(),
+                        *token_estimate,
+                        generated_by_path.clone(),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("an accepted summary is persisted");
+        assert_eq!(summary.0, "plan then implement; both landed");
+        assert_eq!(summary.1, "the run succeeded");
+        assert_eq!(summary.2, vec!["it worked".to_string()]);
+        assert_eq!(summary.3.len(), 1);
+        assert_eq!(summary.3[0].node_key, "plan");
+        assert!(summary.4 > 0, "the token estimate is filled in");
+        assert_eq!(
+            summary.5,
+            Some(InstancePath::new(SUMMARY_INSTANCE_PATH)),
+            "the summary names the node that produced it"
+        );
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RunEffect::Persist(write)
+                    if matches!(write.as_ref(), StoreWrite::RunEvent { kind: RunEventKind::Summary, .. })
+            )),
+            "the journal gets its `summary` entry: {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                RunEffect::Emit(WorkflowEvent::RunSummarized { .. })
+            )),
+            "the app is told to re-read and publish the summary"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::ClosePane { pane } if pane.as_str() == "pane-s")),
+            "the summariser's pane does not outlive the run"
+        );
+    }
+
+    /// The budget is a property of the contract, not a request in the prompt:
+    /// an over-budget `text` fails `maxLength`, spends the one corrective
+    /// re-prompt, and then the ladder ends — without touching the run.
+    #[test]
+    fn an_over_budget_summary_reprompts_once_then_gives_up_without_touching_the_run() {
+        let mut engine = engine_at_end_of_run();
+        spawn_summariser(&mut engine);
+        let over_budget = valid_summary(&"x".repeat(SUMMARY_TEXT_BUDGET + 1));
+
+        let first = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            token: NodeToken::new("token"),
+            result: report(&over_budget),
+        });
+        assert!(
+            first
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "the single corrective re-prompt is delivered: {first:?}"
+        );
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::Running));
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+
+        let second = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            token: NodeToken::new("token"),
+            result: report(&over_budget),
+        });
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::GaveUp));
+        assert_eq!(
+            engine.run_status(),
+            Some(RunStatus::Succeeded),
+            "a summariser that gave up never changes the run's outcome"
+        );
+        assert_eq!(run_finished_count(&second), 0);
+        let journalled = second.iter().any(|effect| match effect {
+            RunEffect::Persist(write) => match write.as_ref() {
+                StoreWrite::RunEvent {
+                    kind: RunEventKind::Error,
+                    payload,
+                    ..
+                } => payload["reason"] == "summary_failed",
+                _ => false,
+            },
+            _ => false,
+        });
+        assert!(journalled, "the give-up is journalled: {second:?}");
+        assert_eq!(
+            second
+                .iter()
+                .filter(|effect| matches!(effect, RunEffect::Notify(_)))
+                .count(),
+            1,
+            "notified once, not once per failure signal"
+        );
+        assert!(second
+            .iter()
+            .any(|effect| matches!(effect, RunEffect::ClosePane { .. })));
+        assert!(!engine.epilogue_pending());
+    }
+
+    /// A within-budget summary is accepted, so the `maxLength` gate is not
+    /// rejecting everything.
+    #[test]
+    fn a_summary_at_the_budget_is_accepted() {
+        let mut engine = engine_at_end_of_run();
+        spawn_summariser(&mut engine);
+        let effects = engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            token: NodeToken::new("token"),
+            result: report(&valid_summary(&"x".repeat(SUMMARY_TEXT_BUDGET))),
+        });
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::Done));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RunEffect::Persist(write) if matches!(write.as_ref(), StoreWrite::RunSummary { .. })
+        )));
+    }
+
+    #[test]
+    fn a_summariser_pane_that_dies_before_reporting_gives_up() {
+        let mut engine = engine_at_end_of_run();
+        spawn_summariser(&mut engine);
+
+        let effects = engine.apply(EngineInput::PaneExited {
+            pane: PublicPaneId::new("pane-s"),
+            code: Some(1),
+        });
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::GaveUp));
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+        assert_eq!(run_finished_count(&effects), 0);
+        assert_eq!(
+            status_of(&engine, SUMMARY_INSTANCE_PATH),
+            NodeStatus::Failed,
+            "the summariser is not retried into a fresh pane on a finished run"
+        );
+    }
+
+    #[test]
+    fn a_summariser_that_cannot_be_spawned_gives_up() {
+        let mut engine = engine_at_end_of_run();
+        let effects = engine.apply(EngineInput::SpawnFailed {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            reason: "no workspace".to_string(),
+        });
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::GaveUp));
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+        assert_eq!(run_finished_count(&effects), 0);
+    }
+
+    #[test]
+    fn a_summariser_self_report_with_no_artifact_gives_up() {
+        let mut engine = engine_at_end_of_run();
+        spawn_summariser(&mut engine);
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            token: NodeToken::new("token"),
+            result: RawJson(serde_json::Value::Null),
+        });
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::GaveUp));
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+    }
+
+    #[test]
+    fn cancelling_mid_epilogue_closes_the_summariser_pane_and_gives_up() {
+        let mut engine = engine_at_end_of_run();
+        spawn_summariser(&mut engine);
+
+        let effects = engine.apply(EngineInput::CancelRun);
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::GaveUp));
+        assert_eq!(
+            engine.run_status(),
+            Some(RunStatus::Succeeded),
+            "cancelling a summariser does not retroactively cancel a finished run"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::ClosePane { pane } if pane.as_str() == "pane-s")),
+            "the pane is closed: {effects:?}"
+        );
+
+        // Idempotent: a second cancel has nothing left to give up on.
+        assert!(engine.apply(EngineInput::CancelRun).is_empty());
+    }
+
+    /// §4 D2: a cancelled run has no outcome worth summarising, and a
+    /// summariser spawned after a cancel would be a pane the user just asked not
+    /// to have.
+    #[test]
+    fn a_cancelled_run_appends_no_epilogue() {
+        let mut engine = started_engine();
+        engine.apply(EngineInput::CancelRun);
+
+        assert_eq!(engine.run_status(), Some(RunStatus::Cancelled));
+        assert!(engine.graph().and_then(|graph| graph.epilogue).is_none());
+        assert!(!engine.epilogue_pending());
+        assert!(engine
+            .graph()
+            .expect("a graph")
+            .nodes
+            .iter()
+            .all(|node| !is_reserved_path(node.path.as_str())));
+    }
+
+    /// A failed run gets a summary too — that is when the history is worth the
+    /// most.
+    #[test]
+    fn a_failed_run_still_gets_a_summariser() {
+        let mut engine = started_engine();
+        report_plan(&mut engine, r#"{"plan":"done"}"#);
+
+        // The leaf's pane dies through both of its attempts, so it fails with
+        // every other node already terminal — which is what makes the *run*
+        // fail rather than pause on an outstanding node.
+        engine.bind_node(&InstancePath::new("implement"), binding("pane-2"));
+        engine.apply(EngineInput::PaneExited {
+            pane: PublicPaneId::new("pane-2"),
+            code: Some(1),
+        });
+        engine.bind_node(&InstancePath::new("implement"), binding("pane-3"));
+        engine.apply(EngineInput::PaneExited {
+            pane: PublicPaneId::new("pane-3"),
+            code: Some(1),
+        });
+
+        assert_eq!(engine.run_status(), Some(RunStatus::Failed));
+        assert_eq!(
+            epilogue_phase(&engine),
+            Some(EpiloguePhase::Pending),
+            "a failed run is exactly when its history is worth the most"
+        );
+    }
+
+    /// Runs the two-node fixture to `Succeeded` under a given engine config, so
+    /// the epilogue's binding can be varied without duplicating the run.
+    fn engine_at_end_of_run_with(config: EngineConfig) -> Engine {
+        let (engine, graph) = two_node_engine();
+        let mut engine = Engine { config, ..engine };
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        report_plan(&mut engine, r#"{"plan":"done"}"#);
+        engine.bind_node(&InstancePath::new("implement"), binding("pane-2"));
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("implement"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"report":"done"}"#),
+        });
+        engine
+    }
+
+    fn command_config() -> EngineConfig {
+        EngineConfig {
+            summary_command: Some(vec!["summarise.sh".to_string()]),
+            ..EngineConfig::default()
+        }
+    }
+
+    /// **Defect D-1.** The epilogue has no kvdag node, so `runner_of` used to
+    /// fall through to its `Agent` default — which is a lie whenever
+    /// `KARVEX_WORKFLOW_SUMMARY_COMMAND` binds the summariser to a script. It
+    /// mattered because `Agent` makes sustained idle an admissible completion
+    /// signal, and the first sustained idle on a node never seen working
+    /// re-delivers the seed prompt through `PromptNode` — i.e. karvex would type
+    /// the summariser's prompt into a **shell**.
+    #[test]
+    fn a_command_bound_summariser_never_takes_the_agent_only_idle_path() {
+        let mut engine = engine_at_end_of_run_with(command_config());
+        spawn_summariser(&mut engine);
+        assert_eq!(
+            engine
+                .graph()
+                .and_then(|graph| graph.epilogue)
+                .map(|state| state.runner),
+            Some(Runner::Command)
+        );
+
+        // Well past `SUSTAINED_IDLE_TICKS`, which for an agent-bound node would
+        // have re-delivered the seed and then given up.
+        let mut effects = Vec::new();
+        for _ in 0..(complete::SUSTAINED_IDLE_TICKS * 3) {
+            effects.extend(engine.apply(EngineInput::AgentStatus {
+                pane: PublicPaneId::new("pane-s"),
+                state: AgentState::Idle,
+                at: Instant::now(),
+            }));
+        }
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "no seed prompt is ever typed into a command pane: {effects:?}"
+        );
+        assert_eq!(
+            epilogue_phase(&engine),
+            Some(EpiloguePhase::Running),
+            "an inadmissible signal is ignored, not treated as a give-up trigger"
+        );
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+
+        // Self-report is the one signal a command runner has, and it still
+        // completes the epilogue normally.
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            token: NodeToken::new("token"),
+            result: report(&valid_summary("the command wrote a summary")),
+        });
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::Done));
+    }
+
+    /// The other half of the ladder still holds for a command-bound summariser:
+    /// a pane that dies before reporting gives up rather than hanging, so the
+    /// override cannot strand `epilogue_pending` forever.
+    #[test]
+    fn a_command_bound_summariser_that_dies_before_reporting_still_gives_up() {
+        let mut engine = engine_at_end_of_run_with(command_config());
+        spawn_summariser(&mut engine);
+        engine.apply(EngineInput::PaneExited {
+            pane: PublicPaneId::new("pane-s"),
+            code: Some(2),
+        });
+
+        assert_eq!(epilogue_phase(&engine), Some(EpiloguePhase::GaveUp));
+        assert!(!engine.epilogue_pending());
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+    }
+
+    /// Without the override the summariser is agent-bound, so the existing
+    /// agent-only ladder is unchanged — including the seed re-delivery that is
+    /// correct for a real `claude` pane.
+    #[test]
+    fn an_agent_bound_summariser_keeps_its_agent_semantics() {
+        let mut engine = engine_at_end_of_run();
+        spawn_summariser(&mut engine);
+        assert_eq!(
+            engine
+                .graph()
+                .and_then(|graph| graph.epilogue)
+                .map(|state| state.runner),
+            Some(Runner::Agent)
+        );
+
+        let mut effects = Vec::new();
+        for _ in 0..complete::SUSTAINED_IDLE_TICKS {
+            effects.extend(engine.apply(EngineInput::AgentStatus {
+                pane: PublicPaneId::new("pane-s"),
+                state: AgentState::Idle,
+                at: Instant::now(),
+            }));
+        }
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, RunEffect::PromptNode { .. })),
+            "an agent that never worked gets its one seed re-delivery: {effects:?}"
+        );
+    }
+
+    /// The argv reaches the spawn plan through the engine, so the binder never
+    /// re-reads the environment and the two can never disagree about what the
+    /// summariser is (§3 item 2, as amended).
+    #[test]
+    fn the_task_spec_carries_the_override_argv() {
+        let engine = engine_at_end_of_run_with(command_config());
+        let spec = engine.summary_task_spec().expect("a run with an epilogue");
+        assert_eq!(spec.command, Some(vec!["summarise.sh".to_string()]));
+
+        let agent = engine_at_end_of_run();
+        let spec = agent.summary_task_spec().expect("a run with an epilogue");
+        assert_eq!(
+            spec.command, None,
+            "no override means the summariser runs as an agent"
+        );
+    }
+
+    #[test]
+    fn summaries_disabled_means_no_epilogue_node_at_all() {
+        let (mut engine, graph) = two_node_engine();
+        engine = Engine {
+            config: EngineConfig {
+                summary_enabled: false,
+                ..EngineConfig::default()
+            },
+            ..engine
+        };
+        engine.apply(EngineInput::Start {
+            graph: Box::new(graph),
+        });
+        engine.bind_node(&InstancePath::new("plan"), binding("pane-1"));
+        report_plan(&mut engine, r#"{"plan":"done"}"#);
+        engine.bind_node(&InstancePath::new("implement"), binding("pane-2"));
+        engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("implement"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"report":"done"}"#),
+        });
+
+        assert_eq!(engine.run_status(), Some(RunStatus::Succeeded));
+        assert!(engine.graph().and_then(|graph| graph.epilogue).is_none());
+        assert_eq!(engine.graph().expect("a graph").nodes.len(), 2);
+    }
+
+    /// §4 D14: `run_event.at` is the producer's fact. A single unstamped
+    /// producer would put the store's flush-time clock back in the read path, so
+    /// the assertion is over *every* journal write a whole run emits.
+    #[test]
+    fn every_journal_write_a_run_emits_is_stamped_by_its_producer() {
+        let mut engine = started_engine();
+        let mut effects = engine.apply(EngineInput::Steer {
+            path: InstancePath::new("plan"),
+            text: "keep going".to_string(),
+        });
+        effects.extend(report_plan(&mut engine, r#"{"nope":true}"#));
+        effects.extend(report_plan(&mut engine, r#"{"plan":"done"}"#));
+        effects.extend(engine.bind_node(&InstancePath::new("implement"), binding("pane-2")));
+        effects.extend(engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new("implement"),
+            token: NodeToken::new("token"),
+            result: report(r#"{"report":"done"}"#),
+        }));
+        effects.extend(spawn_summariser(&mut engine));
+        effects.extend(engine.apply(EngineInput::NodeSelfReport {
+            path: InstancePath::new(SUMMARY_INSTANCE_PATH),
+            token: NodeToken::new("token"),
+            result: report(&valid_summary("it went fine")),
+        }));
+
+        let stamps: Vec<(RunEventKind, u64)> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                RunEffect::Persist(write) => match write.as_ref() {
+                    StoreWrite::RunEvent {
+                        kind, at_unix_ms, ..
+                    } => Some((*kind, *at_unix_ms)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stamps.len() > 10,
+            "the run emitted a representative journal: {stamps:?}"
+        );
+        for (kind, at) in &stamps {
+            assert!(
+                *at > 0,
+                "{kind:?} reached the store with no producer timestamp"
+            );
+        }
+        assert!(
+            stamps
+                .iter()
+                .any(|(kind, _)| *kind == RunEventKind::Summary),
+            "the new `summary` kind is among them: {stamps:?}"
+        );
+    }
+
+    #[test]
+    fn the_summary_schema_is_a_valid_output_schema_and_enforces_the_budget() {
+        let schema =
+            OutputSchema::parse(summary_output_schema()).expect("the built-in schema is valid");
+        assert!(complete::validate(&schema, &report(&valid_summary("short and sweet"))).is_ok());
+
+        let errors = complete::validate(
+            &schema,
+            &report(&valid_summary(&"x".repeat(SUMMARY_TEXT_BUDGET + 1))),
+        )
+        .expect_err("an over-budget summary is invalid");
+        assert!(
+            errors
+                .iter()
+                .any(|violation| violation.at == "text" && violation.message.contains("maxLength")),
+            "the violation names the field and the limit: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn the_summary_task_states_the_budget_and_covers_only_the_user_nodes() {
+        let engine = engine_at_end_of_run();
+        let spec = engine.summary_task_spec().expect("a run with an epilogue");
+
+        assert_eq!(spec.path, InstancePath::new(SUMMARY_INSTANCE_PATH));
+        assert_eq!(spec.output_schema, summary_output_schema());
+        assert!(
+            spec.task_markdown
+                .contains(&SUMMARY_TEXT_BUDGET.to_string()),
+            "the prompt states the budget the schema enforces"
+        );
+        assert!(spec.task_markdown.contains("### `plan`"));
+        assert!(spec.task_markdown.contains("### `implement`"));
+        assert!(
+            !spec.task_markdown.contains(SUMMARY_INSTANCE_PATH),
+            "the summariser is not asked to summarise itself"
         );
     }
 

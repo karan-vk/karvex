@@ -15,8 +15,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use support::{
     cleanup_test_base, client_handshake, encode_varint_u32, frame_message, read_server_message,
-    register_runtime_dir, register_spawned_karvex_pid, unregister_spawned_karvex_pid,
-    wait_for_message_variant, wait_for_socket, wait_until, CURRENT_PROTOCOL,
+    register_runtime_dir, register_spawned_karvex_pid, server_state_dir,
+    unregister_spawned_karvex_pid, wait_for_message_variant, wait_for_socket, wait_until,
+    CURRENT_PROTOCOL,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -193,14 +194,6 @@ fn first_pane_id_in_workspace(socket_path: &PathBuf, workspace_id: &str) -> Stri
         thread::sleep(Duration::from_millis(25));
     }
     panic!("pane.list did not return a pane for workspace {workspace_id} before timeout");
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "karvex-dev"
-    } else {
-        "karvex"
-    }
 }
 
 #[allow(dead_code)]
@@ -833,10 +826,12 @@ fn pane_spawn_cwd_fallback_in_server() {
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("karvex.sock");
     let client_socket = runtime_dir.join("karvex-client.sock");
-    let data_dir = config_home.join(app_dir_name());
+    // The server reads its session state from the directory holding its API
+    // socket, not from XDG_CONFIG_HOME, so seed the fixture there.
+    let state_dir = server_state_dir(&api_socket);
     let missing_cwd = base.join("missing-cwd-for-test");
     let missing_cwd = missing_cwd.to_str().expect("test cwd should be UTF-8");
-    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
     let session = serde_json::json!({
         "version": 2,
         "workspaces": [{
@@ -851,7 +846,7 @@ fn pane_spawn_cwd_fallback_in_server() {
         "selected": 0
     });
     fs::write(
-        data_dir.join("session.json"),
+        state_dir.join("session.json"),
         serde_json::to_vec_pretty(&session).unwrap(),
     )
     .unwrap();

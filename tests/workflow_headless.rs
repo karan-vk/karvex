@@ -122,6 +122,13 @@ struct WorkflowServer {
     /// Set only while a restart is in flight, so the base directory (and with
     /// it the workflow database) outlives the process that owned it.
     keep_base: bool,
+    /// The `config.toml` body and extra environment this server was brought up
+    /// with, kept so [`WorkflowServer::restart`] can bring its replacement up
+    /// the same way. A restart that quietly dropped
+    /// `KARVEX_WORKFLOW_SUMMARY_COMMAND` would read a summarised run back
+    /// through a server that cannot summarise.
+    extra_config: String,
+    extra_env: Vec<(String, String)>,
 }
 
 impl WorkflowServer {
@@ -143,6 +150,8 @@ impl WorkflowServer {
     fn restart(mut self) -> WorkflowServer {
         let base = self.base.clone();
         let socket = self.socket.clone();
+        let extra_config = self.extra_config.clone();
+        let extra_env = self.extra_env.clone();
         send_server_stop(&socket);
 
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -161,7 +170,11 @@ impl WorkflowServer {
         // A stopped server unlinks its own socket; removing it here keeps a
         // leftover file from making `wait_for_socket` connect to nothing.
         let _ = fs::remove_file(&socket);
-        spawn_workflow_server_at(base)
+        let borrowed: Vec<(&str, &str)> = extra_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        spawn_workflow_server_at_with(base, &extra_config, &borrowed)
     }
 }
 
@@ -247,12 +260,56 @@ fn spawn_workflow_server(label: &str) -> WorkflowServer {
     spawn_workflow_server_at(unique_base(label))
 }
 
+/// [`spawn_workflow_server`] with extra `config.toml` lines appended, mirroring
+/// `tests/cli/workflow.rs`'s convention.
+///
+/// The supported way for a fixture to turn a documented knob off — in practice
+/// `workflow.summary_enabled`, for a test that is not about summaries and must
+/// not sit inside the epilogue's admission window (`07-phase3-plan.md` §4 D1's
+/// M8 contract: `run.finished` finalises the *outcome*, not the admission of the
+/// next run).
+///
+/// Deliberately **not** the default. Every test that leaves `summary_enabled`
+/// at its documented `true` also pins the real epilogue path for free —
+/// including give-up-when-`claude`-is-missing — which is exactly the coverage
+/// §4 D1's failure ladder wants, so the knob is turned off only where the
+/// epilogue is incidental to what the test is asserting.
+fn spawn_workflow_server_with_config(label: &str, extra_config: &str) -> WorkflowServer {
+    spawn_workflow_server_at_with(unique_base(label), extra_config, &[])
+}
+
+/// [`spawn_workflow_server_with_config`] plus extra environment for the server
+/// process itself.
+///
+/// The one variable this exists for is `KARVEX_WORKFLOW_SUMMARY_COMMAND`
+/// (`07-phase3-plan.md` §4 D2 / §6 A4): a declared binding override, read once
+/// at engine-config time, that runs the epilogue as a command instead of
+/// `claude`. It is what makes the summariser's whole lifecycle observable in CI
+/// — the alternative is the `claude` on `PATH`, which here is `agent_stub.sh`
+/// and resolves only through the give-up ladder on a schedule no assertion
+/// should depend on.
+fn spawn_workflow_server_with_env(
+    label: &str,
+    extra_config: &str,
+    extra_env: &[(&str, &str)],
+) -> WorkflowServer {
+    spawn_workflow_server_at_with(unique_base(label), extra_config, extra_env)
+}
+
 /// Brings a server up on an explicit base directory. Split out of
 /// [`spawn_workflow_server`] so a restart can reuse one — every path the server
 /// is given, including `KARVEX_WORKFLOW_DB_PATH`, is derived from the base, so
 /// re-spawning on the same base is what makes the replacement read the same
 /// store.
 fn spawn_workflow_server_at(base: PathBuf) -> WorkflowServer {
+    spawn_workflow_server_at_with(base, "", &[])
+}
+
+fn spawn_workflow_server_at_with(
+    base: PathBuf,
+    extra_config: &str,
+    extra_env: &[(&str, &str)],
+) -> WorkflowServer {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let state_home = base.join("state");
@@ -266,7 +323,7 @@ fn spawn_workflow_server_at(base: PathBuf) -> WorkflowServer {
     register_runtime_dir(&runtime_dir);
     fs::write(
         config_home.join(app_dir_name()).join("config.toml"),
-        "onboarding = false\n",
+        format!("onboarding = false\n{extra_config}"),
     )
     .unwrap();
 
@@ -318,6 +375,9 @@ fn spawn_workflow_server_at(base: PathBuf) -> WorkflowServer {
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("KARVEX_CLIENT_SOCKET_PATH");
     cmd.env_remove("KARVEX_ENV");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_karvex_pid(child.process_id());
@@ -329,6 +389,11 @@ fn spawn_workflow_server_at(base: PathBuf) -> WorkflowServer {
         _master: Some(pair.master),
         child,
         keep_base: false,
+        extra_config: extra_config.to_string(),
+        extra_env: extra_env
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
     };
     wait_for_socket(server.socket(), Duration::from_secs(20));
     server
@@ -845,7 +910,15 @@ fn two_node_command_kvdag_runs_to_succeeded_with_a_pane_per_node() {
 
     assert_eq!(
         created_node_paths(&seen),
-        BTreeSet::from(["plan".to_string(), "implement".to_string()]),
+        // `.summary` is the engine-owned epilogue, announced through the same
+        // `workflow.node.created` every other node uses so the DAG shows the
+        // summariser live (`07-phase3-plan.md` §1 WS-H). The set stays exact:
+        // the epilogue's visibility is pinned here, not waved through.
+        BTreeSet::from([
+            "plan".to_string(),
+            "implement".to_string(),
+            ".summary".to_string(),
+        ]),
         "both nodes must be announced; saw {:?}",
         event_kinds(&seen)
     );
@@ -910,7 +983,17 @@ fn two_node_command_kvdag_runs_to_succeeded_with_a_pane_per_node() {
         .as_array()
         .expect("workflow.run.get returned no run graph")
         .clone();
-    assert_eq!(graph_nodes.len(), 2, "expected two run nodes: {run}");
+    // §4 D1's post-`RunFinished` contract (M8): `workflow.run.get` on a
+    // finished run returns the terminal status *and* a graph containing the
+    // `.summary` node in its live state — a succeeded run with a still-working
+    // summariser is the truthful picture. The count is the two declared nodes
+    // plus the epilogue; `nodes_total`/`nodes_done` above still read 2, which is
+    // the D5 split (excluded from counts, never from sight).
+    assert_eq!(
+        graph_nodes.len(),
+        3,
+        "expected two run nodes plus the epilogue: {run}"
+    );
 
     let mut pane_ids = BTreeSet::new();
     for path in ["plan", "implement"] {
@@ -1070,7 +1153,15 @@ fn node_without_a_valid_result_ends_needs_attention_and_the_run_does_not_succeed
 /// every later `workflow.run` with `workflow_run_in_flight`.
 #[test]
 fn a_node_whose_pane_exits_without_a_result_fails_and_closes_the_run() {
-    let server = spawn_workflow_server("pane-exit");
+    // Not a summary test: it starts a second run immediately after the first
+    // closes, which lands inside the epilogue's admission window and draws a
+    // `workflow_run_in_flight` refusal (§4 D1/M8 — `run.finished` finalises the
+    // outcome, not the admission of the next run). Turning the epilogue off is
+    // the honest fix: retrying here would test the guard, not the pane-exit
+    // failure path this test exists for. The give-up ladder stays pinned by the
+    // default-`true` tests.
+    let server =
+        spawn_workflow_server_with_config("pane-exit", "[workflow]\nsummary_enabled = false\n");
     let socket = server.socket().to_path_buf();
     if !require_workflow_api(&socket) {
         server.shutdown();
@@ -1629,11 +1720,12 @@ fn a_finished_run_reads_back_field_equal_to_its_live_projection() {
          did.\nlive:     {live}\nrestored: {restored}"
     );
 
-    // `ended_at_unix_ms` is outside `run_shape` because most timestamps are
-    // uninteresting to compare, but this one used to be stamped twice — once by
-    // the app when the run left the live set and once by the store when the
-    // queued write was applied — so the same finished run reported two
-    // different end times tens of milliseconds apart.
+    // `ended_at_unix_ms` is inside `run_shape` from Phase 3 on, but it keeps its
+    // own assertion because equality alone would also be satisfied by two
+    // `null`s: this field used to be stamped twice — once by the app when the
+    // run left the live set and once by the store when the queued write was
+    // applied — so the same finished run reported two different end times tens
+    // of milliseconds apart.
     assert!(
         live["run"]["ended_at_unix_ms"].is_u64(),
         "a finished run has an end time: {live}"
@@ -1651,9 +1743,24 @@ fn a_finished_run_reads_back_field_equal_to_its_live_projection() {
 /// per-node/per-edge facts that both the live engine and the store are supposed
 /// to know, normalised into a stable order.
 ///
-/// Deliberately excludes what genuinely cannot survive a restart (timestamps
-/// are equal but pointless to compare, and the pane behind `pane_id` is gone)
-/// and what nothing persists yet (`watchdog_interventions`).
+/// Deliberately excludes what genuinely cannot survive a restart (the pane
+/// behind `pane_id` is gone) and what nothing persists yet
+/// (`watchdog_interventions`).
+///
+/// **Phase 3 widened it** (`07-phase3-plan.md` §WS-J scenario 5 / §4 D16). The
+/// original shape omitted exactly the field classes the 0.10.2 P1 family hit —
+/// timestamps, `growth_limited`, and the instance's own `label` — so a decoder
+/// that dropped one of them read back "equal". Every Phase 3 durable field is
+/// here too (`transcript_path`, `restored_from`, `context_runs`,
+/// `restore_from_run`, `workflow_name`), which is what makes this the e2e face
+/// of D16's per-field rule rather than a shape that happens to match.
+///
+/// **Reserved-namespace nodes are excluded.** The `.summary` epilogue node is a
+/// live node at the instant a run reports finished (§4 D1's M8 contract), so
+/// comparing it across a restart would compare a snapshot against a moving
+/// target. The epilogue's own read-back is asserted where it is deterministic:
+/// [`a_restored_and_summarised_run_reads_back_field_equal_to_its_live_projection`],
+/// which waits for `workflow.run.summarized` first.
 fn run_shape(response: &Value) -> Value {
     let run = &response["run"];
     let mut nodes: Vec<Value> = response["graph"]["nodes"]
@@ -1661,10 +1768,12 @@ fn run_shape(response: &Value) -> Value {
         .cloned()
         .unwrap_or_default()
         .iter()
+        .filter(|node| !is_reserved_path(node["path"].as_str().unwrap_or_default()))
         .map(|node| {
             json!({
                 "path": node["path"],
                 "node_key": node["node_key"],
+                "label": node["label"],
                 "depth": node["depth"],
                 "status": node["status"],
                 "demand": node["demand"],
@@ -1675,6 +1784,12 @@ fn run_shape(response: &Value) -> Value {
                 "node_dir": node["node_dir"],
                 "evidence": node["evidence"],
                 "succession": node["succession"],
+                "started_at_unix_ms": node["started_at_unix_ms"],
+                "ended_at_unix_ms": node["ended_at_unix_ms"],
+                "duration_ms": node["duration_ms"],
+                "growth_limited": node["growth_limited"],
+                "transcript_path": node["transcript_path"],
+                "restored_from": node["restored_from"],
             })
         })
         .collect();
@@ -1711,9 +1826,22 @@ fn run_shape(response: &Value) -> Value {
         "tab_id": run["tab_id"],
         "nodes_total": run["nodes_total"],
         "nodes_done": run["nodes_done"],
+        "started_at_unix_ms": run["started_at_unix_ms"],
+        "ended_at_unix_ms": run["ended_at_unix_ms"],
+        "growth_limited": run["growth_limited"],
+        "workflow_name": run["workflow_name"],
+        "context_runs": run["context_runs"],
+        "restore_from_run": run["restore_from_run"],
         "nodes": nodes,
         "edges": edges,
     })
+}
+
+/// Whether an instance path is engine-owned (`07-phase3-plan.md` §3 rule 3:
+/// authored node keys may not begin with `.`, so the reserved namespace is
+/// karvex's alone).
+fn is_reserved_path(path: &str) -> bool {
+    path.starts_with('.')
 }
 
 // ---------------------------------------------------------------------------
@@ -1813,6 +1941,8 @@ fn an_accepted_expansion_creates_children_that_inherit_the_fan_in_point() {
             "collect".to_string(),
             "fanout/worker/1".to_string(),
             "fanout/worker/2".to_string(),
+            // The end-of-run summariser (§4 D1), announced like any node.
+            ".summary".to_string(),
         ]),
         "every node that entered the run graph is announced on the one existing \
          event kind; saw {:?}",
@@ -2343,7 +2473,13 @@ fn a_disallowed_template_is_refused_and_creates_nothing() {
     // ── and changed nothing else ────────────────────────────────────────────
     assert_eq!(
         created_node_paths(&seen),
-        BTreeSet::from(["fanout".to_string(), "collect".to_string()]),
+        // The refused proposal created nothing; `.summary` is the epilogue,
+        // which every finished run gets (§4 D1).
+        BTreeSet::from([
+            "fanout".to_string(),
+            "collect".to_string(),
+            ".summary".to_string(),
+        ]),
         "no node entered the run graph; saw {:?}",
         event_kinds(&seen)
     );
@@ -2478,7 +2614,12 @@ fn event_stream_delivers_cross_type_events_in_causal_order() {
         .iter()
         .position(|event| event["event"] == "workflow_run_finished")
         .unwrap_or_else(|| panic!("no workflow_run_finished on the stream; saw {kinds:?}"));
-    for (path, created) in &created_at {
+    // Same D1/M8 narrowing as the `last_node_event` scan below, at the second
+    // site the invariant is expressed: reserved-namespace nodes legitimately
+    // appear *after* `run_finished`, because the epilogue is created by `finish`
+    // itself. Every node the author declared still has to exist before the run
+    // reports finished — that is the client-cache guarantee this protects.
+    for (path, created) in created_at.iter().filter(|(path, _)| !path.starts_with('.')) {
         assert!(
             *created < finished_at,
             "workflow_run_finished arrived at line {finished_at}, before \
@@ -2486,6 +2627,16 @@ fn event_stream_delivers_cross_type_events_in_causal_order() {
              would see a finished run whose children do not exist yet; saw {kinds:?}"
         );
     }
+    // Reserved-namespace events legitimately follow `run_finished` by D1/M8
+    // design — this narrowing is intent, not accident.
+    //
+    // Scoped to the **user graph**. `workflow_run_finished` is still the last
+    // word on the run's own work — that is what this invariant protects — but
+    // §4 D1 deliberately runs the engine-owned summariser *after* the run's
+    // terminal status is decided, and M8 requires the DAG to show it live, so
+    // `.summary`'s own node events must be able to follow it. Excluding the
+    // reserved namespace keeps the original assertion exactly as strong for
+    // every node the author declared, rather than loosening it for all of them.
     let last_node_event = seen
         .iter()
         .rposition(|event| {
@@ -2496,13 +2647,13 @@ fn event_stream_delivers_cross_type_events_in_causal_order() {
                         | "workflow_node_updated"
                         | "workflow_node_output_checkpoint"
                 )
-            )
+            ) && event_node_path(event).is_none_or(|path| !path.starts_with('.'))
         })
         .unwrap_or_else(|| panic!("no node events at all; saw {kinds:?}"));
     assert!(
         last_node_event < finished_at,
-        "workflow_run_finished must be the last word on the run, but a node event \
-         followed it at line {last_node_event}; saw {kinds:?}"
+        "workflow_run_finished must be the last word on the run's declared work, \
+         but a user-node event followed it at line {last_node_event}; saw {kinds:?}"
     );
 
     // ── the run's growth is trackable from the run stream alone ─────────────
@@ -2521,6 +2672,1076 @@ fn event_stream_delivers_cross_type_events_in_causal_order() {
         grew > nodes_at_start,
         "the run grew from {nodes_at_start} nodes, but no workflow.run.updated \
          reported more than {grew}; saw {kinds:?}"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 (`07-phase3-plan.md` WS-J): end-of-run summaries, prior-run context,
+// restore, pruned history, and the widened restart-fidelity projection
+// ---------------------------------------------------------------------------
+
+/// The argv `KARVEX_WORKFLOW_SUMMARY_COMMAND` takes: a JSON array of strings
+/// (§4 D2). Points the epilogue at `summary_stub.sh` in the given mode.
+fn summary_command_argv(mode: &str) -> String {
+    let stub = fixture_dir().join("summary_stub.sh");
+    assert!(stub.exists(), "missing stub script at {}", stub.display());
+    serde_json::to_string(&["/bin/sh", &stub.to_string_lossy(), mode])
+        .expect("argv is serialisable")
+}
+
+/// A server whose epilogue is bound to [`summary_command_argv`] and whose
+/// `[workflow]` block carries `extra_config`.
+///
+/// Summaries are left **on** here — that is the whole point of these scenarios —
+/// which is why every one of them waits for `workflow.run.summarized` before
+/// starting the next run: `run.finished` finalises the run's *outcome*, not the
+/// admission of the next run, and starting one inside the epilogue window is
+/// answered with `workflow_run_in_flight` (§4 D1/M7, and the E-12 contract the
+/// docs state).
+fn spawn_summary_server(label: &str, mode: &str, extra_config: &str) -> WorkflowServer {
+    spawn_workflow_server_with_env(
+        label,
+        extra_config,
+        &[(
+            "KARVEX_WORKFLOW_SUMMARY_COMMAND",
+            &summary_command_argv(mode),
+        )],
+    )
+}
+
+/// [`subscribe`] plus the Phase 3 event kind. Separate from `subscribe` so the
+/// Phase 1 scenarios keep the exact stream they were written against.
+fn subscribe_phase3(socket: &Path) -> (JsonLineReader, Vec<Value>) {
+    let mut reader = open_subscription(
+        socket,
+        &request(
+            "sub_phase3",
+            "events.subscribe",
+            json!({
+                "subscriptions": [
+                    { "type": "workflow.run.started" },
+                    { "type": "workflow.run.updated" },
+                    { "type": "workflow.run.finished" },
+                    { "type": "workflow.run.summarized" },
+                    { "type": "workflow.node.created" },
+                    { "type": "workflow.node.updated" },
+                    { "type": "pane.created" },
+                ]
+            }),
+        ),
+    );
+    let ack = reader.read_json_line(Duration::from_secs(5));
+    assert_eq!(ack["id"], "sub_phase3", "unexpected subscribe ack: {ack}");
+    assert_eq!(
+        ack["result"]["type"], "subscription_started",
+        "subscribe was rejected: {ack}"
+    );
+    (reader, Vec::new())
+}
+
+/// Blocks until `run_id` reports finished, and returns the event.
+fn wait_for_run_finished(
+    reader: &mut JsonLineReader,
+    seen: &mut Vec<Value>,
+    run_id: &str,
+) -> Value {
+    wait_for_event_matching(reader, seen, "workflow_run_finished", SETTLE, |event| {
+        event["data"]["run"]["run_id"] == run_id
+    })
+}
+
+/// Blocks until `run_id`'s summary lands. Event-driven rather than polled: the
+/// epilogue runs after the run's terminal status, so there is no other moment a
+/// caller can name.
+fn wait_for_run_summarized(
+    reader: &mut JsonLineReader,
+    seen: &mut Vec<Value>,
+    run_id: &str,
+) -> Value {
+    wait_for_event_matching(reader, seen, "workflow_run_summarized", SETTLE, |event| {
+        event["data"]["run_id"] == run_id
+    })
+}
+
+/// Stream position of the first event of `kind` that is about `run_id`.
+fn position_of_run_event(events: &[Value], kind: &str, run_id: &str) -> usize {
+    events
+        .iter()
+        .position(|event| {
+            event["event"] == kind
+                && (event["data"]["run"]["run_id"] == run_id || event["data"]["run_id"] == run_id)
+        })
+        .unwrap_or_else(|| panic!("missing {kind} for {run_id}; saw {:?}", event_kinds(events)))
+}
+
+/// `workflow.summary.get`'s answer. `Value::Null` is the normal "no summary
+/// was written" answer, never an error (§4 D1).
+fn summary_get(socket: &Path, run_id: &str) -> Value {
+    let result = request_ok(
+        socket,
+        &request(
+            "req_summary_get",
+            "workflow.summary.get",
+            json!({ "run_id": run_id }),
+        ),
+    );
+    result["summary"].clone()
+}
+
+fn summary_list(socket: &Path, workflow_id: &str) -> Vec<Value> {
+    let result = request_ok(
+        socket,
+        &request(
+            "req_summary_list",
+            "workflow.summary.list",
+            json!({ "workflow_id": workflow_id }),
+        ),
+    );
+    result["summaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("workflow.summary.list returned no summaries: {result}"))
+        .clone()
+}
+
+/// `workflow.run` with explicit params, returning the whole result so a caller
+/// can read the restore report off it.
+fn start_run_with(socket: &Path, params: Value) -> Value {
+    let result = request_ok(socket, &request("req_run_params", "workflow.run", params));
+    assert_eq!(
+        result["type"], "workflow_run_started",
+        "unexpected: {result}"
+    );
+    result
+}
+
+fn run_id_of(started: &Value) -> String {
+    started["run"]["run_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workflow.run returned no run_id: {started}"))
+        .to_string()
+}
+
+/// The restore fixture with its stub path and `plan`'s prompt substituted.
+/// The prompt is a parameter because §4 D11's compatibility gate is
+/// `sha256(prompt_template)`: changing it is what makes a v2 incompatible.
+fn restore_definition_text(plan_prompt: &str) -> String {
+    let stub = fixture_dir().join("restore_stub.sh");
+    assert!(stub.exists(), "missing stub script at {}", stub.display());
+    let path = fixture_dir().join("restore.toml");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let replaced = text
+        .replace("@RESTORE_STUB@", &stub.to_string_lossy())
+        .replace("@PLAN_PROMPT@", plan_prompt);
+    for placeholder in ["@RESTORE_STUB@", "@PLAN_PROMPT@"] {
+        assert!(
+            !replaced.contains(placeholder),
+            "unresolved {placeholder} in restore.toml"
+        );
+    }
+    replaced
+}
+
+/// How many panes exist right now. Restore's headline claim is that a restored
+/// node never spawns one, and a count is how that is proven against a runtime
+/// where every other node does.
+fn pane_count(socket: &Path) -> usize {
+    let result = request_ok(socket, &request("req_pane_count", "pane.list", json!({})));
+    result["panes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("pane.list returned no panes: {result}"))
+        .len()
+}
+
+/// The absolute `context/prior-runs.md` path a rendered `task.md` points at
+/// (§4 D21: the section is two lines — the path in backticks, and permission to
+/// ignore it).
+fn prior_runs_pointer(task_md: &str) -> Option<String> {
+    let section = task_md.split("## Prior runs\n").nth(1)?;
+    let line = section.lines().find(|line| line.starts_with("- `"))?;
+    line.trim_start_matches("- `")
+        .strip_suffix('`')
+        .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
+// 11. The summary lifecycle: finished, then summarised, then read by the next
+//     run
+// ---------------------------------------------------------------------------
+
+/// `07-phase3-plan.md` §WS-J scenario 1 — the phase's headline promise as one
+/// end-to-end story: **a run leaves something behind, and the next run reads
+/// it.**
+///
+/// Four claims, in the order a user meets them:
+///
+///   * `workflow.run.finished` arrives **before** `workflow.run.summarized`.
+///     The 0.10.2 ordering fix made one connection's stream globally causal, so
+///     stream position is the assertion — and this ordering is the client
+///     contract §4 D1's M8 states: `run.finished` is the durable terminal
+///     signal, `run.summarized` is the follow-up for the summary's content.
+///   * `workflow.summary.get` answers with what the summariser wrote, field for
+///     field, and names the epilogue node that generated it.
+///   * a second run of the same workflow records run 1 in `context_runs` and
+///     every node's `task.md` points at `context/prior-runs.md` (§4 D21), which
+///     really carries run 1's summary.
+///   * a third run started with `include_prior_summaries: false` has neither —
+///     the opt-out is a property of the run, not of the workflow.
+#[test]
+fn a_finished_run_is_summarised_afterwards_and_the_next_run_reads_its_summary() {
+    let server = spawn_summary_server("summary-lifecycle", "ok", "");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_phase3(&socket);
+
+    let workflow_id = create_workflow(&socket, "two_node_command.toml");
+
+    // ── run 1: finished, then summarised ────────────────────────────────────
+    let run1 = start_run(&socket, &workflow_id, "add dark mode");
+    let finished = wait_for_run_finished(&mut reader, &mut seen, &run1);
+    assert_eq!(
+        finished["data"]["run"]["status"], "succeeded",
+        "the fixture must succeed before its summary is asserted: {finished}"
+    );
+    let summarized = wait_for_run_summarized(&mut reader, &mut seen, &run1);
+
+    assert!(
+        position_of_run_event(&seen, "workflow_run_finished", &run1)
+            < position_of_run_event(&seen, "workflow_run_summarized", &run1),
+        "the summary is an epilogue: workflow.run.finished is the terminal \
+         signal and workflow.run.summarized follows it (§4 D1/M8); saw {:?}",
+        event_kinds(&seen)
+    );
+
+    // The run's own status is untouched by the epilogue.
+    assert_eq!(run_status(&socket, &run1), "succeeded");
+
+    // ── what the summariser wrote is what the reader gets ───────────────────
+    let expected_outcome = format!("stub summary of {run1}");
+    let summary = summary_get(&socket, &run1);
+    assert_eq!(summary["run_id"], run1.as_str(), "{summary}");
+    assert_eq!(summary["workflow_id"], workflow_id.as_str(), "{summary}");
+    assert_eq!(
+        summary["text"], "the stub summariser saw this run reach its terminal status",
+        "{summary}"
+    );
+    assert_eq!(summary["outcome"], expected_outcome.as_str(), "{summary}");
+    assert_eq!(
+        summary["highlights"],
+        json!(["the stub summariser ran"]),
+        "{summary}"
+    );
+    assert_eq!(summary["open_gaps"], json!([]), "{summary}");
+    assert_eq!(summary["per_node"], json!([]), "{summary}");
+    assert_eq!(summary["run_pruned"], false, "{summary}");
+    assert_eq!(
+        summary["generated_by_path"], ".summary",
+        "the summary names the epilogue node that produced it (§4 D5): {summary}"
+    );
+    // The event and the read method describe one summary, not two.
+    assert_eq!(
+        summarized["data"]["summary"], summary,
+        "workflow.run.summarized must carry exactly what workflow.summary.get \
+         answers: {summarized}"
+    );
+
+    // The epilogue node is visible in the graph and excluded from the counts
+    // (§4 D5) — the two halves of "excluded from counts, never from sight".
+    let run1_get = run_get(&socket, &run1);
+    assert_eq!(run1_get["run"]["nodes_total"], 2, "{run1_get}");
+    assert_eq!(run1_get["run"]["nodes_done"], 2, "{run1_get}");
+    let epilogue = node_get(&socket, &run1, ".summary");
+    assert_eq!(epilogue["status"], "succeeded", "{epilogue}");
+    assert_eq!(epilogue["evidence"], "self_report", "{epilogue}");
+
+    // ── run 2 reads run 1's summary ─────────────────────────────────────────
+    let run2 = start_run(&socket, &workflow_id, "add light mode");
+    wait_for_run_finished(&mut reader, &mut seen, &run2);
+
+    let run2_get = run_get(&socket, &run2);
+    assert_eq!(
+        run2_get["run"]["context_runs"],
+        json!([run1]),
+        "run 2 must record exactly the runs whose summaries it was offered: \
+         {run2_get}"
+    );
+
+    let task = task_markdown(&socket, &run2, "plan");
+    let pointer = prior_runs_pointer(&task)
+        .unwrap_or_else(|| panic!("run 2's task.md carries no `## Prior runs` pointer:\n{task}"));
+    let prior_runs = fs::read_to_string(&pointer)
+        .unwrap_or_else(|err| panic!("the pointer names {pointer}, which is unreadable: {err}"));
+    assert!(
+        prior_runs.contains(&expected_outcome),
+        "context/prior-runs.md must carry run 1's summary:\n{prior_runs}"
+    );
+
+    wait_for_run_summarized(&mut reader, &mut seen, &run2);
+
+    // ── run 3 opts out, and gets neither half ───────────────────────────────
+    let run3 = run_id_of(&start_run_with(
+        &socket,
+        json!({
+            "workflow_id": workflow_id,
+            "args": { "goal": "add high contrast mode" },
+            "include_prior_summaries": false,
+        }),
+    ));
+    wait_for_run_finished(&mut reader, &mut seen, &run3);
+
+    let run3_get = run_get(&socket, &run3);
+    assert_eq!(
+        run3_get["run"]["context_runs"],
+        json!([]),
+        "--no-prior-summaries records no context runs: {run3_get}"
+    );
+    let run3_task = task_markdown(&socket, &run3, "plan");
+    assert!(
+        !run3_task.contains("## Prior runs"),
+        "the opted-out run's task.md must render byte-identically to a \
+         history-free run (§7 R-7):\n{run3_task}"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 12. An over-budget summary gives up, and the run's outcome is untouched
+// ---------------------------------------------------------------------------
+
+/// `07-phase3-plan.md` §WS-J scenario 1's second half, and the guarantee §4 D1
+/// is built to make: **the summariser can never wedge or flip a run.**
+///
+/// The stub writes a `text` past `SUMMARY_TEXT_BUDGET`, so the built-in schema's
+/// `maxLength` rejects it — the check WS-A added to `complete::check`, without
+/// which the budget would be a hope rather than a schema property. The one
+/// corrective re-prompt is consumed, the epilogue lands in `GaveUp`, and:
+///
+///   * the run still reports `succeeded`;
+///   * `workflow.summary.get` answers `null`, which is a normal answer and not
+///     an error;
+///   * the `.summary` node is `failed` with a recorded succession, so nothing
+///     that walks the graph later finds a succession gap.
+///
+/// The `{"reason": "summary_failed"}` journal entry itself is asserted where a
+/// test can link the store (`src/workflow/engine/mod.rs`, `store/tests.rs`);
+/// this file asserts only API-observable facts, and the API-observable face of
+/// that journal entry is the give-up state above.
+#[test]
+fn an_over_budget_summary_gives_up_and_leaves_the_runs_outcome_alone() {
+    let server = spawn_summary_server("summary-over-budget", "over", "");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_phase3(&socket);
+
+    let workflow_id = create_workflow(&socket, "two_node_command.toml");
+    let run_id = start_run(&socket, &workflow_id, "add dark mode");
+
+    let finished = wait_for_run_finished(&mut reader, &mut seen, &run_id);
+    assert_eq!(finished["data"]["run"]["status"], "succeeded", "{finished}");
+
+    // The give-up is announced on the same node-event stream every other node
+    // uses, so waiting for it is event-driven rather than timed.
+    let gave_up = wait_for_event_matching(
+        &mut reader,
+        &mut seen,
+        "workflow_node_updated",
+        SETTLE,
+        |event| {
+            event_node_path(event).as_deref() == Some(".summary")
+                && event["data"]["node"]["status"] == "failed"
+        },
+    );
+    assert_eq!(
+        gave_up["data"]["node"]["succession"]["type"], "no_followup",
+        "a given-up epilogue records its succession rather than leaving a gap: \
+         {gave_up}"
+    );
+    // The recorded evidence names the schema rule that rejected the summary,
+    // which is the e2e proof that `maxLength` is *enforced* rather than
+    // advisory — the budget is a schema property, not a hope (WS-A's addition
+    // to `complete::check`).
+    let evidence = gave_up["data"]["node"]["succession"]["evidence"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        evidence.contains("maxLength of 4000") && evidence.contains("text"),
+        "the give-up must record which rule rejected the summary: {gave_up}"
+    );
+
+    assert_eq!(
+        summary_get(&socket, &run_id),
+        Value::Null,
+        "an epilogue that gave up leaves no summary, and `None` is the normal \
+         answer (§4 D1)"
+    );
+    assert_eq!(
+        run_status(&socket, &run_id),
+        "succeeded",
+        "the epilogue must never change the run's outcome"
+    );
+    let run = run_get(&socket, &run_id);
+    assert_eq!(run["run"]["nodes_total"], 2, "{run}");
+    assert_eq!(run["run"]["nodes_done"], 2, "{run}");
+    assert_eq!(
+        summary_list(&socket, &workflow_id),
+        Vec::<Value>::new(),
+        "no summary was written, so none is listed"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 13. Restore: a seeded node is pane-less, feeds its downstream edge, and a
+//     changed definition is skipped until the caller forces it
+// ---------------------------------------------------------------------------
+
+/// `07-phase3-plan.md` §WS-J scenario 2, and the e2e face of §4 D3/D4/D11/D18.
+///
+/// Run 1 executes both nodes, and its `plan` payload names run 1 — so when run
+/// 2 restores `plan` and never executes it, the marker in the *downstream*
+/// node's rendered inputs can only have come from run 1's checkpoint. That is
+/// the claim restore makes and the one a topology-only assertion would miss.
+///
+/// Then the cross-version half, both polarities (05 §5.3's requirement): a v2
+/// whose `plan` prompt differs fails §4 D11's `sha256(prompt_template)` gate and
+/// is reported as a `definition_changed` skip — a *successful* run start
+/// carrying the report, never an error — and `allow_changed` restores it anyway.
+///
+/// Summaries are off: this scenario starts four runs of one workflow back to
+/// back, and each start would otherwise land inside the previous run's epilogue
+/// window and be refused with `workflow_run_in_flight` (§4 D1/M7). The epilogue
+/// itself is asserted in scenarios 11, 12, and 15.
+#[test]
+fn restoring_a_past_run_seeds_the_node_pane_less_and_skips_a_changed_definition() {
+    let server =
+        spawn_workflow_server_with_config("restore", "[workflow]\nsummary_enabled = false\n");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_phase3(&socket);
+
+    let workflow_id =
+        create_workflow_from_text(&socket, &restore_definition_text("Plan v1: {{goal}}"));
+
+    // ── run 1: both nodes execute ───────────────────────────────────────────
+    let run1 = start_run(&socket, &workflow_id, "add dark mode");
+    let finished = wait_for_run_finished(&mut reader, &mut seen, &run1);
+    assert_eq!(finished["data"]["run"]["status"], "succeeded", "{finished}");
+    let run1_marker = format!("plan payload from {run1}");
+
+    // ── run 2: `plan` restored, `implement` executed ────────────────────────
+    let panes_before = pane_count(&socket);
+    let started = start_run_with(
+        &socket,
+        json!({
+            "workflow_id": workflow_id,
+            "args": { "goal": "add dark mode" },
+            "restore_from": { "run_id": run1, "nodes": ["plan"] },
+        }),
+    );
+    assert_eq!(
+        started["restore"]["restored"],
+        json!(["plan"]),
+        "an unchanged definition restores the selected node: {started}"
+    );
+    assert_eq!(
+        started["restore"]["skipped"],
+        json!([]),
+        "nothing is skipped when the definition is unchanged: {started}"
+    );
+    let run2 = run_id_of(&started);
+
+    let restored_node = node_get(&socket, &run2, "plan");
+    assert_eq!(restored_node["status"], "restored", "{restored_node}");
+    assert_eq!(restored_node["evidence"], "restored", "{restored_node}");
+    assert_eq!(
+        restored_node["succession"]["type"], "satisfied",
+        "{restored_node}"
+    );
+    assert!(
+        restored_node["pane_id"].is_null(),
+        "a restored node is pane-less (§4 D3): {restored_node}"
+    );
+    assert_eq!(
+        restored_node["restored_from"]["run_id"],
+        run1.as_str(),
+        "{restored_node}"
+    );
+    assert_eq!(
+        restored_node["restored_from"]["node_key"], "plan",
+        "{restored_node}"
+    );
+    assert!(
+        restored_node["restored_from"]["checkpoint_seq"].is_u64(),
+        "the provenance names the source checkpoint (§4 D4): {restored_node}"
+    );
+
+    let run2_finished = wait_for_run_finished(&mut reader, &mut seen, &run2);
+    assert_eq!(
+        run2_finished["data"]["run"]["status"], "succeeded",
+        "a restored upstream must fire its outbound edge like a succeeded one: \
+         {run2_finished}"
+    );
+
+    // Exactly one pane was created for run 2 — `implement`'s. The restored node
+    // did not get one, and nothing spawned a second time to compensate.
+    assert_eq!(
+        pane_count(&socket),
+        panes_before + 1,
+        "run 2 has two nodes and one of them was restored, so exactly one pane \
+         may appear"
+    );
+    assert!(
+        node_get(&socket, &run2, "implement")["pane_id"].is_string(),
+        "the executed node still gets its own pane"
+    );
+
+    // The downstream node was fed run 1's payload, not a fresh one.
+    let downstream_task = task_markdown(&socket, &run2, "implement");
+    assert!(
+        downstream_task.contains(&run1_marker),
+        "the restored node's edge must carry run 1's checkpoint into the \
+         downstream node's inputs, but its task.md names no such payload \
+         (expected {run1_marker:?}):\n{downstream_task}"
+    );
+    let run2_get = run_get(&socket, &run2);
+    assert_eq!(
+        run2_get["run"]["restore_from_run"],
+        run1.as_str(),
+        "the run records where it restored from: {run2_get}"
+    );
+
+    // ── v2 changes `plan`'s prompt: the digest gate skips it ────────────────
+    let versioned = request_ok(
+        &socket,
+        &request(
+            "req_version_create",
+            "workflow.version.create",
+            json!({
+                "workflow_id": workflow_id,
+                "definition": {
+                    "format": "toml",
+                    "text": restore_definition_text("Plan v2, worded differently: {{goal}}"),
+                },
+                "change_summary": "reword the plan prompt",
+            }),
+        ),
+    );
+    assert_eq!(
+        versioned["type"], "workflow_version_created",
+        "unexpected: {versioned}"
+    );
+
+    let skipped = start_run_with(
+        &socket,
+        json!({
+            "workflow_id": workflow_id,
+            "args": { "goal": "add dark mode" },
+            "restore_from": { "run_id": run1, "nodes": ["plan"] },
+        }),
+    );
+    assert_eq!(
+        skipped["restore"]["restored"],
+        json!([]),
+        "a node whose prompt changed is not restorable by default (§4 D11): \
+         {skipped}"
+    );
+    let skips = skipped["restore"]["skipped"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no skip list: {skipped}"));
+    assert_eq!(skips.len(), 1, "{skipped}");
+    assert_eq!(skips[0]["selector"], "plan", "{skipped}");
+    assert_eq!(skips[0]["reason"], "definition_changed", "{skipped}");
+    let run3 = run_id_of(&skipped);
+    wait_for_run_finished(&mut reader, &mut seen, &run3);
+    // A skipped node runs instead of being restored, which is what "defaults to
+    // re-run" means: it executed (self-reported, in its own pane) and carries no
+    // provenance.
+    let reran = node_get(&socket, &run3, "plan");
+    assert_eq!(reran["status"], "succeeded", "{reran}");
+    assert_eq!(reran["evidence"], "self_report", "{reran}");
+    assert!(reran["pane_id"].is_string(), "{reran}");
+    assert!(reran["restored_from"].is_null(), "{reran}");
+
+    // ── the same restore with `allow_changed` goes through ──────────────────
+    let forced = start_run_with(
+        &socket,
+        json!({
+            "workflow_id": workflow_id,
+            "args": { "goal": "add dark mode" },
+            "restore_from": { "run_id": run1, "nodes": ["plan"], "allow_changed": true },
+        }),
+    );
+    assert_eq!(
+        forced["restore"]["restored"],
+        json!(["plan"]),
+        "allow_changed is the documented override for definition_changed: \
+         {forced}"
+    );
+    assert_eq!(forced["restore"]["skipped"], json!([]), "{forced}");
+    let run4 = run_id_of(&forced);
+    assert_eq!(node_get(&socket, &run4, "plan")["status"], "restored");
+    let run4_finished = wait_for_run_finished(&mut reader, &mut seen, &run4);
+    assert_eq!(
+        run4_finished["data"]["run"]["status"], "succeeded",
+        "{run4_finished}"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 14. A pruned run survives as a summary, and says so instead of pretending
+// ---------------------------------------------------------------------------
+
+/// `07-phase3-plan.md` §WS-J scenario 4 / §4 D9, D12, and 03 §9's "summary-only
+/// with restore disabled and a reason".
+///
+/// With `retention_runs = 1`, finishing a second run prunes the first: its
+/// `workflow_run` row is deleted and only its `run_summary` survives. The three
+/// surfaces that must then agree:
+///
+///   * `workflow.summary.list` still returns run 1's summary, flagged
+///     `run_pruned: true` — the M9 pin, because filtering summaries through the
+///     `run` reference would silently drop exactly these rows;
+///   * `workflow.run.list` no longer carries the run at all;
+///   * restore and `workflow.run.get` both answer `workflow_run_pruned` rather
+///     than a bare not-found, so the surviving surface is named.
+///
+/// Pruning fires on the workflow tick after a run settles and has no event of
+/// its own, so the wait is a poll on the API surface itself rather than on the
+/// clock: the state converges and stays converged.
+#[test]
+fn a_pruned_run_survives_as_a_summary_and_refuses_restore_and_run_get() {
+    let server = spawn_summary_server("summary-pruned", "ok", "[workflow]\nretention_runs = 1\n");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_phase3(&socket);
+
+    let workflow_id = create_workflow(&socket, "two_node_command.toml");
+
+    let run1 = start_run(&socket, &workflow_id, "add dark mode");
+    wait_for_run_finished(&mut reader, &mut seen, &run1);
+    wait_for_run_summarized(&mut reader, &mut seen, &run1);
+
+    let run2 = start_run(&socket, &workflow_id, "add light mode");
+    wait_for_run_finished(&mut reader, &mut seen, &run2);
+    wait_for_run_summarized(&mut reader, &mut seen, &run2);
+
+    let pruned_summary = poll_until(
+        "run 1's summary to be flagged pruned",
+        SETTLE,
+        Duration::from_millis(200),
+        || {
+            summary_list(&socket, &workflow_id)
+                .into_iter()
+                .find(|summary| {
+                    summary["run_id"] == run1.as_str() && summary["run_pruned"] == json!(true)
+                })
+        },
+    );
+    assert_eq!(
+        pruned_summary["outcome"],
+        format!("stub summary of {run1}").as_str(),
+        "a pruned run's summary keeps its contents; only the run row goes: \
+         {pruned_summary}"
+    );
+
+    let listed_summary_runs: BTreeSet<String> = summary_list(&socket, &workflow_id)
+        .iter()
+        .filter_map(|summary| summary["run_id"].as_str())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        listed_summary_runs,
+        BTreeSet::from([run1.clone(), run2.clone()]),
+        "the summary of a pruned run is exactly what survives pruning"
+    );
+
+    let listed_runs: BTreeSet<String> = request_ok(
+        &socket,
+        &request(
+            "req_run_list_pruned",
+            "workflow.run.list",
+            json!({ "workflow_id": workflow_id }),
+        ),
+    )["runs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("workflow.run.list returned no runs"))
+        .iter()
+        .filter_map(|run| run["run_id"].as_str())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        listed_runs,
+        BTreeSet::from([run2.clone()]),
+        "retention_runs = 1 keeps exactly one run row"
+    );
+
+    let got = send_request(
+        &socket,
+        &request(
+            "req_run_get_pruned",
+            "workflow.run.get",
+            json!({ "run_id": run1 }),
+        ),
+    );
+    assert_eq!(
+        error_code(&got),
+        "workflow_run_pruned",
+        "a pruned run is refused by name, not as a bare not-found: {got}"
+    );
+
+    let restore_attempt = send_request(
+        &socket,
+        &request(
+            "req_run_restore_pruned",
+            "workflow.run",
+            json!({
+                "workflow_id": workflow_id,
+                "args": { "goal": "add dark mode" },
+                "restore_from": { "run_id": run1 },
+            }),
+        ),
+    );
+    assert_eq!(
+        error_code(&restore_attempt),
+        "workflow_run_pruned",
+        "restore from a pruned run is refused with the same code: \
+         {restore_attempt}"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 15. Every Phase 3 durable field survives a restart, field for field
+// ---------------------------------------------------------------------------
+
+/// The comparable shape of one node, for the epilogue node — which
+/// [`run_shape`] deliberately excludes because it is still live at the instant a
+/// run reports finished. Here it is compared only after
+/// `workflow.run.summarized`, when it is as terminal as any other node.
+///
+/// **The tier fields are the point, not padding.** `demand`, `model`, `effort`,
+/// and `assignment_reason` are exactly what the epilogue cannot derive from a
+/// definition — it has no kvdag node (§4 D5) — so they are the fields a reader
+/// that falls back to a definition-shaped default gets wrong, which is defect
+/// E-13 (`workflow_node_info`'s `Demand::Standard` fallback reporting `standard`
+/// for a row the engine wrote as `light`). `run_shape` compares all four for
+/// every ordinary node and none of them for this one, so without them here the
+/// live-vs-durable rule §4 D16 states has no pin on the only node that needs it
+/// most. `label` is here for the same reason: the epilogue's name comes from
+/// `EPILOGUE_LABEL`, not from an authored kvdag label.
+fn epilogue_node_shape(response: &Value) -> Value {
+    let node = response["graph"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|node| node["path"] == ".summary")
+        .unwrap_or_else(|| panic!("the run graph carries no .summary node: {response}"));
+    json!({
+        "path": node["path"],
+        "label": node["label"],
+        "status": node["status"],
+        "demand": node["demand"],
+        "model": node["model"],
+        "effort": node["effort"],
+        "assignment_reason": node["assignment_reason"],
+        "evidence": node["evidence"],
+        "succession": node["succession"],
+        "cwd": node["cwd"],
+        "node_dir": node["node_dir"],
+        "started_at_unix_ms": node["started_at_unix_ms"],
+        "ended_at_unix_ms": node["ended_at_unix_ms"],
+        "attempt": node["attempt"],
+    })
+}
+
+/// `07-phase3-plan.md` §WS-J scenario 5 — the e2e face of §4 D16, and the guard
+/// against the 0.10.2 P1 defect class the whole phase is designed against.
+///
+/// [`a_finished_run_reads_back_field_equal_to_its_live_projection`] proved the
+/// *shape* survives a restart; it could not prove Phase 3's fields do, because a
+/// plain two-node run has none of them: `context_runs` is empty,
+/// `restore_from_run` is null, no node is restored, and no summary exists. This
+/// run has all four at once — it restores `plan` from a past run, is given that
+/// run's summary as context, and is summarised itself — so every new durable
+/// field is non-trivially populated on the live side before the comparison
+/// means anything.
+///
+/// What is asserted across the restart:
+///
+///   * the widened [`run_shape`] — including the timestamp, `growth_limited`,
+///     and `label` classes the original omitted, plus `transcript_path`,
+///     `restored_from`, `context_runs`, `restore_from_run`, and
+///     `workflow_name`;
+///   * the epilogue node's own projection ([`epilogue_node_shape`]);
+///   * `workflow.summary.get`, **field by field and by name**, so a decoder
+///     that drops one fails with that field's name in the message rather than
+///     with an opaque struct diff.
+///
+/// It also pins the one interrogation path CI can reach through the *durable*
+/// projection: after the restart nothing about this run is in memory, and
+/// `workflow.node.interrogate` on a `runner = "command"` node must still refuse
+/// with `workflow_transcript_unavailable` and create no pane (03 §4.4's "never
+/// a silently failing pane"). The live-run half of that refusal is
+/// `tests/cli/workflow.rs`'s
+/// `node_interrogate_on_command_runner_node_refuses_without_a_pane`.
+#[test]
+fn a_restored_and_summarised_run_reads_back_field_equal_to_its_live_projection() {
+    let server = spawn_summary_server("phase3-restart-fidelity", "ok", "");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_phase3(&socket);
+
+    let workflow_id =
+        create_workflow_from_text(&socket, &restore_definition_text("Plan v1: {{goal}}"));
+
+    // ── run 1: the source of both the checkpoint and the context ────────────
+    let run1 = start_run(&socket, &workflow_id, "add dark mode");
+    wait_for_run_finished(&mut reader, &mut seen, &run1);
+    wait_for_run_summarized(&mut reader, &mut seen, &run1);
+
+    // ── run 2: restores from run 1, reads run 1's summary, summarises ───────
+    let started = start_run_with(
+        &socket,
+        json!({
+            "workflow_id": workflow_id,
+            "args": { "goal": "add dark mode" },
+            "restore_from": { "run_id": run1, "nodes": ["plan"] },
+        }),
+    );
+    assert_eq!(started["restore"]["restored"], json!(["plan"]), "{started}");
+    let run2 = run_id_of(&started);
+    wait_for_run_finished(&mut reader, &mut seen, &run2);
+    wait_for_run_summarized(&mut reader, &mut seen, &run2);
+
+    let live = run_get(&socket, &run2);
+    let live_shape = run_shape(&live);
+    let live_epilogue = epilogue_node_shape(&live);
+    let live_summary = summary_get(&socket, &run2);
+
+    // The live projection is the reference, so it has to carry the Phase 3
+    // facts the restored one is being checked for — otherwise "equal" could
+    // mean "both empty".
+    assert_eq!(
+        live["run"]["context_runs"],
+        json!([run1]),
+        "live run: {live}"
+    );
+    assert_eq!(
+        live["run"]["restore_from_run"],
+        run1.as_str(),
+        "live run: {live}"
+    );
+    assert!(
+        !live["run"]["workflow_name"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "live run: {live}"
+    );
+    let live_plan = live["graph"]["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().find(|node| node["path"] == "plan"))
+        .unwrap_or_else(|| panic!("live run has no plan node: {live}"));
+    assert_eq!(live_plan["status"], "restored", "live plan: {live_plan}");
+    assert_eq!(
+        live_plan["restored_from"]["run_id"],
+        run1.as_str(),
+        "live plan: {live_plan}"
+    );
+    assert!(
+        !live_summary.is_null(),
+        "the run must have a summary before the summary's persistence is \
+         compared"
+    );
+
+    // Durable writes are queued onto the store thread, which serves its jobs in
+    // order; a completed `workflow.run.list` is therefore a barrier proving
+    // every write submitted before it has already been applied.
+    let listed = request_ok(
+        &socket,
+        &request(
+            "req_phase3_barrier",
+            "workflow.run.list",
+            json!({ "workflow_id": workflow_id }),
+        ),
+    );
+    assert!(
+        listed["runs"]
+            .as_array()
+            .is_some_and(|runs| runs.iter().any(|run| run["run_id"] == run2.as_str())),
+        "the run must be in the store before the restart: {listed}"
+    );
+
+    // ── the same run, from a server that never executed it ──────────────────
+    let server = server.restart();
+    let socket = server.socket().to_path_buf();
+    require_workflow_api(&socket);
+
+    let restored = run_get(&socket, &run2);
+    assert_eq!(
+        run_shape(&restored),
+        live_shape,
+        "a restored-and-summarised run read back from the store must describe \
+         the same run the engine did.\nlive:     {live}\nrestored: {restored}"
+    );
+    assert_eq!(
+        epilogue_node_shape(&restored),
+        live_epilogue,
+        "the epilogue node is a run node like any other and reads back like \
+         one.\nlive:     {live}\nrestored: {restored}"
+    );
+
+    // Field by field and by name (§4 D16): a decoder that drops one field fails
+    // naming it, rather than failing on an opaque whole-struct comparison.
+    let restored_summary = summary_get(&socket, &run2);
+    for field in [
+        "run_id",
+        "workflow_id",
+        "workflow_name",
+        "version_id",
+        "text",
+        "outcome",
+        "highlights",
+        "open_gaps",
+        "per_node",
+        "token_estimate",
+        "generated_by_path",
+        "created_at_unix_ms",
+        "run_pruned",
+    ] {
+        assert_eq!(
+            restored_summary[field], live_summary[field],
+            "summary field `{field}` did not survive the restart.\nlive:     \
+             {live_summary}\nrestored: {restored_summary}"
+        );
+    }
+
+    // ── the durable projection still refuses to interrogate a command node ──
+    let panes_before = pane_count(&socket);
+    let refused = send_request(
+        &socket,
+        &request(
+            "req_interrogate_historical",
+            "workflow.node.interrogate",
+            json!({ "run_id": run2, "path": "implement" }),
+        ),
+    );
+    assert_eq!(
+        error_code(&refused),
+        "workflow_transcript_unavailable",
+        "a `runner = \"command\"` node has no session to fork, and the answer \
+         must say so even when the run is only known from the store: {refused}"
+    );
+    assert_eq!(
+        pane_count(&socket),
+        panes_before,
+        "a refused interrogation must never create a pane (03 §4.4)"
+    );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// 16. Interrogating the epilogue is answered by how the summariser was bound
+// ---------------------------------------------------------------------------
+
+/// `workflow.node.interrogate .summary` under a command-bound summariser must
+/// answer **"it ran as a command"**, not "its transcript is unavailable"
+/// (defect M-1).
+///
+/// The epilogue is the one node with no kvdag node behind it (§4 D5), so the
+/// handler's runner gate cannot derive its binding the way it derives every
+/// other node's: a definition lookup misses, and a miss is documented to fall
+/// through to the stat, which then refuses on a transcript that a command node
+/// was never going to have. `EpilogueState::runner` is the recorded authority
+/// (§4 D2 / defect D-1), and this is the assertion that it is the one being
+/// read — the same defect and the same fix as D-C's `runner_for_pane`, reached
+/// by path instead of by pane.
+///
+/// The message is the assertion, because both answers carry
+/// `workflow_transcript_unavailable`: a caller told the transcript is missing
+/// goes looking for a file, and for this node there is no file to find.
+/// `KARVEX_WORKFLOW_SUMMARY_COMMAND` is what [`spawn_summary_server`] sets, so
+/// every summariser in these scenarios is `runner = "command"` already.
+#[test]
+fn interrogating_a_command_bound_epilogue_is_refused_on_its_runner() {
+    let server = spawn_summary_server("epilogue-interrogate", "ok", "");
+    let socket = server.socket().to_path_buf();
+    if !require_workflow_api(&socket) {
+        server.shutdown();
+        return;
+    }
+
+    create_workspace(&socket, &server.base);
+    let (mut reader, mut seen) = subscribe_phase3(&socket);
+
+    let workflow_id = create_workflow(&socket, "two_node_command.toml");
+    let run = start_run(&socket, &workflow_id, "add dark mode");
+    wait_for_run_finished(&mut reader, &mut seen, &run);
+    wait_for_run_summarized(&mut reader, &mut seen, &run);
+
+    // The run is still this server's — the live epilogue state is exactly what
+    // the handler has to consult, and the summariser has finished, so nothing
+    // here is racing the epilogue.
+    let panes_before = pane_count(&socket);
+    let refused = send_request(
+        &socket,
+        &request(
+            "req_interrogate_epilogue",
+            "workflow.node.interrogate",
+            json!({ "run_id": run, "path": ".summary" }),
+        ),
+    );
+    assert_eq!(
+        error_code(&refused),
+        "workflow_transcript_unavailable",
+        "the epilogue has no session to fork, so the interrogation is refused: \
+         {refused}"
+    );
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("ran as a command, not an agent"),
+        "the refusal must name the summariser's *runner*; a transcript-shaped \
+         answer sends the caller looking for a file that never existed: \
+         {refused}"
+    );
+    assert_eq!(
+        pane_count(&socket),
+        panes_before,
+        "a refused interrogation must never create a pane (03 §4.4)"
     );
 
     server.shutdown();

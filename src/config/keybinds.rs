@@ -360,6 +360,9 @@ pub struct Keybinds {
     /// run. Bound rather than menu-only for the same reason the DAG view is —
     /// it is how a run is started without leaving karvex.
     pub open_workflow_launcher: ActionKeybinds,
+    /// Opens the run browser (`07-phase3-plan.md` §WS-F): a list-and-detail
+    /// overlay over past and pruned runs, and restore-all.
+    pub open_workflow_runs: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
 }
 
@@ -524,6 +527,7 @@ impl Config {
             toggle_sidebar: empty_action!(),
             open_workflow_dag: empty_action!(),
             open_workflow_launcher: empty_action!(),
+            open_workflow_runs: empty_action!(),
             custom_commands: Vec::new(),
         };
 
@@ -671,6 +675,7 @@ impl Config {
                 open_workflow_launcher,
                 source
             );
+            apply_action!(keybinds.open_workflow_runs, open_workflow_runs, source);
 
             if source == field_source!(indexed) {
                 append_legacy_indexed_bindings(
@@ -1649,6 +1654,48 @@ open_workflow_launcher = "prefix+ctrl+w"
             binding_triggers(&config.keybinds().open_workflow_launcher),
             vec![BindingTrigger::Prefix((
                 KeyCode::Char('w'),
+                KeyModifiers::CONTROL
+            ))]
+        );
+    }
+
+    /// The run browser (`07-phase3-plan.md` §WS-F) sits beside the DAG view
+    /// and the launcher on the `prefix+shift+<letter>` family; `r` (`reload_config`)
+    /// and `f` (`open_workflow_dag`) are both already taken, so it takes `b`.
+    #[test]
+    fn open_workflow_runs_defaults_to_prefix_shift_b_and_is_rebindable() {
+        let kb = Config::default().keybinds();
+        assert_eq!(
+            binding_triggers(&kb.open_workflow_runs),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('b'),
+                KeyModifiers::SHIFT
+            ))]
+        );
+        for other in [
+            binding_triggers(&kb.open_workflow_dag),
+            binding_triggers(&kb.open_workflow_launcher),
+            binding_triggers(&kb.reload_config),
+            binding_triggers(&kb.toggle_sidebar),
+        ] {
+            assert_ne!(
+                binding_triggers(&kb.open_workflow_runs),
+                other,
+                "the run browser binding must not collide with an existing default"
+            );
+        }
+
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+open_workflow_runs = "prefix+ctrl+h"
+"#,
+        )
+        .expect("the key parses");
+        assert_eq!(
+            binding_triggers(&config.keybinds().open_workflow_runs),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('h'),
                 KeyModifiers::CONTROL
             ))]
         );

@@ -217,11 +217,23 @@ pub struct WorkflowRunParams {
     /// namespace (`kvx workflow run start … --arg k=v`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub args: HashMap<String, String>,
+    /// Seed some nodes from a past run's checkpoints instead of re-executing
+    /// them (`07-phase3-plan.md` §4 D3, D11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_from: Option<WorkflowRestoreRequest>,
+    /// Defaults to `true` when absent (`07-phase3-plan.md` §4 D21): the run's
+    /// nodes read prior runs' summaries via `context/prior-runs.md` unless
+    /// explicitly opted out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_prior_summaries: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowRunListParams {
-    pub workflow_id: String,
+    /// `None` lists runs across every workflow, newest first
+    /// (`07-phase3-plan.md` §4 D9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -490,6 +502,17 @@ pub struct WorkflowRunInfo {
     /// The run's most recent growth limit, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub growth_limited: Option<WorkflowGrowthLimit>,
+    /// Denormalised so a cross-workflow run list can label a row without N
+    /// extra calls (`07-phase3-plan.md` §4 D9).
+    #[serde(default)]
+    pub workflow_name: String,
+    /// Source runs whose summaries this run's nodes were offered via
+    /// `context/prior-runs.md` (`07-phase3-plan.md` §4 D21).
+    #[serde(default)]
+    pub context_runs: Vec<String>,
+    /// The run this one restored checkpoints from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_from_run: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -554,6 +577,15 @@ pub struct WorkflowRunNodeInfo {
     /// The last growth limit this node ran into as a *proposer*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub growth_limited: Option<WorkflowGrowthLimit>,
+    /// The transcript path a workflow pane's session report last confirmed
+    /// (`07-phase3-plan.md` §4 D6). `None` means no session ever reported one
+    /// — interrogation falls back to the pre-launch estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    /// Provenance when this node was seeded from a past run's checkpoint
+    /// rather than executed (`07-phase3-plan.md` §4 D4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<WorkflowRestoredFrom>,
 }
 
 fn default_attempt() -> u32 {
@@ -575,6 +607,159 @@ pub struct WorkflowRunEdgeInfo {
 pub struct WorkflowRunGraph {
     pub nodes: Vec<WorkflowRunNodeInfo>,
     pub edges: Vec<WorkflowRunEdgeInfo>,
+}
+
+// ── run history, summaries, interrogation, restore ─────────────────────────
+
+/// Which spawn shape `workflow.node.interrogate` uses.
+/// `Resumed` forks the source Claude session (`03-storage-schema.md` §4.4);
+/// `Reconstructed` seeds a fresh session from the stored checkpoint when no
+/// transcript is available, and is always explicitly labelled as such —
+/// never presented as the original teammate
+/// (`00-overview.md` Feature 3, `07-phase3-plan.md` §4 D7).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowInterrogationMode {
+    #[default]
+    Resumed,
+    Reconstructed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowNodeInterrogateParams {
+    pub run_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub mode: WorkflowInterrogationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// A live or ended interrogation of a past node's Claude session
+/// (`07-phase3-plan.md` §4 D7-D8). Not a `run_node`: interrogations have their
+/// own lifecycle and are never counted toward a run's node totals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowInterrogationInfo {
+    pub id: String,
+    pub run_id: String,
+    /// The source node's instance path, not the interrogation's own identity.
+    pub path: String,
+    pub source_session_id: String,
+    /// Learned from the pane's session report when not pre-assigned at spawn
+    /// (`07-phase3-plan.md` §4 D7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default)]
+    pub reconstructed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    pub cwd: String,
+    pub started_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowSummaryListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One node's line in a run summary's per-node breakdown
+/// (`04-kvdag-and-execution.md`'s epilogue schema, `07-phase3-plan.md` §4 D1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowSummaryNodeLine {
+    pub node_key: String,
+    pub verdict: String,
+    pub one_liner: String,
+}
+
+/// A completed run's epilogue-authored summary
+/// (`07-phase3-plan.md` §4 D1, D10). `summary.get` returning `None` and this
+/// type being absent from a `summary.list` result both mean the same normal
+/// thing: no summary was written, never an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunSummaryInfo {
+    pub run_id: String,
+    pub workflow_id: String,
+    pub workflow_name: String,
+    pub version_id: String,
+    pub text: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub highlights: Vec<String>,
+    #[serde(default)]
+    pub open_gaps: Vec<String>,
+    #[serde(default)]
+    pub per_node: Vec<WorkflowSummaryNodeLine>,
+    pub token_estimate: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_by_path: Option<String>,
+    pub created_at_unix_ms: u64,
+    /// Set once the source run is pruned; the summary itself is the one
+    /// never-pruned row (`07-phase3-plan.md` §4 D9).
+    #[serde(default)]
+    pub run_pruned: bool,
+}
+
+/// A `workflow.run` request asking to seed some nodes from a past run's
+/// checkpoints instead of re-executing them (`07-phase3-plan.md` §4 D3, D11).
+/// A bare `nodes: []` means every restorable node of the source run
+/// (`07-phase3-plan.md` §4 D18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRestoreRequest {
+    pub run_id: String,
+    #[serde(default)]
+    pub nodes: Vec<String>,
+    #[serde(default)]
+    pub allow_changed: bool,
+}
+
+/// Why one selector's restore did not happen. `definition_changed` is
+/// bypassable with `allow_changed`; the other two never are
+/// (`07-phase3-plan.md` §4 D11, D19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRestoreSkipReason {
+    DefinitionChanged,
+    NoCheckpoint,
+    PayloadTruncated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRestoreSkip {
+    pub selector: String,
+    pub reason: WorkflowRestoreSkipReason,
+    pub message: String,
+}
+
+/// A restore's outcome, carried on `workflow.run`'s response
+/// (`07-phase3-plan.md` §4 D11). An all-skipped restore is a successful run
+/// start with a fully populated `skipped` list, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRestoreReport {
+    /// Instance paths of the nodes seeded from the source run's checkpoints.
+    #[serde(default)]
+    pub restored: Vec<String>,
+    #[serde(default)]
+    pub skipped: Vec<WorkflowRestoreSkip>,
+}
+
+/// Provenance of a restored node, carried on `WorkflowRunNodeInfo`
+/// (`07-phase3-plan.md` §4 D4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRestoredFrom {
+    pub run_id: String,
+    pub node_key: String,
+    pub checkpoint_seq: u64,
 }
 
 /// One projection of a workflow and its head document, read by **both**
@@ -604,7 +789,7 @@ pub struct WorkflowDetail {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::api::schema::{Method, Request, ResponseResult, SuccessResponse};
 
@@ -668,6 +853,8 @@ mod tests {
                     version: Some(1),
                     tier: Some(WorkflowTier::Auto),
                     args: HashMap::from([("goal".to_string(), "add dark mode".to_string())]),
+                    restore_from: None,
+                    include_prior_summaries: None,
                 }),
                 "workflow.run",
             ),
@@ -679,7 +866,7 @@ mod tests {
             ),
             (
                 Method::WorkflowRunList(WorkflowRunListParams {
-                    workflow_id: "workflow:1".into(),
+                    workflow_id: Some("workflow:1".into()),
                     limit: Some(10),
                 }),
                 "workflow.run.list",
@@ -739,6 +926,28 @@ mod tests {
                     count: Some(4),
                 }),
                 "workflow.node.expand",
+            ),
+            (
+                Method::WorkflowNodeInterrogate(WorkflowNodeInterrogateParams {
+                    run_id: "workflow_run:1".into(),
+                    path: "plan".into(),
+                    mode: WorkflowInterrogationMode::Resumed,
+                    note: Some("why did this take three attempts?".into()),
+                }),
+                "workflow.node.interrogate",
+            ),
+            (
+                Method::WorkflowSummaryGet(WorkflowRunTarget {
+                    run_id: "workflow_run:1".into(),
+                }),
+                "workflow.summary.get",
+            ),
+            (
+                Method::WorkflowSummaryList(WorkflowSummaryListParams {
+                    workflow_id: Some("workflow:1".into()),
+                    limit: Some(10),
+                }),
+                "workflow.summary.list",
             ),
         ];
 
@@ -864,6 +1073,8 @@ mod tests {
             assignment_reason: "auto: 4 prior runs at 100% first pass".into(),
             delivery_failure: None,
             growth_limited: None,
+            transcript_path: None,
+            restored_from: None,
         }
     }
 
@@ -921,6 +1132,9 @@ mod tests {
                     max_nodes: 24,
                     nodes_live: 3,
                     growth_limited: None,
+                    workflow_name: String::new(),
+                    context_runs: Vec::new(),
+                    restore_from_run: None,
                 },
                 graph,
             },
@@ -1026,13 +1240,19 @@ mod tests {
             max_nodes: 12,
             nodes_live: 1,
             growth_limited: Some(growth_limit()),
+            workflow_name: "ship-feature".into(),
+            context_runs: Vec::new(),
+            restore_from_run: None,
         };
         let node = sample_run_node_info("plan", None);
 
         for response in [
             SuccessResponse {
                 id: "req_run_started".into(),
-                result: ResponseResult::WorkflowRunStarted { run: run.clone() },
+                result: ResponseResult::WorkflowRunStarted {
+                    run: run.clone(),
+                    restore: None,
+                },
             },
             SuccessResponse {
                 id: "req_run_list".into(),
@@ -1106,6 +1326,313 @@ mod tests {
         assert!(json.contains("\"type\":\"workflow_node_expanded\""));
         let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, response);
+    }
+
+    fn interrogation_info(reconstructed: bool) -> WorkflowInterrogationInfo {
+        WorkflowInterrogationInfo {
+            id: "interrogation:1".into(),
+            run_id: "workflow_run:1".into(),
+            path: "plan".into(),
+            source_session_id: "11111111-1111-1111-1111-111111111111".into(),
+            forked_session_id: Some("22222222-2222-2222-2222-222222222222".into()),
+            pane_id: Some("w_1-3".into()),
+            reconstructed,
+            transcript_path: Some("/home/user/.claude/projects/p/11111111.jsonl".into()),
+            cwd: "/repo".into(),
+            started_at_unix_ms: 10,
+            ended_at_unix_ms: None,
+            note: "why did this take three attempts?".into(),
+        }
+    }
+
+    fn run_summary_info() -> WorkflowRunSummaryInfo {
+        WorkflowRunSummaryInfo {
+            run_id: "workflow_run:1".into(),
+            workflow_id: "workflow:1".into(),
+            workflow_name: "ship-feature".into(),
+            version_id: "kvdag_version:1".into(),
+            text: "Implemented dark mode; review flagged one open question.".into(),
+            outcome: "succeeded".into(),
+            highlights: vec!["dark mode toggle persists across restarts".into()],
+            open_gaps: vec!["no visual regression test yet".into()],
+            per_node: vec![WorkflowSummaryNodeLine {
+                node_key: "plan".into(),
+                verdict: "satisfied".into(),
+                one_liner: "produced a three-step plan".into(),
+            }],
+            token_estimate: 1200,
+            generated_by_path: Some(".summary".into()),
+            created_at_unix_ms: 20,
+            run_pruned: false,
+        }
+    }
+
+    /// `workflow.node.interrogate`'s result and every field of
+    /// `WorkflowInterrogationInfo`, including the reconstructed variant,
+    /// round-trip.
+    #[test]
+    fn workflow_node_interrogated_result_round_trips() {
+        for reconstructed in [false, true] {
+            let response = SuccessResponse {
+                id: "req_interrogate".into(),
+                result: ResponseResult::WorkflowNodeInterrogated {
+                    interrogation: interrogation_info(reconstructed),
+                },
+            };
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains("\"type\":\"workflow_node_interrogated\""));
+            let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, response);
+        }
+    }
+
+    /// `workflow.summary.get` on a run with no summary answers `None`, not an
+    /// error (`07-phase3-plan.md` §4 D1, D10); `workflow.summary.list`
+    /// carries one or more summaries, pruned or not.
+    #[test]
+    fn workflow_summary_get_and_list_results_round_trip() {
+        let mut pruned_summary = run_summary_info();
+        pruned_summary.run_pruned = true;
+
+        for response in [
+            SuccessResponse {
+                id: "req_summary_get_none".into(),
+                result: ResponseResult::WorkflowSummaryGet { summary: None },
+            },
+            SuccessResponse {
+                id: "req_summary_get_some".into(),
+                result: ResponseResult::WorkflowSummaryGet {
+                    summary: Some(run_summary_info()),
+                },
+            },
+            SuccessResponse {
+                id: "req_summary_list".into(),
+                result: ResponseResult::WorkflowSummaryList {
+                    summaries: vec![run_summary_info(), pruned_summary],
+                },
+            },
+        ] {
+            let json = serde_json::to_string(&response).unwrap();
+            let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, response);
+        }
+    }
+
+    /// `workflow.summary.get`'s `None` result serialises with no `summary`
+    /// key at all, matching the module-wide `skip_serializing_if` convention
+    /// (and letting an old client's absent-key path keep working).
+    #[test]
+    fn workflow_summary_get_none_omits_the_summary_key() {
+        let json = serde_json::to_value(SuccessResponse {
+            id: "req".into(),
+            result: ResponseResult::WorkflowSummaryGet { summary: None },
+        })
+        .unwrap();
+        assert!(json["result"].get("summary").is_none());
+    }
+
+    /// `mode` defaults to `resumed` when absent, and `note` is optional.
+    #[test]
+    fn workflow_node_interrogate_params_default_mode_is_resumed() {
+        let json = serde_json::json!({
+            "run_id": "workflow_run:1",
+            "path": "plan",
+        });
+        let params: WorkflowNodeInterrogateParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.mode, WorkflowInterrogationMode::Resumed);
+        assert_eq!(params.note, None);
+    }
+
+    /// `workflow.summary.list` with no `workflow_id` means every workflow.
+    #[test]
+    fn workflow_summary_list_params_workflow_id_is_optional() {
+        let json = serde_json::json!({});
+        let params: WorkflowSummaryListParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.workflow_id, None);
+        assert_eq!(params.limit, None);
+    }
+
+    /// A restore report with every skip reason, and the all-skipped shape a
+    /// successful-but-nothing-restored run start carries.
+    #[test]
+    fn workflow_restore_report_round_trips_every_skip_reason() {
+        let report = WorkflowRestoreReport {
+            restored: vec!["implement".into()],
+            skipped: vec![
+                WorkflowRestoreSkip {
+                    selector: "plan".into(),
+                    reason: WorkflowRestoreSkipReason::DefinitionChanged,
+                    message: "plan's prompt_template changed since the source run".into(),
+                },
+                WorkflowRestoreSkip {
+                    selector: "review".into(),
+                    reason: WorkflowRestoreSkipReason::NoCheckpoint,
+                    message: "review has no result checkpoint in the source run".into(),
+                },
+                WorkflowRestoreSkip {
+                    selector: "verify".into(),
+                    reason: WorkflowRestoreSkipReason::PayloadTruncated,
+                    message: "verify's checkpoint payload exceeded the store's size budget".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let restored: WorkflowRestoreReport = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, report);
+
+        for (reason, wire) in [
+            (
+                WorkflowRestoreSkipReason::DefinitionChanged,
+                "definition_changed",
+            ),
+            (WorkflowRestoreSkipReason::NoCheckpoint, "no_checkpoint"),
+            (
+                WorkflowRestoreSkipReason::PayloadTruncated,
+                "payload_truncated",
+            ),
+        ] {
+            let json = serde_json::to_value(reason).unwrap();
+            assert_eq!(json, serde_json::Value::String(wire.to_string()));
+        }
+    }
+
+    /// `WorkflowRestoreRequest`'s bare form (`nodes: []`) means "every
+    /// restorable node" (`07-phase3-plan.md` §4 D18); `allow_changed`
+    /// defaults to `false`.
+    #[test]
+    fn workflow_restore_request_bare_form_defaults_round_trip() {
+        let json = serde_json::json!({ "run_id": "workflow_run:1" });
+        let request: WorkflowRestoreRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            request,
+            WorkflowRestoreRequest {
+                run_id: "workflow_run:1".into(),
+                nodes: Vec::new(),
+                allow_changed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn workflow_restored_from_round_trips() {
+        let restored_from = WorkflowRestoredFrom {
+            run_id: "workflow_run:1".into(),
+            node_key: "plan".into(),
+            checkpoint_seq: 2,
+        };
+        let json = serde_json::to_value(&restored_from).unwrap();
+        let restored: WorkflowRestoredFrom = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, restored_from);
+    }
+
+    /// `workflow.run.list` decodes both with and without `workflow_id` — the
+    /// back-compat pin for the `String -> Option<String>` loosening
+    /// (`07-phase3-plan.md` §4 D9, D20).
+    #[test]
+    fn workflow_run_list_params_decodes_with_and_without_workflow_id() {
+        let with_workflow: WorkflowRunListParams =
+            serde_json::from_value(serde_json::json!({ "workflow_id": "workflow:1" })).unwrap();
+        assert_eq!(with_workflow.workflow_id, Some("workflow:1".into()));
+
+        let without_workflow: WorkflowRunListParams =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(without_workflow.workflow_id, None);
+    }
+
+    /// `include_prior_summaries` absent decodes to `None`, which the handler
+    /// documents as meaning `true` — the default lives in exactly one place
+    /// (`07-phase3-plan.md` §4 D21).
+    #[test]
+    fn workflow_run_params_include_prior_summaries_absent_is_none() {
+        let params: WorkflowRunParams = serde_json::from_value(serde_json::json!({
+            "workflow_id": "workflow:1",
+        }))
+        .unwrap();
+        assert_eq!(params.include_prior_summaries, None);
+        assert_eq!(params.restore_from, None);
+    }
+
+    /// A `workflow.run` request carrying `restore_from` round-trips, and the
+    /// response's `restore` report carries both a restored node and every
+    /// skip reason together (`07-phase3-plan.md` §4 D3, D11, D18).
+    #[test]
+    fn workflow_run_restore_from_and_restore_report_round_trip() {
+        let request = Request {
+            id: "req_restore".into(),
+            method: Method::WorkflowRun(WorkflowRunParams {
+                workflow_id: "workflow:1".into(),
+                version: Some(2),
+                tier: None,
+                args: HashMap::new(),
+                restore_from: Some(WorkflowRestoreRequest {
+                    run_id: "workflow_run:1".into(),
+                    nodes: vec!["plan".into()],
+                    allow_changed: true,
+                }),
+                include_prior_summaries: Some(false),
+            }),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        let restored: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, request);
+
+        let response = SuccessResponse {
+            id: "req_restore".into(),
+            result: ResponseResult::WorkflowRunStarted {
+                run: WorkflowRunInfo {
+                    run_id: "workflow_run:2".into(),
+                    workflow_id: "workflow:1".into(),
+                    version_id: "kvdag_version:2".into(),
+                    tier: WorkflowTier::Auto,
+                    status: WorkflowRunStatus::Running,
+                    args: HashMap::new(),
+                    workspace_id: None,
+                    tab_id: None,
+                    started_at_unix_ms: 5,
+                    ended_at_unix_ms: None,
+                    total_tokens: 0,
+                    total_tool_uses: 0,
+                    nodes_total: 2,
+                    nodes_done: 0,
+                    failure: None,
+                    max_depth: 3,
+                    max_nodes: 24,
+                    nodes_live: 1,
+                    growth_limited: None,
+                    workflow_name: "ship-feature".into(),
+                    context_runs: Vec::new(),
+                    restore_from_run: Some("workflow_run:1".into()),
+                },
+                restore: Some(WorkflowRestoreReport {
+                    restored: vec!["plan".into()],
+                    skipped: vec![WorkflowRestoreSkip {
+                        selector: "review".into(),
+                        reason: WorkflowRestoreSkipReason::NoCheckpoint,
+                        message: "review has no result checkpoint in the source run".into(),
+                    }],
+                }),
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, response);
+    }
+
+    /// `WorkflowRunNodeInfo.transcript_path`/`restored_from` round-trip,
+    /// including the "restored, no live transcript" combination a restored
+    /// node actually has.
+    #[test]
+    fn workflow_run_node_info_transcript_path_and_restored_from_round_trip() {
+        let mut node = sample_run_node_info("implement", Some(WorkflowSuccession::Satisfied));
+        node.transcript_path = None;
+        node.restored_from = Some(WorkflowRestoredFrom {
+            run_id: "workflow_run:1".into(),
+            node_key: "implement".into(),
+            checkpoint_seq: 3,
+        });
+        let json = serde_json::to_value(&node).unwrap();
+        let restored: WorkflowRunNodeInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, node);
     }
 
     /// Every rejection reason and every limit kind has a wire spelling, and
@@ -1187,6 +1714,21 @@ mod tests {
         }
     }
 
+    /// UI-surface vocabulary banned from every workflow API identifier
+    /// (`docs/design/workflow-builder/05-phase-plan.md` W3,
+    /// `06-phase2-plan.md` WS-D "Naming guard"). `badge`, `banner`, `toast`,
+    /// and `modal` are not UI-surface words the Phase 1 list happened to
+    /// name, but they are UI-surface words by the same rule — hence
+    /// `growth_limited`, not `growth_banner`.
+    ///
+    /// `pub(crate)` so `src/app/api/workflows.rs`'s error-code inventory test
+    /// checks its codes against this same list instead of hand-copying it —
+    /// two independent copies is exactly the kind of drift that let Phase 1–3
+    /// error codes go unchecked for this ban in the first place.
+    pub(crate) const BANNED_UI_SURFACE_WORDS: &[&str] = &[
+        "sidebar", "card", "widget", "row", "panel", "badge", "banner", "toast", "modal",
+    ];
+
     /// Every identifier this task adds to the JSON API (dot-method names,
     /// Rust type/variant/field names) — checked against
     /// `docs/design/workflow-builder/05-phase-plan.md` W3's ban on
@@ -1195,14 +1737,6 @@ mod tests {
     /// `narrow` never false-positive on `row`.
     #[test]
     fn no_new_workflow_api_identifier_uses_banned_ui_surface_words() {
-        // `badge`, `banner`, `toast`, and `modal` are not UI-surface words the
-        // Phase 1 list happened to name, but they are UI-surface words by the
-        // same rule — hence `growth_limited`, not `growth_banner`
-        // (`06-phase2-plan.md` WS-D "Naming guard").
-        const BANNED: &[&str] = &[
-            "sidebar", "card", "widget", "row", "panel", "badge", "banner", "toast", "modal",
-        ];
-
         fn words(identifier: &str) -> Vec<String> {
             let mut words = Vec::new();
             let mut current = String::new();
@@ -1445,6 +1979,69 @@ mod tests {
             "delivery_failure",
             "WorkflowNodeExpanded",
             "rejected",
+            // Phase 3 additions
+            "workflow.node.interrogate",
+            "workflow.summary.get",
+            "workflow.summary.list",
+            "workflow.run.summarized",
+            "workflow.interrogation.started",
+            "workflow.interrogation.ended",
+            "WorkflowInterrogationMode",
+            "resumed",
+            "reconstructed",
+            "WorkflowNodeInterrogateParams",
+            "mode",
+            "note",
+            "WorkflowInterrogationInfo",
+            "id",
+            "source_session_id",
+            "forked_session_id",
+            "transcript_path",
+            "started_at_unix_ms",
+            "ended_at_unix_ms",
+            "WorkflowSummaryListParams",
+            "WorkflowSummaryNodeLine",
+            "node_key",
+            "verdict",
+            "one_liner",
+            "WorkflowRunSummaryInfo",
+            "workflow_name",
+            "version_id",
+            "text",
+            "outcome",
+            "highlights",
+            "open_gaps",
+            "per_node",
+            "token_estimate",
+            "generated_by_path",
+            "created_at_unix_ms",
+            "run_pruned",
+            "WorkflowRestoreRequest",
+            "nodes",
+            "allow_changed",
+            "WorkflowRestoreSkipReason",
+            "definition_changed",
+            "no_checkpoint",
+            "payload_truncated",
+            "WorkflowRestoreSkip",
+            "selector",
+            "WorkflowRestoreReport",
+            "restored",
+            "skipped",
+            "WorkflowRestoredFrom",
+            "checkpoint_seq",
+            "WorkflowNodeInterrogated",
+            "interrogation",
+            "WorkflowSummaryGet",
+            "summary",
+            "WorkflowSummaryList",
+            "summaries",
+            "restore_from",
+            "include_prior_summaries",
+            "context_runs",
+            "restore_from_run",
+            "restored_from",
+            "restore",
         ];
 
         let offenders: Vec<&str> = identifiers
@@ -1453,7 +2050,7 @@ mod tests {
             .filter(|identifier| {
                 words(identifier)
                     .iter()
-                    .any(|word| BANNED.contains(&word.as_str()))
+                    .any(|word| BANNED_UI_SURFACE_WORDS.contains(&word.as_str()))
             })
             .collect();
         assert!(

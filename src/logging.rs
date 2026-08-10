@@ -344,6 +344,21 @@ pub(crate) fn session_clear_failed(path: &Path, err: &str) {
     );
 }
 
+/// Records which directory this server will read and write its session state
+/// in, and whether the socket override moved it off the session default. A
+/// server that starts empty because its state directory is its own must say so
+/// deliberately rather than look like a lost session.
+pub(crate) fn server_state_dir_resolved(state_dir: &Path, api_socket: &Path, isolated: bool) {
+    tracing::info!(
+        event = "persist.state_dir",
+        subsystem = "persist",
+        outcome = if isolated { "isolated" } else { "session" },
+        state_dir = %state_dir.display(),
+        api_socket = %api_socket.display(),
+        "resolved server session state directory"
+    );
+}
+
 pub(crate) fn session_restored(workspaces: usize, outcome: &'static str) {
     tracing::info!(
         event = "persist.restore",

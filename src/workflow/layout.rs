@@ -164,6 +164,20 @@ const NODE_HEIGHT: u16 = 3;
 const COLUMN_GAP: u16 = 2;
 /// Vertical room between layers, reserved for the edge-routing "drop" band.
 const ROW_GAP: u16 = 2;
+/// Blank rows between the deepest graph layer and the detached lane. Narrower
+/// than [`ROW_GAP`] on purpose: nothing is ever routed through it, and the lane
+/// is not another layer.
+const DETACHED_LANE_GAP: u16 = 1;
+/// Detached boxes are **wider** than node boxes, deliberately.
+///
+/// Two reasons, and the second is the load-bearing one. A detached box carries
+/// a longer line than a node's status word — a kind plus a state, e.g.
+/// `reconstructed · ended` — and eliding half of it on the common case is not
+/// a box worth drawing. And a lane on its own column grid can never be
+/// mistaken for another layer of the graph, which is precisely what an
+/// edgeless box sitting under a DAG would otherwise read as
+/// (`07-phase3-plan.md` §4 D8).
+const DETACHED_WIDTH: u16 = 26;
 
 /// Layered layout: layer by longest path from the roots, order within a layer
 /// by a barycenter heuristic with an `instance_path` stability tiebreak, then
@@ -220,6 +234,66 @@ pub fn layout(graph: &RunGraph, area: LayoutRect) -> DagLayout {
     }
 
     DagLayout { nodes, edges }
+}
+
+// ── the detached lane ───────────────────────────────────────────────────────
+
+/// Rows the detached lane needs to draw `count` boxes: a separating gap plus
+/// one box row, and **zero** when there is nothing to draw
+/// (`07-phase3-plan.md` §1 WS-H).
+///
+/// The zero case is the whole point. Interrogation boxes are the DAG overlay's
+/// second optional band, and the first one (the growth banner) established the
+/// rule: an absent band costs no rows, so every pinned geometry number stays
+/// byte-identical for the runs that have none — which is nearly all of them
+/// (`06-phase2-plan.md` §3 frozen interface 10).
+pub fn detached_lane_height(count: usize) -> u16 {
+    if count == 0 {
+        0
+    } else {
+        DETACHED_LANE_GAP.saturating_add(NODE_HEIGHT)
+    }
+}
+
+/// Boxes for `count` detached items, tiled left to right along the bottom of
+/// `area`.
+///
+/// Detached items are **not** graph nodes: they have no edges, no layer, and no
+/// place in [`layout`]'s layered algorithm. Routing them through it would hand
+/// them `assign_layers`' edgeless-node default and draw them as roots, which is
+/// the one thing an interrogation box must never look like
+/// (`07-phase3-plan.md` §4 D8). So they get their own pure function, their own
+/// lane, and — at the call site — their own hit-test namespace.
+///
+/// The returned vec may be **shorter** than `count`: a box that does not fit
+/// horizontally is dropped rather than clipped, exactly as [`layout`]'s callers
+/// drop a node box that overruns the graph band. Nothing invisible stays
+/// clickable, and the caller pairs the rects with its items in order.
+pub fn detached_lane(area: LayoutRect, count: usize) -> Vec<LayoutRect> {
+    if count == 0 || area.width < DETACHED_WIDTH || area.height < NODE_HEIGHT {
+        return Vec::new();
+    }
+    // Bottom-aligned, so the gap always separates the lane from the graph
+    // above it however tall the caller made the band.
+    let y = area.bottom().saturating_sub(NODE_HEIGHT);
+    let mut rects = Vec::with_capacity(count);
+    for position in 0..count {
+        let Ok(position) = u16::try_from(position) else {
+            break;
+        };
+        let Some(offset) = position.checked_mul(DETACHED_WIDTH + COLUMN_GAP) else {
+            break;
+        };
+        let Some(x) = area.x.checked_add(offset) else {
+            break;
+        };
+        let rect = LayoutRect::new(x, y, DETACHED_WIDTH, NODE_HEIGHT);
+        if rect.right() > area.right() {
+            break;
+        }
+        rects.push(rect);
+    }
+    rects
 }
 
 /// Layer assignment: longest path from the roots, computed with Kahn's
@@ -481,6 +555,7 @@ mod tests {
             progress: ProgressTracker::default(),
             succession: None,
             checkpoint_seq: 0,
+            restored_from: None,
         }
     }
 
@@ -508,6 +583,7 @@ mod tests {
             edges,
             status: RunStatus::Running,
             seq: 0,
+            epilogue: None,
         }
     }
 
@@ -744,6 +820,88 @@ mod tests {
         // `end` sat in the third band, so nothing below the first gap remains.
         let merged = dag.edge_cells();
         assert!(merged.keys().all(|(_, y)| *y < 8), "{merged:?}");
+    }
+
+    /// The zero-height-when-absent rule (`07-phase3-plan.md` §1 WS-H): a run
+    /// with no interrogations must cost the graph band nothing at all.
+    #[test]
+    fn an_empty_detached_lane_costs_zero_rows_and_draws_nothing() {
+        assert_eq!(detached_lane_height(0), 0);
+        assert!(detached_lane(LayoutRect::new(0, 0, 200, 10), 0).is_empty());
+        // And a present lane is exactly one box row plus its separating gap —
+        // never a function of how many boxes there are.
+        assert_eq!(detached_lane_height(1), DETACHED_LANE_GAP + NODE_HEIGHT);
+        assert_eq!(detached_lane_height(9), DETACHED_LANE_GAP + NODE_HEIGHT);
+    }
+
+    #[test]
+    fn detached_boxes_tile_left_to_right_along_the_bottom_of_the_lane() {
+        let area = LayoutRect::new(4, 20, 200, detached_lane_height(3));
+        let rects = detached_lane(area, 3);
+        assert_eq!(rects.len(), 3);
+        for rect in &rects {
+            assert_eq!(rect.width, DETACHED_WIDTH);
+            assert_eq!(rect.height, NODE_HEIGHT);
+            // Bottom-aligned: the gap stays between the graph and the lane.
+            assert_eq!(rect.bottom(), area.bottom());
+            assert!(rect.y >= area.y + DETACHED_LANE_GAP);
+        }
+        assert_eq!(rects[0].x, area.x);
+        assert_eq!(rects[1].x, area.x + DETACHED_WIDTH + COLUMN_GAP);
+        assert_eq!(rects[2].x, area.x + 2 * (DETACHED_WIDTH + COLUMN_GAP));
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                assert!(!rects[i].intersects(&rects[j]), "{i} overlaps {j}");
+            }
+        }
+    }
+
+    /// A box that does not fit is dropped whole, the same way a node box that
+    /// overruns the graph band is — a half-drawn box that still hit-tests is
+    /// the failure mode both rules exist to prevent.
+    #[test]
+    fn detached_boxes_that_do_not_fit_are_dropped_not_clipped() {
+        let area = LayoutRect::new(
+            0,
+            0,
+            2 * DETACHED_WIDTH + COLUMN_GAP,
+            detached_lane_height(1),
+        );
+        let rects = detached_lane(area, 5);
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        for rect in &rects {
+            assert!(rect.right() <= area.right());
+        }
+
+        // Too narrow for even one box, and too short for a box row: nothing.
+        assert!(detached_lane(LayoutRect::new(0, 0, DETACHED_WIDTH - 1, 8), 3).is_empty());
+        assert!(detached_lane(LayoutRect::new(0, 0, 200, NODE_HEIGHT - 1), 3).is_empty());
+    }
+
+    /// The lane never borrows a cell from the graph band above it, and its
+    /// rects never collide with a laid-out node box.
+    #[test]
+    fn the_lane_never_overlaps_the_graph_it_sits_below() {
+        let band = LayoutRect::new(0, 0, 200, 40);
+        let lane_height = detached_lane_height(2);
+        let graph_band = LayoutRect::new(
+            band.x,
+            band.y,
+            band.width,
+            band.height.saturating_sub(lane_height),
+        );
+        let dag = layout(&diamond(), graph_band);
+        let lane = LayoutRect::new(band.x, graph_band.bottom(), band.width, lane_height);
+        let rects = detached_lane(lane, 2);
+        assert_eq!(rects.len(), 2);
+        for (_, node) in &dag.nodes {
+            for detached in &rects {
+                assert!(!node.intersects(detached), "{node:?} vs {detached:?}");
+            }
+        }
+        for detached in &rects {
+            assert!(detached.y >= graph_band.bottom());
+        }
     }
 
     #[test]

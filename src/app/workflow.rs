@@ -36,14 +36,15 @@ use crate::api::schema::{
 use crate::app::state::{ToastKind, ToastNotification};
 use crate::app::App;
 use crate::events::WorkflowAppEvent;
-use crate::workflow::binding::{observe, spawn};
+use crate::workflow::binding::{interrogate, observe, spawn};
 use crate::workflow::engine::expand::ExpandLimit;
 use crate::workflow::engine::{DeliveryFailureNote, Engine, EngineConfig};
 use crate::workflow::model::{
-    Demand, EdgeKind, EdgePayload, EngineInput, Evidence, GrowthLimits, InstancePath, Kvdag,
-    KvdagVersionId, NodeBinding, NodeStatus, NodeToken, NoticeLevel, OutputSchema, PublicPaneId,
-    RunEffect, RunGraph, RunId, RunNode, RunNodeIdx, RunStatus, Runner, SpawnSpec, StoreWrite,
-    Succession, UserNotice, WorkflowEvent, WorkflowId,
+    is_reserved_path, Demand, EdgeKind, EdgePayload, EngineInput, Evidence, GrowthLimits,
+    InstancePath, InterrogationId, Isolation, Kvdag, KvdagVersionId, NodeBinding, NodeStatus,
+    NodeToken, NoticeLevel, OutputSchema, PublicPaneId, RunEffect, RunGraph, RunId, RunNode,
+    RunNodeIdx, RunStatus, Runner, SpawnSpec, StoreWrite, Succession, UserNotice, WorkflowEvent,
+    WorkflowId,
 };
 use crate::workflow::tier::Tier;
 
@@ -63,6 +64,16 @@ const PENDING_WRITE_BUDGET: usize = 4096;
 /// `max_attempts` default, so a broken spawn cannot loop forever.
 const SPAWN_ATTEMPT_BUDGET: u8 = 2;
 
+/// Binds the end-of-run summariser to a command instead of `claude`, as a JSON
+/// array of argv strings (`07-phase3-plan.md` §4 D2, §6 A4).
+///
+/// A **declared configuration**, not a test hook: it is the same first-class
+/// command binding every fixture node already uses, and it is documented beside
+/// `KARVEX_WORKFLOW_DB_PATH`. karvex reads it — unlike the `KARVEX_WORKFLOW_*`
+/// variables in `binding::spawn`, which karvex *sets* on a node's process — and
+/// reads it in exactly one place ([`engine_config`]).
+pub(crate) const SUMMARY_COMMAND_ENV_VAR: &str = "KARVEX_WORKFLOW_SUMMARY_COMMAND";
+
 /// Identity and wire-facing metadata of the run the engine is executing. The
 /// engine's own events carry only ids, so this is what a `workflow.*` event
 /// projection is built from.
@@ -77,6 +88,18 @@ pub(crate) struct ActiveRun {
     pub(crate) tab_id: Option<String>,
     pub(crate) started_at_unix_ms: u64,
     pub(crate) ended_at_unix_ms: Option<u64>,
+    /// Past runs whose summaries this run was given (§4 D21). Recorded on the
+    /// live projection as well as the row, so a client watching a run does not
+    /// have to wait for it to close to see what history it started with.
+    pub(crate) context_runs: Vec<RunId>,
+    /// The run this one restored nodes from (§4 D4).
+    pub(crate) restore_from_run: Option<RunId>,
+    /// Absolute path of `context/prior-runs.md`, when this run was given one
+    /// (§4 D21). Held on the run rather than on `AppState` because it is a fact
+    /// about the run, not about what the TUI is showing — and because every
+    /// node's spawn plan reads it, which is a runtime path, not a presentation
+    /// one.
+    pub(crate) prior_runs_path: Option<String>,
 }
 
 impl ActiveRun {
@@ -96,11 +119,32 @@ impl ActiveRun {
             tab_id: None,
             started_at_unix_ms: current_unix_ms(),
             ended_at_unix_ms: None,
+            context_runs: Vec::new(),
+            restore_from_run: None,
+            prior_runs_path: None,
         }
     }
 
     pub(crate) fn with_args(mut self, args: HashMap<String, String>) -> Self {
         self.args = args;
+        self
+    }
+
+    /// The two history facts recorded at run start (§4 D21, §4 D4). Both are
+    /// decided before `create_run` and written to the row in the same call, so
+    /// the live projection and the journal cannot disagree about them.
+    pub(crate) fn with_history(
+        mut self,
+        context_runs: Vec<RunId>,
+        restore_from_run: Option<RunId>,
+    ) -> Self {
+        self.context_runs = context_runs;
+        self.restore_from_run = restore_from_run;
+        self
+    }
+
+    pub(crate) fn with_prior_runs_path(mut self, prior_runs_path: Option<String>) -> Self {
+        self.prior_runs_path = prior_runs_path;
         self
     }
 
@@ -141,6 +185,8 @@ impl WorkflowStartError {
 #[derive(Debug)]
 pub(crate) struct WorkflowRuntimeState {
     config: EngineConfig,
+    /// The app-enforced half of the `[workflow]` block (§4 D12, D21).
+    policy: WorkflowPolicy,
     engine: Engine,
     run: Option<ActiveRun>,
     pending_writes: VecDeque<StoreWrite>,
@@ -182,6 +228,20 @@ pub(crate) struct WorkflowRuntimeState {
     growth_limits: HashMap<InstancePath, WorkflowGrowthLimit>,
     /// The run-level view of the same fact: whichever limit was recorded last.
     last_growth_limit: Option<WorkflowGrowthLimit>,
+    /// The run whose history has already been pruned, so retention fires once
+    /// per run rather than on every tick a finished run still receives
+    /// (§4 D12).
+    pruned_history_for: Option<RunId>,
+    /// Whether E-11's "summaries disabled" notice has already been shown. Once
+    /// per server, not per run: the cause is a process-lifetime fact.
+    summary_disabled_notified: bool,
+    /// Interrogation panes this server is hosting (§4 D7-D8).
+    ///
+    /// Not cleared by [`Self::start`]: an interrogation belongs to the node it
+    /// revived, not to the run this server happens to be executing, and closing
+    /// one because an unrelated run started would strand its pane with no
+    /// record able to stamp its end.
+    interrogations: Vec<LiveInterrogation>,
 }
 
 /// A `RunEffect` delivery into a node's pane that the in-process API refused.
@@ -208,15 +268,155 @@ impl DeliveryFailure {
 fn is_create_write(write: &StoreWrite) -> bool {
     matches!(
         write,
-        StoreWrite::RunNodeCreated { .. } | StoreWrite::RunEdgeCreated { .. }
+        StoreWrite::RunNodeCreated { .. }
+            | StoreWrite::RunEdgeCreated { .. }
+            // `07-phase3-plan.md` §3 rule 4: an interrogation's create is
+            // addressed by an app-minted id that the later
+            // `InterrogationUpdate` reuses. Evicting the create would leave
+            // every update naming a row that does not exist — a permanent
+            // failure, not one lost row.
+            | StoreWrite::InterrogationStarted { .. }
     )
 }
 
-impl WorkflowRuntimeState {
-    pub(crate) fn new(config: EngineConfig) -> Self {
+/// One interrogation pane this server is currently hosting
+/// (`07-phase3-plan.md` §4 D7-D8).
+///
+/// Deliberately **not** a `RunNode` and deliberately not per-run state: an
+/// interrogation of a run that finished last week can be open while a new run
+/// executes, so [`WorkflowRuntimeState::start`] does not clear these the way it
+/// clears everything keyed to the live run.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LiveInterrogation {
+    pub(crate) id: InterrogationId,
+    /// The run the **source node** belongs to, which is not necessarily the run
+    /// this server is executing.
+    pub(crate) run: RunId,
+    /// The source node's instance path.
+    pub(crate) path: InstancePath,
+    pub(crate) pane: PublicPaneId,
+    pub(crate) source_session_id: String,
+    /// Pre-assigned at spawn when `--session-id` combines with
+    /// `--resume --fork-session` (the step-0 spike verified it does), and
+    /// otherwise learned from the pane's session report (§6 A9).
+    pub(crate) forked_session_id: Option<String>,
+    pub(crate) transcript_path: Option<String>,
+    pub(crate) cwd: String,
+    pub(crate) reconstructed: bool,
+    pub(crate) note: String,
+    pub(crate) started_at_unix_ms: u64,
+}
+
+/// What `workflow.node.interrogate` resolved before anything was created: the
+/// mode's precondition, already checked, turned into what the spawn needs.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum InterrogationSeed {
+    /// The source transcript and the recorded cwd both stat'd; fork it.
+    Resumed {
+        cwd: PathBuf,
+        /// The path that was stat'd, recorded on the row so a later reader
+        /// knows which transcript this fork came from.
+        transcript_path: String,
+    },
+    /// No transcript to resume; stand in from this stored checkpoint, and say
+    /// so (`00-overview.md` Feature 3).
+    Reconstructed {
+        cwd: PathBuf,
+        checkpoint_seq: u64,
+        summary: String,
+        payload: String,
+        original_task: Option<String>,
+        label: String,
+    },
+}
+
+/// Why an interrogation whose preconditions all passed could not get a **pane**.
+///
+/// Carries only the reason: the API code is fixed
+/// (`workflow_interrogation_spawn_failed`, E-15) and is chosen by the handler,
+/// because an interrogation is not a run node (§4 D8) and must not be reported
+/// with the node-spawn codes even though it fails through the same pane
+/// machinery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterrogationSpawnFailed(String);
+
+impl InterrogationSpawnFailed {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// A [`spawn::SpawnError`] from the shared pane machinery, kept as prose:
+    /// its own code names a *node* failure, which this is not.
+    fn from_spawn(error: &spawn::SpawnError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl std::fmt::Display for InterrogationSpawnFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The handler's resolved request, handed to the glue that creates the pane.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InterrogationRequest {
+    pub(crate) run: RunId,
+    pub(crate) path: InstancePath,
+    pub(crate) workflow_name: String,
+    /// The source run's workspace, when it recorded one.
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) source_session_id: String,
+    pub(crate) note: String,
+    pub(crate) seed: InterrogationSeed,
+}
+
+/// The `[workflow]` knobs the **app** enforces, as opposed to the engine's.
+///
+/// Retention and history injection are policies about what the server does
+/// around a run — prune afterwards, inject beforehand — not transitions inside
+/// one, so they belong here rather than on [`EngineConfig`]. `App` does not
+/// keep the loaded [`crate::config::Config`], so they are read once at
+/// construction from the same value `engine_config` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkflowPolicy {
+    /// `workflow.retention_runs` (§4 D12).
+    pub(crate) retention_runs: usize,
+    /// `workflow.history_context_runs` (§4 D21, D22).
+    pub(crate) history_context_runs: usize,
+    /// Whether summaries are off because `KARVEX_WORKFLOW_SUMMARY_COMMAND` could
+    /// not be parsed, as opposed to because the user set
+    /// `workflow.summary_enabled = false` (E-11).
+    ///
+    /// The two are deliberately distinguished: switching summaries off is a
+    /// choice that needs no announcement, while a typo'd override leaves the
+    /// user believing their summariser is bound when it is not.
+    pub(crate) summary_override_invalid: bool,
+}
+
+impl Default for WorkflowPolicy {
+    /// The documented defaults, so a test-constructed runtime behaves like a
+    /// server started with no `[workflow]` block at all.
+    fn default() -> Self {
         Self {
+            retention_runs: 50,
+            history_context_runs: 3,
+            summary_override_invalid: false,
+        }
+    }
+}
+
+/// Reads [`WorkflowPolicy`] off the `[workflow]` config block.
+pub(crate) fn workflow_policy(config: &crate::config::Config) -> WorkflowPolicy {
+    workflow_runtime_config(config).1
+}
+
+impl WorkflowRuntimeState {
+    pub(crate) fn new(config: EngineConfig, policy: WorkflowPolicy) -> Self {
+        Self {
+            engine: Engine::new(config.clone()),
             config,
-            engine: Engine::new(config),
+            policy,
             run: None,
             pending_writes: VecDeque::new(),
             dropped_writes: 0,
@@ -231,7 +431,101 @@ impl WorkflowRuntimeState {
             announced_attention: HashSet::new(),
             growth_limits: HashMap::new(),
             last_growth_limit: None,
+            pruned_history_for: None,
+            summary_disabled_notified: false,
+            interrogations: Vec::new(),
         }
+    }
+
+    /// Claims the one "summaries are disabled" notice this server gets (E-11).
+    /// `true` at most once, and only when the disable came from an unusable
+    /// override rather than from a deliberate config setting.
+    pub(crate) fn claim_summary_disabled_notice(&mut self) -> bool {
+        if !self.policy.summary_override_invalid || self.summary_disabled_notified {
+            return false;
+        }
+        self.summary_disabled_notified = true;
+        true
+    }
+
+    /// Claims the one retention pass this run gets. `true` exactly once per
+    /// run id.
+    pub(crate) fn mark_history_pruned(&mut self, run: &RunId) -> bool {
+        if self.pruned_history_for.as_ref() == Some(run) {
+            return false;
+        }
+        self.pruned_history_for = Some(run.clone());
+        true
+    }
+
+    /// The live interrogation of this exact source node, if one is open.
+    ///
+    /// The authority for §4 D7's one-at-a-time rule is this list and **not**
+    /// `interrogation` rows with no `ended_at`: a row left open by a server that
+    /// died names a pane that no longer exists, and treating it as live would
+    /// refuse the node forever.
+    pub(crate) fn live_interrogation(
+        &self,
+        run: &RunId,
+        path: &InstancePath,
+    ) -> Option<&LiveInterrogation> {
+        self.interrogations
+            .iter()
+            .find(|entry| &entry.run == run && &entry.path == path)
+    }
+
+    pub(crate) fn track_interrogation(&mut self, interrogation: LiveInterrogation) {
+        self.interrogations.push(interrogation);
+        // An interrogation can be opened with no run live at all, and `settle`
+        // — the only other thing that arms the tick — never runs without one.
+        // Without this the reconcile sweep would have no cadence to run on.
+        self.rearm_tick(Instant::now());
+    }
+
+    pub(crate) fn interrogation_for_pane(&self, pane: &PublicPaneId) -> Option<&LiveInterrogation> {
+        self.interrogations.iter().find(|entry| &entry.pane == pane)
+    }
+
+    /// Every interrogation pane, for the reconcile sweep to test against the
+    /// layout.
+    pub(crate) fn interrogation_panes(&self) -> Vec<PublicPaneId> {
+        self.interrogations
+            .iter()
+            .map(|entry| entry.pane.clone())
+            .collect()
+    }
+
+    /// Takes the interrogation whose pane went away. Removing it here is what
+    /// makes the end stamp idempotent: two signals racing for the same dead
+    /// pane produce one `InterrogationUpdate`, not two.
+    pub(crate) fn end_interrogation_for_pane(
+        &mut self,
+        pane: &PublicPaneId,
+    ) -> Option<LiveInterrogation> {
+        let index = self
+            .interrogations
+            .iter()
+            .position(|entry| &entry.pane == pane)?;
+        Some(self.interrogations.remove(index))
+    }
+
+    /// Records a forked session id learned after the record was written (§6
+    /// A9). Returns the interrogation when this is genuinely new information,
+    /// so the caller enqueues exactly one `InterrogationUpdate`.
+    pub(crate) fn learn_forked_session_id(
+        &mut self,
+        pane: &PublicPaneId,
+        session_id: &str,
+    ) -> Option<LiveInterrogation> {
+        let entry = self
+            .interrogations
+            .iter_mut()
+            .find(|entry| &entry.pane == pane)?;
+        if entry.forked_session_id.as_deref() == Some(session_id) {
+            return None;
+        }
+        entry.forked_session_id = Some(session_id.to_string());
+        Some(entry.clone())
     }
 
     /// Records the growth guardrail `path`'s proposal ran into.
@@ -358,11 +652,34 @@ impl WorkflowRuntimeState {
     }
 
     pub(crate) fn config(&self) -> EngineConfig {
-        self.config
+        self.config.clone()
+    }
+
+    pub(crate) fn policy(&self) -> WorkflowPolicy {
+        self.policy
     }
 
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Records the transcript path a node's pane reported, and returns the
+    /// durable write for it (§4 D6, closing §0.5).
+    ///
+    /// The two engine calls are wrapped together here rather than exposed to the
+    /// caller separately, so the in-memory correction and the row update cannot
+    /// come apart: recording without persisting is precisely the live-vs-durable
+    /// divergence this phase keeps having to design against. An unchanged path
+    /// is `None` and costs no write.
+    pub(crate) fn record_transcript_path(
+        &mut self,
+        path: &InstancePath,
+        transcript: PathBuf,
+    ) -> Option<RunEffect> {
+        if !self.engine.record_transcript_path(path, transcript) {
+            return None;
+        }
+        self.engine.node_persist_effect(path)
     }
 
     pub(crate) fn active_run(&self) -> Option<&ActiveRun> {
@@ -377,17 +694,84 @@ impl WorkflowRuntimeState {
         self.engine.definition()
     }
 
+    /// How `run`'s epilogue was bound, when `run` is the run this server holds
+    /// in memory.
+    ///
+    /// The reserved `.summary` path has **no kvdag node** (§4 D5), so every
+    /// definition lookup misses for it and the caller that asks "what runner is
+    /// this node?" has nowhere else to read the answer.
+    /// `EpilogueState::runner` is the single authority D-1 established, and
+    /// this is the by-path face of the by-pane read [`Self::runner_for_pane`]
+    /// makes.
+    ///
+    /// `None` covers three cases the caller must treat alike as "unknown":
+    /// there is no run in memory, the run in memory is a different one, or the
+    /// run had no epilogue. Nothing persists the epilogue's runner — no
+    /// `run_node` column carries it — so a run this server did not execute is
+    /// always `None` here rather than answered from a re-derivation of the
+    /// *current* server's `KARVEX_WORKFLOW_SUMMARY_COMMAND`, which would
+    /// describe a configuration that run never had.
+    pub(crate) fn epilogue_runner(&self, run: &RunId) -> Option<Runner> {
+        let graph = self.engine.graph()?;
+        if graph.run_id != *run {
+            return None;
+        }
+        graph.epilogue.map(|state| state.runner)
+    }
+
     pub(crate) fn run_status(&self) -> Option<RunStatus> {
         self.engine.graph().map(|graph| graph.status)
     }
 
     /// A run is live while it can still make progress. A finished run stays
     /// readable until the next one replaces it.
+    ///
+    /// Deliberately **not** widened by Phase 3 (`07-phase3-plan.md` M7): a
+    /// succeeded run whose epilogue is still working is over, and everything
+    /// keyed on `is_live` — restart guards, the DAG's live/closed split, the
+    /// run's terminal status — must keep reading it that way. The two things
+    /// that do have to outlive it are the *tick* and the run-start guard, and
+    /// both say so explicitly ([`Self::needs_tick`],
+    /// `App::handle_workflow_run`).
     pub(crate) fn is_live(&self) -> bool {
         matches!(
             self.run_status(),
             Some(RunStatus::Pending | RunStatus::Running | RunStatus::Paused)
         )
+    }
+
+    /// Whether the engine's own summariser is still working (§4 D1). The
+    /// run-start guard's second disjunct, so a `workflow.run` arriving during
+    /// the epilogue cannot swap the engine out from under it (M7).
+    pub(crate) fn epilogue_pending(&self) -> bool {
+        self.engine.epilogue_pending()
+    }
+
+    /// Whether the workflow tick still has work to drive.
+    ///
+    /// Three independent reasons, and every one of them outlives
+    /// [`Self::is_live`]: a live run's nodes, the epilogue's summariser after
+    /// the run's status is already final (§4 D1 / §7 R-1), and interrogation
+    /// panes, which belong to no run at all and are reconciled against the
+    /// layout on the same cadence node panes are (§4 D8). Without the third, an
+    /// interrogation opened while nothing is running would never have its end
+    /// stamped by the sweep.
+    fn needs_tick(&self) -> bool {
+        self.is_live() || self.engine.epilogue_pending() || !self.interrogations.is_empty()
+    }
+
+    /// Re-arms or lapses the tick deadline from [`Self::needs_tick`].
+    ///
+    /// `settle` does this for everything that goes through the engine; this is
+    /// the same arithmetic for the two things that do not — tracking an
+    /// interrogation with no live run, and the tick that finds the last one
+    /// gone.
+    pub(crate) fn rearm_tick(&mut self, now: Instant) {
+        self.next_tick_at = match (self.needs_tick(), self.next_tick_at) {
+            (false, _) => None,
+            (true, Some(deadline)) if deadline > now => Some(deadline),
+            (true, _) => Some(now + WORKFLOW_TICK_INTERVAL),
+        };
     }
 
     /// Installs the definition and starts the run. The definition has to be
@@ -403,7 +787,7 @@ impl WorkflowRuntimeState {
         if self.is_live() {
             return Err(WorkflowStartError::RunInFlight);
         }
-        self.engine = Engine::new(self.config);
+        self.engine = Engine::new(self.config.clone());
         self.pending_spawns.clear();
         self.claimed_spawns.clear();
         self.spawn_failures.clear();
@@ -411,6 +795,11 @@ impl WorkflowRuntimeState {
         // Persistence health is a property of the run, not of the process: a
         // previous run's lost write must not leave the next one reporting
         // itself degraded.
+        //
+        // The caller (`App::start_workflow_run`) drains this to the store task
+        // *before* calling in, so what is cleared here is only what the store
+        // task had no room for — never an accepted summary that nothing else
+        // would ever write (M7).
         self.pending_writes.clear();
         self.dropped_writes = 0;
         self.persistence_degraded = false;
@@ -477,11 +866,7 @@ impl WorkflowRuntimeState {
         // than an inactivity timer: the sustained-idle rule counts ticks, and a
         // busy sibling node must not push a stuck node's samples out forever.
         let live = self.is_live();
-        self.next_tick_at = match (live, self.next_tick_at) {
-            (false, _) => None,
-            (true, Some(deadline)) if deadline > now => Some(deadline),
-            (true, _) => Some(now + WORKFLOW_TICK_INTERVAL),
-        };
+        self.rearm_tick(now);
         // Fallback only: a run that leaves the live set through a path the
         // engine did not close (so no `StoreWrite::RunStatus` carried a stamp)
         // still gets an end time. `queue_write` overwrites this with the
@@ -655,10 +1040,23 @@ impl WorkflowRuntimeState {
     /// The binding primitive a node's pane accepts (`04` §5). Without a
     /// definition the binding is unknown, and `Runner::Agent` is the
     /// definition's own default.
+    ///
+    /// **The epilogue is asked about itself** (D-C). It has no kvdag node, so
+    /// the definition lookup below can never resolve for it and the
+    /// `Runner::Agent` fallback would be an outright lie whenever the summariser
+    /// is bound to a command: its corrective re-prompt would go out as
+    /// `agent.prompt` to a pane holding a plain process, fail
+    /// `agent_not_found`, and silently kill the one re-prompt rung of the
+    /// epilogue's bounded ladder (§4 D1). `EpilogueState::runner` is the single
+    /// authority D-1 established for exactly this question — recorded once at
+    /// `begin_epilogue`, read here rather than re-derived.
     pub(crate) fn runner_for_pane(&self, pane: &PublicPaneId) -> Runner {
         let runner = self.engine.graph().and_then(|graph| {
-            let key = &graph.node_by_pane(pane)?.key;
-            Some(self.engine.definition()?.node(key)?.runner)
+            let node = graph.node_by_pane(pane)?;
+            if let Some(epilogue) = graph.epilogue.filter(|state| state.node == node.idx) {
+                return Some(epilogue.runner);
+            }
+            Some(self.engine.definition()?.node(&node.key)?.runner)
         });
         runner.unwrap_or(Runner::Agent)
     }
@@ -758,11 +1156,104 @@ fn workflow_agent_name(graph: &RunGraph, definition: &Kvdag, node: &RunNode) -> 
 /// is `usize`-wide; the engine's streak counters are `u16`, so an out-of-range
 /// value saturates instead of wrapping into a much smaller threshold.
 pub(crate) fn engine_config(config: &crate::config::Config) -> EngineConfig {
-    EngineConfig {
+    workflow_runtime_config(config).0
+}
+
+/// Both halves of the `[workflow]` block from **one** read of the environment.
+///
+/// `KARVEX_WORKFLOW_SUMMARY_COMMAND` is read exactly once per construction
+/// (defect D-1), and both the engine's knobs and the app's policy are derived
+/// from that single reading — including whether the override was *unusable*,
+/// which only the app can surface (E-11) and only the engine can act on.
+/// Deriving them in two functions would mean two readings of one variable, which
+/// is the shape of the defect this rule exists to prevent.
+pub(crate) fn workflow_runtime_config(
+    config: &crate::config::Config,
+) -> (EngineConfig, WorkflowPolicy) {
+    // A malformed override disables the epilogue outright rather than quietly
+    // reverting it to `claude`: running — and billing — an agent the caller
+    // explicitly bound to a command is the failure this rejection exists to
+    // prevent.
+    let (summary_command, summary_override_invalid) = match summary_command_override() {
+        SummaryCommand::Agent => (None, false),
+        SummaryCommand::Argv(argv) => (Some(argv), false),
+        SummaryCommand::Invalid => (None, true),
+    };
+    let engine = EngineConfig {
         max_parallel_nodes: config.workflow.max_parallel_nodes.max(1),
         stuck_threshold: u16::try_from(config.workflow.stuck_threshold).unwrap_or(u16::MAX),
         drift_threshold: u16::try_from(config.workflow.drift_threshold).unwrap_or(u16::MAX),
+        summary_command,
+        summary_enabled: config.workflow.summary_enabled && !summary_override_invalid,
+    };
+    let policy = WorkflowPolicy {
+        retention_runs: config.workflow.retention_runs,
+        history_context_runs: config.workflow.history_context_runs,
+        summary_override_invalid,
+    };
+    (engine, policy)
+}
+
+/// `KARVEX_WORKFLOW_SUMMARY_COMMAND` — the declared binding override that runs
+/// the epilogue as a command instead of `claude` (§4 D2 / §6 A4).
+///
+/// **Read exactly once, here** (defect D-1). The engine has to know which runner
+/// the summariser is — the runner decides which completion signals are
+/// admissible — and the spawn plan takes both runner and argv from the engine's
+/// `summary_task_spec`. A second reader of this variable is how the two end up
+/// disagreeing about what the summariser is.
+///
+/// Invalid content is **refused loudly**: the variable is set deliberately, so
+/// a malformed value means the caller believes the summariser is bound to their
+/// command when it is not. Falling back to `claude` silently would run — and
+/// bill — the wrong thing.
+fn summary_command_override() -> SummaryCommand {
+    parse_summary_command(std::env::var(SUMMARY_COMMAND_ENV_VAR).ok().as_deref())
+}
+
+/// The env-free half of [`summary_command_override`], so the three outcomes are
+/// testable without a process-global other tests would race on.
+fn parse_summary_command(raw: Option<&str>) -> SummaryCommand {
+    let Some(raw) = raw else {
+        return SummaryCommand::Agent;
+    };
+    if raw.trim().is_empty() {
+        return SummaryCommand::Agent;
     }
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(argv) if !argv.is_empty() => SummaryCommand::Argv(argv),
+        Ok(_) => {
+            warn!(
+                "{SUMMARY_COMMAND_ENV_VAR} is an empty argv array; end-of-run summaries are \
+                 disabled for this server rather than run as an agent the caller did not ask for"
+            );
+            SummaryCommand::Invalid
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "{SUMMARY_COMMAND_ENV_VAR} is not a JSON array of strings; end-of-run summaries \
+                 are disabled for this server rather than silently run as an agent"
+            );
+            SummaryCommand::Invalid
+        }
+    }
+}
+
+/// How `KARVEX_WORKFLOW_SUMMARY_COMMAND` resolved.
+///
+/// `Invalid` is deliberately **not** collapsed into `Agent`: the variable being
+/// set at all means the caller has an opinion about what the summariser is, and
+/// answering that opinion with "I ran `claude` instead" is the silent fallback
+/// D-1 forbids.
+#[derive(Debug)]
+enum SummaryCommand {
+    /// Unset or empty: the production path, the summariser runs as an agent.
+    Agent,
+    /// A declared command binding.
+    Argv(Vec<String>),
+    /// Set to something unusable. Summaries are switched off for this server.
+    Invalid,
 }
 
 impl App {
@@ -779,6 +1270,21 @@ impl App {
         graph: RunGraph,
     ) -> Result<(), WorkflowStartError> {
         let now = Instant::now();
+        // E-11: a boot-time `warn!` is evidence nobody reads. If the summariser
+        // was switched off because `KARVEX_WORKFLOW_SUMMARY_COMMAND` could not be
+        // parsed, say so at the moment someone actually cares — the first run
+        // that would otherwise have summarised — and say it exactly once per
+        // server, not once per run.
+        self.notice_summaries_disabled_once();
+        // M7, second half. The run-start guard alone is not enough: an accepted
+        // summary can be sitting in `pending_writes` after the epilogue is
+        // already `Done`, and `WorkflowRuntimeState::start` clears that queue
+        // outright — so the enqueued `StoreWrite::RunSummary` would die with the
+        // engine swap even though the guard passed. Handing it to the store task
+        // *first* is immediate and deterministic; the alternative, refusing
+        // until the queue drains, can block indefinitely behind a backlogged
+        // store task. Silent summary loss is the one outcome ruled out.
+        self.flush_workflow_writes();
         let effects = self.workflow.start(run, definition, graph, now)?;
         self.dispatch_workflow_effects(effects);
         self.drive_workflow_spawns();
@@ -811,8 +1317,13 @@ impl App {
         // Before sampling, because a node whose pane is gone has no agent state
         // to sample and must not be counted as idle for another tick.
         let mut changed = self.reconcile_workflow_pane_bindings();
+        changed |= self.reconcile_interrogation_panes();
         changed |= self.sample_workflow_agent_states(now);
         changed |= self.apply_workflow_engine_input_at(EngineInput::Tick { now }, now);
+        // `settle` re-arms whenever the input reached the engine; with no live
+        // run it returns early and this is what keeps — or lapses — the
+        // interrogation sweep's cadence.
+        self.workflow.rearm_tick(now);
         changed
     }
 
@@ -966,11 +1477,22 @@ impl App {
 
     /// `AppEvent::PaneDied` for a node's pane. The event carries no exit status,
     /// so the engine records the failure without a code.
+    ///
+    /// Also the interrogation end stamp's call site (§4 D7): the same two paths
+    /// that report a node pane's disappearance report an interrogation pane's,
+    /// which is what lets Phase 3 leave `src/events.rs` untouched. An
+    /// interrogation pane is never a node pane, so the engine input below is a
+    /// no-op for it and the two cannot double-handle one pane.
     pub(crate) fn observe_workflow_pane_exit(&mut self, pane_id: crate::layout::PaneId) -> bool {
-        self.handle_workflow_app_event(WorkflowAppEvent::NodePaneExited {
-            pane_id,
-            code: None,
-        })
+        let mut changed = false;
+        if let Some(pane) = self.workflow_public_pane_id(pane_id) {
+            changed |= self.end_workflow_interrogation(&pane);
+        }
+        changed
+            | self.handle_workflow_app_event(WorkflowAppEvent::NodePaneExited {
+                pane_id,
+                code: None,
+            })
     }
 
     /// `workflow.node.report` (§4.3 signal 1). The token is authenticated
@@ -1058,7 +1580,49 @@ impl App {
         self.flush_workflow_writes();
         self.mirror_workflow_run_graph();
         changed |= self.announce_workflow_progress();
+        self.prune_run_history_if_settled();
         changed
+    }
+
+    /// Fires retention once the run is genuinely over (§4 D12).
+    ///
+    /// "Over" means closed **and** its epilogue resolved (`Done`, `GaveUp`, or
+    /// absent): pruning between `run.finished` and the summary landing could
+    /// delete the very run whose summary is still being written. Fire-and-forget
+    /// on the store task, and **never on a read path** — opening the run browser
+    /// must not mutate history.
+    ///
+    /// Once per run: the guard is the run's own id, so the twenty ticks a
+    /// finished run still receives while its panes close do not re-run the
+    /// sweep twenty times.
+    fn prune_run_history_if_settled(&mut self) {
+        #[cfg(feature = "workflow")]
+        {
+            if self.workflow.is_live() || self.workflow.epilogue_pending() {
+                return;
+            }
+            let Some(run) = self.workflow.active_run() else {
+                return;
+            };
+            let workflow = run.workflow_id.clone();
+            let run_id = run.run_id.clone();
+            if !self.workflow.mark_history_pruned(&run_id) {
+                return;
+            }
+            let keep = self.workflow.policy().retention_runs;
+            self.workflow_store.submit(move |cx| {
+                let pruned = cx.block_on(cx.store().prune_run_history(&workflow, keep))?;
+                if pruned > 0 {
+                    tracing::info!(
+                        workflow = %workflow,
+                        pruned,
+                        keep,
+                        "pruned run history down to the retention limit"
+                    );
+                }
+                Ok(())
+            });
+        }
     }
 
     /// Tells the user what the settled graph now says. The engine notices only
@@ -1465,6 +2029,354 @@ impl App {
         Ok(())
     }
 
+    /// Creates an interrogation's pane and records it (`07-phase3-plan.md` §4
+    /// D7).
+    ///
+    /// Every precondition was checked by the handler before this was called, so
+    /// the only failures left are the ones creating a pane can produce. That
+    /// ordering is the "never a silent pane" guarantee: a refusal happens with
+    /// nothing created, and a failure here is reported with nothing left behind
+    /// either.
+    pub(crate) fn spawn_interrogation(
+        &mut self,
+        request: InterrogationRequest,
+    ) -> Result<crate::api::schema::WorkflowInterrogationInfo, InterrogationSpawnFailed> {
+        let ws_idx = self
+            .interrogation_workspace(request.workspace_id.as_deref())
+            .ok_or_else(|| {
+                InterrogationSpawnFailed::new("there is no workspace to host the pane")
+            })?;
+        let target_pane = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.focused_pane_id())
+            .ok_or_else(|| InterrogationSpawnFailed::new("the workspace has no pane to split"))?;
+
+        let id = interrogate::mint_interrogation_id();
+        // Pre-assigned rather than learned: the step-0 spike verified that
+        // `--session-id` combines with `--resume --fork-session`, which is §4
+        // D7's preferred path — the row carries the fork's identity from the
+        // moment it is created. The async learn below stays as belt-and-braces
+        // for the case where a future `claude` stops honouring it (§6 A9).
+        let forked_session_id = interrogate::mint_forked_session_id();
+        let reconstructed = matches!(request.seed, InterrogationSeed::Reconstructed { .. });
+
+        let (cwd, argv, seeded_from_seq, source_transcript) = match &request.seed {
+            InterrogationSeed::Resumed {
+                cwd,
+                transcript_path,
+            } => (
+                cwd.clone(),
+                interrogate::resumed_argv(&request.source_session_id, &forked_session_id),
+                None,
+                Some(transcript_path.clone()),
+            ),
+            InterrogationSeed::Reconstructed {
+                cwd,
+                checkpoint_seq,
+                summary,
+                payload,
+                original_task,
+                label,
+            } => {
+                let dir = interrogate::interrogation_dir(
+                    &spawn::run_dir(&spawn::runs_root(), &request.run),
+                    &id,
+                );
+                let markdown = interrogate::ReconstructedSeed {
+                    workflow_name: &request.workflow_name,
+                    run: request.run.as_str(),
+                    path: request.path.as_str(),
+                    label,
+                    checkpoint_seq: *checkpoint_seq,
+                    summary,
+                    payload,
+                    original_task: original_task.as_deref(),
+                    note: &request.note,
+                }
+                .render();
+                let seed_file = interrogate::materialise_interrogation_dir(&dir, &markdown)
+                    .map_err(|err| {
+                        InterrogationSpawnFailed::new(format!(
+                            "the interrogation seed could not be written: {err}"
+                        ))
+                    })?;
+                (
+                    cwd.clone(),
+                    interrogate::reconstructed_argv(&forked_session_id, &dir, &seed_file),
+                    Some(*checkpoint_seq),
+                    None,
+                )
+            }
+        };
+
+        // D6/§0.5's estimate formula, over the **spawn** cwd and the **minted**
+        // session id — the fork's own transcript, not the source's. Recorded at
+        // spawn so a later reader can find the forked transcript the same way
+        // it finds a node's.
+        let transcript_path = spawn::transcript_path(&cwd, &forked_session_id)
+            .ok()
+            .map(|path| path.display().to_string());
+
+        let (rows, cols) = self.state.estimate_pane_size();
+        let context = spawn::PaneSpawnContext {
+            target_pane,
+            direction: Direction::Horizontal,
+            rows,
+            cols,
+            scrollback_limit_bytes: self.state.pane_scrollback_limit_bytes,
+            host_terminal_theme: self.state.host_terminal_theme,
+            host_terminal_appearance: self.state.host_terminal_appearance,
+            // Unlike a node's pane: an interrogation is something the human just
+            // asked for and is about to type into, so it takes focus.
+            focus: true,
+        };
+        let workspace = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .ok_or_else(|| InterrogationSpawnFailed::new("the workspace disappeared"))?;
+        let (tab_idx, new_pane) =
+            interrogate::spawn_interrogation_pane(workspace, context, &argv, &cwd)
+                .map_err(|err| InterrogationSpawnFailed::from_spawn(&err))?;
+
+        let mut terminal = new_pane.terminal;
+        let terminal_id = terminal.id.clone();
+        let pane_title = interrogate::interrogation_pane_title(
+            &request.workflow_name,
+            request.path.as_str(),
+            reconstructed,
+        );
+        terminal.set_manual_label(pane_title);
+        // The same managed-agent confirmation a node's pane gets: an
+        // interrogation *is* a `claude` process, and the detector has to know
+        // that as surely as it does for a node (§3 rule 7).
+        terminal.begin_managed_agent(
+            interrogate::interrogation_agent_name(&request.path, &id),
+            crate::detect::Agent::Claude,
+            Instant::now(),
+            spawn::NODE_AGENT_SETTLE_DELAY,
+            spawn::NODE_AGENT_LAUNCH_WINDOW,
+        );
+        self.terminal_runtimes
+            .insert(terminal_id.clone(), new_pane.runtime);
+        self.state
+            .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
+        self.state.terminals.insert(terminal_id, terminal);
+        self.schedule_session_save();
+        if let Some(pane) = self.pane_info(ws_idx, new_pane.pane_id) {
+            self.emit_event(EventEnvelope {
+                event: EventKind::PaneCreated,
+                data: EventData::PaneCreated { pane },
+            });
+        }
+        self.emit_layout_updated_event(ws_idx, tab_idx);
+
+        let pane = PublicPaneId::new(
+            self.public_pane_id(ws_idx, new_pane.pane_id)
+                .ok_or_else(|| InterrogationSpawnFailed::new("the pane has no public id"))?,
+        );
+        let started_at_unix_ms = current_unix_ms();
+        let live = LiveInterrogation {
+            id: id.clone(),
+            run: request.run.clone(),
+            path: request.path.clone(),
+            pane,
+            source_session_id: request.source_session_id.clone(),
+            forked_session_id: Some(forked_session_id),
+            // The row records the transcript this fork will write, and — for a
+            // resumed fork — the source it was taken from is already named by
+            // `source_session_id`, so nothing is lost by carrying only one.
+            transcript_path: transcript_path.or(source_transcript),
+            cwd: cwd.display().to_string(),
+            reconstructed,
+            note: request.note.clone(),
+            started_at_unix_ms,
+        };
+        self.workflow.queue_write(StoreWrite::InterrogationStarted {
+            id: id.clone(),
+            run: live.run.clone(),
+            path: live.path.clone(),
+            source_session_id: live.source_session_id.clone(),
+            forked_session_id: live.forked_session_id.clone(),
+            transcript_path: live.transcript_path.clone(),
+            cwd: live.cwd.clone(),
+            pane_id: live.pane.clone(),
+            reconstructed,
+            seeded_from_seq,
+            note: live.note.clone(),
+            started_at_unix_ms,
+        });
+        let info = wire_interrogation_info(&live, None);
+        self.workflow.track_interrogation(live);
+        self.flush_workflow_writes();
+        self.emit_event(EventEnvelope {
+            event: EventKind::WorkflowInterrogationStarted,
+            data: EventData::WorkflowInterrogationStarted {
+                interrogation: info.clone(),
+            },
+        });
+        Ok(info)
+    }
+
+    /// Stamps an interrogation's end when its pane goes away.
+    ///
+    /// Called from the two paths that already report a pane's disappearance —
+    /// `AppEvent::PaneDied` and `App::close_pane` — through
+    /// [`App::observe_workflow_pane_exit`], which is why Phase 3 adds no
+    /// `AppEvent` variant (§4 D7, and `07-phase3-plan.md` §0's
+    /// uncommitted-diff rule).
+    pub(crate) fn end_workflow_interrogation(&mut self, pane: &PublicPaneId) -> bool {
+        let Some(ended) = self.workflow.end_interrogation_for_pane(pane) else {
+            return false;
+        };
+        let ended_at_unix_ms = current_unix_ms();
+        self.workflow.queue_write(StoreWrite::InterrogationUpdate {
+            id: ended.id.clone(),
+            forked_session_id: None,
+            ended_at_unix_ms: Some(ended_at_unix_ms),
+        });
+        self.flush_workflow_writes();
+        self.emit_event(EventEnvelope {
+            event: EventKind::WorkflowInterrogationEnded,
+            data: EventData::WorkflowInterrogationEnded {
+                interrogation: wire_interrogation_info(&ended, Some(ended_at_unix_ms)),
+            },
+        });
+        true
+    }
+
+    /// The interrogation half of the reconcile sweep.
+    ///
+    /// Deliberately a **parallel** sweep rather than an extension of
+    /// [`App::reconcile_workflow_pane_bindings`] (§4 D8): that one fails the
+    /// *node* whose pane vanished, and an interrogation has no node to fail —
+    /// running it through there would report a dead node pane for a node that
+    /// is perfectly fine. What it shares is the reason it exists: bulk closes
+    /// (`handle_tab_close`, `handle_workspace_close`) drop panes without telling
+    /// anyone, so the tick reconciles against the layout instead of chasing
+    /// call sites.
+    pub(crate) fn reconcile_interrogation_panes(&mut self) -> bool {
+        let orphaned: Vec<PublicPaneId> = self
+            .workflow
+            .interrogation_panes()
+            .into_iter()
+            .filter(|pane| !self.workflow_pane_is_live(pane))
+            .collect();
+        let mut changed = false;
+        for pane in orphaned {
+            debug!(pane = %pane, "interrogation pane left the layout; stamping its end");
+            changed |= self.end_workflow_interrogation(&pane);
+        }
+        changed
+    }
+
+    /// Surfaces, once, that end-of-run summaries are off because the argv
+    /// override could not be read (E-11, strengthening §4 D2 / §6 A4).
+    ///
+    /// Only for the *malformed-override* case. A user who set
+    /// `workflow.summary_enabled = false` chose that and does not need telling;
+    /// a user whose environment variable is a typo believes their summariser is
+    /// bound and would otherwise find out by noticing summaries never appear.
+    fn notice_summaries_disabled_once(&mut self) {
+        if !self.workflow.claim_summary_disabled_notice() {
+            return;
+        }
+        self.show_workflow_notice(UserNotice {
+            level: NoticeLevel::Warning,
+            run: None,
+            path: None,
+            message: format!(
+                "summaries disabled: {SUMMARY_COMMAND_ENV_VAR} is not a valid argv array"
+            ),
+        });
+    }
+
+    /// Writes back the transcript path a workflow pane's session report carried
+    /// (§4 D6), replacing the pre-launch estimate.
+    ///
+    /// `spawn::transcript_path` derives the stored path from
+    /// `(claude_dir, slug(cwd), session_id)` before the process starts, and its
+    /// own docstring says to prefer the reported path "once it arrives" —
+    /// nothing ever read it back, so a node whose real transcript lived
+    /// elsewhere answered `transcript_unavailable` no matter what was on disk
+    /// (§0.5). This is the read-back.
+    ///
+    /// A **strict no-op** for any pane that is not a workflow node's: the two
+    /// call sites are the general-purpose `pane.report_agent*` handlers, which
+    /// every agent pane in the session reaches, and the workflow runtime has no
+    /// business reacting to panes it does not own.
+    pub(crate) fn observe_workflow_transcript_path(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        source: &str,
+        agent_label: &str,
+        agent_session_path: Option<&str>,
+    ) -> bool {
+        // Cheapest discriminator first: almost every report reaching here is for
+        // a pane no run owns.
+        let Some(reported) =
+            observe::reported_transcript_path(source, agent_label, agent_session_path)
+        else {
+            return false;
+        };
+        let Some(pane) = self.workflow_public_pane_id(pane_id) else {
+            return false;
+        };
+        let Some(path) = self.workflow.node_path_for_pane(&pane) else {
+            return false;
+        };
+        let Some(effect) = self.workflow.record_transcript_path(&path, reported) else {
+            return false;
+        };
+        debug!(path = %path, "a workflow node's session reported its transcript path");
+        // Dispatched rather than queued directly: this is a `RunEffect` like any
+        // other, and the batch dispatcher is what drains it to the store task.
+        self.dispatch_workflow_effects(vec![effect])
+    }
+
+    /// Learns an interrogation's forked session id from its pane's session
+    /// report (§6 A9).
+    ///
+    /// Belt-and-braces: the id is pre-assigned at spawn because the step-0 spike
+    /// verified `--session-id` combines with `--resume --fork-session`. This
+    /// exists so a future `claude` that stops honouring the pre-assignment
+    /// degrades to a late-but-correct record rather than a permanently null one.
+    pub(crate) fn observe_interrogation_session_id(
+        &mut self,
+        pane: &PublicPaneId,
+        session_id: &str,
+    ) -> bool {
+        let Some(learned) = self.workflow.learn_forked_session_id(pane, session_id) else {
+            return false;
+        };
+        self.workflow.queue_write(StoreWrite::InterrogationUpdate {
+            id: learned.id,
+            forked_session_id: learned.forked_session_id,
+            ended_at_unix_ms: None,
+        });
+        self.flush_workflow_writes();
+        true
+    }
+
+    /// Which workspace hosts an interrogation's pane: the source run's own when
+    /// it recorded one and it still resolves, else the active workspace.
+    ///
+    /// Unlike a node's pane, falling back is right here: the run being
+    /// interrogated may have finished in a workspace the user has since closed,
+    /// and refusing to open the pane at all would be a worse answer than opening
+    /// it where the user is looking.
+    fn interrogation_workspace(&self, workspace_id: Option<&str>) -> Option<usize> {
+        let named = workspace_id.and_then(|workspace_id| self.parse_workspace_id(workspace_id));
+        named.or(self.state.active).filter(|ws_idx| {
+            self.state
+                .workspaces
+                .get(*ws_idx)
+                .is_some_and(|workspace| !workspace.tabs.is_empty())
+        })
+    }
+
     /// The run's own workspace when it named one, else the active workspace.
     fn workflow_run_workspace(&self) -> Option<usize> {
         let named = self
@@ -1478,6 +2390,13 @@ impl App {
                 .get(*ws_idx)
                 .is_some_and(|workspace| !workspace.tabs.is_empty())
         })
+    }
+
+    /// [`Self::workflow_node_cwd`] for callers outside this module — the
+    /// interrogation handler's fallback directory for a reconstructed session
+    /// whose node directory is gone.
+    pub(crate) fn workflow_node_cwd_for(&self, ws_idx: usize) -> PathBuf {
+        self.workflow_node_cwd(ws_idx)
     }
 
     /// Phase 1 runs every node in the workspace's own directory.
@@ -1513,6 +2432,13 @@ impl App {
         let node = graph
             .node_by_path(path)
             .ok_or_else(|| format!("no node at {path}"))?;
+        // The epilogue has no kvdag node behind it, so the lookup below would
+        // fail for it. Its whole plan comes from the engine instead (§3 rule 2),
+        // which is also the single authority for whether it is bound to an agent
+        // or to a command (defect D-1).
+        if is_reserved_path(path.as_str()) {
+            return self.epilogue_spawn_plan(run, graph, node, cwd);
+        }
         let spec_node = definition
             .node(&node.key)
             .ok_or_else(|| format!("the definition has no node {}", node.key))?;
@@ -1612,6 +2538,10 @@ impl App {
             contract: &contract,
             prompt: &prompt,
             input_ports: &input_ports,
+            // §4 D21: two lines pointing at the run's one context file, and
+            // absent entirely when the run has none — which is what keeps every
+            // Phase 1–2 `task.md` byte-identical (§7 R-7).
+            prior_runs: run.prior_runs_path.as_deref(),
         }
         .render();
 
@@ -1656,6 +2586,85 @@ impl App {
             inputs,
             transcript_path,
             pane_title,
+        })
+    }
+
+    /// The end-of-run summariser's spawn plan (§4 D1, D2, §3 rule 2).
+    ///
+    /// Every field that would come from a kvdag node comes from the engine's
+    /// [`crate::workflow::engine::Engine::summary_task_spec`] instead — task
+    /// text, output schema, **and the argv override**. The override is read from
+    /// the spec and never from the environment here: two readers of
+    /// `KARVEX_WORKFLOW_SUMMARY_COMMAND` is exactly how the engine's signal
+    /// gating and the binder's argv end up disagreeing about what the
+    /// summariser is (defect D-1).
+    fn epilogue_spawn_plan(
+        &self,
+        run: &ActiveRun,
+        graph: &RunGraph,
+        node: &RunNode,
+        cwd: PathBuf,
+    ) -> Result<NodeSpawnPlan, String> {
+        let spec = self
+            .workflow
+            .engine()
+            .summary_task_spec()
+            .ok_or_else(|| "the run has no epilogue to spawn".to_string())?;
+        let runner = graph
+            .epilogue
+            .map(|state| state.runner)
+            .ok_or_else(|| "the run graph has no epilogue state".to_string())?;
+        let run_dir = spawn::run_dir(&spawn::runs_root(), &run.run_id);
+        let layout = spawn::NodeDirLayout::for_node(&run_dir, &node.path);
+        let agent_session_id =
+            spawn::derive_agent_session_id(&run.run_id, &node.path, node.attempt);
+        let transcript_path = spawn::transcript_path(&cwd, &agent_session_id)
+            .map_err(|err| format!("the summariser's transcript path is unknown: {err}"))?;
+        Ok(NodeSpawnPlan {
+            spec: SpawnSpec {
+                run_id: run.run_id.clone(),
+                path: node.path.clone(),
+                label: spec.label.clone(),
+                runner,
+                command: spec.command.clone(),
+                assignment: node.assignment,
+                agent_session_id,
+                node_dir: layout.root.clone(),
+                cwd,
+                // The summariser reads a file the engine wrote and writes one
+                // back; it has no reason to hold a worktree of its own.
+                isolation: Isolation::None,
+                // No workflow contract: the epilogue is karvex's node, not the
+                // author's, and appending the author's contract would let a
+                // workflow's own instructions rewrite what the summariser is
+                // for.
+                contract: String::new(),
+                seed_prompt: spawn::seed_prompt_for(&layout.root),
+                // A real node token: the summariser completes through the
+                // ordinary `NodeSelfReport` path (§3 rule 2), unlike an
+                // interrogation, which gets none because it is not a node.
+                token: spawn::mint_node_token(),
+            },
+            // Authored by `summary_output_schema`, so it validates by
+            // construction; a parse failure here would mean the engine's own
+            // built-in schema is malformed, which is a bug to surface rather
+            // than a run to fail silently.
+            output_schema: OutputSchema::parse(spec.output_schema.clone())
+                .map_err(|err| format!("the built-in summary schema is invalid: {err}"))?,
+            layout,
+            task_markdown: spec.task_markdown.clone(),
+            // The epilogue has no inbound edges: the evidence it summarises is
+            // rendered into its `task.md` by `summary_task_spec`, not carried
+            // on ports.
+            inputs: BTreeMap::new(),
+            transcript_path,
+            pane_title: spawn::node_pane_title(
+                self.state
+                    .workflow_run_presentation()
+                    .workflow_name
+                    .as_str(),
+                &spec.label,
+            ),
         })
     }
 
@@ -1748,6 +2757,27 @@ impl App {
     }
 
     fn emit_workflow_event(&mut self, event: WorkflowEvent) {
+        // C-4 / §6 A7: the run browser refreshes on run-level event arrivals
+        // rather than polling, which is what keeps `src/app/runtime.rs` and
+        // `app/mod.rs` out of Phase 3's diff entirely. The *trigger* lives here,
+        // with the component that owns event emission; the *behaviour* lives in
+        // WS-F's `refresh_workflow_runs_overlay`, which no-ops unless the
+        // browser is open.
+        //
+        // Cloned only for the four run-level kinds, so the common case — a node
+        // event, several per node per run — pays nothing. Deliberately called
+        // *after* the match rather than before: `RunSummarized`'s arm flushes
+        // the summary write to the store task, and a refresh that re-read the
+        // list before that flush would show the row it is refreshing *for* as
+        // still missing.
+        let refresh = matches!(
+            event,
+            WorkflowEvent::RunStarted { .. }
+                | WorkflowEvent::RunUpdated { .. }
+                | WorkflowEvent::RunFinished { .. }
+                | WorkflowEvent::RunSummarized { .. }
+        )
+        .then(|| event.clone());
         let envelope = match event {
             WorkflowEvent::RunStarted { run } => self.workflow_run_info(&run).map(|run| {
                 (
@@ -1857,11 +2887,77 @@ impl App {
                     },
                 ))
             }
+            // The engine's variant carries only enough to decide that something
+            // needs re-reading; the full `run_summary` row is read back from the
+            // store here, exactly as `NodeUpdated` re-reads the node's
+            // projection. There is no second `run.finished` and no
+            // `run.updated`: the run's status was final before the summariser
+            // started (§4 D1's post-`RunFinished` contract).
+            WorkflowEvent::RunSummarized { run, .. } => {
+                self.stored_run_summary(&run).map(|summary| {
+                    (
+                        EventKind::WorkflowRunSummarized,
+                        EventData::WorkflowRunSummarized {
+                            run_id: run.to_string(),
+                            summary,
+                        },
+                    )
+                })
+            }
         };
-        let Some((event, data)) = envelope else {
-            return;
-        };
-        self.emit_event(EventEnvelope { event, data });
+        if let Some((event, data)) = envelope {
+            self.emit_event(EventEnvelope { event, data });
+        }
+        // Runs even when the envelope was `None` — a run-level event with no
+        // wire projection still means the run set may have moved, and the
+        // browser is showing that set.
+        if let Some(event) = refresh {
+            self.refresh_workflow_runs_overlay(&event);
+        }
+    }
+
+    /// Reads back the summary the epilogue just wrote, for the
+    /// `workflow.run.summarized` event's payload.
+    ///
+    /// The `StoreWrite::RunSummary` is still in the pending queue when the
+    /// engine's `RunSummarized` effect is dispatched — the batch's flush runs
+    /// after every effect — so this flushes first and then reads. The store
+    /// thread serves its jobs in order, which is what makes the read see the
+    /// write submitted immediately before it.
+    ///
+    /// `None` under a backlogged store task means the write had no room in the
+    /// thread's queue yet: the row is not lost (it stays in the engine's own
+    /// bounded queue and lands later) and `workflow.summary.get` answers it, so
+    /// the miss costs the notification, not the summary. That is D10's split —
+    /// the event is a notification, the read method is the contract.
+    fn stored_run_summary(
+        &mut self,
+        run: &RunId,
+    ) -> Option<crate::api::schema::WorkflowRunSummaryInfo> {
+        self.flush_workflow_writes();
+        #[cfg(feature = "workflow")]
+        {
+            let wanted = run.clone();
+            match self
+                .workflow_store
+                .call(move |cx| cx.block_on(cx.store().get_run_summary(&wanted)))
+            {
+                Ok(Ok(Some(record))) => return Some(wire_run_summary_record(record)),
+                Ok(Ok(None)) => {
+                    warn!(run = %run, "the run summary is not readable back yet; \
+                          workflow.run.summarized is not emitted for it");
+                }
+                Ok(Err(error)) => {
+                    warn!(run = %run, error = %error, "reading back the run summary failed");
+                }
+                Err(unavailable) => {
+                    warn!(run = %run, code = unavailable.code, "the workflow store is unavailable");
+                }
+            }
+        }
+        #[cfg(not(feature = "workflow"))]
+        let _ = run;
+        None
     }
 
     /// Wire projection of the active run. Returns `None` for a run id that is
@@ -1893,11 +2989,37 @@ impl App {
             ended_at_unix_ms: active.ended_at_unix_ms,
             total_tokens,
             total_tool_uses,
-            nodes_total: u32::try_from(graph.nodes.len()).unwrap_or(u32::MAX),
+            // §4 D5: these counters mean "the run's **declared** work", so the
+            // engine-owned `.summary` epilogue is excluded from both. Including
+            // it would make every summarised run report `nodes_done <
+            // nodes_total` at the instant `run.finished` fires — the epilogue
+            // has not run yet — which is an ordering lie no client could work
+            // around.
+            //
+            // The store's `refresh_nodes_done`/`refresh_run_node_counters`
+            // apply the same reserved-path filter (WS-B). The two halves are
+            // inseparable: the live and durable projections are compared field
+            // for field by `a_finished_run_reads_back_field_equal_to_its_live_
+            // projection`, so filtering one side alone is a permanent
+            // disagreement, not a partial fix.
+            //
+            // Counts only. The summariser stays **visible** — the DAG's own
+            // `run_counts` and its node box are deliberately unfiltered (§4 D1's
+            // post-`RunFinished` contract): a succeeded run showing a still-
+            // working summariser is the truthful picture.
+            nodes_total: u32::try_from(
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|node| !is_reserved_path(node.path.as_str()))
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
             nodes_done: u32::try_from(
                 graph
                     .nodes
                     .iter()
+                    .filter(|node| !is_reserved_path(node.path.as_str()))
                     .filter(|node| node.status.is_terminal())
                     .count(),
             )
@@ -1913,6 +3035,21 @@ impl App {
             // (`src/workflow/store/queries.rs::growth_limits`), so the two
             // projections agree rather than one of them going quiet.
             growth_limited: self.workflow.last_growth_limit().cloned(),
+            // §4 D9: the name the author gave the workflow, which the run graph
+            // itself only knows as a record id. Read from the same presentation
+            // state the DAG overlay heads the run with, so the live row and the
+            // overlay cannot disagree about what the run is called.
+            workflow_name: self
+                .state
+                .workflow_run_presentation()
+                .workflow_name
+                .to_string(),
+            // §4 D21 / §4 D4: recorded on the run at start and carried on the
+            // live projection too, so a client does not have to wait for the
+            // run to close before it can see what history it was given and what
+            // it restored from.
+            context_runs: active.context_runs.iter().map(RunId::to_string).collect(),
+            restore_from_run: active.restore_from_run.as_ref().map(RunId::to_string),
         })
     }
 
@@ -1920,11 +3057,32 @@ impl App {
     pub(crate) fn workflow_node_info(&self, path: &InstancePath) -> Option<WorkflowRunNodeInfo> {
         let graph = self.workflow.graph()?;
         let node = graph.node_by_path(path)?;
-        let demand = self
-            .workflow
-            .definition()
-            .and_then(|definition| definition.node(&node.key))
-            .map_or(Demand::Standard, |definition| definition.demand);
+        // The epilogue has **no kvdag node behind it** (§4 D5), so the lookup
+        // below cannot succeed for it and its `Standard` fallback would report a
+        // demand the engine never gave it: `begin_epilogue` creates the
+        // summariser at `Demand::Light` and persists exactly that, so the live
+        // projection said `standard` while the row said `light` for the same
+        // node. That is the live-vs-durable disagreement D16 exists to catch.
+        //
+        // The pin is `epilogue_node_shape` inside
+        // `a_restored_and_summarised_run_reads_back_field_equal_to_its_live_
+        // projection`, which compares this node's `demand`/`model`/`effort`/
+        // `label`/`assignment_reason` across a restart once the summariser is
+        // terminal. Not `run_shape`: that projection now filters reserved paths
+        // out entirely — the epilogue is still live at the instant a run reports
+        // finished — so it cannot see this field at all.
+        let demand = if is_reserved_path(node.path.as_str()) {
+            // One constant, two readers (E-13): `begin_epilogue` resolves the
+            // summariser's tier from it and writes it on the row, and this reads
+            // it back for the wire. A literal here would be a second magic value
+            // free to drift from the engine's.
+            crate::workflow::engine::EPILOGUE_DEMAND
+        } else {
+            self.workflow
+                .definition()
+                .and_then(|definition| definition.node(&node.key))
+                .map_or(Demand::Standard, |definition| definition.demand)
+        };
         let binding = node.binding.as_ref();
         Some(WorkflowRunNodeInfo {
             path: node.path.to_string(),
@@ -1975,6 +3133,20 @@ impl App {
             // attribute the run-level breach to the node that caused it
             // without replaying the event stream.
             growth_limited: self.workflow.node_growth_limit(&node.path).cloned(),
+            // §4 D6: the session-reported path once the hook has reported one,
+            // and the pre-launch estimate until then — the binding holds
+            // whichever is current, so this reports what interrogation would
+            // actually stat.
+            transcript_path: binding.map(|binding| binding.transcript_path.display().to_string()),
+            // §4 D4: `None` for every node this run executed; set only on a node
+            // seeded by restore.
+            restored_from: node.restored_from.as_ref().map(|source| {
+                crate::api::schema::WorkflowRestoredFrom {
+                    run_id: source.run.to_string(),
+                    node_key: source.node_key.to_string(),
+                    checkpoint_seq: source.checkpoint_seq,
+                }
+            }),
         })
     }
 
@@ -2005,6 +3177,75 @@ impl App {
             })
             .collect();
         Some(WorkflowRunGraph { nodes, edges })
+    }
+}
+
+/// Wire projection of one interrogation.
+///
+/// `ended_at_unix_ms` is supplied by the caller rather than carried on
+/// [`LiveInterrogation`]: the tracker only ever holds *live* entries, and the
+/// one moment an ended projection is needed is the instant the entry is taken
+/// out of it.
+pub(crate) fn wire_interrogation_info(
+    interrogation: &LiveInterrogation,
+    ended_at_unix_ms: Option<u64>,
+) -> crate::api::schema::WorkflowInterrogationInfo {
+    crate::api::schema::WorkflowInterrogationInfo {
+        id: interrogation.id.to_string(),
+        run_id: interrogation.run.to_string(),
+        path: interrogation.path.to_string(),
+        source_session_id: interrogation.source_session_id.clone(),
+        forked_session_id: interrogation.forked_session_id.clone(),
+        pane_id: Some(interrogation.pane.to_string()),
+        reconstructed: interrogation.reconstructed,
+        transcript_path: interrogation.transcript_path.clone(),
+        cwd: interrogation.cwd.clone(),
+        started_at_unix_ms: interrogation.started_at_unix_ms,
+        ended_at_unix_ms,
+        note: interrogation.note.clone(),
+    }
+}
+
+/// Wire projection of one stored `run_summary` row.
+///
+/// Lives here rather than beside the handlers because both the
+/// `workflow.summary.*` responses and the `workflow.run.summarized` event
+/// project the same record, and two spellings of one mapping is how a field
+/// starts appearing on one surface and not the other.
+///
+/// Feature-gated because its *input* is a store type: only `src/workflow/store`
+/// is behind the `workflow` feature, and a slim build has no `RunSummaryRecord`
+/// to project. The wire type it produces compiles unconditionally, which is what
+/// keeps the schema artifact single-valued on both legs.
+#[cfg(feature = "workflow")]
+pub(crate) fn wire_run_summary_record(
+    record: crate::workflow::store::RunSummaryRecord,
+) -> crate::api::schema::WorkflowRunSummaryInfo {
+    crate::api::schema::WorkflowRunSummaryInfo {
+        run_id: record.run.to_string(),
+        workflow_id: record.workflow.to_string(),
+        workflow_name: record.workflow_name,
+        version_id: record.version.to_string(),
+        text: record.text,
+        outcome: record.outcome,
+        highlights: record.highlights,
+        open_gaps: record.open_gaps,
+        per_node: record
+            .per_node
+            .into_iter()
+            .map(|line| crate::api::schema::WorkflowSummaryNodeLine {
+                node_key: line.node_key,
+                verdict: line.verdict,
+                one_liner: line.one_liner,
+            })
+            .collect(),
+        token_estimate: record.token_estimate,
+        generated_by_path: record
+            .generated_by_path
+            .as_ref()
+            .map(InstancePath::to_string),
+        created_at_unix_ms: record.created_at_unix_ms,
+        run_pruned: record.run_pruned,
     }
 }
 
@@ -2368,7 +3609,8 @@ mod tests {
     }
 
     fn started_state() -> WorkflowRuntimeState {
-        let mut state = WorkflowRuntimeState::new(EngineConfig::default());
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
         let definition = definition();
         let graph = graph_of(&definition);
         state
@@ -2421,12 +3663,291 @@ mod tests {
         assert_eq!(engine.max_parallel_nodes, 4);
         assert_eq!(engine.stuck_threshold, 3);
         assert_eq!(engine.drift_threshold, 5);
+        // §4 D22: summaries default on, and the production path is the agent
+        // binding — `summary_command: None` — unless the environment declares
+        // an override.
+        assert!(engine.summary_enabled);
+        let policy = workflow_policy(&config);
+        assert_eq!(policy.retention_runs, 50);
+        assert_eq!(policy.history_context_runs, 3);
+    }
+
+    /// The three ways `KARVEX_WORKFLOW_SUMMARY_COMMAND` resolves (§4 D2, defect
+    /// D-1). Written against the parser rather than the environment so it does
+    /// not fight other tests over a process-global.
+    #[test]
+    fn a_malformed_summary_command_disables_summaries_rather_than_reverting_to_claude() {
+        // Unset/empty is the production path: run as an agent.
+        assert!(matches!(parse_summary_command(None), SummaryCommand::Agent));
+        assert!(matches!(
+            parse_summary_command(Some("   ")),
+            SummaryCommand::Agent
+        ));
+        // A declared command binding.
+        match parse_summary_command(Some(r#"["/bin/echo","hi"]"#)) {
+            SummaryCommand::Argv(argv) => assert_eq!(argv, vec!["/bin/echo", "hi"]),
+            other => panic!("expected an argv binding, got {other:?}"),
+        }
+        // Set to something unusable. The caller has an opinion about what the
+        // summariser is; answering it with "I ran `claude` instead" is the
+        // silent fallback D-1 forbids, so summaries switch off entirely.
+        assert!(matches!(
+            parse_summary_command(Some("not json")),
+            SummaryCommand::Invalid
+        ));
+        assert!(matches!(
+            parse_summary_command(Some("[]")),
+            SummaryCommand::Invalid
+        ));
+        assert!(matches!(
+            parse_summary_command(Some(r#"{"argv":["x"]}"#)),
+            SummaryCommand::Invalid
+        ));
+    }
+
+    /// E-11: a boot-time log line is evidence nobody reads, so the disable is
+    /// surfaced at the first run that would have summarised — and exactly once,
+    /// because the cause is a process-lifetime fact, not a per-run one.
+    #[test]
+    fn a_disabled_summariser_is_announced_once_per_server() {
+        let mut state = WorkflowRuntimeState::new(
+            EngineConfig {
+                summary_enabled: false,
+                ..EngineConfig::default()
+            },
+            WorkflowPolicy {
+                summary_override_invalid: true,
+                ..WorkflowPolicy::default()
+            },
+        );
+        assert!(
+            state.claim_summary_disabled_notice(),
+            "the first run says so"
+        );
+        assert!(
+            !state.claim_summary_disabled_notice(),
+            "and no run after it repeats the same standing fact"
+        );
+    }
+
+    /// The *deliberate* off-switch is silent: a user who set
+    /// `workflow.summary_enabled = false` chose that and needs no warning. Only
+    /// an override that could not be read is news.
+    #[test]
+    fn summaries_switched_off_by_config_are_not_announced() {
+        let mut state = WorkflowRuntimeState::new(
+            EngineConfig {
+                summary_enabled: false,
+                ..EngineConfig::default()
+            },
+            WorkflowPolicy::default(),
+        );
+        assert!(!state.claim_summary_disabled_notice());
+    }
+
+    /// §4 D6: only the bundled Claude hook's absolute path is taken as a
+    /// transcript. Anything else leaves the pre-launch estimate in place, which
+    /// the stat-first rule already degrades correctly.
+    #[test]
+    fn only_the_claude_hooks_absolute_path_is_read_back_as_a_transcript() {
+        use crate::workflow::binding::observe::{
+            reported_transcript_path, CLAUDE_AGENT_LABEL, CLAUDE_HOOK_SOURCE,
+        };
+
+        assert_eq!(
+            reported_transcript_path(
+                CLAUDE_HOOK_SOURCE,
+                CLAUDE_AGENT_LABEL,
+                Some("/home/u/.claude/projects/-repo/s1.jsonl"),
+            ),
+            Some(PathBuf::from("/home/u/.claude/projects/-repo/s1.jsonl"))
+        );
+        assert_eq!(
+            reported_transcript_path(CLAUDE_HOOK_SOURCE, CLAUDE_AGENT_LABEL, None),
+            None
+        );
+        assert_eq!(
+            reported_transcript_path(
+                CLAUDE_HOOK_SOURCE,
+                CLAUDE_AGENT_LABEL,
+                Some("relative.jsonl")
+            ),
+            None,
+            "the stat happens in the server's cwd, not the pane's"
+        );
+        assert_eq!(
+            reported_transcript_path("karvex:codex", "codex", Some("/t/s.jsonl")),
+            None,
+            "karvex does not know another agent's transcript layout"
+        );
+    }
+
+    /// §4 D8: an interrogation belongs to the node it revived, not to the run
+    /// this server happens to be executing, so a new run must not strand it.
+    #[test]
+    fn an_interrogation_survives_the_next_run_starting() {
+        let mut state = started_state();
+        let interrogation = live_interrogation("w1:p7", "workflow_run:old", "plan");
+        state.track_interrogation(interrogation.clone());
+
+        state.apply(EngineInput::CancelRun, Instant::now());
+        let definition = definition();
+        let graph = graph_of(&definition);
+        state
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the cancelled run does not block the next one");
+
+        assert_eq!(
+            state.interrogation_for_pane(&PublicPaneId::new("w1:p7")),
+            Some(&interrogation),
+            "`start` clears per-run state; an interrogation is not per-run state"
+        );
+    }
+
+    /// The one-at-a-time rule (§4 D7) is keyed on `(run, path)`, so the same
+    /// node in a different run — and a different node in the same run — are
+    /// both still interrogable.
+    #[test]
+    fn one_live_interrogation_per_source_node() {
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
+        state.track_interrogation(live_interrogation("w1:p7", "workflow_run:a", "plan"));
+
+        assert!(state
+            .live_interrogation(&RunId::new("workflow_run:a"), &InstancePath::new("plan"))
+            .is_some());
+        assert!(
+            state
+                .live_interrogation(&RunId::new("workflow_run:a"), &InstancePath::new("review"))
+                .is_none(),
+            "a different node of the same run is not blocked"
+        );
+        assert!(
+            state
+                .live_interrogation(&RunId::new("workflow_run:b"), &InstancePath::new("plan"))
+                .is_none(),
+            "the same node key in a different run is not blocked"
+        );
+    }
+
+    /// Taking the entry out is what makes the end stamp idempotent: `PaneDied`
+    /// and the reconcile sweep can both name the same dead pane, and only the
+    /// first produces an `InterrogationUpdate`.
+    #[test]
+    fn an_interrogation_ends_exactly_once() {
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
+        state.track_interrogation(live_interrogation("w1:p7", "workflow_run:a", "plan"));
+
+        let pane = PublicPaneId::new("w1:p7");
+        assert!(state.end_interrogation_for_pane(&pane).is_some());
+        assert!(
+            state.end_interrogation_for_pane(&pane).is_none(),
+            "a second signal for the same dead pane must not stamp a second end"
+        );
+    }
+
+    /// §6 A9: the id is pre-assigned at spawn, so the async learn is only news
+    /// when it actually differs.
+    #[test]
+    fn learning_a_forked_session_id_is_only_news_once() {
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
+        let mut entry = live_interrogation("w1:p7", "workflow_run:a", "plan");
+        entry.forked_session_id = None;
+        state.track_interrogation(entry);
+        let pane = PublicPaneId::new("w1:p7");
+
+        let learned = state
+            .learn_forked_session_id(&pane, "fork-1")
+            .expect("the first report is news");
+        assert_eq!(learned.forked_session_id.as_deref(), Some("fork-1"));
+        assert!(
+            state.learn_forked_session_id(&pane, "fork-1").is_none(),
+            "re-reporting the same id must not enqueue a second update"
+        );
+    }
+
+    /// §7 R-1 / §4 D8: the tick outlives `is_live()` for two independent
+    /// reasons, and lapses when neither holds.
+    #[test]
+    fn the_tick_outlives_the_run_for_a_live_interrogation() {
+        let now = Instant::now();
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
+        state.rearm_tick(now);
+        assert_eq!(
+            state.next_tick_deadline(),
+            None,
+            "an idle runtime with nothing to drive lets the deadline lapse"
+        );
+
+        state.track_interrogation(live_interrogation("w1:p7", "workflow_run:a", "plan"));
+        assert!(
+            state.next_tick_deadline().is_some(),
+            "an interrogation can be opened with no run live at all, and the \
+             reconcile sweep needs a cadence to run on"
+        );
+
+        state.end_interrogation_for_pane(&PublicPaneId::new("w1:p7"));
+        state.rearm_tick(now + WORKFLOW_TICK_INTERVAL);
+        assert_eq!(
+            state.next_tick_deadline(),
+            None,
+            "and it lapses again once the last one is gone"
+        );
+    }
+
+    /// §3 rule 4: an interrogation's create is addressed by an app-minted id
+    /// the later update reuses, so evicting it would leave every update naming
+    /// a row that does not exist.
+    #[test]
+    fn an_interrogation_create_is_never_evicted() {
+        assert!(is_create_write(&StoreWrite::InterrogationStarted {
+            id: InterrogationId::new("interrogation:1"),
+            run: RunId::new("workflow_run:a"),
+            path: InstancePath::new("plan"),
+            source_session_id: "source".into(),
+            forked_session_id: None,
+            transcript_path: None,
+            cwd: "/repo".into(),
+            pane_id: PublicPaneId::new("w1:p7"),
+            reconstructed: false,
+            seeded_from_seq: None,
+            note: String::new(),
+            started_at_unix_ms: 1,
+        }));
+        assert!(
+            !is_create_write(&StoreWrite::InterrogationUpdate {
+                id: InterrogationId::new("interrogation:1"),
+                forked_session_id: None,
+                ended_at_unix_ms: Some(2),
+            }),
+            "the update is not a create; it is exactly what eviction may drop"
+        );
+    }
+
+    fn live_interrogation(pane: &str, run: &str, path: &str) -> LiveInterrogation {
+        LiveInterrogation {
+            id: InterrogationId::new(format!("interrogation:{pane}")),
+            run: RunId::new(run),
+            path: InstancePath::new(path),
+            pane: PublicPaneId::new(pane),
+            source_session_id: "source-sid".to_string(),
+            forked_session_id: Some("fork-sid".to_string()),
+            transcript_path: Some("/t/fork.jsonl".to_string()),
+            cwd: "/repo".to_string(),
+            reconstructed: false,
+            note: String::new(),
+            started_at_unix_ms: 1,
+        }
     }
 
     #[test]
     fn starting_a_run_admits_the_roots_and_arms_the_tick() {
         let now = Instant::now();
-        let mut state = WorkflowRuntimeState::new(EngineConfig::default());
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
         let definition = definition();
         let graph = graph_of(&definition);
         let effects = state
@@ -2613,20 +4134,74 @@ mod tests {
             );
         }
 
+        // ── the run's own work is over ──────────────────────────────────
         assert_eq!(state.run_status(), Some(RunStatus::Succeeded));
-        assert!(!state.is_live());
-        assert_eq!(state.next_tick_deadline(), None);
-        assert!(state.pending_spawns().is_empty());
+        assert!(!state.is_live(), "the user graph is closed");
         assert!(state
             .active_run()
             .and_then(|run| run.ended_at_unix_ms)
             .is_some());
 
-        let definition = definition();
-        let graph = graph_of(&definition);
-        assert!(state
-            .start(active_run(), definition, graph, Instant::now())
-            .is_ok());
+        // ── but the epilogue holds the tick and the next run ─────────────
+        //
+        // §7 R-1: `epilogue_pending()` is the only new liveness input, and this
+        // is its pin. A succeeded run leaves exactly one thing to spawn — the
+        // engine-owned `.summary` node (§4 D1) — and until it resolves the
+        // workflow tick must stay alive to drive it, and the next run must be
+        // refused rather than silently orphaning the summariser (M7).
+        let summary = InstancePath::new(crate::workflow::model::SUMMARY_INSTANCE_PATH);
+        assert_eq!(state.pending_spawns(), std::slice::from_ref(&summary));
+        assert!(
+            state.next_tick_deadline().is_some(),
+            "a pending epilogue keeps the tick alive; without it nothing would \
+             ever drive the summariser to a conclusion"
+        );
+        // The *admission* refusal lives one layer up, in `handle_workflow_run`
+        // (`is_live() || epilogue_pending()`), together with the
+        // `pending_writes` drain that keeps an accepted summary from dying with
+        // the engine swap — see this module's `start` doc. At this layer `start`
+        // is deliberately unguarded, so it is not asserted here; the e2e
+        // `a_node_whose_pane_exits_without_a_result_fails_and_closes_the_run`
+        // covers the refusal end to end.
+
+        // ── and a give-up releases both ─────────────────────────────────
+        //
+        // The other half of R-1: the ladder ends on its own, so the deadline
+        // lapses and admission reopens without anyone intervening. A `GaveUp`
+        // epilogue that kept ticking would be an unbounded liveness leak.
+        state.bind_node(&summary, binding_for("pane-summary"), Instant::now());
+        state.apply(
+            EngineInput::PaneExited {
+                pane: crate::workflow::model::PublicPaneId::new("pane-summary"),
+                code: Some(1),
+            },
+            Instant::now(),
+        );
+        assert!(
+            !state.engine().epilogue_pending(),
+            "a summariser whose pane died before reporting gives up"
+        );
+        assert_eq!(
+            state.run_status(),
+            Some(RunStatus::Succeeded),
+            "and giving up never changes the run's outcome"
+        );
+        assert_eq!(
+            state.next_tick_deadline(),
+            None,
+            "a resolved epilogue lets the deadline lapse"
+        );
+        assert!(
+            state
+                .start(
+                    active_run(),
+                    definition(),
+                    graph_of(&definition()),
+                    Instant::now()
+                )
+                .is_ok(),
+            "and the next run is admitted"
+        );
     }
 
     #[test]
@@ -2668,6 +4243,7 @@ mod tests {
             kind: RunEventKind::NodeStatus,
             path: None,
             payload: serde_json::json!({}),
+            at_unix_ms: 1,
         };
         for _ in 0..PENDING_WRITE_BUDGET {
             state.queue_write(write());
@@ -2693,6 +4269,105 @@ mod tests {
         assert_eq!(state.pending_write_count(), 0);
     }
 
+    /// D-C: the summariser is asked about **itself**, not about a kvdag node it
+    /// does not have.
+    ///
+    /// With `KARVEX_WORKFLOW_SUMMARY_COMMAND` set, the epilogue is a plain
+    /// process. Resolving its runner through the definition — which has no
+    /// `.summary` node — fell back to `Runner::Agent`, so the one corrective
+    /// re-prompt of §4 D1's bounded ladder went out as `agent.prompt`, failed
+    /// `agent_not_found`, and the rung was dead: an over-budget summary went
+    /// straight to `GaveUp` with no second chance. Production was unaffected
+    /// (a real `claude` epilogue *is* an agent), which is exactly why only the
+    /// override path could expose it.
+    #[test]
+    fn a_command_bound_epilogue_reports_its_own_runner_not_the_definitions() {
+        let mut state = WorkflowRuntimeState::new(
+            EngineConfig {
+                // The declared command binding (§4 D2 / §6 A4).
+                summary_command: Some(vec!["/bin/true".to_string()]),
+                ..EngineConfig::default()
+            },
+            WorkflowPolicy::default(),
+        );
+        // A definition whose *own* nodes are agents, so a runner read from the
+        // definition would answer `Agent` — the exact wrong answer.
+        let definition = definition();
+        let graph = graph_of(&definition);
+        state
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the run starts");
+
+        // Drive the user graph to success so the epilogue is appended.
+        for (path, result) in [
+            ("plan", r#"{"plan":"do it"}"#),
+            ("implement", r#"{"report":"shipped"}"#),
+        ] {
+            state.bind_node(&InstancePath::new(path), binding_for(path), Instant::now());
+            state.apply(
+                EngineInput::NodeSelfReport {
+                    path: InstancePath::new(path),
+                    token: NodeToken::new("token"),
+                    result: report(result),
+                },
+                Instant::now(),
+            );
+        }
+        assert_eq!(state.run_status(), Some(RunStatus::Succeeded));
+
+        let summary = InstancePath::new(crate::workflow::model::SUMMARY_INSTANCE_PATH);
+        state.bind_node(&summary, binding_for("pane-summary"), Instant::now());
+
+        assert_eq!(
+            state.runner_for_pane(&PublicPaneId::new("pane-summary")),
+            Runner::Command,
+            "the epilogue's runner is the one `begin_epilogue` recorded (D-1's \
+             single authority), not the `Agent` default a definition lookup \
+             falls back to for a node the definition does not contain"
+        );
+        // The sibling nodes still resolve through the definition, so the
+        // reserved-path branch is a special case and not a new default.
+        assert_eq!(
+            state.runner_for_pane(&PublicPaneId::new("plan")),
+            Runner::Agent
+        );
+    }
+
+    /// The same node, with the summariser left on its production binding: the
+    /// epilogue is an agent, and the reserved-path branch answers that too.
+    #[test]
+    fn an_agent_bound_epilogue_still_reports_agent() {
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
+        let definition = definition_with(Runner::Command);
+        let graph = graph_of(&definition);
+        state
+            .start(active_run(), definition, graph, Instant::now())
+            .expect("the run starts");
+        for (path, result) in [
+            ("plan", r#"{"plan":"do it"}"#),
+            ("implement", r#"{"report":"shipped"}"#),
+        ] {
+            state.bind_node(&InstancePath::new(path), binding_for(path), Instant::now());
+            state.apply(
+                EngineInput::NodeSelfReport {
+                    path: InstancePath::new(path),
+                    token: NodeToken::new("token"),
+                    result: report(result),
+                },
+                Instant::now(),
+            );
+        }
+        let summary = InstancePath::new(crate::workflow::model::SUMMARY_INSTANCE_PATH);
+        state.bind_node(&summary, binding_for("pane-summary"), Instant::now());
+        assert_eq!(
+            state.runner_for_pane(&PublicPaneId::new("pane-summary")),
+            Runner::Agent,
+            "with no override the summariser is a real `claude` pane, and the \
+             definition's own `Command` nodes must not decide that for it"
+        );
+    }
+
     #[test]
     fn the_delivery_primitive_follows_the_node_runner() {
         let mut agent = started_state();
@@ -2706,7 +4381,8 @@ mod tests {
             Runner::Agent
         );
 
-        let mut command = WorkflowRuntimeState::new(EngineConfig::default());
+        let mut command =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
         let definition = definition_with(Runner::Command);
         let graph = graph_of(&definition);
         command
@@ -2844,7 +4520,8 @@ mod tests {
 
     #[test]
     fn an_input_without_a_run_is_a_no_op() {
-        let mut state = WorkflowRuntimeState::new(EngineConfig::default());
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
         let effects = state.apply(
             EngineInput::Tick {
                 now: Instant::now(),
@@ -3244,9 +4921,16 @@ mod tests {
         // The run notice is the last of the batch and no longer has to win a
         // single slot to be seen: the node notices ahead of it render first and
         // it follows as each expires (§4 D10).
+        // Phase 3 adds one notice *after* the run's: this fixture has no
+        // workspace, so the `.summary` epilogue cannot be spawned and gives up
+        // with a notice of its own (`07-phase3-plan.md` §4 D1). That never
+        // changes the run's outcome, and the run's own notice is still
+        // delivered — which is what this test is about.
         let surfaced = surfaced_toasts(&app);
-        let end = surfaced.last().expect("the run's end is shown");
-        assert_eq!(end.title, "Workflow run");
+        let end = surfaced
+            .iter()
+            .find(|toast| toast.title == "Workflow run")
+            .expect("the run's end is shown");
         assert!(end.context.contains("finished"), "{:?}", end.context);
     }
 
@@ -3657,6 +5341,7 @@ mod tests {
             succession: None,
             started_at_unix_ms: None,
             ended_at_unix_ms: None,
+            restored_from: None,
         }
     }
 
@@ -3678,7 +5363,8 @@ mod tests {
     /// failure. The oldest *update* goes instead.
     #[test]
     fn write_queue_overflow_evicts_an_update_and_never_a_create() {
-        let mut state = WorkflowRuntimeState::new(EngineConfig::default());
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
         state.queue_write(edge_create("child/1"));
         state.queue_write(node_status_write("oldest"));
         state.queue_write(edge_create("child/2"));
@@ -3712,7 +5398,8 @@ mod tests {
     /// queue and the in-memory graph is authoritative either way.
     #[test]
     fn a_write_queue_of_only_creates_grows_past_budget_instead_of_dropping_one() {
-        let mut state = WorkflowRuntimeState::new(EngineConfig::default());
+        let mut state =
+            WorkflowRuntimeState::new(EngineConfig::default(), WorkflowPolicy::default());
         for index in 0..PENDING_WRITE_BUDGET {
             state.queue_write(edge_create(&format!("child/{index}")));
         }

@@ -641,19 +641,21 @@ fn server_start_restores_legacy_session_through_api_identity() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("karvex.sock");
     let client_socket = runtime_dir.join("karvex-client.sock");
-    let data_dir = config_home.join(app_dir_name());
+    // The server's session state lives beside its API socket, not under
+    // XDG_CONFIG_HOME, so seed the legacy fixture there.
+    let state_dir = server_state_dir(&socket_path);
     let pion_cwd = base.join("legacy-pion");
     let karvex_cwd = base.join("legacy-karvex");
 
     fs::create_dir_all(&pion_cwd).unwrap();
     fs::create_dir_all(&karvex_cwd).unwrap();
-    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
     let pion_cwd = pion_cwd.to_str().expect("test cwd should be UTF-8");
     let karvex_cwd = karvex_cwd.to_str().expect("test cwd should be UTF-8");
     let legacy_session = include_str!("../fixtures/session/legacy-pre-tabs-v2.json")
         .replace("/tmp/pion", pion_cwd)
         .replace("/tmp/karvex", karvex_cwd);
-    fs::write(data_dir.join("session.json"), legacy_session).unwrap();
+    fs::write(state_dir.join("session.json"), legacy_session).unwrap();
 
     let karvex = spawn_karvex(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
@@ -731,4 +733,194 @@ fn server_start_restores_legacy_session_through_api_identity() {
     assert_eq!(agents[0]["agent_status"], "working");
 
     cleanup_spawned_karvex(karvex, base);
+}
+
+// ---------------------------------------------------------------------------
+// Session state isolation for socket-overridden servers
+// ---------------------------------------------------------------------------
+
+fn seeded_session_json(label: &str, cwd: &Path) -> String {
+    let session = serde_json::json!({
+        "version": 2,
+        "workspaces": [{
+            "custom_name": label,
+            "layout": { "Pane": 0 },
+            "panes": { "0": { "cwd": cwd.to_str().expect("test cwd should be UTF-8") } },
+            "zoomed": false,
+            "focused": 0,
+            "root_pane": 0
+        }],
+        "active": 0,
+        "selected": 0
+    });
+    serde_json::to_string_pretty(&session).expect("fixture should serialize")
+}
+
+fn workspace_labels(socket_path: &Path) -> Vec<String> {
+    run_cli_json(socket_path, &["workspace", "list"])["result"]["workspaces"]
+        .as_array()
+        .expect("workspace.list should return workspaces")
+        .iter()
+        .filter_map(|workspace| workspace["label"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A server started with only a `KARVEX_SOCKET_PATH` override must not adopt
+/// the default session's state. It used to resolve its state directory to the
+/// config directory, which meant it restored the default session's workspaces
+/// into itself at boot — respawning that session's real agent processes — and
+/// then overwrote the same `session.json` on every save, the final one landing
+/// on `server stop`.
+#[test]
+fn socket_override_server_neither_reads_nor_writes_the_default_session_state() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("karvex.sock");
+    let workspace_cwd = base.join("cwd");
+    let default_state_path = config_home.join(app_dir_name()).join("session.json");
+    let own_state_path = server_state_dir(&socket_path).join("session.json");
+
+    fs::create_dir_all(&workspace_cwd).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
+    let seeded = seeded_session_json("default-session-only", &workspace_cwd);
+    fs::write(&default_state_path, &seeded).unwrap();
+
+    let karvex = spawn_karvex(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let labels = workspace_labels(&socket_path);
+    assert!(
+        !labels.iter().any(|label| label == "default-session-only"),
+        "a socket-override server must not restore the default session's \
+         workspaces; got {labels:?}"
+    );
+
+    run_cli_json(
+        &socket_path,
+        &[
+            "workspace",
+            "create",
+            "--label",
+            "throwaway",
+            "--cwd",
+            workspace_cwd.to_str().unwrap(),
+        ],
+    );
+
+    let stopped = run_cli(&socket_path, &["server", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+            fs::read_to_string(&own_state_path)
+                .map(|state| state.contains("throwaway"))
+                .unwrap_or(false)
+        }),
+        "the server should have saved its own state beside its socket at {}",
+        own_state_path.display()
+    );
+
+    assert_eq!(
+        fs::read_to_string(&default_state_path).unwrap(),
+        seeded,
+        "the default session's state file must be byte-identical after another \
+         server started, ran and stopped on an overridden socket"
+    );
+
+    cleanup_spawned_karvex(karvex, base);
+}
+
+/// Two servers sharing one config directory but holding different sockets keep
+/// separate session state and separate logs; neither touches the default
+/// session's files.
+#[test]
+fn concurrent_socket_override_servers_do_not_cross_contaminate_state() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_a = base.join("runtime-a");
+    let runtime_b = base.join("runtime-b");
+    let socket_a = runtime_a.join("karvex.sock");
+    let socket_b = runtime_b.join("karvex.sock");
+    let workspace_cwd = base.join("cwd");
+    fs::create_dir_all(&workspace_cwd).unwrap();
+
+    let karvex_a = spawn_karvex(&config_home, &runtime_a, &socket_a);
+    let karvex_b = spawn_karvex(&config_home, &runtime_b, &socket_b);
+    wait_for_socket(&socket_a, Duration::from_secs(5));
+    wait_for_socket(&socket_b, Duration::from_secs(5));
+
+    for (socket, label) in [(&socket_a, "only-a"), (&socket_b, "only-b")] {
+        run_cli_json(
+            socket,
+            &[
+                "workspace",
+                "create",
+                "--label",
+                label,
+                "--cwd",
+                workspace_cwd.to_str().unwrap(),
+            ],
+        );
+    }
+
+    // Live view first: each server only knows about its own workspace.
+    assert_eq!(workspace_labels(&socket_a), vec!["only-a".to_string()]);
+    assert_eq!(workspace_labels(&socket_b), vec!["only-b".to_string()]);
+
+    // `server stop` forces each server's final save, so the on-disk assertions
+    // below do not race the periodic save timer under a loaded test run.
+    for socket in [&socket_a, &socket_b] {
+        let stopped = run_cli(socket, &["server", "stop"]);
+        assert!(
+            stopped.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    }
+
+    for (socket, mine, theirs) in [
+        (&socket_a, "only-a", "only-b"),
+        (&socket_b, "only-b", "only-a"),
+    ] {
+        let state_path = server_state_dir(socket).join("session.json");
+        assert!(
+            wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+                fs::read_to_string(&state_path)
+                    .map(|state| state.contains(mine))
+                    .unwrap_or(false)
+            }),
+            "{} should hold this server's own workspace",
+            state_path.display()
+        );
+        let state = fs::read_to_string(&state_path).unwrap();
+        assert!(
+            !state.contains(theirs),
+            "{} leaked the other server's workspace:\n{state}",
+            state_path.display()
+        );
+
+        let log_path = server_state_dir(socket).join("karvex-server.log");
+        assert!(
+            log_path.exists(),
+            "each server must log beside its own socket, not into a shared file; \
+             {} is missing",
+            log_path.display()
+        );
+    }
+
+    let shared_dir = config_home.join(app_dir_name());
+    for shared in ["session.json", "karvex-server.log"] {
+        assert!(
+            !shared_dir.join(shared).exists(),
+            "no socket-override server may write the default session's {shared}"
+        );
+    }
+
+    drop(karvex_a);
+    drop(karvex_b);
+    cleanup_test_base(&base);
 }
