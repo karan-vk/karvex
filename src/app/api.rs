@@ -65,6 +65,9 @@ impl App {
                 results,
                 cache_updates,
             } => self.handle_git_status_refreshed(results, cache_updates),
+            AppEvent::AgentSessionNamesRefreshed { names } => {
+                self.handle_agent_session_names_refreshed(names)
+            }
             ev => {
                 self.handle_internal_event(ev);
                 true
@@ -90,6 +93,18 @@ impl App {
         let changed = self
             .state
             .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+        if changed {
+            self.render_dirty.request_generic();
+            self.render_notify.notify_one();
+        }
+        changed
+    }
+
+    fn handle_agent_session_names_refreshed(
+        &mut self,
+        names: std::collections::HashMap<String, String>,
+    ) -> bool {
+        let changed = self.apply_agent_session_names(names);
         if changed {
             self.render_dirty.request_generic();
             self.render_notify.notify_one();
@@ -129,6 +144,11 @@ impl App {
         } = ev
         {
             self.handle_git_status_refreshed(results, cache_updates);
+            return;
+        }
+
+        if let AppEvent::AgentSessionNamesRefreshed { names } = ev {
+            self.handle_agent_session_names_refreshed(names);
             return;
         }
 

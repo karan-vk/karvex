@@ -2934,6 +2934,13 @@ impl AppState {
                 let _ = cache_updates;
                 Vec::new()
             }
+            // Handled by `App::handle_internal_event` before it reaches here,
+            // like `GitStatusRefreshed`: applying it needs the pane/workspace
+            // wiring that turns changed terminals into pane updates.
+            AppEvent::AgentSessionNamesRefreshed { names } => {
+                let _ = names;
+                Vec::new()
+            }
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),

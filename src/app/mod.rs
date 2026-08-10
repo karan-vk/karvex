@@ -6,6 +6,7 @@
 
 pub(crate) mod actions;
 mod agent_resume;
+mod agent_session_names;
 pub(crate) mod agent_view;
 mod agents;
 mod api;
@@ -40,6 +41,10 @@ pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// How often the agent session registry is re-read. Session names change while
+/// an agent runs (auto-naming, explicit renames), so resolution has to keep
+/// refreshing rather than resolve once when the session is first reported.
+const AGENT_SESSION_NAME_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -117,6 +122,8 @@ pub struct App {
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    pub(crate) last_agent_session_name_refresh: Instant,
+    pub(crate) agent_session_name_refresh_in_flight: bool,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
@@ -747,6 +754,13 @@ impl App {
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             last_git_repo_discovery_refresh: Instant::now(),
+            // Due immediately, so a session restored with panes already on a
+            // named session resolves on the first loop pass instead of showing
+            // bare ids for the first interval.
+            last_agent_session_name_refresh: Instant::now()
+                .checked_sub(AGENT_SESSION_NAME_REFRESH_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            agent_session_name_refresh_in_flight: false,
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,

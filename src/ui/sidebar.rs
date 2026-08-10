@@ -31,6 +31,7 @@ pub(crate) struct AgentPanelEntry {
     pub terminal_title_stripped: Option<String>,
     pub agent_label: Option<String>,
     pub agent_kind_label: Option<String>,
+    pub agent_session_name: Option<String>,
     pub agent: Option<crate::detect::Agent>,
     pub state: AgentState,
     pub seen: bool,
@@ -171,6 +172,7 @@ fn collect_agent_panel_entries_with_runtimes(
                         terminal_title_stripped: detail.terminal_title_stripped,
                         agent_label: Some(detail.agent_label),
                         agent_kind_label: detail.agent_kind_label,
+                        agent_session_name: detail.agent_session_name,
                         agent: detail.agent,
                         state: detail.state,
                         seen: detail.seen,
@@ -1018,6 +1020,7 @@ fn resolved_token_spans(
             | ResolvedTokenKind::Tab(text)
             | ResolvedTokenKind::Pane(text)
             | ResolvedTokenKind::Agent(text)
+            | ResolvedTokenKind::Session(text)
             | ResolvedTokenKind::TerminalTitle(text)
             | ResolvedTokenKind::Branch(text)
             | ResolvedTokenKind::Custom(text) => display_width(text),
@@ -1124,8 +1127,12 @@ fn resolved_token_spans(
                     apply_token_style(workspace_style, token.style),
                 ));
             }
+            // The session name shares the agent token's subdued treatment but
+            // never takes the teammate accent tint: the accent identifies the
+            // agent, and repeating it here would read as a second agent name.
             ResolvedTokenKind::Tab(text)
             | ResolvedTokenKind::Pane(text)
+            | ResolvedTokenKind::Session(text)
             | ResolvedTokenKind::Branch(text) => {
                 spans.push(Span::styled(
                     truncate_end(text, budgets[index]),
@@ -2020,6 +2027,112 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(display_width(&text) <= 8, "resolved title: {text:?}");
+    }
+
+    #[test]
+    fn default_width_sidebar_shows_the_resolved_session_name() {
+        // Regression: the API resolves and exposes the session name (verified
+        // by kvx pane list) but the sidebar row rendered "claude ·" with the
+        // name never appearing, at the user's default (unconstrained) sidebar
+        // width. Exercises the real TerminalState fields production code
+        // writes, not a shortcut into AgentPanelEntry.
+        let mut app = crate::app::state::AppState::test_new();
+        let workspace = Workspace::test_new("one");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(Agent::Claude);
+
+        let session_id = "f593fc46-5328-4998-a7b1-80bb1b3e7e3b";
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "karvex:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id(session_id)
+                .expect("valid session id"),
+        });
+        terminal.resolved_agent_session_name =
+            Some(crate::terminal::state::ResolvedAgentSessionName {
+                session_id: session_id.to_string(),
+                name: "karvex-ff".to_string(),
+            });
+
+        let area = Rect::new(0, 0, 26, 20);
+        let mut terminal_backend = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        terminal_backend
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal_backend.backend().buffer();
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let body = agent_panel_body_rect(agent_area, false);
+        let second = row_text(buffer, body.y + 1, body.width);
+
+        assert!(second.contains("karvex-ff"), "rendered row: {second:?}");
+        assert!(
+            !second.trim_end().ends_with('·'),
+            "rendered row: {second:?}"
+        );
+    }
+
+    #[test]
+    fn session_token_is_visible_alongside_the_agent_token() {
+        // Regression: the session token was missing from resolved_token_spans'
+        // flexible-width table, so its render budget was pinned at 0 and
+        // truncate_end always emptied it, leaving a dangling " · " separator
+        // with nothing after it, regardless of available width.
+        let spans = resolved_token_spans(
+            &[
+                ResolvedToken::unstyled(ResolvedTokenKind::Agent("claude".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::Session("karvex-ff".into())),
+            ],
+            ("", Style::default()),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            &crate::app::state::AppState::test_new().palette,
+            26,
+            None,
+        );
+        let text = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text, "claude · karvex-ff");
+    }
+
+    #[test]
+    fn narrow_session_token_elides_the_name_instead_of_dropping_it() {
+        let spans = resolved_token_spans(
+            &[
+                ResolvedToken::unstyled(ResolvedTokenKind::Agent("claude".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::Session(
+                    "a-very-long-session-name-indeed".into(),
+                )),
+            ],
+            ("", Style::default()),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            &crate::app::state::AppState::test_new().palette,
+            20,
+            None,
+        );
+        let text = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(display_width(&text) <= 20, "resolved row: {text:?}");
+        assert!(text.starts_with("claude · "), "resolved row: {text:?}");
+        // The separator must never dangle with an empty name after it.
+        assert!(!text.ends_with('·'), "resolved row: {text:?}");
+        assert!(text.contains('…'), "resolved row: {text:?}");
     }
 
     #[test]

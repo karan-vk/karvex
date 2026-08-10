@@ -350,6 +350,7 @@ impl App {
         changed |= self.clear_due_selection_highlight(now);
 
         self.start_git_status_refresh_if_due(now);
+        self.start_agent_session_name_refresh_if_due(now);
 
         if self
             .next_auto_update_check
@@ -591,6 +592,9 @@ impl App {
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
                 .flatten(),
+            // Not gated on a connected client: the resolved name is also served
+            // over the API, so a headless server keeps it current on its own.
+            self.agent_session_name_refresh_deadline(),
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,

@@ -20,6 +20,7 @@ pub(super) enum ResolvedTokenKind {
     Tab(String),
     Pane(String),
     Agent(String),
+    Session(String),
     TerminalTitle(String),
     Branch(String),
     GitStatus { ahead: usize, behind: usize },
@@ -67,6 +68,13 @@ pub(super) fn agent_rows(
                         AgentSidebarToken::Agent => {
                             entry.agent_label.clone().map(ResolvedTokenKind::Agent)
                         }
+                        // Panes without an agent session resolve to nothing, so
+                        // the element is simply absent from the row rather than
+                        // taking up width with a placeholder.
+                        AgentSidebarToken::Session => entry
+                            .agent_session_name
+                            .clone()
+                            .map(ResolvedTokenKind::Session),
                         AgentSidebarToken::TerminalTitle => entry
                             .terminal_title
                             .clone()
@@ -242,6 +250,7 @@ mod tests {
             terminal_title_stripped: None,
             agent_label: Some("pi".into()),
             agent_kind_label: Some("pi".into()),
+            agent_session_name: None,
             agent: Some(crate::detect::Agent::Pi),
             state: AgentState::Working,
             seen: true,
@@ -328,6 +337,83 @@ mod tests {
                 ResolvedToken::unstyled(ResolvedTokenKind::TerminalTitle("raw title".into())),
                 ResolvedToken::unstyled(ResolvedTokenKind::Custom("custom title".into())),
             ]]
+        );
+    }
+
+    #[test]
+    fn the_session_token_renders_whatever_the_entry_resolved() {
+        let mut entry = entry();
+        entry.agent_session_name = Some("toilet-presence-sensor".into());
+        let config = AgentsSidebarConfig {
+            rows: vec![vec![AgentSidebarToken::Agent, AgentSidebarToken::Session]],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            agent_rows(&config, &entry, "working"),
+            vec![vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::Agent("pi".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::Session(
+                    "toilet-presence-sensor".into()
+                )),
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_short_id_fallback_reaches_the_session_token_unchanged() {
+        // The aggregate layer already decided name-or-short-id; the token layer
+        // only renders what it was handed.
+        let mut entry = entry();
+        entry.agent_session_name = Some("f593fc46".into());
+        let config = AgentsSidebarConfig {
+            rows: vec![vec![AgentSidebarToken::Session]],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            agent_rows(&config, &entry, "working"),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Session(
+                "f593fc46".into()
+            ))]]
+        );
+    }
+
+    #[test]
+    fn a_pane_without_a_session_drops_the_token_and_can_empty_the_row() {
+        let entry = entry();
+        assert_eq!(entry.agent_session_name, None);
+        let config = AgentsSidebarConfig {
+            rows: vec![
+                vec![AgentSidebarToken::Agent, AgentSidebarToken::Session],
+                vec![AgentSidebarToken::Session],
+            ],
+            ..Default::default()
+        };
+
+        // Row 1 keeps just the agent; row 2 disappears entirely rather than
+        // rendering an empty line.
+        assert_eq!(
+            agent_rows(&config, &entry, "working"),
+            vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Agent(
+                "pi".into()
+            ))]]
+        );
+    }
+
+    #[test]
+    fn default_rows_pair_the_agent_with_its_session() {
+        let mut entry = entry();
+        entry.agent_session_name = Some("sensor-pcb".into());
+
+        let rows = agent_rows(&AgentsSidebarConfig::default(), &entry, "working");
+
+        assert_eq!(
+            rows.last(),
+            Some(&vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::Agent("pi".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::Session("sensor-pcb".into())),
+            ])
         );
     }
 

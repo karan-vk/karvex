@@ -14,6 +14,15 @@ use crate::terminal::TerminalId;
 mod metadata;
 pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
 
+/// A session display name paired with the session id it was resolved for, so a
+/// stale name can be recognised rather than shown. See
+/// [`TerminalState::resolved_agent_session_name`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAgentSessionName {
+    pub session_id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookAuthority {
     pub source: String,
@@ -127,6 +136,14 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    /// Display name resolved for this terminal's agent session from the agent's
+    /// own live session registry (see [`crate::agent_session_registry`]).
+    ///
+    /// Derived runtime state, refreshed on a timer and never persisted. It keeps
+    /// the session id it was resolved for so a session that changes underneath
+    /// it (resume, clear, fork) reads as unresolved immediately rather than
+    /// showing the previous session's name until the next refresh.
+    pub resolved_agent_session_name: Option<ResolvedAgentSessionName>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -160,6 +177,7 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
+            resolved_agent_session_name: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,
@@ -1311,6 +1329,76 @@ impl TerminalState {
         session: crate::agent_resume::PersistedAgentSession,
     ) {
         self.persisted_agent_session = Some(session);
+    }
+
+    /// The id of the agent session currently attributed to this terminal, if it
+    /// is an id-style reference.
+    ///
+    /// Mirrors the precedence used when reporting the session over the API: a
+    /// live hook authority outranks the persisted session. Path-style references
+    /// (used by agents that identify a session by transcript path) have no id to
+    /// resolve a name from and read as `None`.
+    pub fn agent_session_id(&self) -> Option<&str> {
+        let session_ref = self
+            .hook_authority
+            .as_ref()
+            .and_then(|authority| authority.session_ref.as_ref())
+            .or_else(|| {
+                self.persisted_agent_session
+                    .as_ref()
+                    .map(|session| &session.session_ref)
+            })?;
+        (session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id)
+            .then_some(session_ref.value.as_str())
+    }
+
+    /// The registry-resolved display name for the current agent session.
+    ///
+    /// Resolves to `None` unless a name was resolved for exactly the session
+    /// this terminal is on now, so a session change never surfaces the previous
+    /// session's name.
+    pub fn agent_session_name(&self) -> Option<&str> {
+        let session_id = self.agent_session_id()?;
+        self.resolved_agent_session_name
+            .as_ref()
+            .filter(|resolved| resolved.session_id == session_id)
+            .map(|resolved| resolved.name.as_str())
+    }
+
+    /// What the UI shows for this terminal's agent session: the resolved name
+    /// when there is one, otherwise an abbreviated session id.
+    ///
+    /// The abbreviated id is what makes several unnamed sessions in one
+    /// workspace distinguishable before the agent names them. Terminals with no
+    /// id-style session resolve to `None` so the row element is simply omitted.
+    pub fn agent_session_display_name(&self) -> Option<String> {
+        match self.agent_session_name() {
+            Some(name) => Some(name.to_string()),
+            None => self
+                .agent_session_id()
+                .map(crate::agent_session_registry::short_session_id),
+        }
+    }
+
+    /// Applies a freshly read session-id to name map to this terminal.
+    ///
+    /// Returns whether the resolved name changed, so callers can limit repaints
+    /// and change notifications to terminals that actually moved.
+    pub fn apply_resolved_agent_session_names(
+        &mut self,
+        names: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        let resolved = self.agent_session_id().and_then(|session_id| {
+            names.get(session_id).map(|name| ResolvedAgentSessionName {
+                session_id: session_id.to_string(),
+                name: name.clone(),
+            })
+        });
+        if self.resolved_agent_session_name == resolved {
+            return false;
+        }
+        self.resolved_agent_session_name = resolved;
+        true
     }
 
     pub fn set_agent_session_ref(

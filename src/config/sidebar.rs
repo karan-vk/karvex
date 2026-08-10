@@ -108,6 +108,7 @@ pub enum AgentSidebarToken {
     Tab,
     Pane,
     Agent,
+    Session,
     TerminalTitle,
     TerminalTitleStripped,
     Custom(String),
@@ -238,6 +239,7 @@ fn agent_token_name(token: &AgentSidebarToken) -> String {
         AgentSidebarToken::Tab => "tab".into(),
         AgentSidebarToken::Pane => "pane".into(),
         AgentSidebarToken::Agent => "agent".into(),
+        AgentSidebarToken::Session => "session".into(),
         AgentSidebarToken::TerminalTitle => "terminal_title".into(),
         AgentSidebarToken::TerminalTitleStripped => "terminal_title_stripped".into(),
         AgentSidebarToken::Custom(name) => format!("${name}"),
@@ -292,6 +294,7 @@ impl<'de> Deserialize<'de> for AgentSidebarToken {
                 ("tab", Self::Tab),
                 ("pane", Self::Pane),
                 ("agent", Self::Agent),
+                ("session", Self::Session),
                 ("terminal_title", Self::TerminalTitle),
                 ("terminal_title_stripped", Self::TerminalTitleStripped),
             ],
@@ -396,7 +399,11 @@ impl Default for AgentsSidebarConfig {
                     AgentSidebarToken::Workspace,
                     AgentSidebarToken::Tab,
                 ],
-                vec![AgentSidebarToken::Agent],
+                // The session name sits beside the agent name so several
+                // sessions of the same agent in one workspace stay tellable
+                // apart. It resolves to nothing for panes without an agent
+                // session, leaving those rows exactly as they were.
+                vec![AgentSidebarToken::Agent, AgentSidebarToken::Session],
             ],
             rows_by_agent: BTreeMap::new(),
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
@@ -446,7 +453,10 @@ mod tests {
                     AgentSidebarToken::Workspace,
                     AgentSidebarToken::Tab,
                 ],
-                vec![AgentSidebarToken::Agent],
+                // The session token rides along with the agent name; it
+                // resolves to nothing for panes that have no agent session, so
+                // rows for those panes are unchanged.
+                vec![AgentSidebarToken::Agent, AgentSidebarToken::Session],
             ]
         );
         assert!(config.agents.rows_by_agent.is_empty());
@@ -511,6 +521,31 @@ row_gap = 3
             vec![SpaceSidebarToken::Custom("jj_status".into())]
         );
         assert_eq!(config.ui.sidebar.spaces.row_gap, 3);
+    }
+
+    #[test]
+    fn the_session_token_parses_styles_and_round_trips() {
+        let config: crate::config::Config = toml::from_str(
+            r##"
+[ui.sidebar.agents]
+rows = [["agent", "session"], [{ token = "session", dim = true }]]
+"##,
+        )
+        .expect("session token config");
+
+        assert_eq!(
+            config.ui.sidebar.agents.rows[0],
+            vec![AgentSidebarToken::Agent, AgentSidebarToken::Session]
+        );
+        let (token, style) = config.ui.sidebar.agents.rows[1][0].parts();
+        assert_eq!(token, &AgentSidebarToken::Session);
+        assert_eq!(style.dim, Some(true));
+
+        // The name used in config is the name serialization emits back.
+        assert_eq!(
+            serde_json::to_value(AgentSidebarToken::Session).expect("serialize session token"),
+            serde_json::Value::String("session".into())
+        );
     }
 
     #[test]

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- The sidebar's agent rows now show the agent's own name for its current session, so several Claude sessions running in one workspace no longer render as identical rows. Karvex resolves the name from Claude Code's live session registry (`<claude dir>/sessions/*.json`, honouring `$CLAUDE_CONFIG_DIR`), re-reading it every five seconds so renames and auto-naming keep up, and only when some pane actually reports a session id. A session with no name yet falls back to a short session id, and panes with no agent session are unchanged. The value is a new `session` sidebar token, added to the default agent rows as `["agent", "session"]`, so it can be moved, styled, or dropped like any other token. `pane.get`/`pane.list` expose the same name as an optional `name` field on `agent_session`.
+
 ## [0.11.0] - 2026-08-09
 
 ### Added

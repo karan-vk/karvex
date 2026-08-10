@@ -17,6 +17,9 @@ pub struct PaneDetail {
     pub terminal_title_stripped: Option<String>,
     pub agent_label: String,
     pub agent_kind_label: Option<String>,
+    /// Display name for the pane's agent session, already resolved server-side.
+    /// A pure read here — no filesystem work happens during aggregation.
+    pub agent_session_name: Option<String>,
     pub agent: Option<Agent>,
     pub state: AgentState,
     pub seen: bool,
@@ -60,6 +63,7 @@ impl Tab {
                     terminal_title_stripped: terminal.terminal_title_stripped(),
                     agent_label,
                     agent_kind_label,
+                    agent_session_name: terminal.agent_session_display_name(),
                     agent: terminal.effective_known_agent(),
                     state: terminal.state,
                     seen: pane.seen,
@@ -213,6 +217,63 @@ mod tests {
             labels,
             vec![("planner".into(), "planner".into(), Some(Agent::Pi))]
         );
+    }
+
+    #[test]
+    fn pane_details_carry_the_resolved_session_name_for_each_pane() {
+        let mut ws = Workspace::test_new("karvex");
+        let second_pane = ws.test_split(Direction::Horizontal);
+        let first_pane = ws.tabs[0]
+            .panes
+            .keys()
+            .find(|id| **id != second_pane)
+            .copied()
+            .unwrap();
+
+        // Only the first pane's session is named in the registry; the second
+        // has to fall back to a short id.
+        let registry = HashMap::from([("aaaaaaaa-1111".to_string(), "sensor-pcb".to_string())]);
+        let mut terminals = HashMap::new();
+        for (pane, session_id) in [
+            (first_pane, "aaaaaaaa-1111"),
+            (second_pane, "bbbbbbbb-2222"),
+        ] {
+            let mut terminal = terminal_for_pane(&ws, pane);
+            terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "karvex:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
+            terminal.apply_resolved_agent_session_names(&registry);
+            terminals.insert(terminal.id.clone(), terminal);
+        }
+
+        let names: Vec<_> = ws
+            .pane_details(&terminals)
+            .into_iter()
+            .map(|detail| detail.agent_session_name)
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![Some("sensor-pcb".to_string()), Some("bbbbbbbb".to_string())]
+        );
+    }
+
+    #[test]
+    fn pane_details_omit_the_session_name_for_panes_without_an_agent_session() {
+        let ws = Workspace::test_new("karvex");
+        let root_pane = ws.tabs[0].root_pane;
+        let mut terminals = HashMap::new();
+        let mut terminal = terminal_for_pane(&ws, root_pane);
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        terminals.insert(terminal.id.clone(), terminal);
+
+        let details = ws.pane_details(&terminals);
+
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].agent_session_name, None);
     }
 
     #[test]

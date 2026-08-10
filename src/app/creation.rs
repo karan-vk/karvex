@@ -527,6 +527,7 @@ fn terminal_agent_session_info(
                 agent: authority.agent_label.clone(),
                 kind: session_ref.kind,
                 value: session_ref.value.clone(),
+                name: terminal.agent_session_name().map(str::to_string),
             });
         }
     }
@@ -539,5 +540,6 @@ fn terminal_agent_session_info(
             agent: session.agent.clone(),
             kind: session.session_ref.kind,
             value: session.session_ref.value.clone(),
+            name: terminal.agent_session_name().map(str::to_string),
         })
 }

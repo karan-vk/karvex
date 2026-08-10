@@ -228,4 +228,9 @@ pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    /// Display name the agent itself gave this session, when the agent
+    /// publishes one and it has been resolved. Additive and optional: absent
+    /// for agents that publish no such name, and for sessions not yet resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }

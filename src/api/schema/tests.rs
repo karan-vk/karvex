@@ -1318,3 +1318,39 @@ fn popup_close_request_round_trips() {
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
 }
+
+#[test]
+fn agent_session_name_is_optional_and_omitted_when_absent() {
+    let unnamed = AgentSessionInfo {
+        source: "karvex:claude".into(),
+        agent: "claude".into(),
+        kind: crate::agent_resume::AgentSessionRefKind::Id,
+        value: "f593fc46-5328-4998-a7b1-80bb1b3e7e3b".into(),
+        name: None,
+    };
+
+    let json = serde_json::to_value(&unnamed).unwrap();
+    assert!(
+        json.get("name").is_none(),
+        "an unresolved session must not emit a name key: {json}"
+    );
+
+    let named = AgentSessionInfo {
+        name: Some("toilet-presence-sensor".into()),
+        ..unnamed.clone()
+    };
+    assert_eq!(
+        serde_json::to_value(&named).unwrap()["name"],
+        "toilet-presence-sensor"
+    );
+
+    // Additive field: payloads written before it existed still deserialize.
+    let legacy: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+        "source": "karvex:claude",
+        "agent": "claude",
+        "kind": "id",
+        "value": "f593fc46-5328-4998-a7b1-80bb1b3e7e3b",
+    }))
+    .expect("legacy payload without name");
+    assert_eq!(legacy, unnamed);
+}

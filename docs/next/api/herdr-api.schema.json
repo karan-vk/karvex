@@ -47,6 +47,13 @@
             "kind": {
               "$ref": "#/schemas/event/$defs/AgentSessionRefKind"
             },
+            "name": {
+              "description": "Display name the agent itself gave this session, when the agent\npublishes one and it has been resolved. Additive and optional: absent\nfor agents that publish no such name, and for sessions not yet resolved.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "source": {
               "type": "string"
             },
@@ -7456,6 +7463,13 @@
             },
             "kind": {
               "$ref": "#/schemas/success_response/$defs/AgentSessionRefKind"
+            },
+            "name": {
+              "description": "Display name the agent itself gave this session, when the agent\npublishes one and it has been resolved. Additive and optional: absent\nfor agents that publish no such name, and for sessions not yet resolved.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "source": {
               "type": "string"

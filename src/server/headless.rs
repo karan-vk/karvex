@@ -4440,6 +4440,10 @@ impl HeadlessServer {
             self.app.start_git_status_refresh_if_due(now);
         }
 
+        // Unlike git status, this is not gated on a connected client: session
+        // names are served over the API too, so they stay current headless.
+        self.app.start_agent_session_name_refresh_if_due(now);
+
         if self
             .app
             .next_auto_update_check
