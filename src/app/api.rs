@@ -102,7 +102,7 @@ impl App {
 
     fn handle_agent_session_names_refreshed(
         &mut self,
-        names: std::collections::HashMap<String, String>,
+        names: crate::agent_session_registry::AgentSessionNames,
     ) -> bool {
         let changed = self.apply_agent_session_names(names);
         if changed {

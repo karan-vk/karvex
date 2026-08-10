@@ -232,7 +232,9 @@ mod tests {
 
         // Only the first pane's session is named in the registry; the second
         // has to fall back to a short id.
-        let registry = HashMap::from([("aaaaaaaa-1111".to_string(), "sensor-pcb".to_string())]);
+        let registry = crate::agent_session_registry::AgentSessionNames::by_session_id(
+            HashMap::from([("aaaaaaaa-1111".to_string(), "sensor-pcb".to_string())]),
+        );
         let mut terminals = HashMap::new();
         for (pane, session_id) in [
             (first_pane, "aaaaaaaa-1111"),
@@ -245,7 +247,7 @@ mod tests {
                 agent: "claude".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
             });
-            terminal.apply_resolved_agent_session_names(&registry);
+            terminal.apply_resolved_agent_session_names(&registry, None);
             terminals.insert(terminal.id.clone(), terminal);
         }
 

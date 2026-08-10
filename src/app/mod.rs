@@ -125,6 +125,13 @@ pub struct App {
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) last_agent_session_name_refresh: Instant,
     pub(crate) agent_session_name_refresh_in_flight: bool,
+    /// Wall-clock instant this runtime came up.
+    ///
+    /// Public pane ids are assigned by this process and its counters start over
+    /// when it does, so foreign state that names a pane id is only describing
+    /// *these* panes if it was written after this point. See
+    /// [`crate::agent_session_registry::read_agent_session_names`].
+    pub(crate) started_at: std::time::SystemTime,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
@@ -764,6 +771,7 @@ impl App {
                 .checked_sub(AGENT_SESSION_NAME_REFRESH_INTERVAL)
                 .unwrap_or_else(Instant::now),
             agent_session_name_refresh_in_flight: false,
+            started_at: std::time::SystemTime::now(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
