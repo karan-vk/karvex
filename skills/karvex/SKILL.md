@@ -186,7 +186,29 @@ After that failed read, ask the agent to write its complete response as Markdown
 
 ## Claude Code Agent Teams teammate panes
 
-When Claude Code's Agent Teams feature runs inside a Karvex pane with `teammateMode` resolving to `auto` (the default), Karvex makes itself Claude's tmux backend automatically: it exports a tmux-compatible session identity into the pane and puts a `tmux` shim on `PATH` that Claude's own code talks to. The practical effect is that each teammate Claude spawns shows up as an ordinary Karvex pane in the same tab, not as a nested terminal session — the leader pane keeps focus, and teammate panes are visible and controllable the same way any other pane is.
+When Claude Code's Agent Teams feature runs inside a Karvex pane **in a split-pane teammate mode**, Karvex makes itself Claude's tmux backend automatically: it exports a tmux-compatible session identity into the pane and puts a `tmux` shim on `PATH` that Claude's own code talks to. The practical effect is that each teammate Claude spawns shows up as an ordinary Karvex pane in the same tab, not as a nested terminal session — the leader pane keeps focus, and teammate panes are visible and controllable the same way any other pane is.
+
+Two conditions must both hold, and neither is the default:
+
+```bash
+# 1. Agent teams are experimental and off unless this is set.
+CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
+# 2. Teammate mode must resolve to a split-pane backend.
+claude --teammate-mode tmux          # or: --settings '{"teammateMode":"tmux"}'
+```
+
+Claude Code's teammate-mode default is `in-process` (it was `auto` before Claude Code 2.1.179). In-process teammates run inside the leader's own session and **never become Karvex panes**, and being inside tmux does not change that — the spawn path short-circuits before backend detection. So a launch that does not force a split-pane mode will produce a working team with no teammate panes to read or steer. Verify from Claude's own team config rather than from the flag being accepted, and check the first *teammate* — the leader is always `in-process` with `tmuxPaneId: "leader"`:
+
+```bash
+python3 - <<'PY'
+import glob, json
+for f in sorted(glob.glob("$HOME/.claude/teams/*/config.json")):
+    for m in json.load(open(f))["members"]:
+        print(m["name"], m.get("backendType"), m.get("tmuxPaneId"))
+PY
+```
+
+A member reading `tmux` with a `wN:pN` pane id confirms the integration is live.
 
 Treat a teammate pane as a normal Claude Code pane for every read and inspect operation:
 
@@ -212,7 +234,7 @@ env | grep -E '^KARVEX_NO_(TMUX_COMPAT|AUTO_INTEGRATION)='
 
 Both are presence-based, so `grep`ping for the variable name is the reliable check — a `-0`/`-false` value still opts out.
 
-If `KARVEX_NO_TMUX_COMPAT` is set, Claude Code falls back to its own non-tmux backends and teammates will not appear as Karvex panes at all — do not spend time debugging a "missing" teammate pane under that condition; report the opt-out to the user instead.
+If `KARVEX_NO_TMUX_COMPAT` is set, Claude Code falls back to its own non-tmux backends and teammates will not appear as Karvex panes at all — do not spend time debugging a "missing" teammate pane under that condition; report the opt-out to the user instead. The same applies to an in-process teammate mode: absent teammate panes are far more often one of these two opt-outs than a Karvex fault.
 
 ## Safety and coordination rules
 
