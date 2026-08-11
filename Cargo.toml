@@ -93,6 +93,20 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# Local installs, where the binary is run against real state rather than
+# shipped. Derived from `release` on purpose: `debug_assertions` must stay off,
+# because a debug-assertions build switches karvex to the separate `karvex-dev`
+# config namespace and stops seeing the state you were trying to test against.
+# Everything release does for size is then traded back for build time, since a
+# local install is rebuilt far more often than it is downloaded.
+[profile.fastdev]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 1
+strip = false
+debug = false
+
 [target.'cfg(windows)'.dependencies]
 wmi = { version = "0.18.4", default-features = false }
 windows-sys = { version = "0.61.2", features = [
