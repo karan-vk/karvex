@@ -1307,22 +1307,21 @@ output_schema = { type = "object" }
         let journal = watchdog_journal(&mut app, &run_id);
         for entry in &journal {
             assert_eq!(entry.payload["class"], "local_loop", "{:?}", entry.payload);
-            assert_eq!(
+            assert!(
                 entry.run_node.is_some(),
-                true,
                 "every rung names the node it was about: {:?}",
                 entry.payload
             );
         }
-        for rung in 0..3 {
+        for (index, entry) in journal.iter().enumerate().take(3) {
             assert_eq!(
-                journal[rung].payload["delivered"],
-                true,
+                entry.payload["delivered"],
+                serde_json::json!(true),
                 "rung {} was delivered: {:?}",
-                rung + 1,
-                journal[rung].payload
+                index + 1,
+                entry.payload
             );
-            assert_eq!(journal[rung].payload["channel"], "inbox_socket");
+            assert_eq!(entry.payload["channel"], "inbox_socket");
         }
         assert_eq!(
             journal[0].payload["target"], TEAMMATE,
