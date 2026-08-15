@@ -342,6 +342,22 @@ impl ActiveSubscription {
                     last_sequence: 0,
                 }))
             }
+            Subscription::WorkflowNodeWatchdog {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowNodeWatchdog,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowReviewStarted {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowReviewStarted,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowReviewReady {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowReviewReady,
+                last_sequence: 0,
+            })),
+            Subscription::WorkflowReviewClosed {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkflowReviewClosed,
+                last_sequence: 0,
+            })),
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,
@@ -832,6 +848,7 @@ mod tests {
             subject: String::new(),
             owner: String::new(),
             emergent: false,
+            attention: None,
         }
     }
 

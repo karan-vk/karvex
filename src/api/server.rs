@@ -458,6 +458,11 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorkflowNodeInterrogate(_) => "workflow.node.interrogate",
         Method::WorkflowSummaryGet(_) => "workflow.summary.get",
         Method::WorkflowSummaryList(_) => "workflow.summary.list",
+        Method::WorkflowReviewStart(_) => "workflow.review.start",
+        Method::WorkflowReviewGet(_) => "workflow.review.get",
+        Method::WorkflowReviewApply(_) => "workflow.review.apply",
+        Method::WorkflowReviewAnswer(_) => "workflow.review.answer",
+        Method::WorkflowReviewReport(_) => "workflow.review.report",
     }
 }
 

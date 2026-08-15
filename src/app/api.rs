@@ -11,6 +11,8 @@ pub(crate) mod plugins;
 mod responses;
 mod session;
 mod tabs;
+pub(crate) mod workflow_review;
+pub(crate) mod workflow_review_apply;
 pub(crate) mod workflows;
 mod workspaces;
 mod worktrees;
@@ -1238,6 +1240,21 @@ impl App {
             }
             Method::WorkflowSummaryList(params) => {
                 return self.handle_workflow_summary_list(request.id, params);
+            }
+            Method::WorkflowReviewStart(target) => {
+                return self.handle_workflow_review_start(request.id, target);
+            }
+            Method::WorkflowReviewGet(target) => {
+                return self.handle_workflow_review_get(request.id, target);
+            }
+            Method::WorkflowReviewApply(params) => {
+                return self.handle_workflow_review_apply(request.id, params);
+            }
+            Method::WorkflowReviewAnswer(params) => {
+                return self.handle_workflow_review_answer(request.id, params);
+            }
+            Method::WorkflowReviewReport(params) => {
+                return self.handle_workflow_review_report(request.id, params);
             }
             _ => {
                 return responses::encode_error(

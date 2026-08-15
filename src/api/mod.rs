@@ -86,6 +86,14 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::WorkflowNodeExpand(_)
             | Method::WorkflowNodeRestart(_)
             | Method::WorkflowNodeInterrogate(_)
+            // Phase 4 additions (`.local/prd/phase4-retarget-plan.md` §5
+            // packet P3): the four review methods that mutate a cycle or spawn
+            // an interview/synthesis pane. `workflow.review.get` stays out —
+            // it only reads.
+            | Method::WorkflowReviewStart(_)
+            | Method::WorkflowReviewApply(_)
+            | Method::WorkflowReviewAnswer(_)
+            | Method::WorkflowReviewReport(_)
     )
 }
 

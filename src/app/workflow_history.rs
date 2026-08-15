@@ -634,6 +634,7 @@ mod tests {
             subject: String::new(),
             owner: String::new(),
             emergent: false,
+            attention: None,
         }
     }
 

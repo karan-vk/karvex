@@ -189,6 +189,14 @@ pub struct RunNodeRecord {
     /// A task the definition never planned. The drift is the record — §3.7's
     /// `workflow capture` promotes it back into a definition later.
     pub emergent: bool,
+    /// `run_node.watchdog_interventions` (`0001_init.surql`), carried through
+    /// so the durable projection can report the same count the live run does
+    /// instead of hardcoding `0` regardless of what was journalled
+    /// (`.local/prd/phase4-retarget-plan.md` §5 packet P3 wire-honesty sweep).
+    /// The column has had no writer before Phase 4's watchdog lands
+    /// (`tier.rs:267`), so this reads `0` until then — honestly, because it
+    /// is reading the real row rather than a Rust literal.
+    pub watchdog_interventions: u32,
 }
 
 /// One `run_member` row: a member of the run's Claude Code team as the
@@ -1466,6 +1474,7 @@ fn run_node_record(
         subject: row.subject,
         owner: row.owner,
         emergent: row.emergent,
+        watchdog_interventions: u32::try_from(row.watchdog_interventions).unwrap_or(u32::MAX),
     })
 }
 
