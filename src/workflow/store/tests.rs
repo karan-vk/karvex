@@ -1075,31 +1075,12 @@ async fn statically_materialised_run_nodes_all_sit_at_expansion_depth_zero() {
         );
     }
 
-    // The same graph materialised in memory, which is what a live run answers
-    // from. The two projections have to agree field for field.
-    let kvdag = store
-        .load_version(
-            &store
-                .get_run(&run)
-                .await
-                .expect("get_run")
-                .expect("the run exists")
-                .version,
-        )
-        .await
-        .expect("load_version");
-    let live = crate::workflow::model::RunGraph::materialise(&kvdag, run.clone(), Tier::Auto);
-    for node in &nodes {
-        let live_node = live
-            .node_by_path(&node.instance_path)
-            .unwrap_or_else(|| panic!("the live graph has {}", node.instance_path));
-        assert_eq!(
-            u32::from(node.depth),
-            u32::from(live_node.depth),
-            "depth disagrees for {}",
-            node.instance_path
-        );
-    }
+    // The second half of C6 cross-checked these depths against
+    // `RunGraph::materialise`, the engine's in-memory materialisation. That
+    // materialisation went with the engine (`09-agent-teams-rework.md` §2), and
+    // with it the second projection that could disagree: the stored rows are
+    // now the only reading of a run's shape, which `workflow.run.get` serves and
+    // the DAG view renders.
 }
 
 // ── 5: cycle rejection ───────────────────────────────────────────────────

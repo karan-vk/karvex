@@ -272,10 +272,7 @@ mod tests {
 
     #[test]
     fn the_run_context_file_is_the_path_the_writer_returns() {
-        let dir = std::env::temp_dir().join(format!(
-            "karvex-run-context-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("karvex-run-context-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let written = write_run_context(&dir, "# Prior runs\n").expect("write run context");
         assert_eq!(written, run_context_file(&dir));

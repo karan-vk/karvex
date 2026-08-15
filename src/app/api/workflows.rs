@@ -19,17 +19,14 @@
 
 #[cfg(feature = "workflow")]
 use std::collections::BTreeMap;
-#[cfg(feature = "workflow")]
-use std::path::PathBuf;
 
 #[cfg(feature = "workflow")]
 use crate::api::schema::{
     ErrorBody, KvdagEdgeInfo, KvdagNodeInfo, KvdagVersionDetail, KvdagVersionSummary,
     ResponseResult, WorkflowArgSpec, WorkflowDefinitionFormat, WorkflowDetail, WorkflowEdgePayload,
-    WorkflowExpandRejection, WorkflowExpandRejectionReason, WorkflowGrowthLimit,
-    WorkflowGrowthLimitKind, WorkflowIsolation, WorkflowNodeKind, WorkflowRunEdgeInfo,
-    WorkflowRunGraph, WorkflowRunInfo, WorkflowRunNodeInfo, WorkflowRunner, WorkflowSummary,
-    WorkflowTier, WorkflowVersionOrigin,
+    WorkflowGrowthLimit, WorkflowGrowthLimitKind, WorkflowIsolation, WorkflowNodeKind,
+    WorkflowRunEdgeInfo, WorkflowRunGraph, WorkflowRunInfo, WorkflowRunNodeInfo, WorkflowRunner,
+    WorkflowSummary, WorkflowTier, WorkflowVersionOrigin,
 };
 use crate::api::schema::{
     WorkflowCreateParams, WorkflowNodeExpandParams, WorkflowNodeReportParams,
@@ -54,7 +51,7 @@ use crate::workflow::definition::{Definition, DefinitionError};
 #[cfg(feature = "workflow")]
 use crate::workflow::model::{
     EdgePayload, InstancePath, Isolation, Kvdag, KvdagEdge, KvdagNode, KvdagVersionId, NodeKey,
-    NodeKind, NodeStatus, RestoredRef, RestoredSeed, RunId, RunStatus, Runner, WorkflowId,
+    NodeKind, RestoredRef, RestoredSeed, RunId, Runner, WorkflowId,
 };
 #[cfg(feature = "workflow")]
 use crate::workflow::store::error::WORKFLOW_NAME_TAKEN_CODE;
@@ -108,52 +105,13 @@ const MISSING_ARG_CODE: &str = "workflow_missing_arg";
 /// (`09-agent-teams-rework.md` §3.3).
 #[cfg(feature = "workflow")]
 const INVALID_ARGUMENT_CODE: &str = "workflow_invalid_argument";
-/// A node method that delivers into the node's pane addressed a node that has
-/// none. `05-phase-plan.md` W5 scopes steering and interrupting to a running
-/// node; answering with a success the node never received would be worse than
-/// refusing.
-#[cfg(feature = "workflow")]
-const NODE_NOT_RUNNING_CODE: &str = "workflow_node_not_running";
-/// A steer or interrupt reached the node's pane path and the runtime refused to
-/// write it. `04-kvdag-and-execution.md` §5 makes these deliveries, not
-/// requests: a control surface that answers `ok` for keystrokes the process
-/// never saw is worse than one that fails loudly.
-#[cfg(feature = "workflow")]
-const DELIVERY_FAILED_CODE: &str = "workflow_node_delivery_failed";
-/// A self-reported result the completion gate refused because it does not
-/// validate against the node's `output_schema` (`04-kvdag-and-execution.md`
-/// §4.3). The node's own process is the one that has to fix it, and its only
-/// channel back is this response — answering `ok` for a result the engine just
-/// rejected is what let a schema-invalid report stall a run silently.
-#[cfg(feature = "workflow")]
-const RESULT_INVALID_CODE: &str = "workflow_node_result_invalid";
-/// A node method addressed a run that has already reached a final status.
-/// A closed run will never settle again, so anything handed back to it —
-/// a restart, a steer, an interrupt, or an expand proposal — is work nothing
-/// will ever collect. Every one of them is refused rather than performed
-/// (`06-phase2-plan.md` H2).
-#[cfg(feature = "workflow")]
-const RUN_CLOSED_CODE: &str = "workflow_run_closed";
-/// The transcript an interrogation would resume is not reachable
-/// (`07-phase3-plan.md` §3 rule 8). One code for every reason — a node that ran
-/// as a command and never had a session, a transcript file that is gone, a
-/// recorded cwd that no longer exists, a reconstruction with no checkpoint to
-/// seed from — with the *reason* in the message text, matching the existing
-/// single-code style. `03-storage-schema.md` §4.4's stat-first rule is what
-/// makes this a structured answer instead of a pane that silently fails to
-/// start.
-///
-/// `src/app/workflow_history.rs` carries its own copy of this literal rather
-/// than importing this constant: that module's `interrogate_intent`/
-/// `interrogate_outcome` compile unconditionally (its own module doc: only
-/// `historical_interrogations` is `#[cfg(feature = "workflow")]`), and this
-/// constant is not — it is gated off entirely in a `--no-default-features`
-/// build, where an unconditional `use` of it would not compile. The two
-/// literals' equality is asserted in
-/// `all_workflow_error_codes_are_a_well_formed_disjoint_family` below so they
-/// cannot silently diverge.
-#[cfg(feature = "workflow")]
-const TRANSCRIPT_UNAVAILABLE_CODE: &str = "workflow_transcript_unavailable";
+// Five codes were deleted here with the engine (`09-agent-teams-rework.md`
+// §2), because nothing can produce them any more:
+// `workflow_node_{not_running,delivery_failed,result_invalid}` belonged to the
+// node contract's delivery and completion gates, `workflow_run_closed` to the
+// four node verbs' closed-run guard, and `workflow_transcript_unavailable`
+// lives on in `src/app/workflow_history.rs` alone now that interrogation is
+// gone from the API.
 /// The run's history has been pruned: only its `run_summary` row survives
 /// (`03-storage-schema.md` §9, `07-phase3-plan.md` §4 D12). Restore and
 /// interrogation are impossible, and `workflow.run.get` answers this rather
@@ -170,10 +128,12 @@ const RESTORE_UNKNOWN_SELECTOR_CODE: &str = "workflow_restore_unknown_selector";
 /// (`09-agent-teams-rework.md` §2). Its own code rather than a bare
 /// `not_implemented`, so a client that still sends one of these can tell "this
 /// server does not execute nodes any more" from "this method never existed".
+#[cfg(feature = "workflow")]
 const NODE_VERB_RETIRED_CODE: &str = "workflow_node_verb_retired";
 
 /// The one answer every retired node verb gives. `action` completes the
 /// sentence "karvex no longer executes nodes, so it cannot …".
+#[cfg(feature = "workflow")]
 fn node_verb_retired(id: String, action: &str) -> String {
     encode_error(
         id,
@@ -1203,15 +1163,18 @@ impl App {
         // §3.3: a run cancels by closing its lead's pane. Teammates belong to
         // the lead, so there is no task-level kill choreography.
         if !self.is_live_lead_run(&run_id) {
-            return encode_error(
-                id,
-                NO_ACTIVE_RUN_CODE,
-                format!("run {} is not the run this server is executing", run_id),
-            );
+            return not_the_active_run(id, run_id.as_str());
         }
         self.cancel_lead_run(&run_id, unix_now_ms());
         match self.stored_run(&run_id) {
             Ok(Some((run, _graph))) => {
+                // Cancelling is terminal, so it is a `run.finished` on the
+                // wire: there is no separate cancelled event kind, and a client
+                // that only watches finishes must not miss this one.
+                self.emit_workflow_run_event(
+                    crate::api::schema::EventKind::WorkflowRunFinished,
+                    crate::api::schema::EventData::WorkflowRunFinished { run: run.clone() },
+                );
                 encode_success(id, ResponseResult::WorkflowRunCancelled { run })
             }
             Ok(None) => encode_error(id, NOT_FOUND_CODE, format!("no run {run_id}")),
@@ -1864,20 +1827,6 @@ fn is_truncated_payload(payload: &serde_json::Value) -> bool {
         .is_some_and(|object| object.get("truncated") == Some(&serde_json::Value::Bool(true)))
 }
 
-/// Why an interrogation was refused before anything was created.
-///
-/// The two arms are genuinely different answers: the caller can act on
-/// `Unavailable` (delete nothing, ask for `mode: reconstructed` instead), while
-/// `Store` is the subsystem failing and carries the store's own code.
-#[cfg(feature = "workflow")]
-enum InterrogationRefusal {
-    /// `workflow_transcript_unavailable`, with the reason in the message.
-    Unavailable(String),
-    /// The store answered with an error or is unavailable; its response,
-    /// deferred so the caller keeps ownership of the request id.
-    Store(Box<dyn FnOnce(String) -> String>),
-}
-
 #[cfg(feature = "workflow")]
 fn unavailable_response(id: String, unavailable: &StoreUnavailable) -> String {
     encode_error_body(
@@ -1941,6 +1890,12 @@ fn workflow_detail(
     }
 }
 
+/// The one wording for "this server is not executing that run".
+///
+/// `workflow.run.cancel` is the only caller left: the node verbs that shared it
+/// answer `workflow_node_verb_retired` now (§2). It stays a function rather
+/// than an inline `format!` because the CLI matches on this sentence and the
+/// duplicate literal is exactly how the two would drift apart.
 #[cfg(feature = "workflow")]
 fn not_the_active_run(id: String, run_id: &str) -> String {
     encode_error(
@@ -1948,35 +1903,6 @@ fn not_the_active_run(id: String, run_id: &str) -> String {
         NO_ACTIVE_RUN_CODE,
         format!("run {run_id} is not the run this server is executing"),
     )
-}
-
-/// Wire spelling of a run status, for messages the user reads.
-#[cfg(feature = "workflow")]
-fn run_status_label(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Pending => "pending",
-        RunStatus::Running => "running",
-        RunStatus::Paused => "paused",
-        RunStatus::Succeeded => "succeeded",
-        RunStatus::Failed => "failed",
-        RunStatus::Cancelled => "cancelled",
-    }
-}
-
-#[cfg(feature = "workflow")]
-fn node_status_label(status: NodeStatus) -> &'static str {
-    match status {
-        NodeStatus::Pending => "pending",
-        NodeStatus::Ready => "ready",
-        NodeStatus::Running => "running",
-        NodeStatus::NeedsAttention => "needs_attention",
-        NodeStatus::Blocked => "blocked",
-        NodeStatus::Succeeded => "succeeded",
-        NodeStatus::Failed => "failed",
-        NodeStatus::Skipped => "skipped",
-        NodeStatus::Restored => "restored",
-        NodeStatus::Cancelled => "cancelled",
-    }
 }
 
 #[cfg(feature = "workflow")]
@@ -4545,7 +4471,7 @@ port = "summary"
     #[cfg(feature = "workflow")]
     #[test]
     fn the_durable_projection_reports_parent_path_and_growth_limited() {
-        use crate::workflow::model::Demand;
+        use crate::workflow::model::{Demand, NodeStatus, RunStatus};
         use crate::workflow::store::{RunNodeRecord, RunRecord, StoredGrowthLimit};
 
         let node = RunNodeRecord {
@@ -5084,23 +5010,29 @@ output_schema = { type = "object", required = ["done"] }
     /// event names, enum variants, and struct fields, never error codes. Two
     /// "absent check" incidents already came out of that gap: Phase 3 nearly
     /// shipped `workflow_interrogation_spawn_failed` reusing a node-spawn
-    /// code (E-15, formerly pinned locally in
-    /// `the_interrogation_spawn_code_follows_the_family_convention`, now
-    /// subsumed by the general check below), and a keybind collision of the
-    /// same shape (E-7) shipped and had to be fixed later.
+    /// code (E-15), and a keybind collision of the same shape (E-7) shipped
+    /// and had to be fixed later.
     ///
     /// Values are pulled from the handlers themselves — the `_CODE` constants
-    /// and the `SpawnError`/`ReportRejected`/`WorkflowStartError` `code()`
-    /// methods — never hand-copied, so a changed constant changes this list
-    /// for free. Only the *domain* label per entry is hand-maintained, and
+    /// and the `WorkflowStartError::code()` method — never hand-copied, so a
+    /// changed constant changes this list for free. Only the *domain* label
+    /// per entry is hand-maintained, and
     /// `every_workflow_error_code_literal_in_source_is_inventoried` below
     /// greps the source tree so a brand-new code (or constant) left off this
     /// list fails loudly instead of silently going unchecked the way all of
     /// these did before.
+    ///
+    /// Nine codes left with the engine (`09-agent-teams-rework.md` §2): the
+    /// node-contract refusals `workflow_node_{not_running,delivery_failed,
+    /// result_invalid}` and `workflow_node_report_*`, the spawn family
+    /// `workflow_node_spawn_*`, `workflow_run_closed`, and the interrogation
+    /// pair `workflow_interrogation_{active,spawn_failed}`. None of them has a
+    /// producer any more, and the grep below is what proves it: a code left in
+    /// this list with nothing defining it fails just as loudly as a new one
+    /// missing from it.
     #[cfg(feature = "workflow")]
     fn all_workflow_error_codes() -> Vec<(&'static str, &'static str)> {
         use crate::app::workflow::WorkflowStartError;
-        use crate::workflow::binding::spawn::SpawnError;
         use crate::workflow::store::error::{
             WORKFLOW_INVALID_DEFINITION_CODE, WORKFLOW_NAME_TAKEN_CODE, WORKFLOW_STORE_ERROR_CODE,
             WORKFLOW_UNAVAILABLE_CODE,
@@ -5136,47 +5068,22 @@ output_schema = { type = "object", required = ["done"] }
                 "lead_unavailable",
                 crate::workflow::binding::lead::LEAD_UNAVAILABLE_CODE,
             ),
-            ("node_not_running", NODE_NOT_RUNNING_CODE),
-            ("node_delivery_failed", DELIVERY_FAILED_CODE),
-            ("node_result_invalid", RESULT_INVALID_CODE),
-            ("run_closed", RUN_CLOSED_CODE),
-            ("transcript_unavailable", TRANSCRIPT_UNAVAILABLE_CODE),
+            // Owned by `workflow_history.rs` now: that module's
+            // `interrogate_outcome` compiles unconditionally and is the only
+            // remaining producer, so the duplicate copy this file used to carry
+            // (and pin against divergence) is gone with the handlers that used
+            // it.
+            (
+                "transcript_unavailable",
+                crate::app::workflow_history::TRANSCRIPT_UNAVAILABLE_CODE,
+            ),
             ("run_pruned", RUN_PRUNED_CODE),
             ("restore_unknown_selector", RESTORE_UNKNOWN_SELECTOR_CODE),
-            ("interrogation_active", INTERROGATION_ACTIVE_CODE),
-            (
-                "interrogation_spawn_failed",
-                INTERROGATION_SPAWN_FAILED_CODE,
-            ),
+            // §2: a node verb the removed engine was the only possible server
+            // of. Its own domain, not `not_found`: the run may be perfectly
+            // alive and the verb still gone.
+            ("node_verb_retired", NODE_VERB_RETIRED_CODE),
             ("store_error", WORKFLOW_STORE_ERROR_CODE),
-            (
-                "node_report_unknown_node",
-                ReportRejected::UnknownNode.code(),
-            ),
-            (
-                "node_report_invalid_token",
-                ReportRejected::InvalidToken.code(),
-            ),
-            (
-                "node_report_missing_result",
-                ReportRejected::MissingResult.code(),
-            ),
-            (
-                "node_spawn_missing_command",
-                SpawnError::MissingCommand(InstancePath::new(String::new())).code(),
-            ),
-            (
-                "node_spawn_invalid_argument",
-                SpawnError::InvalidArgument(String::new()).code(),
-            ),
-            (
-                "node_spawn_target_pane_not_found",
-                SpawnError::TargetPaneNotFound.code(),
-            ),
-            (
-                "node_spawn_failed",
-                SpawnError::PaneLaunchFailed(String::new()).code(),
-            ),
             ("run_in_flight", WorkflowStartError::RunInFlight.code()),
         ]
     }
@@ -5194,7 +5101,7 @@ output_schema = { type = "object", required = ["done"] }
         let codes = all_workflow_error_codes();
         assert_eq!(
             codes.len(),
-            29,
+            17,
             "the inventory grew or shrank; update this count alongside the list itself"
         );
 
@@ -5230,20 +5137,6 @@ output_schema = { type = "object", required = ["done"] }
                 );
             }
         }
-
-        // `workflow_history.rs` cannot import `TRANSCRIPT_UNAVAILABLE_CODE`
-        // (it is `#[cfg(feature = "workflow")]`-gated here, but that module's
-        // `interrogate_outcome` compiles unconditionally) and so carries its
-        // own copy of the literal instead. That copy is not in
-        // `all_workflow_error_codes()` — it is the same value under a
-        // different name, not a second domain — so it is pinned here
-        // directly, keeping the one duplicate this file can't eliminate from
-        // silently drifting the way a duplicated literal already has before
-        // in this phase.
-        assert_eq!(
-            TRANSCRIPT_UNAVAILABLE_CODE,
-            crate::app::workflow_history::TRANSCRIPT_UNAVAILABLE_CODE
-        );
     }
 
     /// [`all_workflow_error_codes`] is hand-maintained — the values come from

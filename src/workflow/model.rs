@@ -13,7 +13,6 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::detect::AgentState;
 use crate::terminal::TerminalId;
 use crate::workflow::tier::{Assignment, Effort, ModelAlias, Tier};
 
