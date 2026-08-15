@@ -46,10 +46,14 @@ pub(crate) const WORKFLOW_REVIEW_NOT_FOUND_CODE: &str = "workflow_review_not_fou
 /// not abandoned — but genuinely unused Rust until then.
 #[allow(dead_code)] // wave-0 wire shape; wave 2b's precondition check produces this
 pub(crate) const WORKFLOW_REVIEW_IN_FLIGHT_CODE: &str = "workflow_review_in_flight";
-/// `workflow.review.apply` addressed a cycle that is not `awaiting_user`
-/// (`workflow_review_apply.rs`). Same wave-0/wave-2b split as
-/// [`WORKFLOW_REVIEW_IN_FLIGHT_CODE`].
-#[allow(dead_code)] // wave-0 wire shape; wave 2b's precondition check produces this
+/// `workflow.review.apply` addressed a cycle that is not `awaiting_user`:
+/// still `running`, or already decided
+/// (`workflow_review_apply.rs`, which produces it — P11 filled that stub in).
+///
+/// Feature-off builds answer `workflow_unavailable` long before any
+/// precondition runs, so there it is genuinely unused — the same
+/// `cfg_attr` [`WORKFLOW_REVIEW_NOT_FOUND_CODE`] carries.
+#[cfg_attr(not(feature = "workflow"), allow(dead_code))]
 pub(crate) const WORKFLOW_REVIEW_NOT_AWAITING_CODE: &str = "workflow_review_not_awaiting";
 /// `workflow.review.start` on a run with zero interviewable members: no
 /// member (or the lead) has a captured session id and a readable transcript,

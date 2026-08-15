@@ -4763,6 +4763,14 @@ port = "summary"
                 "review_no_interviewable_members",
                 crate::app::api::workflow_review::WORKFLOW_REVIEW_NO_INTERVIEWABLE_MEMBERS_CODE,
             ),
+            // Its own domain, deliberately not `definition_invalid`: nothing
+            // was authored and nothing was written — the accepted findings did
+            // not compile, and the cycle is still there to decide with a
+            // smaller set (P11).
+            (
+                "review_compile_failed",
+                crate::app::api::workflow_review_apply::WORKFLOW_REVIEW_COMPILE_FAILED_CODE,
+            ),
         ]
     }
 
@@ -4779,7 +4787,7 @@ port = "summary"
         let codes = all_workflow_error_codes();
         assert_eq!(
             codes.len(),
-            22,
+            23,
             "the inventory grew or shrank; update this count alongside the list itself"
         );
 
