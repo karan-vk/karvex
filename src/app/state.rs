@@ -869,6 +869,16 @@ pub struct DagNodeView {
     pub agent_state: Option<crate::detect::AgentState>,
     pub successors: Vec<crate::workflow::model::RunNodeIdx>,
     pub predecessors: Vec<crate::workflow::model::RunNodeIdx>,
+    /// Karvex's own opinion about this node needing a human — never the
+    /// node's projected `status` (`.local/prd/phase4-retarget-plan.md` §6
+    /// D-10). `None` means the watchdog has nothing to report, which covers
+    /// both "healthy" and "the watchdog has not looked yet"; the DAG detail
+    /// strip must not guess which.
+    pub attention: Option<crate::api::schema::WorkflowAttention>,
+    /// How many watchdog rungs have surfaced against this node
+    /// (`ProjectedNodeFacts::watchdog_interventions`'s known undercount
+    /// applies here too).
+    pub watchdog_interventions: u32,
 }
 
 /// The DAG overlay's view state.
@@ -949,6 +959,12 @@ pub struct DagViewState {
     // Populated by WS-H's DAG compute path, step 2f; empty allocates zero rows.
     #[allow(dead_code)]
     pub interrogation_nodes: Vec<DagInterrogationView>,
+    /// This run's self-improvement review cycle status, mirrored from
+    /// [`crate::app::state::HistoricalRunSnapshot::review`] — `None` means no
+    /// cycle has ever run. Drives the header's passive ask
+    /// (`.local/prd/phase4-retarget-plan.md` §3.5, §6 D19: "asks, never
+    /// automatic") and the `V` key's dispatch.
+    pub review_status: Option<crate::api::schema::WorkflowReviewStatus>,
 }
 
 /// Which verb the DAG overlay's one-line composer is composing for.
@@ -1110,23 +1126,103 @@ pub struct ViewState {
 }
 
 /// The workflow review overlay's state
-/// (`.local/prd/phase4-retarget-plan.md` §3.5, packet P2).
+/// (`.local/prd/phase4-retarget-plan.md` §3.5, packets P2 and P13).
 ///
-/// Landed as an inert stub: this packet owns every exhaustive `Mode` match
-/// once so the review/self-improvement behaviour (P10/P13) never has to
-/// fight match-arm churn across the tree again. There is no
-/// `workflow.review.*` wire method yet (that lands in P3/P10), so this holds
-/// only client-owned geometry — never a guess at a domain shape nobody has
-/// designed yet. It lives beside [`DagViewState`], [`WorkflowLaunchState`]
-/// and [`WorkflowRunsState`] on [`ViewState`] for the same reason they do:
-/// selection/scroll/hit-geometry are client concerns, carried across frames
-/// because `ViewState` is rebuilt wholesale every pass.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// P2 landed this as an inert stub — no `workflow.review.*` wire method
+/// existed yet, so it held only client-owned geometry rather than guessing at
+/// a domain shape nobody had designed. P3/P10/P11 landed the wire surface,
+/// the orchestration, and apply; this is P13's real shape: a findings list
+/// with per-row accept state (`Space` toggles), a detail strip for the
+/// selection, and a two-step confirm before `workflow.review.apply` actually
+/// runs — the run-browser's `WorkflowRunsConfirmRestore` precedent
+/// (`state.rs:1229`).
+///
+/// The data is loaded through in-process wire dispatch
+/// (`workflow.review.get`/`.start`/`.apply`), never a private store read
+/// (`AGENTS.md`'s runtime/client boundary guardrail) — same rule
+/// [`WorkflowRunsState`] follows. It lives beside [`DagViewState`],
+/// [`WorkflowLaunchState`] and [`WorkflowRunsState`] on [`ViewState`] for the
+/// same reason they do: selection/scroll/hit-geometry are client concerns,
+/// carried across frames because `ViewState` is rebuilt wholesale every pass.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkflowReviewState {
+    /// The run this cycle belongs to — empty while nothing has loaded.
+    pub run_id: String,
+    /// `None` means this run has never had a review cycle, matching
+    /// `workflow.review.get`'s own "no cycle" answer
+    /// (`WorkflowReviewGet::review`).
+    pub status: Option<crate::api::schema::WorkflowReviewStatus>,
+    /// How many of this cycle's interviews degraded to `evidence_only`,
+    /// mirrored from `WorkflowReviewInfo::evidence_only_count` so the
+    /// overlay can say "the review ran" and "the review heard from everyone"
+    /// are not the same claim.
+    pub evidence_only_count: u32,
+    /// One row per finding this cycle produced, in the order
+    /// `workflow.review.get` returned them.
+    pub findings: Vec<WorkflowReviewFindingRow>,
+    /// Set when there is nothing to decide: no cycle has ever run, one is
+    /// still running, or this cycle already closed. Mirrors P2's honest
+    /// placeholder text for every state that is not "waiting on your
+    /// decision" — never a guess, always what the last load actually found.
+    pub message: Option<String>,
+    /// Index into [`Self::findings`].
+    pub selected: usize,
+    pub scroll: usize,
+    /// `Some` while the apply/decline confirmation is open, reusing the
+    /// run-browser's two-step pattern: `Enter`/`d` propose, `Enter` again (or
+    /// `Esc` to cancel) is what actually calls `workflow.review.apply`.
+    pub confirm: Option<WorkflowReviewConfirm>,
     // ── geometry, stored by the view-computation pass and read by both the
     // renderer and the mouse hit-test, so what is clickable can never
     // disagree with what was drawn — same rule as every other overlay here.
     pub modal_rect: Rect,
+    pub list_rect: Rect,
+    pub row_rects: Vec<Rect>,
+    pub detail_rect: Rect,
+    pub footer_rect: Rect,
+}
+
+/// One finding, projected for the overlay's list/detail (§3.5).
+///
+/// `accept` is the overlay's own **pending** decision, never the wire's own
+/// `accepted` (which means "already folded into a compiled version" —
+/// meaningless for a cycle that is still `awaiting_user`, the only status the
+/// overlay ever lets a human act on). Defaults to `false`: nothing is applied
+/// unless the human explicitly says so, row by row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowReviewFindingRow {
+    /// The compiler's own key for this finding — also `workflow.review.apply`'s
+    /// `accept` vocabulary, so this is what the toggle actually tracks.
+    pub node_key: String,
+    pub run_path: Option<String>,
+    pub interview_mode: crate::api::schema::WorkflowReviewInterviewMode,
+    pub level: crate::api::schema::WorkflowReviewFindingLevel,
+    pub verdict: crate::api::schema::WorkflowReviewVerdict,
+    pub rationale: String,
+    /// Who this finding is attributed to and how, already resolved into a
+    /// sentence the detail strip can show verbatim — the one place the
+    /// resumed/evidence-only distinction is spelled out
+    /// (`.local/prd/phase4-retarget-plan.md`: "a finding derived without a
+    /// live interview must never be presented as the teammate's own words").
+    pub attribution: String,
+    /// A compact, pre-formatted read of `evidence`/`proposed_change` — the
+    /// measured facts put to the teammate (or reasoned from durable
+    /// evidence), never the raw JSON.
+    pub evidence_summary: String,
+    pub proposed_change_summary: String,
+    /// The overlay's own pending decision for this finding, toggled by
+    /// `Space`. Never pre-seeded from the wire's `accepted` — see the struct
+    /// doc.
+    pub accept: bool,
+}
+
+/// What the review overlay's confirm step is proposing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowReviewConfirm {
+    /// `Enter`: apply whatever is currently toggled on.
+    Apply,
+    /// `d`: decline the whole cycle, regardless of any row's toggle.
+    DeclineAll,
 }
 
 /// The run browser overlay's state: a list of a workflow's runs — plus
@@ -2199,6 +2295,18 @@ pub(crate) struct HistoricalRunSnapshot {
     /// The run's team members (§3.4), which is what resolves a node's owner to
     /// the pane that owns it.
     pub members: Vec<crate::api::schema::WorkflowRunMemberInfo>,
+    /// This run's self-improvement review cycle, when one has ever been
+    /// started (`.local/prd/phase4-retarget-plan.md` §3.5, packet P13).
+    /// Loaded through `workflow.review.get` beside the run graph — a shared
+    /// runtime fact, never a private store read (`AGENTS.md`'s runtime/client
+    /// boundary guardrail) — and kept current by
+    /// [`crate::app::App::refresh_open_dag_review`], which the `workflow.review.*`
+    /// event funnel calls so a review's progress is visible on a run whose
+    /// live projection has already stopped polling.
+    pub review: Option<crate::api::schema::WorkflowReviewInfo>,
+    /// The cycle's findings, alongside [`Self::review`]. Empty while
+    /// `review` is `None` or the cycle has not synthesised yet.
+    pub review_findings: Vec<crate::api::schema::WorkflowReviewFindingInfo>,
 }
 
 impl HistoricalRunSnapshot {
@@ -2225,6 +2333,19 @@ pub(crate) struct ProjectedNodeFacts {
     pub subject: String,
     pub owner: String,
     pub emergent: bool,
+    /// Karvex's own opinion about this node needing a human, read verbatim
+    /// off the wire's `run_node.attention` column — never derived from
+    /// `status` (`.local/prd/phase4-retarget-plan.md` §6 D-10: the watchdog's
+    /// opinion and Claude Code's projected status are two different facts and
+    /// must never be conflated into one).
+    pub attention: Option<crate::api::schema::WorkflowAttention>,
+    /// The wire's `watchdog_interventions` count, verbatim. As of P9/P10
+    /// (WI-R5, `.local/prd/phase4-retarget-plan.md` amendment log) the store
+    /// column only increments once `attention` is surfaced (rung 4), so this
+    /// under-counts rungs 1-3 until that honesty debt is paid — displayed
+    /// as-is rather than re-derived, since re-deriving it here would silently
+    /// disagree with what `workflow.run.get` answers everywhere else.
+    pub watchdog_interventions: u32,
 }
 
 /// One interrogation row on a [`HistoricalRunSnapshot`].
@@ -3256,7 +3377,9 @@ mod tests {
 
     /// Packet P2's gate: the review overlay mode exists and round-trips, is
     /// a member of the two `Mode` predicates every overlay depends on, and
-    /// starts empty (`.local/prd/phase4-retarget-plan.md` §3.5, P2).
+    /// starts empty until the view-computation pass — or, since P13, the
+    /// `App`-level opener — populates it
+    /// (`.local/prd/phase4-retarget-plan.md` §3.5, P2/P13).
     #[test]
     fn workflow_review_mode_round_trips() {
         let mut state = AppState::test_new();
@@ -3269,7 +3392,7 @@ mod tests {
         assert_eq!(
             state.view.workflow_review,
             WorkflowReviewState::default(),
-            "the review overlay starts empty — no wire method to seed it yet"
+            "nothing has loaded a cycle onto raw `AppState` yet"
         );
 
         state.mode = initial;
@@ -3309,6 +3432,8 @@ mod tests {
             lead_pane_id: None,
             projected: std::collections::BTreeMap::new(),
             members: Vec::new(),
+            review: None,
+            review_findings: Vec::new(),
         };
         state.set_historical_run(Some(snapshot));
         let stored = state.historical_run().expect("just set");

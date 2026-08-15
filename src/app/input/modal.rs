@@ -172,13 +172,19 @@ pub(super) fn open_workflow_dag(state: &mut AppState) -> bool {
     true
 }
 
-/// Opens the review overlay (`.local/prd/phase4-retarget-plan.md` §3.5,
-/// packet P2). Unlike the DAG view there is no live-run gate: this packet
-/// lands the mode as an inert stub, with no `workflow.review.*` wire method
-/// yet to decide whether a review is actually available — that decision
-/// belongs to the packet that wires the method (P10/P13). So the keybind is
-/// always reachable, and the stub renders its own honest "not available yet"
-/// state instead of refusing to open.
+/// Opens the review overlay onto a raw default state
+/// (`.local/prd/phase4-retarget-plan.md` §3.5, packet P2).
+///
+/// P2 landed this as the whole implementation, when there was no
+/// `workflow.review.*` wire method yet to load anything through. P13 gave
+/// the overlay real content, which needs `&mut App` to dispatch
+/// `workflow.review.get` (`App::open_workflow_review`,
+/// `src/app/input/workflow_review.rs`) — so every production opener (the
+/// `impl App` navigate-action arm, the DAG's `V` key) calls that instead.
+/// This pure `&mut AppState`-only version survives only as the test-only
+/// pure navigate-dispatch path's stand-in (`execute_navigate_action_in_context`
+/// below), which has no runtime to ask for real data.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn open_workflow_review(state: &mut AppState) {
     state.view.workflow_review = crate::app::state::WorkflowReviewState::default();
     state.mode = Mode::WorkflowReview;

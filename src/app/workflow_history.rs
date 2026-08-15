@@ -74,6 +74,15 @@ impl App {
         let lead_pane_id = run.lead_pane_id.clone();
         let members = graph.members.clone();
         let projected = projected_facts(&graph);
+        // Only a lead run can ever have a review cycle (§3.5: the trigger is
+        // a Claude Code team lead's run reaching a terminal status), so an
+        // engine-era run skips the round trip rather than asking a question
+        // that can only ever answer `None`.
+        let (review, review_findings) = if team_name.is_some() || lead_pane_id.is_some() {
+            self.fetch_workflow_review(run_id)
+        } else {
+            (None, Vec::new())
+        };
         let graph = rehydrate_run_graph(&run, graph);
         let interrogations = self.historical_interrogations(&graph.run_id);
         self.state.set_historical_run(Some(HistoricalRunSnapshot {
@@ -84,9 +93,147 @@ impl App {
             lead_pane_id,
             projected,
             members,
+            review,
+            review_findings,
         }));
         self.state.mode = Mode::WorkflowDag;
         Ok(())
+    }
+
+    /// `workflow.review.get` for `run_id` — the DAG overlay's own read of the
+    /// run's self-improvement review cycle, dispatched in-process exactly
+    /// like `workflow.run.get` above it (`AGENTS.md`'s runtime/client
+    /// boundary guardrail: a shared runtime fact, read through the JSON API,
+    /// never a private store read from the TUI).
+    ///
+    /// A failure here degrades to "no review" rather than failing the whole
+    /// load: the run graph is still a usable overlay without it, the same
+    /// reasoning `load_historical_run` already applies to a missing summary.
+    fn fetch_workflow_review(
+        &mut self,
+        run_id: &str,
+    ) -> (
+        Option<crate::api::schema::WorkflowReviewInfo>,
+        Vec<crate::api::schema::WorkflowReviewFindingInfo>,
+    ) {
+        let response = self.dispatch_api_request(
+            "tui.workflow.review.get",
+            Method::WorkflowReviewGet(WorkflowRunTarget {
+                run_id: run_id.to_string(),
+            }),
+        );
+        match success_result(&response) {
+            Some(ResponseResult::WorkflowReviewGet { review, findings }) => (review, findings),
+            _ => {
+                if let Some(message) = error_message(&response) {
+                    tracing::debug!(%message, %run_id, "could not read this run's review cycle");
+                }
+                (None, Vec::new())
+            }
+        }
+    }
+
+    /// Refreshes only the review half of an already-open DAG snapshot, in
+    /// response to a `workflow.review.*` event
+    /// (`.local/prd/phase4-retarget-plan.md` §5 packet P13's contract:
+    /// "refresh only on `workflow.review.*` and `workflow.node.watchdog`
+    /// events").
+    ///
+    /// Deliberately narrower than [`Self::reload_open_lead_run`]: a review
+    /// cycle runs on a run that has already reached a terminal status, so by
+    /// the time it exists there is no live projection left to drive the
+    /// poll-triggered reload — `poll_run_watchdog`'s "did anything change"
+    /// edge never fires again once the run has closed. This is the seam that
+    /// keeps a closed run's review cycle visible without inventing a second
+    /// poll timer: the review's own event stream is the trigger.
+    pub(crate) fn refresh_open_dag_review(&mut self, run_id: &str) -> bool {
+        if self.state.mode != Mode::WorkflowDag {
+            return false;
+        }
+        let open = self
+            .state
+            .historical_run()
+            .is_some_and(|snapshot| snapshot.graph.run_id.as_str() == run_id);
+        if !open {
+            return false;
+        }
+        let (review, review_findings) = self.fetch_workflow_review(run_id);
+        if let Some(snapshot) = self.state.historical_run.as_mut() {
+            snapshot.review = review;
+            snapshot.review_findings = review_findings;
+        }
+        true
+    }
+
+    /// `V` in the DAG view: the review ask's other half, dispatched off
+    /// exactly what [`crate::app::state::DagViewState::review_status`] says —
+    /// never automatic (`.local/prd/phase4-retarget-plan.md` §6 D19).
+    ///
+    /// No cycle yet on a finished lead run starts one; a cycle waiting on the
+    /// human opens the findings overlay through the same path the global
+    /// `keys.open_workflow_review` binding uses, so there is exactly one
+    /// place that turns a `workflow.review.get` answer into
+    /// [`crate::app::state::WorkflowReviewState`]. Anything else — still
+    /// running, already decided, or no run open at all — is a quiet no-op:
+    /// there is nothing this key could usefully start or open.
+    pub(crate) fn handle_workflow_dag_review_key(&mut self) {
+        let Some(run_id) = self
+            .state
+            .historical_run()
+            .map(|snapshot| snapshot.graph.run_id.to_string())
+        else {
+            return;
+        };
+        let dag = &self.state.view.dag;
+        match dag.review_status {
+            None if dag.lead_run
+                && dag
+                    .run_status
+                    .is_some_and(run_status_is_terminal_for_review) =>
+            {
+                self.start_review_from_dag(run_id);
+            }
+            Some(crate::api::schema::WorkflowReviewStatus::AwaitingUser) => {
+                self.open_workflow_review();
+            }
+            _ => {}
+        }
+    }
+
+    /// `workflow.review.start`, from the DAG's `V` key. Updates the open
+    /// snapshot's review field directly from the response rather than
+    /// re-fetching: `workflow.review.start`'s own answer already carries the
+    /// cycle it just created.
+    fn start_review_from_dag(&mut self, run_id: String) {
+        let response = self.dispatch_api_request(
+            "tui.workflow.review.start",
+            Method::WorkflowReviewStart(WorkflowRunTarget {
+                run_id: run_id.clone(),
+            }),
+        );
+        match success_result(&response) {
+            Some(ResponseResult::WorkflowReviewStarted { review }) => {
+                if let Some(snapshot) = self.state.historical_run.as_mut() {
+                    snapshot.review = Some(review);
+                }
+                self.show_workflow_notice(crate::workflow::model::UserNotice {
+                    level: crate::workflow::model::NoticeLevel::Info,
+                    run: Some(RunId::new(run_id)),
+                    path: None,
+                    message: "review started — interviewing the run's team".to_string(),
+                });
+            }
+            _ => {
+                let message = error_message(&response)
+                    .unwrap_or_else(|| "could not start a review for this run".to_string());
+                self.show_workflow_notice(crate::workflow::model::UserNotice {
+                    level: crate::workflow::model::NoticeLevel::Warning,
+                    run: Some(RunId::new(run_id)),
+                    path: None,
+                    message,
+                });
+            }
+        }
     }
 
     /// Re-reads the run the overlay currently has open, when the run
@@ -348,7 +495,13 @@ fn projected_facts(graph: &WorkflowRunGraph) -> BTreeMap<String, ProjectedNodeFa
     graph
         .nodes
         .iter()
-        .filter(|node| node.task_id.is_some() || !node.subject.is_empty() || !node.owner.is_empty())
+        .filter(|node| {
+            node.task_id.is_some()
+                || !node.subject.is_empty()
+                || !node.owner.is_empty()
+                || node.attention.is_some()
+                || node.watchdog_interventions > 0
+        })
         .map(|node| {
             (
                 node.path.clone(),
@@ -357,6 +510,8 @@ fn projected_facts(graph: &WorkflowRunGraph) -> BTreeMap<String, ProjectedNodeFa
                     subject: node.subject.clone(),
                     owner: node.owner.clone(),
                     emergent: node.emergent,
+                    attention: node.attention,
+                    watchdog_interventions: node.watchdog_interventions,
                 },
             )
         })
@@ -578,6 +733,22 @@ fn succession(succession: &WorkflowSuccession) -> Succession {
     }
 }
 
+/// Whether a run has reached a status a review could start on
+/// (`workflow.review.start`'s own precondition, §3.5). A deliberate small
+/// copy of `app/workflow_review.rs`'s private `run_status_is_terminal` rather
+/// than a cross-module dependency on another workstream's file — the same
+/// call `ui/workflow_runs.rs` already makes for `run_status_color`/
+/// `run_status_glyph`. This is a hint for when to *show* the ask; the
+/// server's own precondition is what actually decides, so drift here can
+/// only ever cost an extra refused `workflow.review.start`, never a wrong
+/// acceptance.
+fn run_status_is_terminal_for_review(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
+    )
+}
+
 fn success_result(response: &str) -> Option<ResponseResult> {
     serde_json::from_str::<SuccessResponse>(response)
         .ok()
@@ -746,6 +917,27 @@ mod tests {
         assert_eq!(graph.nodes.len(), 2);
     }
 
+    /// A node the watchdog has an opinion about is projected even when the
+    /// team recorded nothing else for it — a stuck node with no claimed task
+    /// yet must still be visible.
+    #[test]
+    fn watchdog_facts_alone_are_enough_to_project_a_node() {
+        let mut wire = wire_graph();
+        wire.nodes[0].watchdog_interventions = 2;
+        wire.nodes[0].attention = Some(crate::api::schema::WorkflowAttention::Stuck);
+
+        let facts = projected_facts(&wire);
+        let stuck = facts
+            .get("plan")
+            .expect("watchdog facts alone still project");
+        assert_eq!(stuck.watchdog_interventions, 2);
+        assert_eq!(
+            stuck.attention,
+            Some(crate::api::schema::WorkflowAttention::Stuck)
+        );
+        assert!(stuck.owner.is_empty(), "nothing else was observed for it");
+    }
+
     /// An edge naming a node the projection does not carry is dropped, not
     /// pointed at nothing.
     #[test]
@@ -864,6 +1056,8 @@ mod tests {
                 agent_state: None,
                 successors: Vec::new(),
                 predecessors: Vec::new(),
+                attention: None,
+                watchdog_interventions: 0,
             })
             .collect();
         dag.selected = Some(RunNodeIdx(0));
@@ -1093,5 +1287,121 @@ mod tests {
         for (wire, engine) in all {
             assert_eq!(node_status(wire), engine, "{wire:?}");
         }
+    }
+
+    // ── the DAG's `V` key and the review refresh seam (packet P13) ─────────
+
+    fn test_app() -> App {
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    /// Opens the DAG on a bare lead-run snapshot for `run_id`, without ever
+    /// having actually run anything server-side — enough to exercise the
+    /// `V` key's dispatch and `refresh_open_dag_review`'s gating without the
+    /// cost of a full review cycle (panes, interviews, synthesis).
+    fn open_dag_on(app: &mut App, run_id: &str) {
+        app.state.mode = Mode::WorkflowDag;
+        app.state.set_historical_run(Some(HistoricalRunSnapshot {
+            graph: Box::new(RunGraph {
+                run_id: RunId::new(run_id.to_string()),
+                version_id: KvdagVersionId::new("kvdag_version:1"),
+                tier: Tier::Auto,
+                growth: GrowthLimits::default(),
+                assignments: BTreeMap::new(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                status: RunStatus::Succeeded,
+                seq: 0,
+                epilogue: None,
+            }),
+            workflow_name: "demo".to_string(),
+            interrogations: Vec::new(),
+            team_name: Some("session-213aa9bf".to_string()),
+            lead_pane_id: None,
+            projected: BTreeMap::new(),
+            members: Vec::new(),
+            review: None,
+            review_findings: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn refresh_open_dag_review_no_ops_outside_dag_mode() {
+        let mut app = test_app();
+        assert!(!app.refresh_open_dag_review("workflow_run:none"));
+    }
+
+    #[test]
+    fn refresh_open_dag_review_no_ops_for_a_run_that_is_not_open() {
+        let mut app = test_app();
+        open_dag_on(&mut app, "workflow_run:a");
+        assert!(!app.refresh_open_dag_review("workflow_run:b"));
+    }
+
+    #[test]
+    fn refresh_open_dag_review_reloads_the_open_run_even_with_no_server_side_cycle() {
+        let mut app = test_app();
+        open_dag_on(&mut app, "workflow_run:a");
+        assert!(app.refresh_open_dag_review("workflow_run:a"));
+        assert!(
+            app.state
+                .historical_run()
+                .expect("still open")
+                .review
+                .is_none(),
+            "no cycle on this server, so the honest answer is none"
+        );
+    }
+
+    #[test]
+    fn v_does_nothing_with_no_dag_run_open() {
+        let mut app = test_app();
+        app.state.mode = Mode::WorkflowDag;
+        app.handle_workflow_dag_review_key();
+        assert_eq!(app.state.mode, Mode::WorkflowDag);
+    }
+
+    #[test]
+    fn v_does_nothing_while_a_review_is_already_running() {
+        let mut app = test_app();
+        open_dag_on(&mut app, "workflow_run:a");
+        app.state.view.dag.lead_run = true;
+        app.state.view.dag.run_status = Some(RunStatus::Succeeded);
+        app.state.view.dag.review_status = Some(crate::api::schema::WorkflowReviewStatus::Running);
+        app.handle_workflow_dag_review_key();
+        assert_eq!(
+            app.state.mode,
+            Mode::WorkflowDag,
+            "a running cycle offers nothing new to press"
+        );
+    }
+
+    #[test]
+    fn v_does_nothing_on_a_run_that_has_not_finished() {
+        let mut app = test_app();
+        open_dag_on(&mut app, "workflow_run:a");
+        app.state.view.dag.lead_run = true;
+        app.state.view.dag.run_status = Some(RunStatus::Running);
+        app.state.view.dag.review_status = None;
+        app.handle_workflow_dag_review_key();
+        assert_eq!(app.state.mode, Mode::WorkflowDag);
+    }
+
+    #[test]
+    fn v_opens_the_findings_overlay_when_the_cached_status_says_awaiting_user() {
+        let mut app = test_app();
+        open_dag_on(&mut app, "workflow_run:a");
+        app.state.view.dag.lead_run = true;
+        app.state.view.dag.run_status = Some(RunStatus::Succeeded);
+        app.state.view.dag.review_status =
+            Some(crate::api::schema::WorkflowReviewStatus::AwaitingUser);
+        app.handle_workflow_dag_review_key();
+        assert_eq!(app.state.mode, Mode::WorkflowReview);
     }
 }

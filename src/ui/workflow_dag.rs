@@ -103,6 +103,12 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
         // graph: the graph looks the same either way, and which verbs the
         // overlay may offer depends entirely on which engine ran it.
         lead_run: historical.is_some_and(|snapshot| snapshot.is_lead_run()),
+        // The header's passive review ask reads this, never a second fetch —
+        // the snapshot is where `App::load_historical_run`/
+        // `App::refresh_open_dag_review` already put it (§3.5, packet P13).
+        review_status: historical
+            .and_then(|snapshot| snapshot.review.as_ref())
+            .map(|review| review.status),
         ..DagViewState::default()
     };
 
@@ -448,6 +454,11 @@ fn project_node(
         agent_state: None,
         successors,
         predecessors,
+        // Same reasoning as `owner`/`subject` above: a `RunNode` is the
+        // engine's model and has no attention/watchdog columns of its own —
+        // `merge_projection` fills these in for a lead run only.
+        attention: None,
+        watchdog_interventions: 0,
     }
 }
 
@@ -469,6 +480,8 @@ fn merge_projection(
             node.subject = facts.subject.clone();
             node.owner = facts.owner.clone();
             node.emergent = facts.emergent;
+            node.attention = facts.attention;
+            node.watchdog_interventions = facts.watchdog_interventions;
         }
         // An unclaimed task has an empty owner, which matches no member — so
         // the lookup answers `None` rather than picking an arbitrary teammate,
@@ -891,6 +904,14 @@ fn render_header(dag: &DagViewState, extras: &DagExtras, p: &Palette, frame: &mu
         }
         Some(EpiloguePhase::Done) | None => {}
     }
+    // The self-improvement review's passive ask — a header segment plus the
+    // `V` key, never a modal (`.local/prd/phase4-retarget-plan.md` §3.5, §6
+    // D19). `None` on a still-running or non-terminal run says nothing at
+    // all: the ask only ever appears once there is something to do.
+    if let Some((text, color)) = review_header_segment(dag, p) {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
     spans.push(Span::styled(" · ", dim));
     spans.push(Span::styled(
         format!("{} nodes", dag.counts.total),
@@ -1239,6 +1260,33 @@ fn render_detail(dag: &DagViewState, extras: &DagExtras, p: &Palette, frame: &mu
             width,
         )));
     }
+    // Karvex's own opinion about this node needing a human — never the
+    // node's own projected `status` above (`.local/prd/phase4-retarget-plan.md`
+    // §6 D-10). An optional line, same rule the blocker/delivery-failure
+    // lines above already follow: `DETAIL_HEIGHT` stays a true constant, so a
+    // node that carries every optional fact at once clips rather than
+    // growing the strip.
+    if node.attention.is_some() || node.watchdog_interventions > 0 {
+        let mut spans = Vec::new();
+        if node.watchdog_interventions > 0 {
+            spans.push(Span::styled(" watchdog: ", dim));
+            spans.push(Span::styled(
+                format!("{} intervention(s)", node.watchdog_interventions),
+                Style::default().fg(p.peach),
+            ));
+        }
+        if let Some(attention) = node.attention {
+            if !spans.is_empty() {
+                spans.push(Span::styled("  ", dim));
+            }
+            spans.push(Span::styled(" attention: ", dim));
+            spans.push(Span::styled(
+                attention_label(attention),
+                Style::default().fg(p.red).add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(truncate_spans(spans, width)));
+    }
     // The node box elides this to whatever fits its fixed ~20-column title
     // row (`render_nodes` above); the detail strip is the one place selecting
     // that node is guaranteed to show the *whole* limit, because it is the
@@ -1382,6 +1430,21 @@ fn agent_state_label(state: crate::detect::AgentState) -> &'static str {
         crate::detect::AgentState::Idle => "idle",
         crate::detect::AgentState::Blocked => "needs input",
         crate::detect::AgentState::Unknown => "unknown",
+    }
+}
+
+/// The watchdog's own opinion, in the overlay's vocabulary
+/// (`.local/prd/phase4-retarget-plan.md` §6 D-10, P4's four `Attention`
+/// variants plus `Unbound`). Never the node's projected `status` — this is
+/// what makes the DAG detail's `attention:` line a second, distinct fact
+/// rather than a restatement of the line above it.
+fn attention_label(attention: crate::api::schema::WorkflowAttention) -> &'static str {
+    match attention {
+        crate::api::schema::WorkflowAttention::Stuck => "stuck",
+        crate::api::schema::WorkflowAttention::BudgetExceeded => "budget exceeded",
+        crate::api::schema::WorkflowAttention::NeedsInput => "needs input",
+        crate::api::schema::WorkflowAttention::LeadBlocked => "lead blocked",
+        crate::api::schema::WorkflowAttention::Unbound => "unbound",
     }
 }
 
@@ -1648,6 +1711,34 @@ fn run_status_color(status: RunStatus, p: &Palette) -> Color {
         RunStatus::Paused => p.peach,
         RunStatus::Pending => p.subtext0,
         RunStatus::Cancelled => p.overlay0,
+    }
+}
+
+/// The header's passive review ask
+/// (`.local/prd/phase4-retarget-plan.md` §3.5, §6 D19): text plus color, or
+/// nothing at all when there is nothing to ask.
+///
+/// Reads [`DagViewState::review_status`], mirrored from
+/// [`crate::app::state::HistoricalRunSnapshot::review`] — never a second
+/// fetch from here, and never a guess: a cycle already `applied`/`declined`/
+/// `failed` says nothing, because the ask is for a decision that has not
+/// been made yet, not a permanent badge.
+fn review_header_segment(dag: &DagViewState, p: &Palette) -> Option<(String, Color)> {
+    use crate::api::schema::WorkflowReviewStatus;
+    match dag.review_status {
+        None if dag.lead_run
+            && dag.run_status.is_some_and(|status| {
+                matches!(
+                    status,
+                    RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
+                )
+            }) =>
+        {
+            Some(("review available (V)".to_string(), p.teal))
+        }
+        Some(WorkflowReviewStatus::Running) => Some(("reviewing…".to_string(), p.subtext0)),
+        Some(WorkflowReviewStatus::AwaitingUser) => Some(("review ready (V)".to_string(), p.peach)),
+        _ => None,
     }
 }
 
@@ -2483,6 +2574,164 @@ mod tests {
         );
     }
 
+    /// P13's own contract: the DAG detail's watchdog/attention line appears
+    /// only when the fields are set — never a phantom "0 interventions" row
+    /// for a node the watchdog has not looked at.
+    #[test]
+    fn the_watchdog_and_attention_lines_appear_only_when_the_fields_are_set() {
+        let graph = diamond();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut view = view_of(&graph, area);
+
+        let screen = screen_of(&view, area);
+        let detail: String = screen
+            .lines()
+            .skip(view.detail_rect.y as usize)
+            .take(view.detail_rect.height as usize)
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(!detail.contains("watchdog:"), "{detail}");
+        assert!(!detail.contains("attention:"), "{detail}");
+
+        view.nodes[0].watchdog_interventions = 3;
+        view.nodes[0].attention = Some(crate::api::schema::WorkflowAttention::Stuck);
+        let screen = screen_of(&view, area);
+        let detail: String = screen
+            .lines()
+            .skip(view.detail_rect.y as usize)
+            .take(view.detail_rect.height as usize)
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(detail.contains("watchdog:"), "{detail}");
+        assert!(detail.contains("3 intervention"), "{detail}");
+        assert!(detail.contains("attention:"), "{detail}");
+        assert!(detail.contains("stuck"), "{detail}");
+    }
+
+    /// The watchdog count alone, with no surfaced attention yet, still shows
+    /// — `attention: None` means "healthy" or "not looked at yet", and
+    /// WI-R5's undercount is a separate honesty debt from whether the
+    /// number itself is worth showing.
+    #[test]
+    fn a_nonzero_watchdog_count_shows_even_with_no_surfaced_attention() {
+        let graph = diamond();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut view = view_of(&graph, area);
+        view.nodes[0].watchdog_interventions = 1;
+
+        let screen = screen_of(&view, area);
+        let detail: String = screen
+            .lines()
+            .skip(view.detail_rect.y as usize)
+            .take(view.detail_rect.height as usize)
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(detail.contains("watchdog:"), "{detail}");
+        assert!(!detail.contains("attention:"), "{detail}");
+    }
+
+    /// The header's passive review ask: available on a terminal lead run
+    /// with no cycle yet, `reviewing…` while one runs, `review ready` once
+    /// it is waiting on the human, and silent once it is decided — never a
+    /// modal, always a header segment
+    /// (`.local/prd/phase4-retarget-plan.md` §3.5, §6 D19).
+    #[test]
+    fn the_header_offers_the_review_ask_only_when_there_is_something_to_do() {
+        let mut graph = diamond();
+        graph.status = RunStatus::Succeeded;
+        let area = Rect::new(0, 0, 120, 40);
+
+        let mut view = view_of(&graph, area);
+        view.lead_run = true;
+        view.run_status = Some(RunStatus::Succeeded);
+        view.review_status = None;
+        let screen = screen_of(&view, area);
+        assert!(
+            screen
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("review available")),
+            "{screen}"
+        );
+
+        view.review_status = Some(crate::api::schema::WorkflowReviewStatus::Running);
+        let screen = screen_of(&view, area);
+        assert!(
+            screen
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("reviewing…")),
+            "{screen}"
+        );
+
+        view.review_status = Some(crate::api::schema::WorkflowReviewStatus::AwaitingUser);
+        let screen = screen_of(&view, area);
+        assert!(
+            screen
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("review ready")),
+            "{screen}"
+        );
+
+        for status in [
+            crate::api::schema::WorkflowReviewStatus::Applied,
+            crate::api::schema::WorkflowReviewStatus::Declined,
+            crate::api::schema::WorkflowReviewStatus::Failed,
+        ] {
+            view.review_status = Some(status);
+            let screen = screen_of(&view, area);
+            assert!(
+                screen.lines().next().is_some_and(|line| {
+                    !line.contains("review available")
+                        && !line.contains("reviewing…")
+                        && !line.contains("review ready")
+                }),
+                "{status:?}: {screen}"
+            );
+        }
+    }
+
+    /// A non-terminal or non-lead run never offers the ask — starting a
+    /// review on a run that has not finished, or that no team lead ever
+    /// executed, is exactly what `workflow.review.start`'s own precondition
+    /// refuses.
+    #[test]
+    fn the_review_ask_is_silent_on_a_running_or_engine_era_run() {
+        let mut graph = diamond();
+        graph.status = RunStatus::Running;
+        let area = Rect::new(0, 0, 120, 40);
+
+        let mut view = view_of(&graph, area);
+        view.lead_run = true;
+        view.run_status = Some(RunStatus::Running);
+        view.review_status = None;
+        let screen = screen_of(&view, area);
+        assert!(!screen
+            .lines()
+            .next()
+            .unwrap_or("")
+            .contains("review available"));
+
+        view.run_status = Some(RunStatus::Succeeded);
+        view.lead_run = false;
+        let screen = screen_of(&view, area);
+        assert!(!screen
+            .lines()
+            .next()
+            .unwrap_or("")
+            .contains("review available"));
+    }
+
     /// 2.8: the two states with opposite remedies must not share a color, and
     /// the node the run is stuck behind is never quieter than the cursor.
     #[test]
@@ -2777,6 +3026,8 @@ mod tests {
             lead_pane_id: None,
             projected: std::collections::BTreeMap::new(),
             members: Vec::new(),
+            review: None,
+            review_findings: Vec::new(),
         }));
         app
     }
@@ -2878,6 +3129,7 @@ mod tests {
                     subject: "plan".to_string(),
                     owner: "research".to_string(),
                     emergent: false,
+                    ..ProjectedNodeFacts::default()
                 },
             ),
             (
@@ -2887,6 +3139,7 @@ mod tests {
                     subject: "retest the parser".to_string(),
                     owner: "verify".to_string(),
                     emergent: true,
+                    ..ProjectedNodeFacts::default()
                 },
             ),
         ]
@@ -2904,6 +3157,8 @@ mod tests {
                 member("research", None),
                 member("verify", Some(&owner_pane)),
             ],
+            review: None,
+            review_findings: Vec::new(),
         }));
         app
     }
@@ -3375,6 +3630,8 @@ mod tests {
             lead_pane_id: None,
             projected: std::collections::BTreeMap::new(),
             members: Vec::new(),
+            review: None,
+            review_findings: Vec::new(),
         }));
         let view = compute_workflow_dag_view(&app, area);
         assert!(view.historical);
