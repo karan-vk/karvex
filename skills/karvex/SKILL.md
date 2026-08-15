@@ -311,9 +311,18 @@ kvx workflow run message --to <name> --text "Also check the error paths."
 
 Karvex separately watches for a task a teammate's own task list still marks `in_progress` while that teammate's pane has actually sat idle — Claude Code's own docs note teammates sometimes finish work and never mark the task complete, so a status by itself is never proof of anything. When the disagreement holds for long enough, Karvex says so directly in-session: a message framed `[karvex · watchdog]`, first nudging the idle owner, then re-prompting it more specifically if nothing moved, and — if a teammate still never answers — telling the **lead** instead, with what Karvex measured and the lead's own options (message the teammate, reassign the task, or respawn it; Karvex itself can do none of those three, only watch and report). A lead whose own pane goes idle gets the same nudge/re-prompt pair about the run as a whole, with no third rung, since escalating the lead to itself would be a message to nobody. Recognise the frame as the runtime talking, not the user, and act inside the affected session rather than replying to Karvex on its behalf.
 
-### Self-improvement review (not live yet)
+### Self-improvement review
 
-The workflow protocol already has review-cycle methods for turning accepted findings from a past run into a new workflow version, but there is no `kvx workflow review` command yet and no cycle you can start: every one of those methods still answers with a refusal today, because the orchestration that creates and drives a cycle has not shipped. If a user asks for a review cycle, or you remember one from a newer Karvex, say plainly that it is not available on this build rather than guessing at a command.
+Once a run reaches a terminal status (succeeded, failed, or cancelled), `kvx workflow review start <run-id>` interviews the team over what worked and what did not, and lets you turn anything you accept into a new, immutable workflow version:
+
+```bash
+kvx workflow review start <run-id>
+kvx workflow review show <run-id>
+kvx workflow review apply <run-id> --accept plan --accept lint
+kvx workflow review apply <run-id> --decline-all
+```
+
+`review show` prints the cycle's status and, once its synthesis pane has reported, the findings list. `review apply` is the human's per-finding decision: `--accept <node_key>` is repeatable and everything not named is declined; `--decline-all` declines the whole cycle and mints nothing. A bare `apply` with neither flag is refused outright — minting a version is irreversible, so it never defaults to anything. `kvx workflow review answer --file <path>` and `kvx workflow review report --file <path>` are self-report verbs the review's own interview and synthesis panes run *on themselves*, exactly the way `run finish` is the lead's own self-report — do not run either one yourself. Each pane's own rendered prompt already tells it the exact command to run; it self-identifies from `KARVEX_WORKFLOW_REVIEW_RUN_ID`/`KARVEX_WORKFLOW_REVIEW_MEMBER`, which Karvex exports into that pane, not from anything you would pass it.
 
 ### Finish
 

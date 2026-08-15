@@ -104,6 +104,26 @@ const DOCUMENTED_VERBS: &[DocumentedVerb] = &[
         path: &["summary", "show"],
         flags: &[],
     },
+    DocumentedVerb {
+        path: &["review", "start"],
+        flags: &[],
+    },
+    DocumentedVerb {
+        path: &["review", "show"],
+        flags: &[],
+    },
+    DocumentedVerb {
+        path: &["review", "apply"],
+        flags: &["accept", "decline-all"],
+    },
+    DocumentedVerb {
+        path: &["review", "answer"],
+        flags: &["file"],
+    },
+    DocumentedVerb {
+        path: &["review", "report"],
+        flags: &["file"],
+    },
 ];
 
 /// The six `kvx workflow node …` verbs whose wire method the removed engine
@@ -126,10 +146,20 @@ struct DocumentedEnvVar {
     source: &'static str,
 }
 
-const DOCUMENTED_ENV_VARS: &[DocumentedEnvVar] = &[DocumentedEnvVar {
-    value: crate::workflow::binding::spawn::RUN_ID_ENV_VAR,
-    source: "binding::spawn::RUN_ID_ENV_VAR",
-}];
+const DOCUMENTED_ENV_VARS: &[DocumentedEnvVar] = &[
+    DocumentedEnvVar {
+        value: crate::workflow::binding::spawn::RUN_ID_ENV_VAR,
+        source: "binding::spawn::RUN_ID_ENV_VAR",
+    },
+    DocumentedEnvVar {
+        value: crate::cli::workflow::REVIEW_RUN_ID_ENV_VAR,
+        source: "cli::workflow::REVIEW_RUN_ID_ENV_VAR",
+    },
+    DocumentedEnvVar {
+        value: crate::cli::workflow::REVIEW_MEMBER_ENV_VAR,
+        source: "cli::workflow::REVIEW_MEMBER_ENV_VAR",
+    },
+];
 
 /// Walks `path` through the clap tree built by [`crate::cli::spec::command`],
 /// starting at `kvx workflow`. Panics with the failing segment on drift —
