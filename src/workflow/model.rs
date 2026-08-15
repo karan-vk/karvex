@@ -76,6 +76,16 @@ pub struct PublicPaneId(pub String);
 #[serde(transparent)]
 pub struct InterrogationId(pub String);
 
+/// Identity of one self-improvement review cycle over a finished run.
+///
+/// Allocated by the app at cycle start, the same way [`InterrogationId`] is,
+/// so the [`StoreWrite::ReviewCycleStarted`] write and every later
+/// [`StoreWrite::ReviewCycleUpdate`]/[`StoreWrite::ReviewFindings`] address the
+/// same record without a read-back.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReviewCycleId(pub String);
+
 macro_rules! impl_string_id {
     ($($ty:ident),* $(,)?) => {
         $(
@@ -108,6 +118,7 @@ impl_string_id!(
     SpecDigest,
     PublicPaneId,
     InterrogationId,
+    ReviewCycleId,
 );
 
 // ── reserved namespace ──────────────────────────────────────────────────────
@@ -1140,6 +1151,43 @@ impl NodeStatus {
     }
 }
 
+/// Karvex's own opinion about a node needing intervention — never the
+/// projected [`NodeStatus`] itself (`phase4-retarget-plan.md` D-10: "the
+/// difference between a projection and an opinion"). `NodeStatus` is Claude
+/// Code's fact, projected verbatim from its task/team state; `Attention` is
+/// what the watchdog concludes from watching that fact over time, and it must
+/// never overwrite the status column — it lives in its own `run_node.attention`
+/// column instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Attention {
+    /// No material progress for `stuck_threshold` consecutive watchdog
+    /// samples (§3.7).
+    Stuck,
+    /// The node's usage has crossed the run's configured budget.
+    BudgetExceeded,
+    /// The node's owner is waiting on a human or another agent to answer.
+    NeedsInput,
+    /// The team lead itself is blocked; every member downstream inherits it
+    /// rather than each independently discovering the same fact.
+    LeadBlocked,
+    /// The watchdog has samples for this node but has not yet learned a
+    /// claude session to attribute them to.
+    Unbound,
+}
+
+impl Attention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stuck => "stuck",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::NeedsInput => "needs_input",
+            Self::LeadBlocked => "lead_blocked",
+            Self::Unbound => "unbound",
+        }
+    }
+}
+
 /// Which completion signal was accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1569,6 +1617,51 @@ pub enum CheckpointKind {
     ArtifactIndex,
 }
 
+/// `review_cycle.status`, mirroring the store's ASSERT
+/// (`store/migrations/0001_init.surql:261-262`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCycleStatus {
+    Running,
+    AwaitingUser,
+    Applied,
+    Declined,
+    Failed,
+}
+
+impl ReviewCycleStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::AwaitingUser => "awaiting_user",
+            Self::Applied => "applied",
+            Self::Declined => "declined",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// `review_finding.interview_mode`, mirroring the store's ASSERT
+/// (`store/migrations/0001_init.surql:278-279`): `"resumed"` is a teammate's
+/// own account via `claude --resume … --fork-session`; `"evidence_only"` is an
+/// inference over the journal/checkpoints/usage when the source session could
+/// not be resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterviewMode {
+    Resumed,
+    EvidenceOnly,
+}
+
+impl InterviewMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resumed => "resumed",
+            Self::EvidenceOnly => "evidence_only",
+        }
+    }
+}
+
 // ── engine interface: pure state machine ────────────────────────────────────
 
 /// A durable write the engine wants made. Issued off the critical path: the
@@ -1866,8 +1959,103 @@ pub enum StoreWrite {
         backend_type: String,
         is_active: bool,
         cwd: Option<String>,
+        /// The member's own claude session id, learned the same way karvex
+        /// already learns it for every tmux teammate today: the bundled
+        /// `SessionStart` hook's report, joined on `tmuxPaneId`
+        /// (`phase4-retarget-plan.md` S1). `None` until that report lands.
+        session_id: Option<String>,
+        /// Derived alongside `session_id`, never read from the dead
+        /// `~/.claude/sessions/<pid>.json` registry fallback for a teammate
+        /// (S1: that registry is lead-only). `None` until the first turn
+        /// writes the transcript file.
+        transcript_path: Option<String>,
+        /// The last observed pane agent state, so a finished run can still say
+        /// how long a teammate sat idle while its task stayed `in_progress`
+        /// (§3.7, `run_member.last_state`). Free text, not a closed
+        /// vocabulary: it mirrors whatever the pane's own detection reported.
+        last_state: Option<String>,
+        /// When `last_state` was last observed to change.
+        last_state_at_unix_ms: Option<u64>,
         observed_at_unix_ms: u64,
     },
+    /// The watchdog's current opinion about one node, written independently of
+    /// [`StoreWrite::RunNode`] because [`Attention`] is karvex's own column,
+    /// never a value the projected `run_node.status` takes on
+    /// (`phase4-retarget-plan.md` D-10). `None` clears a prior attention once
+    /// the watchdog sees the node moving again — this is a re-evaluation on
+    /// every tick, not a one-way escalation.
+    RunNodeAttention {
+        run: RunId,
+        path: InstancePath,
+        attention: Option<Attention>,
+        observed_at_unix_ms: u64,
+    },
+    /// A past run's self-improvement review cycle began.
+    ///
+    /// A create, so the app's bounded `pending_writes` queue must never evict
+    /// it — [`StoreWrite::ReviewCycleUpdate`] and [`StoreWrite::ReviewFindings`]
+    /// address this row by id and would have nothing to update
+    /// (`07-phase3-plan.md` §3 rule 4, the same rule
+    /// [`StoreWrite::InterrogationStarted`] follows).
+    ReviewCycleStarted {
+        id: ReviewCycleId,
+        run: RunId,
+        kvdag_version: KvdagVersionId,
+        started_at_unix_ms: u64,
+    },
+    /// What changes on a review cycle after it starts: its status, when it
+    /// ended, and the kvdag version an accepted change produced. One shape for
+    /// all three, because any of them can be the only thing that ever changes
+    /// (the same reasoning [`StoreWrite::InterrogationUpdate`] uses) — `None`
+    /// leaves the corresponding column untouched rather than clearing it.
+    ReviewCycleUpdate {
+        id: ReviewCycleId,
+        status: Option<ReviewCycleStatus>,
+        ended_at_unix_ms: Option<u64>,
+        resulting_version: Option<KvdagVersionId>,
+    },
+    /// One review cycle's findings, written together once its interviews (or
+    /// their `evidence_only` fallbacks) are in.
+    ReviewFindings {
+        cycle: ReviewCycleId,
+        findings: Vec<ReviewFindingSeed>,
+    },
+}
+
+/// One finding as it is written to the store: the pure-layer shape of a
+/// `review_finding` row, minus the ids the store resolves at write time
+/// (`review_finding.cycle` from [`StoreWrite::ReviewFindings::cycle`], its own
+/// row id from the `CREATE`).
+///
+/// `level` and `verdict` mirror `review_finding`'s own ASSERTed vocabulary
+/// (`"prompt"`/`"structural"` and `"keep"`/`"improve"`/`"replace"`,
+/// `store/migrations/0001_init.surql:280-283`) but are left untyped here: the
+/// pure review core that actually produces these values, and therefore owns
+/// naming them, is `workflow::review` (P5), not this packet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewFindingSeed {
+    pub node_key: NodeKey,
+    /// The run node this finding is about, when it resolves to one. `None` is
+    /// tolerated the way `review_finding.run_node` allows it.
+    pub run_node: Option<InstancePath>,
+    /// The interview this finding came out of. `None` only when
+    /// `interview_mode` is [`InterviewMode::EvidenceOnly`].
+    pub interview: Option<InterrogationId>,
+    pub interview_mode: InterviewMode,
+    pub level: String,
+    pub verdict: String,
+    pub rationale: String,
+    /// Measured, not asserted: attempts, watchdog interventions, tokens, tool
+    /// uses, duration, downstream rework, schema failures — the free-form
+    /// object `review_finding.evidence` holds.
+    pub evidence: serde_json::Value,
+    /// The concrete change: prompt rewrite, or a node/edge delta.
+    pub proposed_change: serde_json::Value,
+    /// Mandatory when `verdict = "replace"`: a full replacement role
+    /// definition. The store enforces the pairing
+    /// (`store/migrations/0001_init.surql:306-308`); this layer only carries
+    /// what the review core produced.
+    pub replacement: Option<serde_json::Value>,
 }
 
 /// One node's line in a run summary: what the summariser concluded about it.
@@ -1927,6 +2115,35 @@ pub enum WorkflowEvent {
     /// summariser started (`07-phase3-plan.md` §4 D1).
     RunSummarized {
         run: RunId,
+    },
+    /// The watchdog's opinion about one node changed (§3.7,
+    /// `workflow.node.watchdog`). Carries the new value rather than nothing,
+    /// unlike [`WorkflowEvent::RunSummarized`]'s re-read pattern, because
+    /// [`Attention`] has no durable row of its own for the emitter to re-read
+    /// — it lives on `run_node.attention` alongside the fields
+    /// [`WorkflowEvent::NodeUpdated`] already re-reads from.
+    NodeWatchdog {
+        run: RunId,
+        path: InstancePath,
+        attention: Option<Attention>,
+    },
+    /// A self-improvement review cycle began (`workflow.review.started`).
+    ReviewStarted {
+        run: RunId,
+        cycle: ReviewCycleId,
+    },
+    /// A review cycle's interviews (or their `evidence_only` fallbacks) are in
+    /// and its findings are ready for the user (`workflow.review.ready`).
+    ReviewReady {
+        run: RunId,
+        cycle: ReviewCycleId,
+    },
+    /// A review cycle reached a terminal status: `applied`, `declined`, or
+    /// `failed` (`workflow.review.closed`).
+    ReviewClosed {
+        run: RunId,
+        cycle: ReviewCycleId,
+        status: ReviewCycleStatus,
     },
     // No interrogation variants. Step 1a landed `InterrogationStarted`/
     // `InterrogationEnded` here because §1 WS-A read as though the app-side
@@ -2590,5 +2807,148 @@ mod tests {
         .expect("a minimal edge deserialises");
         assert_eq!(edge.payload, EdgePayload::Summary);
         assert_eq!(edge.condition, None);
+    }
+
+    // ── phase 4, packet P1: serde round-trips for the new enums ────────────
+
+    #[test]
+    fn attention_round_trips_through_json_and_matches_the_store_assert() {
+        let variants = [
+            (Attention::Stuck, "\"stuck\""),
+            (Attention::BudgetExceeded, "\"budget_exceeded\""),
+            (Attention::NeedsInput, "\"needs_input\""),
+            (Attention::LeadBlocked, "\"lead_blocked\""),
+            (Attention::Unbound, "\"unbound\""),
+        ];
+        for (value, wire) in variants {
+            let encoded = serde_json::to_string(&value).expect("attention serialises");
+            assert_eq!(encoded, wire);
+            assert_eq!(value.as_str(), wire.trim_matches('"'));
+            let decoded: Attention = serde_json::from_str(&encoded).expect("attention parses");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn review_cycle_status_round_trips_through_json_and_matches_the_store_assert() {
+        let variants = [
+            (ReviewCycleStatus::Running, "\"running\""),
+            (ReviewCycleStatus::AwaitingUser, "\"awaiting_user\""),
+            (ReviewCycleStatus::Applied, "\"applied\""),
+            (ReviewCycleStatus::Declined, "\"declined\""),
+            (ReviewCycleStatus::Failed, "\"failed\""),
+        ];
+        for (value, wire) in variants {
+            let encoded = serde_json::to_string(&value).expect("review cycle status serialises");
+            assert_eq!(encoded, wire);
+            assert_eq!(value.as_str(), wire.trim_matches('"'));
+            let decoded: ReviewCycleStatus =
+                serde_json::from_str(&encoded).expect("review cycle status parses");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn interview_mode_round_trips_through_json_and_matches_the_store_assert() {
+        let variants = [
+            (InterviewMode::Resumed, "\"resumed\""),
+            (InterviewMode::EvidenceOnly, "\"evidence_only\""),
+        ];
+        for (value, wire) in variants {
+            let encoded = serde_json::to_string(&value).expect("interview mode serialises");
+            assert_eq!(encoded, wire);
+            assert_eq!(value.as_str(), wire.trim_matches('"'));
+            let decoded: InterviewMode =
+                serde_json::from_str(&encoded).expect("interview mode parses");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn review_cycle_id_and_attention_are_usable_in_the_new_store_writes() {
+        // A construction smoke test, not a behaviour test (P1 ships shape
+        // only): every new `StoreWrite` variant and `ReviewFindingSeed` build
+        // from the types this packet defines, and `WorkflowEvent`'s new
+        // variants carry them too.
+        let run = RunId::new("workflow_run:abc");
+        let cycle = ReviewCycleId::new("review_cycle:1");
+        let path = InstancePath("plan".to_string());
+
+        let attention_write = StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: path.clone(),
+            attention: Some(Attention::Stuck),
+            observed_at_unix_ms: 1,
+        };
+        assert!(matches!(
+            attention_write,
+            StoreWrite::RunNodeAttention { .. }
+        ));
+
+        let cycle_started = StoreWrite::ReviewCycleStarted {
+            id: cycle.clone(),
+            run: run.clone(),
+            kvdag_version: KvdagVersionId::new("kvdag_version:1"),
+            started_at_unix_ms: 1,
+        };
+        assert!(matches!(
+            cycle_started,
+            StoreWrite::ReviewCycleStarted { .. }
+        ));
+
+        let cycle_update = StoreWrite::ReviewCycleUpdate {
+            id: cycle.clone(),
+            status: Some(ReviewCycleStatus::AwaitingUser),
+            ended_at_unix_ms: None,
+            resulting_version: None,
+        };
+        assert!(matches!(cycle_update, StoreWrite::ReviewCycleUpdate { .. }));
+
+        let finding = ReviewFindingSeed {
+            node_key: NodeKey::new("plan"),
+            run_node: Some(path),
+            interview: None,
+            interview_mode: InterviewMode::EvidenceOnly,
+            level: "prompt".to_string(),
+            verdict: "keep".to_string(),
+            rationale: "no drift observed".to_string(),
+            evidence: serde_json::json!({}),
+            proposed_change: serde_json::json!({}),
+            replacement: None,
+        };
+        let findings_write = StoreWrite::ReviewFindings {
+            cycle: cycle.clone(),
+            findings: vec![finding],
+        };
+        assert!(matches!(findings_write, StoreWrite::ReviewFindings { .. }));
+
+        let watchdog_event = WorkflowEvent::NodeWatchdog {
+            run: run.clone(),
+            path: InstancePath("plan".to_string()),
+            attention: Some(Attention::NeedsInput),
+        };
+        assert!(matches!(watchdog_event, WorkflowEvent::NodeWatchdog { .. }));
+
+        let review_started = WorkflowEvent::ReviewStarted {
+            run: run.clone(),
+            cycle: cycle.clone(),
+        };
+        assert!(matches!(
+            review_started,
+            WorkflowEvent::ReviewStarted { .. }
+        ));
+
+        let review_ready = WorkflowEvent::ReviewReady {
+            run: run.clone(),
+            cycle: cycle.clone(),
+        };
+        assert!(matches!(review_ready, WorkflowEvent::ReviewReady { .. }));
+
+        let review_closed = WorkflowEvent::ReviewClosed {
+            run,
+            cycle,
+            status: ReviewCycleStatus::Applied,
+        };
+        assert!(matches!(review_closed, WorkflowEvent::ReviewClosed { .. }));
     }
 }

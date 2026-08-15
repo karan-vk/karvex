@@ -3724,6 +3724,10 @@ fn member_snapshot(run: &RunId, name: &str, model: &str, observed_at_unix_ms: u6
         backend_type: "tmux".to_string(),
         is_active: true,
         cwd: Some("/home/karan/code/karvex".to_string()),
+        session_id: None,
+        transcript_path: None,
+        last_state: None,
+        last_state_at_unix_ms: None,
         observed_at_unix_ms,
     }
 }
@@ -4245,6 +4249,10 @@ async fn member_snapshots_upsert_in_place_and_list_in_first_seen_order() {
             backend_type: "tmux".to_string(),
             is_active: false,
             cwd: Some("/home/karan/code/karvex".to_string()),
+            session_id: None,
+            transcript_path: None,
+            last_state: None,
+            last_state_at_unix_ms: None,
             observed_at_unix_ms: 1_700_000_009_000,
         })
         .await

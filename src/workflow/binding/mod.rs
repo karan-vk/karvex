@@ -9,4 +9,5 @@
 pub mod identity;
 pub mod lead;
 pub mod messaging;
+pub mod review;
 pub mod spawn;

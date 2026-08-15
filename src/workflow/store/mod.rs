@@ -299,6 +299,14 @@ struct MemberSnapshot {
     backend_type: String,
     is_active: bool,
     cwd: Option<String>,
+    /// Carried through from [`StoreWrite::RunMemberSnapshot`] but not yet
+    /// written: `run_member.session_id`/`transcript_path`/`last_state`/
+    /// `last_state_at` don't exist until migration `0006` (P7). This packet
+    /// only lands the mechanical shape (`phase4-retarget-plan.md` P1).
+    session_id: Option<String>,
+    transcript_path: Option<String>,
+    last_state: Option<String>,
+    last_state_at_unix_ms: Option<u64>,
     observed_at_unix_ms: u64,
 }
 
@@ -1190,6 +1198,10 @@ impl WorkflowStore {
                 backend_type,
                 is_active,
                 cwd,
+                session_id,
+                transcript_path,
+                last_state,
+                last_state_at_unix_ms,
                 observed_at_unix_ms,
             } => {
                 self.write_run_member_snapshot(MemberSnapshot {
@@ -1201,9 +1213,48 @@ impl WorkflowStore {
                     backend_type,
                     is_active,
                     cwd,
+                    session_id,
+                    transcript_path,
+                    last_state,
+                    last_state_at_unix_ms,
                     observed_at_unix_ms,
                 })
                 .await
+            }
+            // Mechanical seam only (`phase4-retarget-plan.md` P1: "write-arm
+            // destructuring only — no queries, no behaviour"). `run_node.attention`
+            // and the review tables' writers land in P7, once migration `0006`
+            // exists and `workflow::review`/`workflow::watchdog` have producers.
+            StoreWrite::RunNodeAttention {
+                run,
+                path,
+                attention,
+                observed_at_unix_ms,
+            } => {
+                let _ = (run, path, attention, observed_at_unix_ms);
+                Ok(())
+            }
+            StoreWrite::ReviewCycleStarted {
+                id,
+                run,
+                kvdag_version,
+                started_at_unix_ms,
+            } => {
+                let _ = (id, run, kvdag_version, started_at_unix_ms);
+                Ok(())
+            }
+            StoreWrite::ReviewCycleUpdate {
+                id,
+                status,
+                ended_at_unix_ms,
+                resulting_version,
+            } => {
+                let _ = (id, status, ended_at_unix_ms, resulting_version);
+                Ok(())
+            }
+            StoreWrite::ReviewFindings { cycle, findings } => {
+                let _ = (cycle, findings);
+                Ok(())
             }
         }
     }

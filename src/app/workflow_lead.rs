@@ -1016,6 +1016,12 @@ impl crate::app::App {
                 backend_type: member.backend_type.clone(),
                 is_active: member.is_active,
                 cwd: member.cwd.clone(),
+                // Learned by P8; P1 only lands the shape, not the behaviour
+                // (`phase4-retarget-plan.md`).
+                session_id: None,
+                transcript_path: None,
+                last_state: None,
+                last_state_at_unix_ms: None,
                 observed_at_unix_ms: crate::app::workflow::current_unix_ms(),
             });
         }
