@@ -204,6 +204,11 @@ pub struct RunNodeRow {
     pub owner: String,
     /// A task the definition never planned (§3.4).
     pub emergent: bool,
+    // ── added by migrations/0006_member_identity_and_review.surql ──
+    /// Karvex's own opinion that this node needs intervention — never
+    /// [`Self::status`] itself, which stays the projected fact
+    /// (`phase4-retarget-plan.md` D-10).
+    pub attention: Option<String>,
 }
 
 /// `run_edge` is `TYPE RELATION FROM run_node TO run_node`.
@@ -238,6 +243,15 @@ pub struct RunMemberRow {
     pub cwd: Option<String>,
     pub first_seen_at: Datetime,
     pub last_seen_at: Datetime,
+    // ── added by migrations/0006_member_identity_and_review.surql ──
+    /// The member's own claude session id, learned the same way karvex
+    /// already learns it for every tmux teammate (bundled `SessionStart`
+    /// hook, joined on `tmuxPaneId`; `09-agent-teams-rework.md` §3.3, S1).
+    pub session_id: Option<String>,
+    pub transcript_path: Option<String>,
+    /// The last observed pane agent state, free text.
+    pub last_state: Option<String>,
+    pub last_state_at: Option<Datetime>,
 }
 
 // ── journal, checkpoints, summaries ────────────────────────────────────────
@@ -305,6 +319,46 @@ pub struct InterrogationRow {
     pub note: String,
     pub reconstructed: bool,
     pub seeded_from: Option<RecordId>,
+}
+
+// ── review: self-improvement review cycle (schema present since 0001; the
+//     writers land in migration 0006, `phase4-retarget-plan.md` P7) ──────────
+
+/// One `review_cycle` row: a past run's self-improvement review, over its
+/// terminal state, forking each interesting teammate's session for interview.
+#[derive(Debug, Clone, PartialEq, SurrealValue)]
+pub struct ReviewCycleRow {
+    pub id: RecordId,
+    pub run: RecordId,
+    pub kvdag_version: RecordId,
+    pub status: String,
+    pub started_at: Datetime,
+    pub ended_at: Option<Datetime>,
+    pub resulting_version: Option<RecordId>,
+    /// The 1:1 interviews this cycle conducted, one per reviewed teammate —
+    /// `interrogation` row ids, appended to as [`super::WorkflowStore`]
+    /// writes each [`crate::workflow::model::StoreWrite::ReviewFindings`]
+    /// batch.
+    pub interviews: Vec<RecordId>,
+}
+
+/// One `review_finding` row: one node's verdict out of a review cycle.
+#[derive(Debug, Clone, PartialEq, SurrealValue)]
+pub struct ReviewFindingRow {
+    pub id: RecordId,
+    pub cycle: RecordId,
+    pub run_node: Option<RecordId>,
+    pub node_key: String,
+    pub interview: Option<RecordId>,
+    pub interview_mode: String,
+    pub level: String,
+    pub verdict: String,
+    pub rationale: String,
+    pub evidence: Json,
+    pub proposed_change: Json,
+    pub replacement: Option<Json>,
+    pub accepted: bool,
+    pub applied_in: Option<RecordId>,
 }
 
 // ── schema_meta ──────────────────────────────────────────────────────────────

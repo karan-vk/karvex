@@ -4125,6 +4125,7 @@ port = "summary"
             owner: String::new(),
             emergent: false,
             watchdog_interventions: 4,
+            attention: None,
         };
 
         let limit = StoredGrowthLimit {
