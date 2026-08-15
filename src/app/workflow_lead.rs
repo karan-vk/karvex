@@ -465,6 +465,25 @@ impl crate::app::App {
                 let Some(run) = self.workflow_lead.as_mut() else {
                     return false;
                 };
+                // A bound run keeps the team it bound to — a binding is
+                // recorded once and never re-derived — so a lead that comes
+                // back under a *different* session id would leave karvex
+                // observing one team while messaging another. That is a state
+                // nothing here can repair, and the one thing worse than it is
+                // reaching it quietly.
+                if let Some(binding) = run.binding.as_ref() {
+                    if binding.lead_session_id != endpoint.session_id {
+                        warn!(
+                            run = %run_id,
+                            bound_session = %binding.lead_session_id,
+                            reported_session = %endpoint.session_id,
+                            bound_team = %binding.team_name,
+                            "the run's lead reported a different session id than the one the \
+                             run is bound to; karvex keeps observing the bound team and will \
+                             message the session that just reported"
+                        );
+                    }
+                }
                 let changed = run.lead_endpoint.as_ref() != Some(&endpoint);
                 run.lead_endpoint = Some(endpoint);
                 changed
