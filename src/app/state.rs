@@ -2339,12 +2339,12 @@ pub(crate) struct ProjectedNodeFacts {
     /// opinion and Claude Code's projected status are two different facts and
     /// must never be conflated into one).
     pub attention: Option<crate::api::schema::WorkflowAttention>,
-    /// The wire's `watchdog_interventions` count, verbatim. As of P9/P10
-    /// (WI-R5, `.local/prd/phase4-retarget-plan.md` amendment log) the store
-    /// column only increments once `attention` is surfaced (rung 4), so this
-    /// under-counts rungs 1-3 until that honesty debt is paid — displayed
-    /// as-is rather than re-derived, since re-deriving it here would silently
-    /// disagree with what `workflow.run.get` answers everywhere else.
+    /// The wire's `watchdog_interventions` count, verbatim: every ladder rung
+    /// the watchdog actually spent, rungs 1-3 included, an undelivered rung
+    /// among them (karvex did intervene). WI-R5 closed the undercount that
+    /// counted only surfaced opinions. Displayed as-is rather than re-derived,
+    /// since re-deriving it here would silently disagree with what
+    /// `workflow.run.get` answers everywhere else.
     pub watchdog_interventions: u32,
 }
 

@@ -2614,10 +2614,10 @@ mod tests {
         assert!(detail.contains("stuck"), "{detail}");
     }
 
-    /// The watchdog count alone, with no surfaced attention yet, still shows
-    /// — `attention: None` means "healthy" or "not looked at yet", and
-    /// WI-R5's undercount is a separate honesty debt from whether the
-    /// number itself is worth showing.
+    /// The watchdog count alone, with no surfaced attention yet, still shows:
+    /// a node nudged twice and then left alone has spent two rungs with
+    /// `attention: None`, and `None` means "healthy" or "not looked at yet",
+    /// never "nothing ever happened here".
     #[test]
     fn a_nonzero_watchdog_count_shows_even_with_no_surfaced_attention() {
         let graph = diamond();
