@@ -773,6 +773,25 @@ impl App {
         };
         let assignments = resolve_assignments(&kvdag, tier, &history);
 
+        // §4 D11: restore is resolved **before** `create_run`, for the same
+        // reason the definition is. An unknown selector is a hard error, and a
+        // hard error after the row exists would leave an orphan `workflow_run`
+        // no lead will ever pick up.
+        //
+        // It is also resolved before the `claude` preflight below. Both are
+        // pre-`create_run` refusals, so the order only decides which one a
+        // caller who is wrong twice hears about — and a malformed request is
+        // the caller's to fix whatever this machine has installed, while
+        // checking the request second would mask a restore typo behind
+        // `workflow_lead_unavailable` on every host without agent teams.
+        let restore = match params.restore_from.as_ref() {
+            Some(request) => match self.resolve_restore(request, &kvdag) {
+                Ok(plan) => Some(plan),
+                Err(response) => return response(id),
+            },
+            None => None,
+        };
+
         // §3.1 step 5 / §4's last risk row. The preflight runs before
         // `create_run` for the same reason the definition resolution does: a
         // hard error after the row exists leaves an orphan run nothing will
@@ -782,18 +801,6 @@ impl App {
         if let Err(error) = self.preflight_claude_for_lead() {
             return encode_error(id, error.code(), error.to_string());
         }
-
-        // §4 D11: restore is resolved **before** `create_run`, for the same
-        // reason the definition is. An unknown selector is a hard error, and a
-        // hard error after the row exists would leave an orphan `workflow_run`
-        // no engine will ever advance.
-        let restore = match params.restore_from.as_ref() {
-            Some(request) => match self.resolve_restore(request, &kvdag) {
-                Ok(plan) => Some(plan),
-                Err(response) => return response(id),
-            },
-            None => None,
-        };
         // §4 D21: absent means true. The default lives here, in the handler, and
         // exactly here — the wire type carries `Option<bool>` precisely so the
         // policy is not duplicated into every client.
