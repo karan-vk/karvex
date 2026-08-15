@@ -236,6 +236,76 @@ Both are presence-based, so `grep`ping for the variable name is the reliable che
 
 If `KARVEX_NO_TMUX_COMPAT` is set, Claude Code falls back to its own non-tmux backends and teammates will not appear as Karvex panes at all — do not spend time debugging a "missing" teammate pane under that condition; report the opt-out to the user instead. The same applies to an in-process teammate mode: absent teammate panes are far more often one of these two opt-outs than a Karvex fault.
 
+## Run a multi-agent workflow
+
+A Karvex **workflow** is a stored, versioned plan: named nodes, their dependencies, and per-node model demands. Karvex does not execute it. `workflow run` launches one interactive Claude Code **team lead** in a pane, hands it the plan as a rendered prompt, and then only watches: the lead creates the shared task list, spawns teammates, and decides retries and completion. Every node that runs is a real Claude session in a real Karvex pane.
+
+Use a workflow when the user wants a repeatable multi-step plan they can rerun, save, and inspect later. For one-off parallel work, split panes and `agent start` directly — a workflow is heavier and stores history.
+
+Inspect and author:
+
+```bash
+kvx workflow list
+kvx workflow show <name>
+kvx workflow create --file <definition.toml>
+```
+
+`workflow create` is all-or-nothing: an invalid definition stores nothing. Two rules the validator enforces that are easy to get wrong — a node `key` becomes the prefix of its task subject, and every edge `port` must appear as `{{port}}` in the downstream node's `prompt_template`, or the edge's data has nowhere to land.
+
+Start a run from a pane in the workspace the run should live in:
+
+```bash
+kvx workflow run start <name> --arg key=value
+kvx workflow run show <run-id>
+kvx workflow run list <name>
+kvx workflow run cancel <run-id>
+```
+
+`run start` preflights two things and refuses rather than launching a lead that cannot work: the installed `claude` must support agent teams, and Claude Code must already trust the run's working directory. An untrusted directory does not merely prompt — Claude's folder-trust dialog **discards the lead's initial prompt**, leaving a healthy session with no plan. If the preflight refuses on trust, have the user open `claude` in that directory once and accept the dialog.
+
+`run show` is the projection of the team's own state, not Karvex's opinion:
+
+```
+nodes:
+  bugs      succeeded   Find correctness bugs
+  style     succeeded   Review style and clarity
+  verdict   running     Write the review verdict
+  .task/4   pending     finish: write the run summary
+members:
+  team-lead (idle) — in-process
+  bugs (idle, opus) — pane w1:p4
+  style (idle, sonnet) — pane w1:p5
+```
+
+Planned nodes are matched back to the definition by the `node-id:` prefix on the task subject. Tasks the lead invented appear as **emergent** nodes under `.task/` — that is expected, not an error. `members` maps each teammate to the pane it occupies.
+
+### Steer a running workflow
+
+Read and steer a node exactly like any other agent pane — the pane *is* the interface:
+
+```bash
+kvx agent read <teammate-pane> --source recent-unwrapped --lines 120
+kvx agent prompt <teammate-pane> "Also check the error paths." --wait
+```
+
+Steer the **lead's** pane for anything about the run as a whole: reprioritising, spawning more teammates, or abandoning a node. Find it in `run show` (`lead_pane_id` in JSON output).
+
+Two conditions occur often enough to check for before reporting a run stuck:
+
+- **A permission prompt in the lead's pane blocks the whole run.** Teammate permission requests bubble up to the lead, and the lead waits. `kvx agent read <lead-pane>` shows the dialog; the user answers it, or you do only if the user has authorised that action. Pre-approving the run's expected tools avoids this.
+- **A teammate finishes its work but leaves its task `in_progress`.** This is a known Claude Code agent-teams limitation, not a Karvex fault. The node's pane state (`idle`) is the truth; the task file lags. Tell the lead to confirm the result and mark the task complete.
+
+### Finish
+
+The lead closes its own run by calling `kvx workflow run finish --summary-file <path>` from its pane; Karvex never decides a run is done. Until that call, a run with every task complete is still `running`. The stored summary is then readable with:
+
+```bash
+kvx workflow summary list
+kvx workflow summary show <run-id>
+```
+
+Do not call `run finish` on the user's behalf from outside the lead's pane unless the user asks you to force-close a run whose lead has died.
+
 ## Safety and coordination rules
 
 - Use `--no-focus` for background work unless the user asked to switch context.
