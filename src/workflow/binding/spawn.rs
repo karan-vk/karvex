@@ -204,13 +204,27 @@ mod tests {
             record,
             PathBuf::from("/state/workflow-runs/workflow_run-abc")
         );
+        // A traversal attempt is flattened into that one segment rather than
+        // being read as structure. The check is on the path's *components*, not
+        // on its text: `..-..-etc-passwd` still contains the two characters and
+        // is still exactly one harmless directory name. (The engine-era
+        // `node_dir` sanitised each `/`-separated segment separately, so a
+        // substring check was meaningful there; run ids are one segment.)
         let sneaky = run_dir(
             Path::new("/state/workflow-runs"),
             &RunId("../../etc/passwd".to_string()),
         );
         assert!(sneaky.starts_with("/state/workflow-runs"));
-        assert!(!sneaky.to_string_lossy().contains(".."));
         assert_eq!(sneaky.components().count(), 4);
+        for component in sneaky.components() {
+            assert!(
+                !matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                ),
+                "{sneaky:?} carries a traversal component"
+            );
+        }
     }
 
     #[test]

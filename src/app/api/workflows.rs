@@ -3089,9 +3089,18 @@ output_schema = { type = "object" }
         assert_eq!(error_code(&response), MISSING_ARG_CODE);
     }
 
+    /// The retired node verbs and the guard that survived them.
+    ///
+    /// `workflow.node.{steer,interrupt,restart}` are gone for good — a node is
+    /// a Claude Code teammate in its own pane now
+    /// (`09-agent-teams-rework.md` §3.5) — so they name the *retirement*
+    /// whatever run id they are handed, and never the missing run: a client
+    /// that retries against a live run would otherwise be told to keep trying.
+    /// `workflow.run.cancel` survives the rework, so it still answers the
+    /// not-the-active-run guard for a run this server is not executing.
     #[cfg(feature = "workflow")]
     #[test]
-    fn node_methods_refuse_a_run_this_server_is_not_executing() {
+    fn the_retired_node_verbs_name_their_retirement_and_cancel_still_guards_the_run() {
         let mut app = app();
         for response in [
             app.handle_workflow_node_steer(
@@ -3116,15 +3125,23 @@ output_schema = { type = "object" }
                     path: "plan".into(),
                 },
             ),
-            app.handle_workflow_run_cancel(
-                "req".into(),
-                WorkflowRunTarget {
-                    run_id: "workflow_run:ghost".into(),
-                },
-            ),
         ] {
-            assert_eq!(error_code(&response), NO_ACTIVE_RUN_CODE, "{response}");
+            assert_eq!(error_code(&response), NODE_VERB_RETIRED_CODE, "{response}");
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            let message = value["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("pane"),
+                "a retired verb names the affordance that replaced it: {message}"
+            );
         }
+
+        let cancelled = app.handle_workflow_run_cancel(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: "workflow_run:ghost".into(),
+            },
+        );
+        assert_eq!(error_code(&cancelled), NO_ACTIVE_RUN_CODE, "{cancelled}");
     }
 
     #[cfg(feature = "workflow")]
@@ -3481,33 +3498,21 @@ output_schema = {{ type = "object" }}
         assert_eq!(error_code(&response), NOT_FOUND_CODE, "{response}");
     }
 
-    /// Starts a single-node `runner = "command"` workflow and binds its node to
-    /// `pane`, so the node methods have a live run and a bound node to address.
-    /// The pane need not exist: what the delivery path does with a pane it
-    /// cannot write to is exactly what these tests are about.
+    /// A live lead run, minus the lead.
+    ///
+    /// It replaces `app_with_a_bound_command_node`, which bound an engine node
+    /// and minted it a result token; nodes are Claude Code tasks now and karvex
+    /// records them rather than binding them (`09-agent-teams-rework.md` §2).
+    /// The state is built by `App::test_bind_a_live_lead_run`, beside the
+    /// production `bind_lead_run` it mirrors, so the overlay tests in
+    /// `src/app/input/` build the same run these handler tests do.
     #[cfg(feature = "workflow")]
-    fn app_with_a_bound_command_node(pane: &str) -> (App, String) {
-        use crate::workflow::model::{NodeBinding, NodeToken};
-        use std::path::PathBuf;
-
+    fn app_with_a_live_lead_run() -> (App, String) {
         let mut app = app();
         let created = app.handle_workflow_create(
             "req".into(),
             WorkflowCreateParams {
-                definition: WorkflowDefinitionDocument {
-                    format: WorkflowDefinitionFormat::Toml,
-                    text: r#"
-name = "control-surface"
-[[node]]
-key = "only"
-label = "Only"
-runner = "command"
-command = ["/bin/true"]
-prompt_template = "run it"
-output_schema = { type = "object", required = ["done"] }
-"#
-                    .to_string(),
-                },
+                definition: single_node_definition("lead-run", "run it"),
             },
         );
         let created: serde_json::Value = serde_json::from_str(&created).unwrap();
@@ -3515,310 +3520,81 @@ output_schema = { type = "object", required = ["done"] }
             .as_str()
             .expect("the workflow was created")
             .to_string();
-
-        let started = app.handle_workflow_run(
-            "req".into(),
-            WorkflowRunParams {
-                workflow_id,
-                version: None,
-                tier: None,
-                args: HashMap::new(),
-                restore_from: None,
-                include_prior_summaries: None,
-            },
-        );
-        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
-        let run_id = started["result"]["run"]["run_id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("the run started: {started}"))
-            .to_string();
-
-        app.workflow
-            .record_node_token(&InstancePath::new("only"), NodeToken::new("node-token"));
-        app.bind_workflow_node(
-            &InstancePath::new("only"),
-            NodeBinding {
-                pane_id: crate::workflow::model::PublicPaneId::new(pane),
-                terminal_id: crate::terminal::TerminalId::alloc(),
-                agent_session_id: "session-1".to_string(),
-                transcript_path: PathBuf::from("transcript.jsonl"),
-                node_dir: PathBuf::from("/runs/test/only"),
-                cwd: PathBuf::from("/repo"),
-            },
-        );
-        (app, run_id)
+        let run_id = app.test_bind_a_live_lead_run(&workflow_id, "lead-run");
+        (app, run_id.to_string())
     }
 
-    /// E4: `workflow.node.interrupt` is a *delivery*. When the runtime refuses
-    /// to write the keystroke — here because the bound pane does not exist —
-    /// answering `workflow_node_interrupted` would tell the caller their
-    /// interrupt landed on a process that never saw it.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn an_interrupt_that_was_not_delivered_is_not_reported_as_success() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-
-        let response = app.handle_workflow_node_interrupt(
-            "req".into(),
-            WorkflowNodeTarget {
-                run_id: run_id.clone(),
-                path: "only".into(),
-            },
-        );
-        assert_eq!(error_code(&response), DELIVERY_FAILED_CODE, "{response}");
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        let message = value["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("pane.send_keys"),
-            "the error names the delivery that failed: {message}"
-        );
-
-        // A steer is the same shape of delivery and must fail the same way.
-        let response = app.handle_workflow_node_steer(
-            "req".into(),
-            WorkflowNodeSteerParams {
-                run_id,
-                path: "only".into(),
-                text: "keep going".into(),
-            },
-        );
-        assert_eq!(error_code(&response), DELIVERY_FAILED_CODE, "{response}");
-    }
-
-    /// D4: `kvx workflow node complete` reports `null` when it cannot read or
-    /// parse `result.json`, and the server — not the client — is what turns
-    /// that into `NeedsAttention`. A `runner = "command"` node has no other
-    /// completion signal, so without this it stalls `Running` forever.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn a_report_with_no_result_reaches_needs_attention_through_the_server() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-        assert_eq!(
-            app.workflow_node_info(&InstancePath::new("only"))
-                .map(|node| node.status),
-            Some(crate::api::schema::WorkflowNodeStatus::Running)
-        );
-
-        let response = app.handle_workflow_node_report(
-            "req".into(),
-            WorkflowNodeReportParams {
-                run_id,
-                path: "only".into(),
-                token: "node-token".into(),
-                result: serde_json::Value::Null,
-            },
-        );
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(
-            value["result"]["type"], "workflow_node_reported",
-            "the report is accepted by the server, not refused: {value}"
-        );
-        assert_eq!(
-            value["result"]["node"]["status"], "needs_attention",
-            "a report with no result artifact never completes a node: {value}"
-        );
-        assert!(
-            value["result"]["node"]["evidence"].is_null(),
-            "a node with no result artifact records no completion evidence: {value}"
-        );
-    }
-
-    /// 2.12: a `runner = "command"` node wrote `{"wrong_field":123}` against a
-    /// schema requiring `done`, and `kvx workflow node complete` printed a
-    /// `workflow_node_reported` success envelope and exited 0 while the node sat
-    /// `Running`. The response is the only correction channel a command node
-    /// has, so it has to carry the refusal and the violations.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn a_schema_invalid_report_is_answered_with_the_rejection_not_a_success() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-
-        let response = app.handle_workflow_node_report(
-            "req".into(),
-            WorkflowNodeReportParams {
-                run_id: run_id.clone(),
-                path: "only".into(),
-                token: "node-token".into(),
-                result: serde_json::json!({ "wrong_field": 123 }),
-            },
-        );
-        assert_eq!(error_code(&response), RESULT_INVALID_CODE, "{response}");
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        let message = value["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("output_schema")
-                && message.contains("missing required field \"done\""),
-            "the rejection quotes the schema violation the node has to fix: {message}"
-        );
-        assert!(
-            message.contains("kvx workflow node complete"),
-            "the rejection names the next move: {message}"
-        );
-        assert_eq!(
-            app.workflow_node_info(&InstancePath::new("only"))
-                .map(|node| node.status),
-            Some(crate::api::schema::WorkflowNodeStatus::Running),
-            "the first invalid result still earns the documented corrective re-prompt"
-        );
-
-        // Second strike: still refused, and now the node is surfaced rather than
-        // left `Running` with nothing to wait for.
-        let response = app.handle_workflow_node_report(
-            "req".into(),
-            WorkflowNodeReportParams {
-                run_id,
-                path: "only".into(),
-                token: "node-token".into(),
-                result: serde_json::json!({ "wrong_field": 456 }),
-            },
-        );
-        assert_eq!(error_code(&response), RESULT_INVALID_CODE, "{response}");
-        assert_eq!(
-            app.workflow_node_info(&InstancePath::new("only"))
-                .map(|node| node.status),
-            Some(crate::api::schema::WorkflowNodeStatus::NeedsAttention),
-            "a node never stays Running after its corrective re-prompt is spent"
-        );
-    }
-
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn a_valid_report_is_still_answered_as_a_success() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-        let response = app.handle_workflow_node_report(
-            "req".into(),
-            WorkflowNodeReportParams {
-                run_id,
-                path: "only".into(),
-                token: "node-token".into(),
-                result: serde_json::json!({ "done": true }),
-            },
-        );
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(
-            value["result"]["type"], "workflow_node_reported",
-            "unexpected: {value}"
-        );
-        assert_eq!(value["result"]["node"]["status"], "succeeded");
-    }
-
-    /// 2.13: after `run cancel`, `workflow.node.restart` succeeded — the run
-    /// reported `cancelled` while the node it restarted reported `running`, in a
-    /// pane nothing would ever collect a result from.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn node_restart_is_refused_once_the_run_has_been_cancelled() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-        app.handle_workflow_run_cancel(
-            "req".into(),
-            WorkflowRunTarget {
-                run_id: run_id.clone(),
-            },
-        );
-        assert_eq!(
-            app.workflow.run_status(),
-            Some(RunStatus::Cancelled),
-            "the fixture run is cancelled before the restart"
-        );
-
-        let response = app.handle_workflow_node_restart(
-            "req".into(),
-            WorkflowNodeTarget {
-                run_id,
-                path: "only".into(),
-            },
-        );
-        assert_eq!(error_code(&response), RUN_CLOSED_CODE, "{response}");
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        let message = value["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("cancelled") && message.contains("kvx workflow run start"),
-            "the refusal names the run's status and what to do instead: {message}"
-        );
-        assert_eq!(
-            app.workflow_node_info(&InstancePath::new("only"))
-                .map(|node| node.status),
-            Some(crate::api::schema::WorkflowNodeStatus::Cancelled),
-            "the node is not resurrected"
-        );
-    }
-
-    /// B-T5 (P2b decision): `run cancel` on an already-closed run used to
+    /// B-T5 kept, re-aimed. `run cancel` on an already-closed run used to
     /// answer `ok` with an envelope literally named `workflow_run_cancelled`
-    /// while the run's status stayed whatever it already was — inconsistent
-    /// with `steer`/`interrupt`/`restart`, which all reject a closed run with
-    /// `workflow_run_closed`.
+    /// while the run's status stayed whatever it already was. It is still a
+    /// refusal — but the code changed with the engine: there is no
+    /// `workflow_run_closed` any more, because the only run this server can
+    /// cancel is the one whose lead is live (§3.3), and a closed one is simply
+    /// not that run.
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn cancelling_a_closed_run_is_refused_like_steer_and_interrupt() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-        app.handle_workflow_run_cancel(
+    fn cancelling_a_closed_run_is_refused_rather_than_answered_ok() {
+        let (mut app, run_id) = app_with_a_live_lead_run();
+
+        let first = app.handle_workflow_run_cancel(
             "req".into(),
             WorkflowRunTarget {
                 run_id: run_id.clone(),
             },
         );
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
         assert_eq!(
-            app.workflow.run_status(),
-            Some(RunStatus::Cancelled),
-            "the fixture run is cancelled before the second cancel"
+            value["result"]["type"], "workflow_run_cancelled",
+            "the first cancel is the one that closes the run: {value}"
+        );
+        assert_eq!(value["result"]["run"]["status"], "cancelled", "{value}");
+        assert!(
+            !app.lead_run_is_live(),
+            "cancelling releases the single-live-run guard"
         );
 
-        let response = app.handle_workflow_run_cancel(
+        let second = app.handle_workflow_run_cancel(
             "req".into(),
             WorkflowRunTarget {
                 run_id: run_id.clone(),
             },
         );
-        assert_eq!(error_code(&response), RUN_CLOSED_CODE, "{response}");
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(error_code(&second), NO_ACTIVE_RUN_CODE, "{second}");
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
         let message = value["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("cancelled") && message.contains("kvx workflow run start"),
-            "the refusal names the run's status and what to do instead: {message}"
+            message.contains(&run_id),
+            "the refusal names the run it refused: {message}"
         );
-        assert_eq!(
-            app.workflow.run_status(),
-            Some(RunStatus::Cancelled),
-            "the refusal does not reopen or otherwise mutate the run"
+
+        // And the refusal is a refusal, not a second mutation.
+        let read_back = app.handle_workflow_run_get(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
         );
+        let value: serde_json::Value = serde_json::from_str(&read_back).unwrap();
+        assert_eq!(value["result"]["run"]["status"], "cancelled", "{value}");
     }
 
-    /// 2.14: `workflow_run_in_flight` claimed the blocking run was "still
-    /// executing" when it was in fact paused waiting for a human, and named
-    /// neither the run nor a way out.
+    /// 2.14 kept, re-aimed. `workflow_run_in_flight` used to claim the blocking
+    /// run was "still executing" when it was in fact paused, and named neither
+    /// the run nor a way out. There is no paused state and no blocking node to
+    /// name any more — the lead decides what its team works on — so what the
+    /// message still owes the user is the run that is holding the server and
+    /// the two ways to get past it.
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn run_in_flight_names_the_paused_run_the_blocking_node_and_the_remedies() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-        // Two invalid results spend the corrective re-prompt, surface the node,
-        // and leave the run paused with nothing runnable.
-        for _ in 0..2 {
-            app.handle_workflow_node_report(
-                "req".into(),
-                WorkflowNodeReportParams {
-                    run_id: run_id.clone(),
-                    path: "only".into(),
-                    token: "node-token".into(),
-                    result: serde_json::json!({ "wrong_field": 1 }),
-                },
-            );
-        }
-        assert_eq!(app.workflow.run_status(), Some(RunStatus::Paused));
-
+    fn run_in_flight_names_the_live_lead_run_and_the_way_out() {
+        let (mut app, run_id) = app_with_a_live_lead_run();
         app.handle_workflow_create(
             "req".into(),
             WorkflowCreateParams {
                 definition: single_node_definition("second-workflow", "run it"),
             },
         );
+
         let response = app.handle_workflow_run(
             "req".into(),
             WorkflowRunParams {
@@ -3843,17 +3619,20 @@ output_schema = { type = "object", required = ["done"] }
             "the refusal names the blocking run: {message}"
         );
         assert!(
-            message.contains("paused") && message.contains("waiting for a human"),
-            "the refusal says the run is not executing: {message}"
+            message.contains("team lead is live"),
+            "the refusal says what is holding the server: {message}"
         );
         assert!(
-            message.contains("blocked on node \"only\""),
-            "the refusal names the node the run is stuck on: {message}"
+            message.contains(&format!("kvx workflow run cancel {run_id}")),
+            "the refusal names the way out: {message}"
         );
-        assert!(
-            message.contains(&format!("kvx workflow run cancel {run_id}"))
-                && message.contains(&format!("kvx workflow node restart {run_id} only")),
-            "the refusal names both ways out: {message}"
+
+        // The guard refuses before `create_run`, so a refused start leaves no
+        // orphan row behind — the half that made 2.14 worth pinning.
+        assert_eq!(
+            run_row_count(&mut app, "second-workflow"),
+            0,
+            "a refused start must create no run row"
         );
     }
 
@@ -3917,483 +3696,22 @@ port = "summary"
         }
     }
 
-    /// Starts the expanding workflow and binds `plan`, so it is a live,
-    /// token-holding node that can propose.
-    #[cfg(feature = "workflow")]
-    fn app_with_an_expanding_run(tier: Option<WorkflowTier>) -> (App, String) {
-        use crate::workflow::model::{NodeBinding, NodeToken};
-        use std::path::PathBuf;
-
-        let mut app = app();
-        let created = app.handle_workflow_create(
-            "req".into(),
-            WorkflowCreateParams {
-                definition: expanding_definition(None),
-            },
-        );
-        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
-        let workflow_id = created["result"]["workflow"]["workflow_id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("the workflow was created: {created}"))
-            .to_string();
-
-        let started = app.handle_workflow_run(
-            "req".into(),
-            WorkflowRunParams {
-                workflow_id,
-                version: None,
-                tier,
-                args: HashMap::new(),
-                restore_from: None,
-                include_prior_summaries: None,
-            },
-        );
-        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
-        let run_id = started["result"]["run"]["run_id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("the run started: {started}"))
-            .to_string();
-
-        app.workflow
-            .record_node_token(&InstancePath::new("plan"), NodeToken::new("node-token"));
-        app.bind_workflow_node(
-            &InstancePath::new("plan"),
-            NodeBinding {
-                pane_id: crate::workflow::model::PublicPaneId::new("w9:p9"),
-                terminal_id: crate::terminal::TerminalId::alloc(),
-                agent_session_id: "session-1".to_string(),
-                transcript_path: PathBuf::from("transcript.jsonl"),
-                node_dir: PathBuf::from("/runs/test/plan"),
-                cwd: PathBuf::from("/repo"),
-            },
-        );
-        (app, run_id)
-    }
-
-    /// Settles `plan` with a result that fills the `summary` port, which is
-    /// what admits `review`.
-    #[cfg(feature = "workflow")]
-    fn report_plan(app: &mut App, run_id: &str) {
-        app.handle_workflow_node_report(
-            "req".into(),
-            WorkflowNodeReportParams {
-                run_id: run_id.to_string(),
-                path: "plan".into(),
-                token: "node-token".into(),
-                result: serde_json::json!({ "summary": "done" }),
-            },
-        );
-    }
-
-    /// Binds the downstream node to its own pane, the step that moves an
-    /// admitted node from `Ready` to `Running`.
-    #[cfg(feature = "workflow")]
-    fn bind_review(app: &mut App) {
-        use crate::workflow::model::{NodeBinding, NodeToken};
-        use std::path::PathBuf;
-
-        app.workflow
-            .record_node_token(&InstancePath::new("review"), NodeToken::new("node-token"));
-        app.bind_workflow_node(
-            &InstancePath::new("review"),
-            NodeBinding {
-                pane_id: crate::workflow::model::PublicPaneId::new("w9:p8"),
-                terminal_id: crate::terminal::TerminalId::alloc(),
-                agent_session_id: "session-2".to_string(),
-                transcript_path: PathBuf::from("transcript.jsonl"),
-                node_dir: PathBuf::from("/runs/test/review"),
-                cwd: PathBuf::from("/repo"),
-            },
-        );
-    }
-
-    #[cfg(feature = "workflow")]
-    fn expand_params(run_id: &str, template: &str, count: Option<u32>) -> WorkflowNodeExpandParams {
-        WorkflowNodeExpandParams {
-            run_id: run_id.to_string(),
-            path: "plan".into(),
-            token: "node-token".into(),
-            template: template.to_string(),
-            label: String::new(),
-            inputs: HashMap::new(),
-            count,
-        }
-    }
-
-    /// An accepted proposal creates the children it names, at the §3 frozen
-    /// instance-path grammar, and reports exactly those paths.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn an_accepted_expand_proposal_creates_the_children_it_reports() {
-        let (mut app, run_id) = app_with_an_expanding_run(None);
-        let response = app
-            .handle_workflow_node_expand("req".into(), expand_params(&run_id, "worker", Some(2)));
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(
-            value["result"]["type"], "workflow_node_expanded",
-            "unexpected: {value}"
-        );
-        let accepted: Vec<&str> = value["result"]["accepted"]
-            .as_array()
-            .unwrap_or_else(|| panic!("accepted is an array: {value}"))
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect();
-        assert_eq!(accepted, vec!["plan/worker/1", "plan/worker/2"], "{value}");
-        assert!(
-            value["result"]["rejected"]
-                .as_array()
-                .is_some_and(Vec::is_empty),
-            "a wholly accepted proposal reports no rejection: {value}"
-        );
-        for path in accepted {
-            assert!(
-                app.workflow_node_info(&InstancePath::new(path)).is_some(),
-                "the response only names children that exist: {path}"
-            );
-        }
-    }
-
-    /// The headline guarantee, handler-side: a refused proposal is a
-    /// **successful** response carrying the refusal, not an error — the run
-    /// continues and the node learns exactly what it hit.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn a_rejected_expand_proposal_is_a_success_response_carrying_the_rejection() {
-        let (mut app, run_id) = app_with_an_expanding_run(None);
-        let before = app.workflow.graph().map(|graph| graph.nodes.len());
-
-        let response =
-            app.handle_workflow_node_expand("req".into(), expand_params(&run_id, "review", None));
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(
-            value["result"]["type"], "workflow_node_expanded",
-            "a rejection is not an error: {value}"
-        );
-        assert!(
-            value["result"]["accepted"]
-                .as_array()
-                .is_some_and(Vec::is_empty),
-            "{value}"
-        );
-        let rejected = value["result"]["rejected"].as_array().unwrap();
-        assert_eq!(rejected.len(), 1, "{value}");
-        assert_eq!(rejected[0]["reason"], "not_allowed");
-        assert_eq!(rejected[0]["template"], "review");
-        assert_eq!(rejected[0]["requested"], 1);
-        assert_eq!(rejected[0]["accepted"], 0);
-        assert!(
-            rejected[0]["limit"].is_null(),
-            "a validation refusal is not a guardrail: {value}"
-        );
-        assert!(
-            rejected[0]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("expand_allow"),
-            "{value}"
-        );
-        assert_eq!(
-            app.workflow.graph().map(|graph| graph.nodes.len()),
-            before,
-            "a refused proposal creates nothing"
-        );
-    }
-
-    /// §4 D2: partial acceptance is the interesting case. Four asked for, two
-    /// created, and the shortfall reported with the exact guardrail — never
-    /// accept-all and never a silent truncation.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn a_truncated_expand_proposal_reports_both_halves() {
-        let (mut app, run_id) = app_with_an_expanding_run(None);
-        let response = app
-            .handle_workflow_node_expand("req".into(), expand_params(&run_id, "worker", Some(4)));
-        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(
-            value["result"]["accepted"].as_array().map(Vec::len),
-            Some(2),
-            "expand_max 2 caps the acceptance: {value}"
-        );
-        let rejected = value["result"]["rejected"].as_array().unwrap();
-        assert_eq!(rejected.len(), 1, "{value}");
-        assert_eq!(rejected[0]["reason"], "truncated");
-        assert_eq!(rejected[0]["requested"], 4);
-        assert_eq!(rejected[0]["accepted"], 2);
-        assert_eq!(rejected[0]["limit"]["kind"], "expand_max");
-        assert_eq!(rejected[0]["limit"]["limit_value"], 2);
-        assert_eq!(rejected[0]["limit"]["requested"], 4);
-        assert_eq!(rejected[0]["limit"]["accepted"], 2);
-        assert!(
-            rejected[0]["limit"]["at_unix_ms"].as_u64().unwrap_or(0) > 0,
-            "a growth limit is stamped when it is hit: {value}"
-        );
-        assert!(
-            rejected[0]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("2 of 4"),
-            "{value}"
-        );
-    }
-
-    /// The token is the node's capability, exactly as it is for
-    /// `workflow.node.report`: an operator holding the run id cannot grow
-    /// someone else's graph.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn an_expand_proposal_with_the_wrong_token_is_refused() {
-        let (mut app, run_id) = app_with_an_expanding_run(None);
-        let mut params = expand_params(&run_id, "worker", Some(1));
-        params.token = "not-the-token".into();
-        let response = app.handle_workflow_node_expand("req".into(), params);
-        assert_eq!(
-            error_code(&response),
-            "workflow_node_token_invalid",
-            "{response}"
-        );
-        assert!(
-            app.workflow_node_info(&InstancePath::new("plan/worker/1"))
-                .is_none(),
-            "an unauthenticated proposal creates nothing"
-        );
-    }
-
-    /// `count` is `u32` on the wire and `u16` in the engine, so an
-    /// out-of-range value is refused rather than truncated to a number the
-    /// caller never asked for.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn an_out_of_range_expand_count_is_refused_rather_than_truncated() {
-        let (mut app, run_id) = app_with_an_expanding_run(None);
-        let response = app.handle_workflow_node_expand(
-            "req".into(),
-            expand_params(&run_id, "worker", Some(u32::from(u16::MAX) + 1)),
-        );
-        assert_eq!(error_code(&response), "invalid_params", "{response}");
-        assert!(app
-            .workflow_node_info(&InstancePath::new("plan/worker/1"))
-            .is_none());
-    }
-
-    /// H2 — the closed-run guard is one helper applied to all four verbs.
-    /// Three terminal statuses × three verbs, each naming the status it
-    /// refused for.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn steer_interrupt_and_expand_are_refused_once_the_run_has_closed() {
-        use crate::workflow::model::PublicPaneId;
-
-        for (label, close) in [
-            (
-                "cancelled",
-                Box::new(|app: &mut App, run_id: &str| {
-                    app.handle_workflow_run_cancel(
-                        "req".into(),
-                        WorkflowRunTarget {
-                            run_id: run_id.to_string(),
-                        },
-                    );
-                }) as Box<dyn Fn(&mut App, &str)>,
-            ),
-            (
-                "succeeded",
-                Box::new(|app: &mut App, run_id: &str| {
-                    // Every node reports a valid result, so the run reaches its
-                    // own terminal status rather than being cancelled into one.
-                    report_plan(app, run_id);
-                    bind_review(app);
-                    app.handle_workflow_node_report(
-                        "req".into(),
-                        WorkflowNodeReportParams {
-                            run_id: run_id.to_string(),
-                            path: "review".into(),
-                            token: "node-token".into(),
-                            result: serde_json::json!({ "summary": "reviewed" }),
-                        },
-                    );
-                }),
-            ),
-            (
-                "failed",
-                Box::new(|app: &mut App, run_id: &str| {
-                    // The last node's pane dies before a result arrives, which
-                    // §4.3 makes a failure with the exit code; every node is
-                    // then terminal and one of them failed.
-                    report_plan(app, run_id);
-                    bind_review(app);
-                    app.apply_workflow_engine_input(EngineInput::PaneExited {
-                        pane: PublicPaneId::new("w9:p8"),
-                        code: Some(1),
-                    });
-                }),
-            ),
-        ] {
-            let (mut app, run_id) = app_with_an_expanding_run(None);
-            close(&mut app, &run_id);
-            let status = app.workflow.run_status();
-            let nodes: Vec<(String, NodeStatus, bool)> = app
-                .workflow
-                .graph()
-                .map(|graph| {
-                    graph
-                        .nodes
-                        .iter()
-                        .map(|node| {
-                            (
-                                node.path.to_string(),
-                                node.status,
-                                node.succession.is_some(),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            assert!(
-                status.is_some_and(is_closed_run),
-                "the {label} fixture closes the run, got {status:?} with {nodes:?}"
-            );
-
-            let responses = [
-                (
-                    "steer",
-                    app.handle_workflow_node_steer(
-                        "req".into(),
-                        WorkflowNodeSteerParams {
-                            run_id: run_id.clone(),
-                            path: "plan".into(),
-                            text: "keep going".into(),
-                        },
-                    ),
-                ),
-                (
-                    "interrupt",
-                    app.handle_workflow_node_interrupt(
-                        "req".into(),
-                        WorkflowNodeTarget {
-                            run_id: run_id.clone(),
-                            path: "plan".into(),
-                        },
-                    ),
-                ),
-                (
-                    "restart",
-                    app.handle_workflow_node_restart(
-                        "req".into(),
-                        WorkflowNodeTarget {
-                            run_id: run_id.clone(),
-                            path: "plan".into(),
-                        },
-                    ),
-                ),
-                (
-                    "expand",
-                    app.handle_workflow_node_expand(
-                        "req".into(),
-                        expand_params(&run_id, "worker", Some(1)),
-                    ),
-                ),
-            ];
-
-            for (verb, response) in responses {
-                assert_eq!(
-                    error_code(&response),
-                    RUN_CLOSED_CODE,
-                    "{verb} on a {label} run: {response}"
-                );
-                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
-                let message = value["error"]["message"].as_str().unwrap_or_default();
-                assert!(
-                    message.contains(label) && message.contains("kvx workflow run start"),
-                    "{verb} on a {label} run names the status and the way out: {message}"
-                );
-            }
-            assert!(
-                app.workflow_node_info(&InstancePath::new("plan/worker/1"))
-                    .is_none(),
-                "a closed run cannot grow ({label})"
-            );
-        }
-    }
-
-    /// §4 D4 / R-3: the tier narrows the version's ceilings **once**, at run
-    /// create, so what the `RunGraph` enforces is what the run row persists.
-    /// Without the narrowing a `--tier low` run's row says 30 while its graph
-    /// says 12.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn the_persisted_growth_limits_are_the_ones_the_run_graph_enforces() {
-        for (tier, expected) in [
-            (WorkflowTier::Max, 30_u16),
-            (WorkflowTier::High, 30),
-            (WorkflowTier::Auto, 30),
-            (WorkflowTier::Medium, 24),
-            (WorkflowTier::Low, 12),
-        ] {
-            let mut app = app();
-            let created = app.handle_workflow_create(
-                "req".into(),
-                WorkflowCreateParams {
-                    definition: expanding_definition(Some(30)),
-                },
-            );
-            let created: serde_json::Value = serde_json::from_str(&created).unwrap();
-            let workflow_id = created["result"]["workflow"]["workflow_id"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{created}"))
-                .to_string();
-            let started = app.handle_workflow_run(
-                "req".into(),
-                WorkflowRunParams {
-                    workflow_id,
-                    version: None,
-                    tier: Some(tier),
-                    args: HashMap::new(),
-                    restore_from: None,
-                    include_prior_summaries: None,
-                },
-            );
-            let started: serde_json::Value = serde_json::from_str(&started).unwrap();
-            let run_id = RunId::new(
-                started["result"]["run"]["run_id"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{started}"))
-                    .to_string(),
-            );
-
-            let enforced = app
-                .workflow
-                .graph()
-                .map(|graph| graph.growth.max_nodes)
-                .expect("the run graph is live");
-            assert_eq!(enforced, expected, "{tier:?} narrows the graph's ceiling");
-            assert_eq!(
-                started["result"]["run"]["max_nodes"].as_u64(),
-                Some(u64::from(expected)),
-                "{tier:?}: the projection reports the effective ceiling: {started}"
-            );
-
-            let wanted = run_id.clone();
-            let persisted = app
-                .workflow_store
-                .call(move |cx| cx.block_on(cx.store().get_run(&wanted)))
-                .expect("the in-memory store is available")
-                .expect("the run row reads back")
-                .expect("the run row exists");
-            assert_eq!(
-                persisted.max_nodes, enforced,
-                "{tier:?}: the run row and the run graph must not disagree"
-            );
-            assert_eq!(persisted.max_depth, 3, "{tier:?}: depth is never narrowed");
-        }
-    }
+    // Phase 2's expansion coverage — `an_accepted_expand_proposal_creates_the
+    // _children_it_reports`, the rejected/truncated/wrong-token/out-of-range
+    // proposals, `steer_interrupt_and_expand_are_refused_once_the_run_has
+    // _closed`, and `the_persisted_growth_limits_are_the_ones_the_run_graph
+    // _enforces` — went with the engine (`09-agent-teams-rework.md` §2).
+    //
+    // What left the product with them: `workflow.node.expand`'s proposal
+    // protocol (token, template allow-list, count ceiling, truncation report)
+    // and the growth guardrails it was judged against. The lead creates tasks
+    // freely now and karvex records emergent nodes instead of judging them.
+    // `steer`/`interrupt`/`restart`/`expand` no longer have a closed-run arm
+    // because they no longer have an open-run arm — see
+    // `the_retired_node_verbs_name_their_retirement_and_cancel_still_guards_the_run`
+    // above. The tier narrowing those growth ceilings came from is still pinned,
+    // as a pure function, in `src/workflow/tier.rs`'s
+    // `a_tier_narrows_the_versions_ceilings_and_never_widens_them`.
 
     /// H3 / §4 D16: one projection. `detail` is what both the human renderer
     /// and `--json` read, so it has to describe the head document's whole
@@ -4626,266 +3944,28 @@ port = "summary"
         assert_eq!(run_limit.kind, WorkflowGrowthLimitKind::MaxNodes);
     }
 
-    // ── Phase 3: interrogation, restore, summaries ─────────────────────────
+    // ── Phase 3: restore and summaries ─────────────────────────────────────
 
-    #[cfg(feature = "workflow")]
-    fn pane_count(app: &App) -> usize {
-        app.state
-            .workspaces
-            .iter()
-            .map(|workspace| {
-                workspace
-                    .tabs
-                    .iter()
-                    .map(|tab| tab.layout.pane_count())
-                    .sum::<usize>()
-            })
-            .sum()
-    }
-
-    /// The agent-runner twin of [`app_with_a_bound_command_node`].
-    ///
-    /// The interrogation ladder gates on the node's **runner**, so the command
-    /// fixture can only ever exercise the first refusal; everything past it
-    /// needs a node the definition declares as an agent.
-    #[cfg(feature = "workflow")]
-    fn app_with_a_bound_agent_node(pane: &str, cwd: PathBuf, transcript: PathBuf) -> (App, String) {
-        let mut app = app();
-        let created = app.handle_workflow_create(
-            "req".into(),
-            WorkflowCreateParams {
-                definition: WorkflowDefinitionDocument {
-                    format: WorkflowDefinitionFormat::Toml,
-                    text: r#"
-name = "interrogable"
-[[node]]
-key = "only"
-label = "Only"
-runner = "agent"
-prompt_template = "do it"
-output_schema = { type = "object", required = ["done"] }
-"#
-                    .to_string(),
-                },
-            },
-        );
-        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
-        let workflow_id = created["result"]["workflow"]["workflow_id"]
-            .as_str()
-            .expect("the workflow was created")
-            .to_string();
-
-        let started = app.handle_workflow_run(
-            "req".into(),
-            WorkflowRunParams {
-                workflow_id,
-                version: None,
-                tier: None,
-                args: HashMap::new(),
-                restore_from: None,
-                include_prior_summaries: None,
-            },
-        );
-        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
-        let run_id = started["result"]["run"]["run_id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("the run started: {started}"))
-            .to_string();
-
-        app.bind_workflow_node(
-            &InstancePath::new("only"),
-            crate::workflow::model::NodeBinding {
-                pane_id: crate::workflow::model::PublicPaneId::new(pane),
-                terminal_id: crate::terminal::TerminalId::alloc(),
-                agent_session_id: "00000000-0000-4000-8000-000000000001".to_string(),
-                transcript_path: transcript,
-                node_dir: PathBuf::from("/runs/test/only"),
-                cwd,
-            },
-        );
-        (app, run_id)
-    }
-
-    #[cfg(feature = "workflow")]
-    fn interrogate(app: &mut App, run_id: &str, path: &str, reconstructed: bool) -> String {
-        app.handle_workflow_node_interrogate(
-            "req".into(),
-            WorkflowNodeInterrogateParams {
-                run_id: run_id.to_string(),
-                path: path.to_string(),
-                mode: if reconstructed {
-                    WorkflowInterrogationMode::Reconstructed
-                } else {
-                    WorkflowInterrogationMode::Resumed
-                },
-                note: None,
-            },
-        )
-    }
-
-    /// The "never a silent pane" pin (`00-overview.md` Feature 3,
-    /// `07-phase3-plan.md` §WS-D "Tested").
-    ///
-    /// A `runner: command` node never had a Claude session, so its transcript
-    /// can never exist. The refusal has to be structured *and* has to happen
-    /// before anything is created — a pane that starts and dies would be the
-    /// exact failure the stat-first rule exists to prevent, so the pane count
-    /// is asserted, not just the error code.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn interrogating_a_command_node_is_refused_and_creates_no_pane() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-        let before = pane_count(&app);
-
-        let response = interrogate(&mut app, &run_id, "only", false);
-
-        assert_eq!(error_code(&response), "workflow_transcript_unavailable");
-        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
-        let message = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("command"),
-            "the message has to say *why* there is no transcript, or the caller \
-             goes looking for a file that was never going to exist: {message}"
-        );
-        assert_eq!(
-            pane_count(&app),
-            before,
-            "a refused interrogation must leave the workspace exactly as it was"
-        );
-    }
-
-    /// A node that *does* have a session but whose transcript is not on disk
-    /// takes the same code with a different reason, and still creates nothing.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn interrogating_a_node_whose_transcript_is_gone_names_the_missing_file() {
-        let (mut app, run_id) = app_with_a_bound_agent_node(
-            "w9:p9",
-            std::env::temp_dir(),
-            PathBuf::from("/nonexistent/transcript.jsonl"),
-        );
-        let before = pane_count(&app);
-
-        let response = interrogate(&mut app, &run_id, "only", false);
-
-        assert_eq!(error_code(&response), "workflow_transcript_unavailable");
-        let body: serde_json::Value = serde_json::from_str(&response).unwrap();
-        let message = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("/nonexistent/transcript.jsonl"),
-            "the refusal names the path it stat'd, so the caller can check it: {message}"
-        );
-        assert_eq!(pane_count(&app), before);
-    }
-
-    /// A reconstruction with nothing to reconstruct from is refused too: the
-    /// degraded path is a stand-in for a stored result, and with no checkpoint
-    /// there is nothing to stand in for.
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn a_reconstruction_with_no_checkpoint_is_refused() {
-        let (mut app, run_id) = app_with_a_bound_agent_node(
-            "w9:p9",
-            std::env::temp_dir(),
-            PathBuf::from("/nonexistent/transcript.jsonl"),
-        );
-        let before = pane_count(&app);
-
-        let response = interrogate(&mut app, &run_id, "only", true);
-
-        assert_eq!(error_code(&response), "workflow_transcript_unavailable");
-        assert_eq!(pane_count(&app), before);
-    }
-
-    /// §WS-D "Tested": with the transcript actually on disk the ladder gets all
-    /// the way through, and the two things CI can check about a real fork are
-    /// checked — the argv is exactly the frozen six tokens, and the source
-    /// transcript's bytes are untouched by the call.
-    ///
-    /// The spawn itself fails here (a headless `AppState` has no pane to split),
-    /// which is the point: the failure is *after* every precondition passed, so
-    /// what is asserted is the argv the binder built and the file it did not
-    /// write to. The real-fork non-mutation check is in the manual list (§5).
-    #[cfg(feature = "workflow")]
-    #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn a_resumable_node_builds_the_frozen_fork_argv_and_never_writes_the_source() {
-        use crate::workflow::binding::interrogate;
-
-        let dir = std::env::temp_dir().join(format!(
-            "karvex-interrogate-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&dir).expect("the fixture directory");
-        let transcript = dir.join("source.jsonl");
-        let contents = b"{\"type\":\"user\"}\n";
-        std::fs::write(&transcript, contents).expect("the fixture transcript");
-
-        let (mut app, run_id) =
-            app_with_a_bound_agent_node("w9:p9", dir.clone(), transcript.clone());
-        let before = pane_count(&app);
-
-        let response = interrogate(&mut app, &run_id, "only", false);
-
-        // Every precondition passed, so the failure is the pane and it says so
-        // (E-15) — not "there was nothing to fork", which would send the caller
-        // to check a file that is sitting right there.
-        assert_eq!(
-            error_code(&response),
-            INTERROGATION_SPAWN_FAILED_CODE,
-            "the transcript and cwd both stat; the ladder must be past them: {response}"
-        );
-        assert_eq!(
-            std::fs::read(&transcript).expect("the source transcript survives"),
-            contents,
-            "`--fork-session` is what makes this non-mutating; nothing on the \
-             interrogate path may write the source transcript"
-        );
-        assert_eq!(
-            pane_count(&app),
-            before,
-            "this fixture has no pane to split, so the spawn fails and leaves nothing"
-        );
-
-        // The frozen argv itself (§3 rule 7), asserted at the binder rather than
-        // through a pane CI cannot create.
-        let argv = interrogate::resumed_argv("source-sid", "forked-sid");
-        assert_eq!(
-            argv[1..],
-            [
-                "--session-id".to_string(),
-                "forked-sid".to_string(),
-                "--resume".to_string(),
-                "source-sid".to_string(),
-                "--fork-session".to_string(),
-            ]
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An unknown run is a plain not-found, and — the m9 half — is answered
-    /// before any node lookup, since a run that does not exist has no nodes.
-    #[cfg(feature = "workflow")]
-    #[test]
-    fn interrogating_an_unknown_run_is_not_found() {
-        let mut app = app();
-        let response = interrogate(&mut app, "workflow_run:missing", "plan", false);
-        assert_eq!(error_code(&response), "workflow_not_found");
-    }
+    // Phase 3's interrogation coverage — the command-node refusal, the missing
+    // transcript, the checkpoint-less reconstruction, and the frozen-fork argv
+    // — went with `binding/interrogate.rs` (`09-agent-teams-rework.md` §3.6).
+    //
+    // What left the product with it: `workflow.node.interrogate`, its two modes,
+    // and the `workflow_interrogation_*` codes. Phase E's interrogate is a
+    // different mechanism (resume a *member's* session id out of the run's
+    // snapshot), and 09 §3.6 is explicit that a seam shaped like the old one
+    // would be a wrong-shaped hole, so there is nothing here to keep ignored
+    // against it.
 
     /// `workflow.summary.get` on a run with no summary is a **success** with
-    /// `summary: null`, never an error (§4 D1): a run whose epilogue was
-    /// disabled, cancelled, or gave up simply has none.
+    /// `summary: null`, never an error (§4 D1). The epilogue subsystem that
+    /// used to produce one went with the engine; the lead writes its own
+    /// summary through `workflow.run.finish` (§3.3), so "no summary yet" is now
+    /// the normal state of every run that has not finished.
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn a_run_with_no_summary_answers_null_rather_than_an_error() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
+        let (mut app, run_id) = app_with_a_live_lead_run();
         let response = app.handle_workflow_summary_get(
             "req".into(),
             WorkflowRunTarget {
@@ -4949,27 +4029,28 @@ output_schema = { type = "object", required = ["done"] }
     /// §4 D11's typo protection: a selector naming no node of the **target**
     /// version is a hard error, and — the half that matters — the run is not
     /// created, so a refused restore leaves no orphan `workflow_run` row.
+    ///
+    /// The restore request is resolved before the `claude` preflight as well as
+    /// before `create_run`: a malformed request is the caller's to fix whatever
+    /// the machine has installed, and resolving it second would mask a typo
+    /// behind `workflow_lead_unavailable` on any host without agent teams.
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn an_unknown_restore_selector_is_refused_and_starts_no_run() {
-        let (mut app, run_id) = app_with_a_bound_command_node("w9:p9");
-        // Close the first run so the in-flight guard is not what refuses this.
-        app.cancel_workflow_run();
-        let workflow_id = {
-            let listed = app.handle_workflow_list("req".into());
-            let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
-            listed["result"]["workflows"][0]["workflow_id"]
-                .as_str()
-                .expect("the workflow exists")
-                .to_string()
-        };
-        let runs_before = run_row_count(&mut app, &workflow_id);
+        let (mut app, run_id) = app_with_a_live_lead_run();
+        // Close the run so the single-live-run guard is not what refuses this.
+        app.handle_workflow_run_cancel(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+        );
+        let runs_before = run_row_count(&mut app, "lead-run");
 
         let response = app.handle_workflow_run(
             "req".into(),
             WorkflowRunParams {
-                workflow_id: workflow_id.clone(),
+                workflow_id: "lead-run".into(),
                 version: None,
                 tier: None,
                 args: HashMap::new(),
@@ -4988,35 +4069,26 @@ output_schema = { type = "object", required = ["done"] }
             "{response}"
         );
         assert_eq!(
-            run_row_count(&mut app, &workflow_id),
+            run_row_count(&mut app, "lead-run"),
             runs_before,
             "a hard restore error must be raised before create_run, or it leaves \
-             an orphan run row no engine will ever advance"
+             an orphan run row no lead will ever pick up"
         );
     }
 
-    /// Restoring from a run that has been pruned answers `workflow_run_pruned`
-    /// — its checkpoints went with the run, and the caller is told which of
-    /// "gone" and "never existed" happened.
+    /// Restoring from a run that has neither a row nor a surviving summary is
+    /// a plain not-found, told apart from `workflow_run_pruned` — "gone" and
+    /// "never existed" are different answers to the caller.
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn restoring_from_an_unknown_run_is_not_found_not_pruned() {
-        let (mut app, _) = app_with_a_bound_command_node("w9:p9");
-        app.cancel_workflow_run();
-        let workflow_id = {
-            let listed = app.handle_workflow_list("req".into());
-            let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
-            listed["result"]["workflows"][0]["workflow_id"]
-                .as_str()
-                .expect("the workflow exists")
-                .to_string()
-        };
+        let (mut app, run_id) = app_with_a_live_lead_run();
+        app.handle_workflow_run_cancel("req".into(), WorkflowRunTarget { run_id });
 
         let response = app.handle_workflow_run(
             "req".into(),
             WorkflowRunParams {
-                workflow_id,
+                workflow_id: "lead-run".into(),
                 version: None,
                 tier: None,
                 args: HashMap::new(),

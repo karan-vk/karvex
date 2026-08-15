@@ -351,6 +351,41 @@ mod tests {
         assert_eq!(steer_failure_message(accepted), None);
     }
 
+    /// The accounting that replaced the store queue's `take_write_failures`
+    /// counter (`src/app/workflow_store.rs`): `persist_workflow_write` waits
+    /// for every write now, so a rejection degrades the run here, on the spot.
+    /// Once per server, not once per write — a lead run writes several rows a
+    /// poll, and a store that is refusing them is refusing all of them.
+    #[test]
+    fn a_degraded_journal_is_surfaced_once_per_server() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        // The shipped default delivery is `off`, and this notice is about the
+        // delivery, so it has to be asked for.
+        config.ui.toast.delivery = crate::config::ToastDelivery::Karvex;
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        app.mark_workflow_persistence_degraded();
+        assert!(app.workflow_persistence_degraded);
+        let shown = app
+            .state
+            .toast
+            .as_ref()
+            .expect("the degradation is shown, not only logged");
+        assert_eq!(shown.kind, ToastKind::NeedsAttention);
+        assert!(
+            shown.context.contains("durable write"),
+            "the notice says what was lost: {}",
+            shown.context
+        );
+
+        app.mark_workflow_persistence_degraded();
+        assert!(
+            app.state.toast_queue.is_empty(),
+            "a second failing write must not queue a second notice"
+        );
+    }
+
     #[test]
     fn a_second_run_is_refused_by_name() {
         assert_eq!(
