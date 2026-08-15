@@ -535,15 +535,13 @@ mod tests {
     use crate::config::Config;
 
     fn app() -> App {
+        app_with_event_hub(crate::api::EventHub::default())
+    }
+
+    fn app_with_event_hub(event_hub: crate::api::EventHub) -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         #[cfg_attr(not(feature = "workflow"), allow(unused_mut))]
-        let mut app = App::new(
-            &Config::default(),
-            true,
-            None,
-            api_rx,
-            crate::api::EventHub::default(),
-        );
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub);
         // Never let a unit test open — or lock — the user's real workflow
         // database. With the feature off there is no store to redirect.
         #[cfg(feature = "workflow")]
@@ -1047,6 +1045,54 @@ mod tests {
             assert!(stored_findings(&mut app, &seeded.cycle)
                 .iter()
                 .all(|finding| finding.accepted));
+        }
+
+        /// Both terminal outcomes reach `workflow.review.closed` with the
+        /// cycle attached — a client watching for "the review is over" must
+        /// not have to guess which verb produced it, and must not need a
+        /// second round trip to learn whether a version came out of it.
+        #[test]
+        fn applying_and_declining_both_emit_workflow_review_closed() {
+            for (accept, expected_status, minted) in [
+                (vec!["plan"], "applied", true),
+                (Vec::new(), "declined", false),
+            ] {
+                let hub = crate::api::EventHub::default();
+                let mut app = app_with_event_hub(hub.clone());
+                let seeded = seed(
+                    &mut app,
+                    vec![finding_seed(
+                        "plan",
+                        "prompt",
+                        "improve",
+                        serde_json::json!({"role": "planner"}),
+                    )],
+                    ReviewCycleStatus::AwaitingUser,
+                );
+                let before = hub.current_sequence();
+                result(&apply(&mut app, &seeded.run, &accept));
+
+                let closed: Vec<_> = hub
+                    .events_after(before)
+                    .into_iter()
+                    .map(|(_, envelope)| envelope)
+                    .filter(|envelope| envelope.event == EventKind::WorkflowReviewClosed)
+                    .collect();
+                assert_eq!(closed.len(), 1, "{expected_status}: {closed:?}");
+                let EventData::WorkflowReviewClosed { run_id, review } = &closed[0].data else {
+                    panic!("{expected_status}: wrong event payload");
+                };
+                assert_eq!(run_id, &seeded.run.to_string());
+                assert_eq!(
+                    review.status,
+                    wire_status(stored_cycle(&mut app, &seeded.run).status)
+                );
+                assert_eq!(
+                    review.resulting_version_id.is_some(),
+                    minted,
+                    "{expected_status}"
+                );
+            }
         }
 
         // ── refusals ───────────────────────────────────────────────────────
