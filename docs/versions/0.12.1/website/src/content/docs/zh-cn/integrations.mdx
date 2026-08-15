@@ -1,0 +1,368 @@
+---
+title: 集成
+description: 为 Pi、OMP、Claude Code、Codex、GitHub Copilot CLI、Devin CLI、Droid、Kimi Code CLI、OpenCode、Kilo Code CLI、Hermes Agent、Qoder CLI、Cursor Agent CLI、MastraCode、Antigravity CLI 和 Grok CLI 安装 Herdr 集成。
+---
+
+Herdr 自动检测受支持的智能体。官方集成可以额外提供用于恢复的原生会话身份、生命周期状态上报,或两者兼有。
+
+当你想要智能体原生会话恢复、直接生命周期上报,或两者都要时,使用集成。完整的状态权威模型见[智能体](/zh-cn/docs/agents/)。
+
+## 安装集成
+
+在 Herdr 中打开设置,用集成标签页为 `PATH` 上发现的智能体安装推荐集成,或手动运行命令:
+
+```bash
+herdr integration install pi
+herdr integration install omp
+herdr integration install claude
+herdr integration install codex
+herdr integration install copilot
+herdr integration install devin
+herdr integration install droid
+herdr integration install kimi
+herdr integration install opencode
+herdr integration install kilo
+herdr integration install hermes
+herdr integration install mastracode
+herdr integration install qodercli
+herdr integration install cursor
+herdr integration install antigravity-cli
+herdr integration install grok
+```
+
+## 卸载集成
+
+```bash
+herdr integration uninstall pi
+herdr integration uninstall omp
+herdr integration uninstall claude
+herdr integration uninstall codex
+herdr integration uninstall copilot
+herdr integration uninstall devin
+herdr integration uninstall droid
+herdr integration uninstall kimi
+herdr integration uninstall opencode
+herdr integration uninstall kilo
+herdr integration uninstall hermes
+herdr integration uninstall mastracode
+herdr integration uninstall qodercli
+herdr integration uninstall cursor
+herdr integration uninstall antigravity-cli
+herdr integration uninstall grok
+```
+
+## Herdr 如何使用集成
+
+Herdr 以两种不同方式使用集成:
+
+| 集成类型 | 智能体 | 效果 |
+| --- | --- | --- |
+| 生命周期权威 | Pi、OMP、Kimi Code CLI、OpenCode、Kilo Code CLI、MastraCode | 已安装且在为该窗格主动上报时,由钩子或插件事件决定 `idle`、`working` 和 `blocked`。对同一个生命周期权威,Herdr 不再使用屏幕清单兜底。 |
+| 会话身份 | Claude Code、Codex、GitHub Copilot CLI、Devin CLI、Droid、Qoder CLI、Cursor Agent CLI、Hermes Agent、Antigravity CLI、Grok CLI | 集成上报用于恢复的原生会话引用。状态仍来自 Herdr 的屏幕清单检测。 |
+
+自定义 socket 集成在定义了原生终端 UI 中不可见的状态时,也可以上报状态。
+
+一些集成会上报智能体的原生会话引用。除非被 `[session] resume_agents_on_restore = false` 禁用,Herdr 会在服务器重启后使用官方会话引用恢复 Claude Code、Codex、Devin CLI、Droid、Kimi Code CLI、Qoder CLI、Cursor Agent CLI、Grok CLI、GitHub Copilot CLI、Pi、OMP、Hermes Agent、OpenCode、Kilo Code CLI、MastraCode 和 Antigravity CLI 的窗格。
+
+原生会话恢复需要最新的 Herdr 集成: Pi 集成版本 `2`、OMP 版本 `3`、Claude Code 版本 `6`、Codex 版本 `5`、GitHub Copilot CLI 版本 `2`、Devin CLI 版本 `2`、Droid 版本 `2`、Kimi Code CLI 版本 `3`、Qoder CLI 版本 `2`、Cursor Agent CLI 版本 `1`、Grok CLI 版本 `1`、OpenCode 版本 `5`、Kilo Code CLI 版本 `1`、Hermes Agent 版本 `2`、MastraCode 版本 `1`、Antigravity CLI 版本 `1`。用 `herdr integration status` 查看已安装版本。
+
+## Pi
+
+安装 Pi 集成:
+
+```bash
+herdr integration install pi
+```
+
+Herdr 把内置扩展写入:
+
+```text
+~/.pi/agent/extensions/herdr-agent-state.ts
+```
+
+如果设置了 `PI_CODING_AGENT_DIR`,Herdr 会改为写入 `$PI_CODING_AGENT_DIR/extensions/herdr-agent-state.ts`。如果 Pi agent 目录已经存在,Herdr 会创建 extensions 目录。卸载只删除那个扩展文件。
+
+## OMP
+
+安装 OMP 集成:
+
+```bash
+herdr integration install omp
+```
+
+Herdr 把内置扩展写入:
+
+```text
+~/.omp/agent/extensions/herdr-omp-agent-state.ts
+```
+
+如果设置了 `PI_CODING_AGENT_DIR`,Herdr 会改为写入 `$PI_CODING_AGENT_DIR/extensions/herdr-omp-agent-state.ts`。如果 OMP agent 目录已经存在,Herdr 会创建 extensions 目录。卸载只删除那个扩展文件。
+
+OMP 集成通过 Herdr 的 socket API 上报智能体标签 `omp`、生命周期状态和原生会话身份。它不需要对 `omp` 可执行文件做原生进程检测,并且 Herdr 可以在服务器重启后用 `omp --resume=<session>` 恢复 OMP 窗格。
+
+## Claude Code
+
+安装 Claude Code 钩子:
+
+```bash
+herdr integration install claude
+```
+
+该钩子在会话启动时把 Claude Code 的会话身份上报给本地 Herdr socket。Claude Code 的状态来自 Herdr 的屏幕清单检测。
+
+Herdr 默认使用 `~/.claude`,设置了 `CLAUDE_CONFIG_DIR` 时使用后者。Claude 配置目录必须已经存在。安装会写入 `hooks/herdr-agent-state.sh`,并向 `settings.json` 添加 Herdr 钩子条目。卸载会移除匹配的钩子条目并删除钩子脚本。
+
+## Claude Agent Teams
+
+当 `teammateMode` 解析为 `auto`(默认值)时,Claude Code 的 Agent Teams 功能会通过 tmux 后端启动每个队友。Herdr 会自动让自己成为这个后端: 每个由 Herdr 管理的窗格都会导出一个 tmux 兼容的会话身份,并且 Herdr 会在该窗格的 `PATH` 中放置一个名为 `tmux` 的可执行文件,它与本地 Herdr socket 通信,而不是真正的 tmux 服务器。Claude Code 检测到设置了 `$TMUX`,便把该窗格当作 tmux 处理,并把每个队友作为原生 Herdr 窗格在同一个标签页中启动 — 不需要单独的终端复用器,也不需要挂接嵌套的会话。首领窗格保留焦点,队友窗格会出现在侧边栏中,并像其他被检测到的 Claude Code 窗格一样上报生命周期状态。
+
+这要求 `teammateMode` 实际解析为 `auto`。如果 Claude 的设置文件把 `teammateMode` 固定为其他值(例如 `iterm2`),tmux 后端就会失效,而 Herdr 无法从 Claude 自身配置之外覆盖这一点 — 如果队友没有以 Herdr 窗格的形式出现,请先检查这个设置。
+
+有两个环境变量可以选择退出,都会在窗格启动或服务器启动时读取:
+
+```bash
+KARVEX_NO_TMUX_COMPAT=1   # 不要向新窗格导出 tmux 身份
+KARVEX_NO_AUTO_INTEGRATION=1   # 服务器启动时不要自动安装 Claude Code 钩子
+```
+
+`KARVEX_NO_TMUX_COMPAT=1` 不会删除 Herdr 已经安装的垫片;它只会停止向设置之后启动的窗格导出该身份。Herdr 窗格内 `PATH` 上已有的真正 `tmux` 仍然可以正常工作 — Herdr 的垫片只拦截 Claude Code 队友后端使用的这一小部分命令,其余的一律原样传递,包括指向无关服务器的 `tmux -L <name>` 调用。
+
+`PATH` 的最终顺序由窗格的 shell 决定。macOS 的 `path_helper`、`brew shellenv`、`fish_add_path`、mise、asdf、nix,以及普通的 `export PATH="...:$PATH"`,都会在 Herdr 把 `PATH` 交给窗格之后重新排序,经常把 Herdr 的垫片目录挤到后面。只有当排在前面的某个目录里恰好有真正的 `tmux` 时,这才会造成问题:那时 Claude Code 会用那个 tmux 去连接 Herdr 的套接字,调用失败,Claude Code 就会悄悄回退到进程内的队友,而不是生成窗格。
+
+因此,只有当 `PATH` 上确实存在另一个 `tmux` 时,Herdr 才会把垫片同时安装到自己二进制文件的旁边:也就是让 `herdr` 能按名称运行的那个 `PATH` 目录,它是你的 `PATH` 上唯一本就属于 Herdr 的位置。其他地方一概不动:Herdr 从不创建目录,从不写入包管理器的前缀(Homebrew、Nix、`/usr`),也从不替换它不拥有的真实文件或符号链接;除非 Herdr 已按名称安装在 `PATH` 上,否则它根本不会在自己的数据目录之外写入任何东西。如果 `PATH` 上任何位置都没有其他 `tmux`,这一步就不必要,也不会写入。
+
+如果那个 `tmux` 在 `PATH` 上排在 Herdr 自己的目录之前,或者 Herdr 安装在包管理器的前缀里(它不会往那里写入),Herdr 就不会安装任何东西,而是在服务器日志中记录一条警告;此时队友可能会在 Herdr 窗格之外生成。把包含 `herdr` 的目录移到竞争目录之前即可解决。
+
+镜像位于你运行的所有命令都能看到的 `PATH` 上,因此它刻意保持透明:在 Herdr 窗格之外,以及在真正的 tmux 会话内部,垫片会把每条命令原样传递给真正的 `tmux`,绝不会用 Herdr 自己的窗格来作答。
+
+目前没有 `herdr uninstall` 命令,因此删除垫片需要手动完成。尤其是镜像会在卸载 Herdr 之后继续存在,在删除之前一直遮蔽真正的 `tmux`。删除之前先确认每个链接确实属于 Herdr:
+
+```bash
+readlink ~/.config/herdr/shims/tmux   # 垫片本体;每个会话另有自己的副本
+rm ~/.config/herdr/shims/tmux
+
+readlink ~/.local/bin/tmux            # 需要时放在 `herdr` 旁边的那个;只有指向 Herdr 安装位置时才删除它
+rm ~/.local/bin/tmux
+```
+
+命名会话在 `~/.config/herdr/sessions/<name>/shims/tmux` 有自己的副本。除非同时设置了 `KARVEX_NO_TMUX_COMPAT`,否则这两个链接都会在下次启动窗格时被重新创建,因此如果希望删除是永久性的,请先设置该退出开关。
+
+作为原生窗格的 Claude Agent Teams 在 Windows 上不受支持。Herdr 在那里不会导出 tmux 身份,因此 Claude Code 会为队友回退到自己的非 tmux 后端。
+
+## Codex
+
+安装 Codex 钩子:
+
+```bash
+herdr integration install codex
+```
+
+Codex 钩子通过与其他集成相同的本地 socket API 上报会话身份。Codex 的状态来自 Herdr 的屏幕清单检测。
+
+Herdr 默认使用 `~/.codex`,设置了 `CODEX_HOME` 时使用后者。Codex 配置目录必须已经存在。安装会写入 `herdr-agent-state.sh`、更新 `hooks.json`,并确保 `config.toml` 中有 `[features] hooks = true`。如果存在已弃用的顶层 `codex_hooks` 标志,它也会一并移除。卸载会从 `hooks.json` 中移除 Herdr 条目并删除钩子脚本,但不改动 `config.toml`。
+
+## GitHub Copilot CLI
+
+安装 GitHub Copilot CLI 钩子:
+
+```bash
+herdr integration install copilot
+```
+
+Copilot 钩子通过与其他集成相同的本地 socket API 上报会话身份。Copilot 的状态来自 Herdr 的屏幕清单检测。
+
+Herdr 默认使用 `~/.copilot`,设置了 `COPILOT_HOME` 时使用后者。Copilot 配置目录必须已经存在。安装会写入 `hooks/herdr-agent-state.sh`,并向 `settings.json` 添加一个 `SessionStart` 钩子条目。卸载会从 `settings.json` 中移除 Herdr 条目并删除钩子脚本。
+
+在 Copilot 发出携带会话信息的事件后,Herdr 可以用上报的会话 id 通过 `copilot --resume=<id>` 恢复该窗格。
+
+## Devin CLI
+
+安装 Devin CLI 钩子:
+
+```bash
+herdr integration install devin
+```
+
+该钩子从 Devin 的会话、提示、工具使用、权限和停止事件中上报原生会话身份。Devin 的状态仍来自 Herdr 的屏幕清单和 OSC 检测,因为 Devin 钩子不会在每次权限取消或用户中断后都发出可靠的状态转换。
+
+Herdr 默认使用 `~/.config/devin`,设置了 `XDG_CONFIG_HOME` 时使用 `$XDG_CONFIG_HOME/devin`。Devin 配置目录必须已经存在。安装会写入 `herdr-agent-state.sh`,并向 `config.json` 添加 Herdr 钩子条目。钩子在 Devin 运行期间刷新会话引用。卸载会从 `config.json` 中移除 Herdr 条目并删除钩子脚本。
+
+Herdr 用 `devin --resume <id>` 恢复保存的 Devin 会话。无论钩子是否安装,屏幕清单检测始终是状态权威。
+
+## Kimi Code CLI
+
+安装 Kimi Code CLI 钩子:
+
+```bash
+herdr integration install kimi
+```
+
+该钩子向 Herdr 上报 Kimi 的会话身份和生命周期状态,用于原生恢复和权威的 `idle`、`working`、`blocked` 状态。需要 Kimi Code CLI `0.14.0` 或更新版本。
+
+Herdr 默认使用 `~/.kimi-code`,设置了 `KIMI_CODE_HOME` 时使用后者。Kimi Code 配置目录必须已经存在。安装会写入 `hooks/herdr-agent-state.sh`,并在 `config.toml` 中追加 Herdr 管理的 `[[hooks]]` 条目。卸载会移除 Herdr 管理的配置块并删除钩子脚本。
+
+Herdr 用 `kimi --session <id>` 恢复保存的 Kimi 会话。
+
+## Droid
+
+安装 Droid 钩子:
+
+```bash
+herdr integration install droid
+```
+
+Droid 钩子通过与其他集成相同的本地 socket API 上报会话身份。生命周期状态仍来自 Herdr 的屏幕清单检测,因为 Droid 钩子没有覆盖所有生命周期转换。
+
+Herdr 的 Droid 钩子使用 `~/.factory`。Factory 配置目录必须已经存在。安装会写入 `hooks/herdr-agent-state.sh`,向 `settings.json` 添加 Herdr 的 `SessionStart` 钩子条目,并在 `hooks.json` 中存在旧的 Herdr Droid 钩子条目时将其移除。卸载会从两个配置文件中移除 Herdr 条目并删除钩子脚本。
+
+在 Droid 发出会话启动事件后,Herdr 可以用上报的会话 id 通过 `droid --resume <id>` 恢复该窗格。
+
+## OpenCode
+
+安装 OpenCode 插件:
+
+```bash
+herdr integration install opencode
+```
+
+Herdr 把插件写入 `~/.config/opencode/plugins/herdr-agent-state.js`。OpenCode 配置目录必须已经存在。卸载只删除那个插件文件。
+
+该插件在 OpenCode 运行于 Herdr 窗格内时上报生命周期状态和会话身份。在 OpenCode 发出携带会话信息的事件后,Herdr 可以用上报的会话 id 通过 `opencode --session <id>` 恢复该窗格。插件未安装时,屏幕清单检测仍然可用。
+
+## Kilo Code CLI
+
+安装 Kilo Code CLI 插件:
+
+```bash
+herdr integration install kilo
+```
+
+Herdr 把插件写入 `~/.config/kilo/plugin/herdr-agent-state.js`。Kilo 配置目录必须已经存在。卸载只删除那个插件文件。
+
+该插件在 Kilo 运行于 Herdr 窗格内时上报生命周期状态和会话身份。在 Kilo 发出携带会话信息的事件后,Herdr 可以用上报的会话 id 通过 `kilo --session <id>` 恢复该窗格。插件未安装时,屏幕清单检测仍然可用。
+
+## Hermes Agent
+
+安装 Hermes Agent 插件:
+
+```bash
+herdr integration install hermes
+```
+
+Herdr 写入 `~/.hermes/plugins/herdr-agent-state/`,并在 `~/.hermes/config.yaml` 中启用 `herdr-agent-state`。Hermes 配置目录必须已经存在。安装后请重启 Hermes 以加载插件。卸载会删除插件目录,并从 `plugins.enabled` 中移除 `herdr-agent-state`。
+
+该插件在 Hermes 运行于 Herdr 窗格内时上报可恢复的会话 id。Herdr 使用屏幕清单检测 `working`、`idle` 和 `blocked`,并可用上报的会话 id 通过 `hermes --resume <id>` 恢复该窗格。
+
+## Qoder CLI
+
+安装 Qoder CLI 钩子:
+
+```bash
+herdr integration install qodercli
+```
+
+该钩子向 Herdr 上报 Qoder CLI 的会话身份,用于原生恢复。生命周期状态仍来自 Herdr 的屏幕清单检测,因为 Qoder 钩子没有覆盖所有生命周期转换。
+
+Herdr 默认使用 `~/.qoder`,设置了 `QODER_CONFIG_DIR` 时使用后者。Qoder 配置目录必须已经存在。安装会写入 `hooks/herdr-agent-state.sh`,并向 `settings.json` 添加 Herdr 钩子条目。卸载会移除匹配的钩子条目并删除钩子脚本。
+
+Herdr 用 `qodercli --resume <id>` 恢复保存的 Qoder CLI 会话。
+
+钩子未安装时,屏幕清单检测仍然可用。
+
+## Cursor Agent CLI
+
+安装 Cursor Agent CLI 钩子:
+
+```bash
+herdr integration install cursor
+```
+
+该钩子在 Cursor Agent CLI 运行于 Herdr 窗格内时,通过 Cursor 的 `sessionStart` 钩子上报会话身份。Cursor 的状态来自 Herdr 的屏幕清单检测。
+
+Herdr 默认使用 `~/.cursor`,设置了 `CURSOR_CONFIG_DIR` 时使用后者。Cursor 配置目录必须已经存在。安装会写入 `herdr-agent-state.sh`,并向 `hooks.json` 添加 Herdr 的 `sessionStart` 条目。卸载会移除匹配的钩子条目并删除钩子脚本。
+
+在 Cursor 发出会话启动事件后,Herdr 可以用上报的会话 id 通过 `cursor-agent --resume <id>` 恢复该窗格。Herdr 恢复窗格时,`cursor-agent` 命令必须在 `PATH` 上;Herdr 不会启动通用的 `agent` 命令。
+
+## MastraCode
+
+安装 MastraCode 钩子:
+
+```bash
+herdr integration install mastracode
+```
+
+该钩子向 Herdr 上报 MastraCode 生命周期状态和线程身份,用于权威的 `idle`、`working`、`blocked` 状态和原生恢复。MastraCode 没有屏幕清单兜底;当 MastraCode 在 Herdr 窗格内运行时,状态来自该钩子。
+
+Herdr 使用 `~/.mastracode`。安装会写入 `hooks/herdr-agent-state.sh`,并把 Herdr 命令条目添加到 `hooks.json`;目录不存在时会创建。卸载会删除匹配的钩子条目和钩子脚本。
+
+Herdr 用 `mastracode --thread <id>` 恢复保存的 MastraCode 线程。
+
+## Antigravity CLI
+
+安装 Antigravity CLI 钩子:
+
+```bash
+herdr integration install antigravity-cli
+```
+
+Herdr 默认使用 `~/.gemini/config/`,设置了 `ANTIGRAVITY_CLI_CONFIG_DIR` 时使用后者。这是 Antigravity CLI 读取全局自定义配置的目录,并且必须已经存在。安装会写入 `hooks/herdr-agent-state.sh`（Windows 上为 `herdr-agent-state.ps1`）,并向 `hooks.json` 添加由 Herdr 管理的 `herdr` 块。Antigravity CLI 按钩子名称管理 `hooks.json`,因此安装只会重写该块,不会改动其他命名钩子。卸载会移除 `herdr` 块并删除钩子脚本。
+
+该集成仅上报会话。它会上报窗格当前运行的对话,但不上报智能体状态,因此 Herdr 仍根据 Antigravity CLI 在屏幕上绘制的内容判断 `working`、`idle` 和 `blocked`。
+
+钩子在 `PreInvocation` 时运行,所以 Herdr 会在发送第一个提示词后获知对话。此后,Herdr 服务器重启时可以用 `agy --conversation <id>` 恢复窗格。
+
+## Grok CLI
+
+安装 Grok CLI 钩子:
+
+```bash
+herdr integration install grok
+```
+
+该钩子在 Grok CLI 运行于 Herdr 窗格内时,通过 Grok 的 `SessionStart` 钩子上报会话身份。Grok 的状态来自 Herdr 的屏幕清单检测。
+
+Herdr 默认使用 `~/.grok`,设置了 `GROK_HOME` 时使用后者。Grok 配置目录必须已经存在。Grok 会合并该目录中的所有 `hooks/*.json` 文件,因此安装会写入独立的 `hooks/herdr.json`,其中包含 Herdr 的 `SessionStart` 条目,并同时写入 `hooks/herdr-agent-state.sh`;它不会修改其他钩子文件。卸载只会删除这两个由 Herdr 管理的文件。
+
+Grok 发出会话启动事件后,Herdr 可以用上报的会话 id 通过 `grok --resume <id>` 恢复窗格。
+
+## 自定义状态标签
+
+集成只把生命周期状态作为语义状态上报。例如,上报智能体为 `working` 时,不在生命周期报告中添加展示字段。
+
+```bash
+herdr pane report-agent w1:p1 \
+  --source custom:docs \
+  --agent docs-bot \
+  --state working
+```
+
+与 Herdr 管理的集成并行运行的用户钩子,应该使用元数据而不是 `report-agent`。元数据只改变展示,不会夺走集成对 `idle`、`working`、`blocked` 或会话恢复的权威。`--agent` 和 `--applies-to-source` 只守卫展示字段 (`--title`、`--display-agent` 和 `--state-label`)。令牌补丁始终生效;上报方负责清除或刷新 TTL。`--display-agent` 修改显示名称。
+
+```bash
+herdr pane report-metadata "$HERDR_PANE_ID" \
+  --source user:claude-title \
+  --agent claude \
+  --title "Refactor auth middleware" \
+  --display-agent "Claude: auth" \
+  --token summary="refactor auth" \
+  --state-label working="refactoring auth" \
+  --ttl-ms 3600000
+```
+
+令牌和状态标签只影响视觉。等待、通知和工作区汇总仍使用语义状态。
+
+## 调试集成状态
+
+列出已知的智能体:
+
+```bash
+herdr agent list
+```
+
+需要验证 Herdr 能看到什么时,读取窗格:
+
+```bash
+herdr pane read w1:p1 --source recent --lines 50
+```
+
+如果集成状态看起来不对,先确认智能体运行在 Herdr 内部,并且相关的钩子或插件是为同一个用户账号安装的。
