@@ -197,8 +197,15 @@ pub fn data_dir_for(name: Option<&str>) -> PathBuf {
     }
 }
 
+/// File name Karvex always gives its API socket, for every session.
+///
+/// Also read back the other way: the tmux-compat shim uses it to recognise a
+/// socket path named by `$TMUX` as one of Karvex's own rather than a real
+/// tmux server's (`src/cli/tmux_compat.rs`).
+pub const API_SOCKET_FILE_NAME: &str = "karvex.sock";
+
 pub fn api_socket_path_for(name: Option<&str>) -> PathBuf {
-    data_dir_for(name).join("karvex.sock")
+    data_dir_for(name).join(API_SOCKET_FILE_NAME)
 }
 
 pub fn active_api_socket_path() -> PathBuf {

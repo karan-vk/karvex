@@ -168,8 +168,9 @@ fn apply_tmux_compat_env(cmd: &mut CommandBuilder, pane_id: &str) {
 ///
 /// ⚠ The thunk is deliberately lazy and the opt-out is checked *before* it
 /// runs: `ensure_tmux_shim_dir` is not a pure query, it creates
-/// `<data_dir>/shims/tmux` (and, on macOS, the `~/.local/bin/tmux` mirror
-/// that outlives an uninstall — D6/R2). Resolving it eagerly would install a
+/// `<data_dir>/shims/tmux` (and, where a foreign `tmux` would otherwise win
+/// the lookup, a `PATH` mirror that outlives an uninstall — D6/R2).
+/// Resolving it eagerly would install a
 /// `tmux` symlink onto an opted-out user's `PATH`, which is precisely what
 /// `KARVEX_NO_TMUX_COMPAT` exists to prevent. Covered by
 /// `tmux_compat_opt_out_never_resolves_the_shim_dir`.
@@ -185,42 +186,48 @@ fn apply_tmux_compat_env_with_shim_dir(
         return;
     };
 
-    let socket_path = crate::api::socket_path();
     let existing_path = cmd.get_env("PATH").map(std::ffi::OsStr::to_os_string);
+    // D1 again, one level down: a `PATH` the shim directory cannot be put on
+    // is the same situation as a shim that would not install, so nothing is
+    // exported rather than pointing Claude at a `tmux` it will not find.
+    let Some(path) = prepend_path_once(&shim_dir, existing_path.as_deref()) else {
+        return;
+    };
+    let socket_path = crate::api::socket_path();
 
     cmd.env(
         "TMUX",
         format!("{},{},0", socket_path.display(), std::process::id()),
     );
     cmd.env("TMUX_PANE", pane_id);
-    cmd.env(
-        "PATH",
-        prepend_path_once(&shim_dir, existing_path.as_deref()),
-    );
+    cmd.env("PATH", path);
 }
 
-/// Prepends `dir` to a `:`-joined PATH exactly once, preserving the order of
-/// every other entry. A `PATH` that already starts with `dir` is returned
-/// unchanged rather than duplicated.
-fn prepend_path_once(dir: &Path, existing: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
-    if let Some(existing) = existing {
-        let already_first = existing
-            .to_str()
-            .and_then(|value| value.split(':').next())
-            .is_some_and(|first| Path::new(first) == dir);
-        if already_first {
-            return existing.to_os_string();
-        }
+/// Prepends `dir` to a `PATH` exactly once, preserving the order of every
+/// other entry. A `PATH` that already starts with `dir` is returned unchanged
+/// rather than duplicated. `None` when the result cannot be represented as a
+/// `PATH` (an entry containing the platform separator).
+///
+/// Split and rejoined through `std::env` rather than around a hard-coded `:`
+/// so the separator is the platform's own.
+///
+/// ⚠ Prepending here is necessary but not sufficient: the pane's shell rewrites
+/// `PATH` during its own startup and routinely demotes this entry, which is why
+/// `platform::ensure_tmux_shim_dir` also mirrors the shim into a directory that
+/// is already on `PATH` when something else would win the `tmux` lookup.
+fn prepend_path_once(dir: &Path, existing: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let entries: Vec<std::path::PathBuf> = existing
+        .map(|existing| std::env::split_paths(existing).collect())
+        .unwrap_or_default();
+    if entries.first().is_some_and(|first| first == dir) {
+        return existing.map(std::ffi::OsStr::to_os_string);
     }
 
-    let mut path = dir.as_os_str().to_os_string();
-    if let Some(existing) = existing {
-        if !existing.is_empty() {
-            path.push(":");
-            path.push(existing);
-        }
-    }
-    path
+    // Any other occurrence is dropped rather than left in place: a pane whose
+    // shell demoted the entry can be the parent of the next pane launch, and
+    // stacking a fresh copy on each one grows `PATH` without bound.
+    let rest = entries.into_iter().filter(|entry| entry != dir);
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(rest)).ok()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3180,8 +3187,9 @@ mod tests {
 
     /// The opt-out must be checked *before* the shim directory is resolved.
     /// `platform::ensure_tmux_shim_dir` is not a query — it creates
-    /// `<data_dir>/shims/tmux` and, on macOS, the `~/.local/bin/tmux` mirror
-    /// that outlives an uninstall (D6/R2). Resolving it eagerly would plant a
+    /// `<data_dir>/shims/tmux` and, where a foreign `tmux` would otherwise
+    /// win the lookup, a `PATH` mirror that outlives an uninstall (D6/R2).
+    /// Resolving it eagerly would plant a
     /// `tmux` symlink on an opted-out user's `PATH`, shadowing their real
     /// tmux, which is exactly what `KARVEX_NO_TMUX_COMPAT` exists to prevent.
     #[test]
@@ -3236,19 +3244,36 @@ mod tests {
     #[test]
     fn tmux_compat_env_prepends_shim_dir_once_and_preserves_path_order() {
         let shim_dir = Path::new("/opt/karvex/shims");
+        let joined = |entries: &[&str]| {
+            std::env::join_paths(entries.iter().map(Path::new)).expect("join test PATH")
+        };
 
-        assert_eq!(prepend_path_once(shim_dir, None), shim_dir.as_os_str());
-
-        let existing = std::ffi::OsString::from("/usr/bin:/bin");
-        let updated = prepend_path_once(shim_dir, Some(&existing));
         assert_eq!(
-            updated,
-            std::ffi::OsString::from("/opt/karvex/shims:/usr/bin:/bin")
+            prepend_path_once(shim_dir, None),
+            Some(shim_dir.as_os_str().to_os_string())
         );
 
-        let already_first = std::ffi::OsString::from("/opt/karvex/shims:/usr/bin:/bin");
-        let unchanged = prepend_path_once(shim_dir, Some(&already_first));
-        assert_eq!(unchanged, already_first);
+        let existing = joined(&["/usr/bin", "/bin"]);
+        assert_eq!(
+            prepend_path_once(shim_dir, Some(&existing)),
+            Some(joined(&["/opt/karvex/shims", "/usr/bin", "/bin"]))
+        );
+
+        let already_first = joined(&["/opt/karvex/shims", "/usr/bin", "/bin"]);
+        assert_eq!(
+            prepend_path_once(shim_dir, Some(&already_first)),
+            Some(already_first.clone())
+        );
+
+        // A demoted shim directory is moved back to the front rather than
+        // duplicated: that is the state a pane's shell leaves behind after its
+        // own startup re-orders PATH, and a nested pane launch must not stack
+        // another copy of the entry on top of it.
+        let demoted = joined(&["/usr/bin", "/opt/karvex/shims", "/bin"]);
+        assert_eq!(
+            prepend_path_once(shim_dir, Some(&demoted)),
+            Some(joined(&["/opt/karvex/shims", "/usr/bin", "/bin"]))
+        );
     }
 
     #[tokio::test]

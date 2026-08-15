@@ -7,6 +7,12 @@ v2.1.226 with real Agent Teams teammates; its results are recorded inline
 below in place of the former TBD markers. Everything here reflects shipped
 behavior and is backed by tests, live evidence, or both.
 
+Amended after the shim was found unreachable on machines whose shell startup
+re-orders `PATH` past it (the fix that made teammate spawning work on Linux
+and macOS regardless of `PATH` order): see
+[Shim visibility](#shim-visibility-on-path), and the socket-ownership rule in
+[D5](#d5-socket-resolution) that had to land with it.
+
 ## Provenance
 
 This document is the Karvex adaptation of
@@ -66,6 +72,65 @@ with no Karvex server reachable (see [D3](#d3-shim-transport)).
 something else defeats the tmux backend outright, and Karvex has no way to
 override that from outside Claude's own config. This is documented for users
 in `integrations.mdx`, not just here.
+
+## Shim visibility on PATH
+
+Everything below only happens if Claude's `tmux` lookup lands on Karvex's
+shim. That lookup is an ordinary `PATH` search (Claude spawns `tmux` by
+name), and `PATH` is not Karvex's to control: Karvex prepends
+`<data_dir>/shims` when it launches the pane, and the pane's **shell startup
+then re-orders `PATH`**. `path_helper` (macOS `/etc/zprofile`) moves every
+inherited entry behind `/usr/local/bin` and `/etc/paths.d`; `brew shellenv`
+prepends the Homebrew prefix; `fish_add_path`, mise, asdf, nix and a plain
+`export PATH="...:$PATH"` all prepend too.
+
+Measured on a stock fish setup: the shims directory Karvex handed the pane as
+`PATH[0]` came out of shell startup at **index 9**, behind eight directories
+the shell had prepended.
+
+That is harmless until one of those directories holds a real `tmux` — the
+Homebrew prefix being the common case, which is why this bit macOS hardest.
+Then Claude runs the real tmux with `-S <karvex socket>`, it fails, and
+Claude's backend registry marks `inProcessFallbackActive` and **silently
+falls back to in-process teammates**. The user's report is "teammates don't
+spawn as panes", with nothing in Karvex's own logs to explain it.
+
+So the prepend is necessary but not sufficient, and Karvex adds one mirror:
+
+- **Only when it can lose.** If no foreign `tmux` is anywhere on `PATH`, the
+  prepend cannot be beaten and Karvex writes nothing outside its data
+  directory.
+- **Only beside the binary that owns it.** The mirror goes next to Karvex's
+  own `kvx` on `PATH` — the directory the user installed Karvex into, found by
+  canonicalizing `<path entry>/kvx` against `current_exe()`, so symlinked
+  installs recognise themselves. Nowhere else is Karvex's to write to, and
+  nowhere else needs guessing. An install directory that sits *behind* the
+  foreign tmux is skipped rather than shadowed for nothing.
+- **Never in someone else's prefix.** `/nix/store`, `/usr`, `/opt/homebrew`,
+  `/opt/local`, `/home/linuxbrew`, `/snap`, Homebrew Cellar paths and friends
+  are excluded even when Karvex itself was installed there.
+- **Never by an uninstalled binary.** See [D6](#d6-shim-ownership-guard).
+- **Always refreshed.** A mirror answers `tmux` for the whole machine, so an
+  existing one is repointed at the current binary on every install pass; a
+  Karvex upgrade cannot leave a dangling `tmux` behind.
+- **Never created directories, never foreign files.** Same rules as the
+  primary shim, one implementation (`link::install_shim_symlink`).
+
+When the install directory sits behind the foreign tmux — or is a package
+manager's prefix, so a Homebrew- or Nix-installed Karvex cannot put a `tmux`
+next to itself — Karvex installs no mirror and logs one warning per process
+naming the tmux that wins. The
+identity export is deliberately **not** withheld in that case: the prediction
+is made from the server's `PATH` and can be wrong in the user's favour, and
+Claude degrades to in-process teammates on its own.
+
+The policy lives in `src/platform/tmux_shim/plan.rs` as a pure function over
+an injected `ShimFacts`, so every case above is a unit test with no
+filesystem involved; the symlink mechanics are `src/platform/tmux_shim/link.rs`.
+
+⚠ Putting a `tmux` on the user's `PATH` is only safe because passthrough is
+airtight — see [D5](#d5-socket-resolution) for the socket-ownership rule that
+had to land with it.
 
 ## Invocation forms
 
@@ -256,7 +321,9 @@ installed still points Claude at a tmux backend that isn't there. Karvex
 calls `platform::ensure_tmux_shim_dir()` first and only exports the identity
 env on success. On Windows, and on any install failure, pane env is
 unchanged and Claude falls back to its own backends — see
-[D10](#d10-windows).
+[D10](#d10-windows). The same rule applies one level down: a `PATH` the shim
+directory cannot be prepended to (`prepend_path_once` returning `None`)
+exports nothing either.
 
 ### D3: shim transport
 
@@ -282,23 +349,63 @@ Claude's `isAvailable` check keeps passing against a stopped server.
 
 ### D5: socket resolution
 
-The shim never falls back to the default session. It resolves its socket, in
-order: `$KARVEX_SOCKET_PATH` (non-empty after trim); else the first
-comma-field of `$TMUX` (non-empty after trim); else the command is not
-serviced and passes through. A `-S <path>` argument is compared against the
-resolved path (canonicalized where possible, else a trimmed string compare)
-and passes through on mismatch.
+The shim never falls back to the default session, and never answers for a
+multiplexer that is not Karvex.
+
+`$TMUX` is the authority on which multiplexer the process is running inside,
+so it is consulted first: a socket it names is serviced only when that socket
+is demonstrably Karvex's own — it matches `$KARVEX_SOCKET_PATH`, or it
+carries Karvex's own socket file name (`session::API_SOCKET_FILE_NAME`).
+Anything else is a real tmux server's socket and passes through. When `$TMUX`
+is unset, `$KARVEX_SOCKET_PATH` (non-empty after trim) still resolves on its
+own: that is an unambiguous request to talk to one named Karvex server.
+Otherwise the command is not serviced and passes through. A `-S <path>`
+argument is compared against the resolved path (canonicalized where possible,
+else a trimmed string compare) and passes through on mismatch.
+
+⚠ **The ownership check is load-bearing, not defensive tidying.** The earlier
+rule preferred `$KARVEX_SOCKET_PATH` and otherwise trusted `$TMUX` outright,
+which mis-serviced two real cases now that the shim is reachable from the
+user's own `PATH` (see [Shim visibility](#shim-visibility-on-path)): a user
+running a real tmux *inside* a Karvex pane still inherits
+`$KARVEX_SOCKET_PATH`, and a user running one outside Karvex has `$TMUX`
+pointing at `/tmp/tmux-<uid>/default`. Both were answered out of Karvex's
+pane tree instead of reaching the tmux they named.
 
 ### D6: shim ownership guard
 
-The shim symlink at `<data_dir>/shims/tmux` (and its macOS
-`~/.local/bin/tmux` mirror) is only ever installed or re-pointed by a binary
-whose `current_exe()` file stem is exactly `kvx` — not `kvx-<hash>` or
-`karvex-<hash>` (Cargo's test binary naming), so `cargo nextest` can never
-hijack a user's real `tmux`. A pre-existing link is only replaced when its
-recorded target's stem also passes that check (including a **dangling**
-link left by a package-manager upgrade, inspected via `symlink_metadata`); a
-real file, or a foreign symlink, is never touched — only logged.
+The shim symlink at `<data_dir>/shims/tmux` (and any `PATH` mirror) is only
+ever installed or re-pointed by a binary whose `current_exe()` file stem is
+exactly `kvx` — not `kvx-<hash>` or `karvex-<hash>` (Cargo's test binary
+naming), so `cargo nextest` can never hijack a user's real `tmux`. A
+pre-existing link is only replaced when its recorded target's stem also
+passes that check (including a **dangling** link left by a package-manager
+upgrade, inspected via `symlink_metadata`); a real file, or a foreign
+symlink, is never touched — only logged.
+
+A **second** gate applies to mirrors only, because a mirror is machine-visible
+state rather than something inside Karvex's own data directory: the only
+directory Karvex will write one into is the one that makes the *running*
+binary runnable by name (`<path entry>/kvx` canonicalizes to `current_exe()`,
+so symlinked installs — `~/.local/bin/kvx`, a Homebrew `bin` entry into the
+Cellar, a Nix profile link into the store — all recognise themselves), and
+never when that directory belongs to a package manager.
+
+The exact-stem rule alone does not cover this, and neither does a
+home-relative candidate list. Karvex's own test suites spawn the *real* `kvx`
+binary with the developer's `$PATH` inherited — `tests/cli/` straight out of
+`target/debug`, and `tests/workflow_headless.rs` / `tests/cli/workflow.rs`
+through a `<test base>/bin/kvx` symlink they prepend to that `PATH` so a
+node's own `kvx workflow node complete` resolves to the binary under test. An
+earlier version of this rule mirrored into `~/.local/bin` when it appeared on
+`PATH` ahead of a real tmux, and those workflow suites promptly installed a
+`tmux` into the developer's home. Binding the mirror to the directory the
+running binary is reachable from makes that structurally impossible: a
+`target/debug` build writes nothing, and a test's `<test base>/bin` build
+writes only into its own sandbox. Covered by
+`a_binary_that_is_not_installed_on_path_writes_nothing_outside_its_data_dir`,
+`an_uninstalled_binary_never_writes_outside_its_data_dir`, and
+`a_mirror_only_ever_lands_next_to_the_binary_that_owns_it`.
 
 ### D7: hook reconciliation
 
@@ -448,12 +555,22 @@ of done:
 
 - **No macOS end-to-end coverage.** The crate's `tests/cli/` tree (where the
   real-shim-binary tests live) is compiled out on macOS
-  (`#![cfg(not(target_os = "macos"))]` on `tests/cli.rs`), which is exactly
-  the platform where the riskiest write — the `~/.local/bin/tmux` mirror —
-  lives. The mirror's guarantees (never created if `~/.local/bin` doesn't
-  already exist, ownership rules, dangling-link handling) are instead
-  covered by `src/`-level unit tests, which do run on macOS, plus a
-  by-hand pass in the gate phase on a macOS box when one is available.
+  (`#![cfg(not(target_os = "macos"))]` on `tests/cli.rs`), which is also the
+  platform the `PATH` mirror matters most on. The mirror's guarantees
+  (installed only when something could shadow the shim, only ahead of it,
+  only next to the binary that owns it, never in a package manager's prefix,
+  ownership rules, dangling-link handling) are covered by `src/`-level unit
+  tests, which do run on macOS, plus live verification on Linux against a
+  real server with a real competing `tmux` on `PATH`.
+- **A `tmux` ahead of Karvex's own install directory cannot be beaten**, and
+  neither can one competing with a Karvex installed inside a package manager's
+  prefix (Homebrew, Nix). Karvex logs a warning and leaves the export in
+  place; teammates may then spawn in-process. The user-facing remedy is to put
+  the directory holding `kvx` ahead of the competing one on `PATH`. The alternative — re-asserting the
+  prepend from inside the pane's shell startup, the way editors inject shell
+  integration (`ZDOTDIR`, `bash --init-file`, `fish -C`) — would cover this
+  case too, at the cost of Karvex taking over every user's shell startup;
+  that is a deliberate non-goal here.
 - **`select-layout` and `resize-pane` are accept-and-drop.** Karvex does not
   map Claude's leader-30%/teammates-stacked layout request onto its own
   split geometry; Karvex's own layout stands in instead. A real mapping
@@ -654,12 +771,13 @@ shim entirely:
   `~/.config/karvex/sessions/<name>` for a named one, so a machine that has
   used named sessions has one link per session. Set `KARVEX_NO_TMUX_COMPAT`
   first, or the next Managed pane launch recreates it.
-- On macOS, the `~/.local/bin/tmux` mirror **outlives an uninstall of
+- A `PATH` mirror, if one was needed (see
+  [Shim visibility](#shim-visibility-on-path)), **outlives an uninstall of
   Karvex** and keeps shadowing the user's real tmux until removed by hand:
   check that it points at Karvex before deleting it (`readlink
   ~/.local/bin/tmux`), then `rm ~/.local/bin/tmux` if so. Karvex never
-  creates `~/.local/bin` itself and never touches a foreign file or symlink
-  there — only its own link.
+  creates those directories itself and never touches a foreign file or
+  symlink there — only its own link.
 
 The user-facing version of this is in `integrations.mdx`'s Claude Agent
 Teams section; keep the two in sync if either changes.

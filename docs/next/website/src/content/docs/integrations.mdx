@@ -127,13 +127,21 @@ KARVEX_NO_AUTO_INTEGRATION=1   # do not auto-install the Claude Code hook on ser
 
 `KARVEX_NO_TMUX_COMPAT=1` does not remove a shim Herdr already installed; it only stops exporting the identity into panes launched after it is set. A real `tmux` already on `PATH` still works normally inside a Herdr pane — Herdr's shim only intercepts the narrow command surface Claude Code's teammate backend uses and passes everything else through, including a `tmux -L <name>` invocation naming an unrelated server.
 
-On macOS, Herdr additionally mirrors the shim to `~/.local/bin/tmux` so it wins ordering fights with Homebrew's PATH setup; Herdr only creates that mirror when `~/.local/bin` already exists and never overwrites a real file or a symlink it doesn't own. There is no `herdr uninstall` command, so removing the shim is manual — and the macOS mirror in particular outlives an uninstall of Herdr and keeps shadowing a real `tmux` until it is removed. Confirm each link belongs to Herdr before removing it:
+A pane's shell gets the last word on `PATH`. `path_helper` on macOS, `brew shellenv`, `fish_add_path`, mise, asdf, nix and a plain `export PATH="...:$PATH"` all re-order `PATH` after Herdr has handed it to the pane, which regularly pushes Herdr's shim directory behind other directories. That only matters when one of them holds a real `tmux` — then Claude Code runs that tmux against Herdr's socket, the call fails, and Claude Code quietly falls back to in-process teammates instead of spawning panes.
+
+So when another `tmux` is on `PATH` at all, Herdr also installs the shim next to its own binary — the directory on `PATH` that makes `herdr` runnable by name, which is the one place on your `PATH` that is already Herdr's. Nothing else is touched: Herdr never creates a directory, never writes into a package manager's prefix (Homebrew, Nix, `/usr`), never replaces a real file or a symlink it doesn't own, and writes nothing outside its own data directory at all unless it is installed on `PATH` by name. With no other `tmux` anywhere on `PATH` this is unnecessary, so nothing is written.
+
+If that other `tmux` comes before Herdr's own directory on `PATH` — or Herdr was installed inside a package manager's prefix, where it will not write — Herdr installs nothing and logs a warning to the server log; teammates may then spawn outside Herdr panes. Moving the directory that holds `herdr` ahead of the competing one on `PATH` resolves it.
+
+A mirror is on `PATH` for everything you run, so it deliberately stays transparent: outside a Herdr pane, and inside a real tmux session, the shim passes every command through to the real `tmux` and never answers out of Herdr's own panes.
+
+There is no `herdr uninstall` command, so removing the shim is manual — and a mirror in particular outlives an uninstall of Herdr and keeps shadowing a real `tmux` until it is removed. Confirm each link belongs to Herdr before removing it:
 
 ```bash
 readlink ~/.config/herdr/shims/tmux   # the shim itself; sessions have their own copy
 rm ~/.config/herdr/shims/tmux
 
-readlink ~/.local/bin/tmux            # macOS only; remove only if it points into a Herdr install
+readlink ~/.local/bin/tmux            # the copy beside `herdr`, if one was needed; remove only if it points into a Herdr install
 rm ~/.local/bin/tmux
 ```
 

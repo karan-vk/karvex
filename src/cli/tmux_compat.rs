@@ -285,28 +285,57 @@ fn parse_invocation(args: &[String]) -> ParsedInvocation {
 // ---------------------------------------------------------------------------
 
 /// Resolve the socket this shim speaks to, with **no** fallback to the default
-/// session (see D5): `$KARVEX_SOCKET_PATH`, else the first comma-field of
-/// `$TMUX`, else "not serviced".
+/// session (see D5).
 fn resolve_socket_path() -> Option<String> {
     let socket_env = std::env::var(crate::api::SOCKET_PATH_ENV_VAR).ok();
     let tmux_env = std::env::var("TMUX").ok();
     socket_from_env_values(socket_env.as_deref(), tmux_env.as_deref())
 }
 
-/// Pure half of [`resolve_socket_path`].
+/// Pure half of [`resolve_socket_path`] (D5).
+///
+/// `$TMUX` is the authority on which multiplexer this process is running
+/// inside, so it is consulted first and a socket it names is only serviced
+/// when it is demonstrably Karvex's own — either it matches
+/// `$KARVEX_SOCKET_PATH`, or it carries Karvex's own socket file name.
+///
+/// That check is what keeps the shim honest once it is reachable from a
+/// directory on the user's `PATH` (the mirror in
+/// `src/platform/tmux_shim.rs`): a `tmux` run *inside a real tmux session* —
+/// including one started inside a Karvex pane, where `$KARVEX_SOCKET_PATH` is
+/// still inherited — names the real server's socket in `$TMUX`, and answering
+/// those commands out of Karvex's own pane tree would be plainly wrong.
+/// Passing through hands them to the real tmux they were meant for.
+///
+/// `$KARVEX_SOCKET_PATH` alone still resolves when `$TMUX` is unset: that is
+/// an explicit, unambiguous request to talk to one named Karvex server.
 fn socket_from_env_values(socket_path: Option<&str>, tmux: Option<&str>) -> Option<String> {
-    if let Some(value) = socket_path {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+    let karvex_socket = socket_path.map(str::trim).filter(|value| !value.is_empty());
+    let tmux_socket = tmux
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (tmux_socket, karvex_socket) {
+        (Some(tmux_socket), Some(karvex_socket))
+            if socket_paths_match(tmux_socket, karvex_socket) =>
+        {
+            Some(karvex_socket.to_string())
         }
+        (Some(tmux_socket), _) if is_karvex_socket(tmux_socket) => Some(tmux_socket.to_string()),
+        (Some(_), _) => None,
+        (None, karvex_socket) => karvex_socket.map(str::to_string),
     }
-    let first = tmux?.split(',').next()?.trim();
-    if first.is_empty() {
-        None
-    } else {
-        Some(first.to_string())
-    }
+}
+
+/// Whether a socket path names a Karvex API socket rather than some other
+/// multiplexer's. Karvex gives every session's socket the same file name, and
+/// a real tmux server socket (`/tmp/tmux-<uid>/default`) never carries it.
+fn is_karvex_socket(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name == crate::session::API_SOCKET_FILE_NAME)
 }
 
 fn should_service(parsed: &ParsedInvocation, resolved_socket: Option<&str>) -> bool {
@@ -1547,21 +1576,47 @@ mod tests {
     // -- socket resolution (D5) --------------------------------------------
 
     #[test]
-    fn socket_resolution_prefers_socket_path_then_tmux() {
+    fn socket_resolution_services_a_karvex_socket_named_by_tmux() {
+        // The pane case: Karvex exports both, naming the same socket.
         assert_eq!(
-            socket_from_env_values(Some("/tmp/a.sock"), Some("/tmp/b.sock,42,0")),
-            Some("/tmp/a.sock".to_string())
+            socket_from_env_values(
+                Some("/home/u/.config/karvex/karvex.sock"),
+                Some("/home/u/.config/karvex/karvex.sock,42,0")
+            ),
+            Some("/home/u/.config/karvex/karvex.sock".to_string())
+        );
+        // `$TMUX` alone still resolves when it names a Karvex socket, so a
+        // pane that lost `$KARVEX_SOCKET_PATH` keeps working.
+        assert_eq!(
+            socket_from_env_values(None, Some("/home/u/.config/karvex/karvex.sock,42,0")),
+            Some("/home/u/.config/karvex/karvex.sock".to_string())
         );
         assert_eq!(
-            socket_from_env_values(None, Some("/tmp/b.sock,42,0")),
-            Some("/tmp/b.sock".to_string())
-        );
-        assert_eq!(
-            socket_from_env_values(Some("  "), Some("/tmp/b.sock,42,0")),
-            Some("/tmp/b.sock".to_string())
+            socket_from_env_values(Some("  "), Some("/tmp/karvex-b/karvex.sock,42,0")),
+            Some("/tmp/karvex-b/karvex.sock".to_string())
         );
         assert_eq!(socket_from_env_values(None, Some(",42,0")), None);
         assert_eq!(socket_from_env_values(None, None), None);
+    }
+
+    #[test]
+    fn a_foreign_tmux_session_is_never_serviced() {
+        // Inside a real tmux, `$TMUX` names that server's socket. Karvex must
+        // pass those commands through even when it can see a Karvex socket in
+        // the environment — which is exactly the case inside a Karvex pane
+        // where the user started a real tmux: `$KARVEX_SOCKET_PATH` is still
+        // inherited, but the tmux being addressed is not Karvex.
+        assert_eq!(
+            socket_from_env_values(
+                Some("/home/u/.config/karvex/karvex.sock"),
+                Some("/tmp/tmux-1000/default,42,0")
+            ),
+            None
+        );
+        assert_eq!(
+            socket_from_env_values(None, Some("/tmp/tmux-1000/default,42,0")),
+            None
+        );
     }
 
     #[test]
@@ -1570,8 +1625,9 @@ mod tests {
         let previous_socket = std::env::var(crate::api::SOCKET_PATH_ENV_VAR).ok();
         let previous_tmux = std::env::var("TMUX").ok();
 
+        // No `$TMUX`: an explicit, unambiguous request for one Karvex server.
         std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, "/tmp/karvex-explicit.sock");
-        std::env::set_var("TMUX", "/tmp/karvex-from-tmux.sock,42,0");
+        std::env::remove_var("TMUX");
         assert_eq!(
             resolve_socket_path(),
             Some("/tmp/karvex-explicit.sock".to_string())
@@ -1588,10 +1644,10 @@ mod tests {
         let previous_tmux = std::env::var("TMUX").ok();
 
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
-        std::env::set_var("TMUX", "/tmp/karvex-from-tmux.sock,42,0");
+        std::env::set_var("TMUX", "/tmp/karvex-from-tmux/karvex.sock,42,0");
         assert_eq!(
             resolve_socket_path(),
-            Some("/tmp/karvex-from-tmux.sock".to_string())
+            Some("/tmp/karvex-from-tmux/karvex.sock".to_string())
         );
 
         std::env::remove_var("TMUX");
@@ -1617,12 +1673,12 @@ mod tests {
         let previous_tmux = std::env::var("TMUX").ok();
 
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
-        std::env::set_var("TMUX", "/tmp/karvex-scratch-target.sock,42,0");
+        std::env::set_var("TMUX", "/tmp/karvex-scratch-target/karvex.sock,42,0");
         let resolved = resolve_socket_path().expect("socket resolves from TMUX");
         let shim = Shim::new(PathBuf::from(&resolved));
         assert_eq!(
             shim.client.socket_path(),
-            PathBuf::from("/tmp/karvex-scratch-target.sock")
+            PathBuf::from("/tmp/karvex-scratch-target/karvex.sock")
         );
         assert_ne!(shim.client.socket_path(), ApiClient::local().socket_path());
 

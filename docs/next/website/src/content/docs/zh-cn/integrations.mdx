@@ -127,13 +127,21 @@ KARVEX_NO_AUTO_INTEGRATION=1   # 服务器启动时不要自动安装 Claude Cod
 
 `KARVEX_NO_TMUX_COMPAT=1` 不会删除 Herdr 已经安装的垫片;它只会停止向设置之后启动的窗格导出该身份。Herdr 窗格内 `PATH` 上已有的真正 `tmux` 仍然可以正常工作 — Herdr 的垫片只拦截 Claude Code 队友后端使用的这一小部分命令,其余的一律原样传递,包括指向无关服务器的 `tmux -L <name>` 调用。
 
-在 macOS 上,Herdr 还会把垫片镜像到 `~/.local/bin/tmux`,以便在与 Homebrew 的 PATH 设置的顺序之争中获胜;Herdr 只在 `~/.local/bin` 已经存在时才创建这个镜像,并且从不覆盖它不拥有的真实文件或符号链接。目前没有 `herdr uninstall` 命令,因此删除垫片需要手动完成。尤其是 macOS 上的镜像会在卸载 Herdr 之后继续存在,在删除之前一直遮蔽真正的 `tmux`。删除之前先确认每个链接确实属于 Herdr:
+`PATH` 的最终顺序由窗格的 shell 决定。macOS 的 `path_helper`、`brew shellenv`、`fish_add_path`、mise、asdf、nix,以及普通的 `export PATH="...:$PATH"`,都会在 Herdr 把 `PATH` 交给窗格之后重新排序,经常把 Herdr 的垫片目录挤到后面。只有当排在前面的某个目录里恰好有真正的 `tmux` 时,这才会造成问题:那时 Claude Code 会用那个 tmux 去连接 Herdr 的套接字,调用失败,Claude Code 就会悄悄回退到进程内的队友,而不是生成窗格。
+
+因此,只有当 `PATH` 上确实存在另一个 `tmux` 时,Herdr 才会把垫片同时安装到自己二进制文件的旁边:也就是让 `herdr` 能按名称运行的那个 `PATH` 目录,它是你的 `PATH` 上唯一本就属于 Herdr 的位置。其他地方一概不动:Herdr 从不创建目录,从不写入包管理器的前缀(Homebrew、Nix、`/usr`),也从不替换它不拥有的真实文件或符号链接;除非 Herdr 已按名称安装在 `PATH` 上,否则它根本不会在自己的数据目录之外写入任何东西。如果 `PATH` 上任何位置都没有其他 `tmux`,这一步就不必要,也不会写入。
+
+如果那个 `tmux` 在 `PATH` 上排在 Herdr 自己的目录之前,或者 Herdr 安装在包管理器的前缀里(它不会往那里写入),Herdr 就不会安装任何东西,而是在服务器日志中记录一条警告;此时队友可能会在 Herdr 窗格之外生成。把包含 `herdr` 的目录移到竞争目录之前即可解决。
+
+镜像位于你运行的所有命令都能看到的 `PATH` 上,因此它刻意保持透明:在 Herdr 窗格之外,以及在真正的 tmux 会话内部,垫片会把每条命令原样传递给真正的 `tmux`,绝不会用 Herdr 自己的窗格来作答。
+
+目前没有 `herdr uninstall` 命令,因此删除垫片需要手动完成。尤其是镜像会在卸载 Herdr 之后继续存在,在删除之前一直遮蔽真正的 `tmux`。删除之前先确认每个链接确实属于 Herdr:
 
 ```bash
 readlink ~/.config/herdr/shims/tmux   # 垫片本体;每个会话另有自己的副本
 rm ~/.config/herdr/shims/tmux
 
-readlink ~/.local/bin/tmux            # 仅限 macOS;只有指向 Herdr 安装位置时才删除它
+readlink ~/.local/bin/tmux            # 需要时放在 `herdr` 旁边的那个;只有指向 Herdr 安装位置时才删除它
 rm ~/.local/bin/tmux
 ```
 

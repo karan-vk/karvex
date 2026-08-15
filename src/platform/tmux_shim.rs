@@ -1,108 +1,53 @@
-//! Unix-only installation of the `tmux` shim symlink that gives Claude Code
-//! (and anything else that dispatches on tmux presence) a `tmux` binary to
-//! find on PATH inside a Karvex pane. See
-//! `docs/design/claude-teammates/01-port-plan.md` D1/D2/D6 for the design
-//! this implements, and R2/R8 for why the guards here are load-bearing: a
-//! wrong move hijacks a user's real `tmux` or shadows an unrelated binary
-//! for every process the user runs in the pane.
+//! Unix installation of the `tmux` shim symlinks that give Claude Code (and
+//! anything else that dispatches on tmux presence) a `tmux` binary to find on
+//! PATH inside a Karvex pane. See `docs/design/claude-teammates/01-port-plan.md`
+//! D1/D2/D6 for the design this implements, and R2/R8 for why the guards here
+//! are load-bearing: a wrong move hijacks a user's real `tmux` or shadows an
+//! unrelated binary for every process the user runs.
 //!
-//! macOS also gets a `~/.local/bin/tmux` mirror (R3): `path_helper`/`brew
-//! shellenv`/rc files can re-order PATH after our prepend, so a Homebrew
-//! `tmux` would otherwise win.
+//! Two placements, one mechanism ([`link::install_shim_symlink`]):
+//!
+//! * `<data_dir>/shims/tmux` — always installed. Karvex prepends this
+//!   directory to every managed pane's `PATH`.
+//! * a *mirror* beside Karvex's own binary on `PATH` — installed only when
+//!   some foreign `tmux` would otherwise win the lookup, because a pane's
+//!   shell re-orders `PATH` during its own startup and routinely demotes the
+//!   prepended directory (`path_helper`, `brew shellenv`, `fish_add_path`,
+//!   mise/asdf/nix hooks). [`plan`] owns that decision and explains it.
 
-use std::io;
+mod link;
+mod plan;
+
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
+use tracing::{info, warn};
 
-/// True only for Karvex's own primary binary name, `kvx`, exactly.
-///
-/// This is the nextest guard (D6): cargo test binaries are named
-/// `kvx-<hash>` / `karvex-<hash>` under `target/*/deps`, so an exact match
-/// keeps them from ever installing a shim that could hijack a user's real
-/// `tmux`. It is deliberately a pure function over just the stem so it is
-/// unit-testable without spawning binaries.
-fn binary_owns_shim(stem: &str) -> bool {
-    stem == "kvx"
+use plan::{ShimFacts, TmuxEntry};
+
+/// The one name Karvex ever writes into a shim directory. The `<data_dir>/shims`
+/// directory is prepended to every managed pane's `PATH`, so it must never
+/// become a general-purpose bin directory (R8's single-entry invariant).
+const TMUX_BINARY_NAME: &str = "tmux";
+
+pub(super) fn ensure_tmux_shim_dir_platform() -> Option<PathBuf> {
+    ensure_tmux_shim_dir_in(&crate::session::data_dir())
 }
 
-/// A broader, separate "is this pre-existing shim symlink one Karvex
-/// created" test, used only to decide whether an existing link at the shim
-/// path is safe to replace or re-point. Deliberately more permissive than
-/// `binary_owns_shim`: a link whose recorded target lives under our own
-/// data dir, or whose stem is `kvx`, or starts with `kvx-`/`karvex-`, is
-/// ours; anything else (a real tmux, an unrelated tool) is left alone (D6).
-fn existing_link_is_ours(recorded_target: &Path, data_dir: &Path) -> bool {
-    if recorded_target.starts_with(data_dir) {
-        return true;
+fn ensure_tmux_shim_dir_in(data_dir: &Path) -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let stem = current_exe.file_stem().and_then(|stem| stem.to_str())?;
+    if !link::binary_owns_shim(stem) {
+        return None;
     }
-    recorded_target
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| {
-            binary_owns_shim(stem) || stem.starts_with("kvx-") || stem.starts_with("karvex-")
-        })
+
+    let shims_dir = install_shims_dir(data_dir, &current_exe)?;
+    ensure_shim_reachable_on_path(data_dir, &current_exe);
+    Some(shims_dir)
 }
 
-fn create_symlink(target: &Path, link_path: &Path) -> io::Result<bool> {
-    match std::os::unix::fs::symlink(target, link_path) {
-        Ok(()) => Ok(true),
-        // A concurrent pane spawn may have already won the race to create
-        // this exact link; that is success, not a conflict.
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(true),
-        Err(err) => Err(err),
-    }
-}
-
-/// Installs, repoints, or leaves alone a symlink at `link_path` that should
-/// point at `target`.
-///
-/// Returns `Ok(true)` when `link_path` now points at `target` (freshly
-/// created, already correct, or repointed because it was ours to repoint —
-/// including a dangling link left by a package-manager upgrade, inspected
-/// via `symlink_metadata` rather than `metadata` so a vanished target does
-/// not read as "nothing here"). Returns `Ok(false)` when a real file or a
-/// foreign symlink already occupies `link_path` and was deliberately left
-/// untouched. `Err` is an unexpected I/O failure.
-fn install_shim_symlink(link_path: &Path, target: &Path, data_dir: &Path) -> io::Result<bool> {
-    match std::fs::symlink_metadata(link_path) {
-        Ok(metadata) => {
-            if !metadata.file_type().is_symlink() {
-                warn!(
-                    path = %link_path.display(),
-                    "refusing to replace a non-symlink at the tmux shim path"
-                );
-                return Ok(false);
-            }
-            let recorded_target = std::fs::read_link(link_path)?;
-            if recorded_target == target {
-                return Ok(true);
-            }
-            if !existing_link_is_ours(&recorded_target, data_dir) {
-                warn!(
-                    path = %link_path.display(),
-                    recorded_target = %recorded_target.display(),
-                    "leaving a foreign tmux shim symlink alone"
-                );
-                return Ok(false);
-            }
-            std::fs::remove_file(link_path)?;
-            create_symlink(target, link_path)
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => create_symlink(target, link_path),
-        Err(err) => Err(err),
-    }
-}
-
-/// Creates `<data_dir>/shims` (if needed) and installs the `tmux` shim
-/// inside it pointing at `target`, then best-effort mirrors it into
-/// `~/.local/bin` on macOS. Returns the shims directory on success.
-///
-/// Deliberately writes only the single `tmux` entry into the shims
-/// directory (R8's single-entry invariant): every managed pane gets this
-/// directory prepended to `PATH` ahead of everything else, so it must never
-/// become a general-purpose bin dir.
-fn install_tmux_shim_dir(data_dir: &Path, target: &Path) -> Option<PathBuf> {
+/// Creates `<data_dir>/shims` (if needed) and installs the `tmux` shim inside
+/// it pointing at `target`. Returns the shims directory on success.
+fn install_shims_dir(data_dir: &Path, target: &Path) -> Option<PathBuf> {
     let shims_dir = data_dir.join("shims");
     if let Err(err) = std::fs::create_dir_all(&shims_dir) {
         warn!(
@@ -113,8 +58,14 @@ fn install_tmux_shim_dir(data_dir: &Path, target: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    let link_path = shims_dir.join("tmux");
-    let installed = match install_shim_symlink(&link_path, target, data_dir) {
+    install_shim(&shims_dir, target, data_dir).then_some(shims_dir)
+}
+
+/// Installs `<dir>/tmux` pointing at `target`. Returns whether `tmux` in that
+/// directory now resolves to Karvex.
+fn install_shim(dir: &Path, target: &Path, data_dir: &Path) -> bool {
+    let link_path = dir.join(TMUX_BINARY_NAME);
+    match link::install_shim_symlink(&link_path, target, data_dir) {
         Ok(installed) => installed,
         Err(err) => {
             warn!(
@@ -124,208 +75,114 @@ fn install_tmux_shim_dir(data_dir: &Path, target: &Path) -> Option<PathBuf> {
             );
             false
         }
+    }
+}
+
+/// Keeps `tmux` resolving to Karvex even after a pane's shell has re-ordered
+/// `PATH` past the prepended shims directory. [`plan::plan_mirror`] decides
+/// what that takes; this only carries it out.
+fn ensure_shim_reachable_on_path(data_dir: &Path, target: &Path) {
+    let path_entries: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    let facts = InstalledShims {
+        data_dir,
+        running_exe: target,
     };
-    if !installed {
-        return None;
+    let plan = plan::plan_mirror(&facts, &path_entries);
+
+    if let Some(refresh_dir) = &plan.refresh {
+        install_shim(refresh_dir, target, data_dir);
     }
 
-    #[cfg(target_os = "macos")]
-    install_macos_mirror(target, data_dir);
+    if let Some(mirror_dir) = &plan.mirror_dir {
+        if install_shim(mirror_dir, target, data_dir) {
+            info!(
+                path = %mirror_dir.join(TMUX_BINARY_NAME).display(),
+                "installed a tmux shim beside the kvx binary so agent teammates reach Karvex"
+            );
+        }
+    }
 
-    Some(shims_dir)
+    if let Some(shadowed_by) = &plan.shadowed_by {
+        warn_shadowed(shadowed_by);
+    }
 }
 
-/// Mirrors the shim into `~/.local/bin/tmux` (R3). Never creates
-/// `~/.local/bin` itself (D6) — that directory outliving an uninstall of
-/// Karvex is exactly why W8 documents an explicit removal command instead.
-#[cfg(target_os = "macos")]
-fn install_macos_mirror(target: &Path, data_dir: &Path) {
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+/// One warning per process: the shim install runs on every managed pane
+/// launch, and repeating this for every pane would drown the log.
+fn warn_shadowed(shadowed_by: &Path) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
-    };
-    let local_bin = PathBuf::from(home).join(".local").join("bin");
-    if !local_bin.is_dir() {
-        return;
+    }
+    warn!(
+        tmux = %shadowed_by.join(TMUX_BINARY_NAME).display(),
+        "another tmux precedes the directory kvx is installed in, so agent teammates may \
+         spawn outside Karvex panes; put that install directory earlier on PATH to fix this"
+    );
+}
+
+/// [`ShimFacts`] adapter: answers the planner's questions against real
+/// directories, reusing the same ownership rules the installer writes under.
+struct InstalledShims<'a> {
+    data_dir: &'a Path,
+    running_exe: &'a Path,
+}
+
+impl ShimFacts for InstalledShims<'_> {
+    fn tmux_entry(&self, dir: &Path) -> TmuxEntry {
+        let path = dir.join(TMUX_BINARY_NAME);
+        match link::link_owner(&path, self.data_dir) {
+            link::LinkOwner::Vacant => TmuxEntry::Absent,
+            link::LinkOwner::Ours => TmuxEntry::Ours,
+            // A directory named `tmux` is not a tmux to get ahead of.
+            link::LinkOwner::Foreign if path.is_dir() => TmuxEntry::Absent,
+            link::LinkOwner::Foreign => TmuxEntry::Foreign,
+        }
     }
 
-    let link_path = local_bin.join("tmux");
-    if let Err(err) = install_shim_symlink(&link_path, target, data_dir) {
-        warn!(
-            error = %err,
-            path = %link_path.display(),
-            "failed to install the macOS ~/.local/bin tmux mirror"
-        );
+    /// Compared after canonicalising both sides, so the usual installs — a
+    /// `~/.local/bin/kvx` symlink into a versioned directory, a Homebrew
+    /// `bin` entry pointing into the Cellar, a Nix profile link into the
+    /// store — all still recognise themselves.
+    fn holds_running_exe(&self, dir: &Path) -> bool {
+        let candidate = dir.join(link::KARVEX_BINARY_NAME);
+        match (candidate.canonicalize(), self.running_exe.canonicalize()) {
+            (Ok(candidate), Ok(running_exe)) => candidate == running_exe,
+            _ => false,
+        }
     }
 }
 
-fn ensure_tmux_shim_dir_in(data_dir: &Path) -> Option<PathBuf> {
-    let current_exe = std::env::current_exe().ok()?;
-    let stem = current_exe.file_stem().and_then(|stem| stem.to_str())?;
-    if !binary_owns_shim(stem) {
-        return None;
-    }
-    install_tmux_shim_dir(data_dir, &current_exe)
-}
-
-pub(super) fn ensure_tmux_shim_dir_platform() -> Option<PathBuf> {
-    ensure_tmux_shim_dir_in(&crate::session::data_dir())
+/// Shared by this module's tests and [`link`]'s: a unique, throwaway
+/// directory per test, so nothing here ever races or reuses state.
+#[cfg(test)]
+pub(super) fn scratch_dir(label: &str) -> PathBuf {
+    static UNIQUE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = UNIQUE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "karvex-tmux-shim-test-{label}-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    static UNIQUE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    fn scratch_dir(label: &str) -> PathBuf {
-        let unique = UNIQUE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "karvex-tmux-shim-test-{label}-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
-
-    #[test]
-    fn binary_owns_shim_accepts_kvx_and_rejects_test_binaries() {
-        assert!(binary_owns_shim("kvx"));
-        assert!(!binary_owns_shim("kvx-9f2a1c"));
-        assert!(!binary_owns_shim("karvex-9f2a1c"));
-        assert!(!binary_owns_shim("tmux"));
-        assert!(!binary_owns_shim("bakr"));
-    }
-
-    #[test]
-    fn install_shim_symlink_refuses_real_file() {
-        let dir = scratch_dir("real-file");
-        let link_path = dir.join("tmux");
-        std::fs::write(&link_path, b"not a symlink").expect("write real file");
-        let target = dir.join("kvx");
-        std::fs::write(&target, b"binary").expect("write target");
-
-        let installed = install_shim_symlink(&link_path, &target, &dir).expect("no io error");
-
-        assert!(!installed);
-        assert!(!std::fs::symlink_metadata(&link_path)
-            .expect("metadata")
-            .file_type()
-            .is_symlink());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn install_shim_symlink_refuses_foreign_symlink() {
-        let dir = scratch_dir("foreign-symlink");
-        // The foreign target must live *outside* `data_dir` — otherwise the
-        // "recorded target lives under our data dir" ownership clause would
-        // (correctly) claim it, defeating the point of this test.
-        let data_dir = dir.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let foreign_target = dir.join("real-tmux");
-        std::fs::write(&foreign_target, b"real tmux").expect("write foreign target");
-        let link_path = data_dir.join("tmux");
-        std::os::unix::fs::symlink(&foreign_target, &link_path).expect("create foreign symlink");
-        let our_target = data_dir.join("kvx");
-        std::fs::write(&our_target, b"binary").expect("write our target");
-
-        let installed =
-            install_shim_symlink(&link_path, &our_target, &data_dir).expect("no io error");
-
-        assert!(!installed);
-        assert_eq!(
-            std::fs::read_link(&link_path).expect("read link"),
-            foreign_target
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn install_shim_symlink_replaces_own_link_and_is_idempotent() {
-        let dir = scratch_dir("replace-own");
-        let old_target = dir.join("kvx-old-version");
-        std::fs::write(&old_target, b"binary").expect("write old target");
-        let link_path = dir.join("tmux");
-        std::os::unix::fs::symlink(&old_target, &link_path).expect("create own symlink");
-        let new_target = dir.join("kvx");
-        std::fs::write(&new_target, b"binary").expect("write new target");
-
-        let installed_first =
-            install_shim_symlink(&link_path, &new_target, &dir).expect("no io error");
-        assert!(installed_first);
-        assert_eq!(
-            std::fs::read_link(&link_path).expect("read link"),
-            new_target
-        );
-
-        // Idempotent: calling again with the same target is a no-op success.
-        let installed_second =
-            install_shim_symlink(&link_path, &new_target, &dir).expect("no io error");
-        assert!(installed_second);
-        assert_eq!(
-            std::fs::read_link(&link_path).expect("read link"),
-            new_target
-        );
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn install_shim_symlink_repoints_dangling_own_link() {
-        let dir = scratch_dir("dangling-own");
-        let vanished_target = dir.join("kvx-vanished-store-path");
-        // Deliberately never create `vanished_target`: this simulates a
-        // Homebrew/Nix/mise upgrade that removed the recorded target while
-        // leaving the link itself in place.
-        let link_path = dir.join("tmux");
-        std::os::unix::fs::symlink(&vanished_target, &link_path)
-            .expect("create dangling own symlink");
-        let new_target = dir.join("kvx");
-        std::fs::write(&new_target, b"binary").expect("write new target");
-
-        let installed = install_shim_symlink(&link_path, &new_target, &dir).expect("no io error");
-
-        assert!(installed);
-        assert_eq!(
-            std::fs::read_link(&link_path).expect("read link"),
-            new_target
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn install_shim_symlink_leaves_dangling_foreign_link_alone() {
-        let dir = scratch_dir("dangling-foreign");
-        // As above: the dangling target's path must live outside `data_dir`
-        // so only its stem is under test, not the data-dir containment
-        // clause.
-        let data_dir = dir.join("data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let vanished_target = dir.join("some-other-tool-9f2a1c");
-        let link_path = data_dir.join("tmux");
-        std::os::unix::fs::symlink(&vanished_target, &link_path)
-            .expect("create dangling foreign symlink");
-        let new_target = data_dir.join("kvx");
-        std::fs::write(&new_target, b"binary").expect("write new target");
-
-        let installed =
-            install_shim_symlink(&link_path, &new_target, &data_dir).expect("no io error");
-
-        assert!(!installed);
-        assert_eq!(
-            std::fs::read_link(&link_path).expect("read link"),
-            vanished_target
-        );
-        let _ = std::fs::remove_dir_all(dir);
+    fn write_binary(path: &Path) {
+        std::fs::write(path, b"binary").expect("write binary");
     }
 
     #[test]
     fn shims_dir_contains_only_tmux() {
         let dir = scratch_dir("single-entry");
         let target = dir.join("kvx");
-        std::fs::write(&target, b"binary").expect("write target");
+        write_binary(&target);
 
-        let shims_dir = install_tmux_shim_dir(&dir, &target).expect("install succeeds");
+        let shims_dir = install_shims_dir(&dir, &target).expect("install succeeds");
 
         let entries: Vec<_> = std::fs::read_dir(&shims_dir)
             .expect("read shims dir")
@@ -345,56 +202,198 @@ mod tests {
         assert!(ensure_tmux_shim_dir_platform().is_none());
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_mirror_is_not_created_when_local_bin_is_absent() {
+    /// Drives `ensure_shim_reachable_on_path` against a fake `PATH`.
+    fn with_path<R>(path: &[&Path], body: impl FnOnce() -> R) -> R {
         let _lock = crate::integration::integration_env_lock();
-        let dir = scratch_dir("macos-mirror-absent");
-        let fake_home = dir.join("home");
-        std::fs::create_dir_all(&fake_home).expect("create fake home");
-        let target = dir.join("kvx");
-        std::fs::write(&target, b"binary").expect("write target");
-
-        let previous_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &fake_home);
-
-        install_macos_mirror(&target, &dir);
-
-        let local_bin = fake_home.join(".local").join("bin");
-        assert!(!local_bin.exists(), "must never create ~/.local/bin");
-
-        match previous_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_mirror_is_created_when_local_bin_exists() {
-        let _lock = crate::integration::integration_env_lock();
-        let dir = scratch_dir("macos-mirror-present");
-        let fake_home = dir.join("home");
-        let local_bin = fake_home.join(".local").join("bin");
-        std::fs::create_dir_all(&local_bin).expect("create fake local bin");
-        let target = dir.join("kvx");
-        std::fs::write(&target, b"binary").expect("write target");
-
-        let previous_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", &fake_home);
-
-        install_macos_mirror(&target, &dir);
-
-        assert_eq!(
-            std::fs::read_link(local_bin.join("tmux")).expect("mirror link"),
-            target
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(path.iter()).expect("join fake PATH"),
         );
 
-        match previous_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
+        let outcome = body();
+
+        match previous_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
         }
+        outcome
+    }
+
+    /// A fake machine: a data dir, a directory holding a real tmux, and an
+    /// install directory where `kvx` is reachable by name — the state that
+    /// makes a running binary an *installed* Karvex.
+    struct Machine {
+        root: PathBuf,
+        data_dir: PathBuf,
+        install_bin: PathBuf,
+        foreign_bin: PathBuf,
+        target: PathBuf,
+    }
+
+    impl Machine {
+        fn new(label: &str) -> Self {
+            let root = scratch_dir(label);
+            let data_dir = root.join("data");
+            let install_bin = root.join("install");
+            let foreign_bin = root.join("foreign");
+            for path in [&data_dir, &install_bin, &foreign_bin] {
+                std::fs::create_dir_all(path).expect("create dir");
+            }
+            let target = data_dir.join("kvx");
+            write_binary(&target);
+            std::os::unix::fs::symlink(&target, install_bin.join("kvx"))
+                .expect("install kvx under its own name");
+            Self {
+                root,
+                data_dir,
+                install_bin,
+                foreign_bin,
+                target,
+            }
+        }
+
+        fn install_a_real_tmux(&self) {
+            write_binary(&self.foreign_bin.join("tmux"));
+        }
+
+        fn ensure_with_path(&self, path: &[&Path]) {
+            with_path(path, || {
+                ensure_shim_reachable_on_path(&self.data_dir, &self.target)
+            });
+        }
+
+        fn mirror(&self) -> PathBuf {
+            self.install_bin.join("tmux")
+        }
+    }
+
+    impl Drop for Machine {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_foreign_tmux_behind_the_install_dir_gets_a_mirror() {
+        // The macOS/Homebrew shape: the pane's shell demotes the prepended
+        // shims directory, so a real tmux would win unless Karvex also sits
+        // beside its own binary, which is already ahead of it.
+        let machine = Machine::new("mirror-needed");
+        machine.install_a_real_tmux();
+
+        machine.ensure_with_path(&[&machine.install_bin, &machine.foreign_bin]);
+
+        assert_eq!(
+            std::fs::read_link(machine.mirror()).expect("mirror link"),
+            machine.target
+        );
+    }
+
+    #[test]
+    fn no_foreign_tmux_means_no_mirror_is_written() {
+        // Blast radius: with nothing to lose the lookup to, Karvex must not
+        // put a `tmux` on the user's PATH at all.
+        let machine = Machine::new("mirror-unneeded");
+
+        machine.ensure_with_path(&[&machine.install_bin, &machine.foreign_bin]);
+
+        assert!(!machine.mirror().exists());
+    }
+
+    #[test]
+    fn a_mirror_behind_the_foreign_tmux_is_not_written() {
+        let machine = Machine::new("mirror-too-late");
+        machine.install_a_real_tmux();
+
+        machine.ensure_with_path(&[&machine.foreign_bin, &machine.install_bin]);
+
+        assert!(
+            !machine.mirror().exists(),
+            "shadowing a user's PATH buys nothing when the real tmux still wins"
+        );
+    }
+
+    #[test]
+    fn a_binary_that_is_not_installed_on_path_writes_nothing_outside_its_data_dir() {
+        // The regression this guards: the test suite spawns the real `kvx`
+        // binary out of `target/debug`, with the developer's own `$PATH`
+        // inherited. Without this rule a test run would install — or
+        // repoint — a `tmux` in a directory on that PATH.
+        let machine = Machine::new("uninstalled-binary");
+        machine.install_a_real_tmux();
+        std::os::unix::fs::symlink(machine.data_dir.join("kvx-stale"), machine.mirror())
+            .expect("pre-existing mirror from a real install");
+
+        // The install directory is deliberately left off PATH: nothing here
+        // can run `kvx` by name.
+        machine.ensure_with_path(&[&machine.foreign_bin]);
+
+        assert_eq!(
+            std::fs::read_link(machine.mirror()).expect("mirror link"),
+            machine.data_dir.join("kvx-stale"),
+            "an uninstalled binary must not even repoint an existing mirror"
+        );
+    }
+
+    #[test]
+    fn an_existing_mirror_is_repointed_even_when_no_mirror_is_needed() {
+        // A mirror outlives the condition that created it and is on PATH for
+        // everything the user runs, so a link left dangling by an upgrade has
+        // to be repointed rather than ignored.
+        let machine = Machine::new("mirror-refresh");
+        std::os::unix::fs::symlink(machine.data_dir.join("kvx-vanished"), machine.mirror())
+            .expect("stale mirror");
+
+        machine.ensure_with_path(&[&machine.install_bin]);
+
+        assert_eq!(
+            std::fs::read_link(machine.mirror()).expect("mirror link"),
+            machine.target
+        );
+    }
+
+    #[test]
+    fn a_foreign_tmux_beside_the_binary_is_never_replaced() {
+        let machine = Machine::new("mirror-foreign-candidate");
+        machine.install_a_real_tmux();
+        write_binary(&machine.mirror());
+
+        machine.ensure_with_path(&[&machine.install_bin, &machine.foreign_bin]);
+
+        assert!(
+            std::fs::symlink_metadata(machine.mirror())
+                .expect("still there")
+                .file_type()
+                .is_file(),
+            "a real tmux beside the kvx binary stays exactly as it was"
+        );
+    }
+
+    #[test]
+    fn installed_shims_classifies_by_ownership() {
+        let dir = scratch_dir("facts");
+        let data_dir = dir.join("data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let ours_dir = dir.join("ours");
+        let foreign_dir = dir.join("foreign");
+        let empty_dir = dir.join("empty");
+        for path in [&ours_dir, &foreign_dir, &empty_dir] {
+            std::fs::create_dir_all(path).expect("create dir");
+        }
+        let target = data_dir.join("kvx");
+        write_binary(&target);
+        std::os::unix::fs::symlink(&target, ours_dir.join("tmux")).expect("our link");
+        write_binary(&foreign_dir.join("tmux"));
+
+        let facts = InstalledShims {
+            data_dir: &data_dir,
+            running_exe: &target,
+        };
+
+        assert_eq!(facts.tmux_entry(&ours_dir), TmuxEntry::Ours);
+        assert_eq!(facts.tmux_entry(&foreign_dir), TmuxEntry::Foreign);
+        assert_eq!(facts.tmux_entry(&empty_dir), TmuxEntry::Absent);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
