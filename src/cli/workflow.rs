@@ -2649,12 +2649,12 @@ fn print_workflow_node_response(response: &serde_json::Value, json: bool) -> std
     if let Some(pane_id) = node["pane_id"].as_str() {
         println!("pane_id: {pane_id}");
     }
-    // `run_node.watchdog_interventions` (`app/workflow_watchdog.rs`'s own doc):
-    // counts SURFACED watchdog opinions, not every ladder rung it walked —
-    // WI-R5 (`.local/prd/phase4-retarget-plan.md` amendment log) names this a
-    // known undercount, still open. Printed verbatim rather than reworded into
-    // "interventions", which the column does not yet mean. Zero is the common
-    // case and is skipped, matching `growth_limited`/`delivery_failure` below.
+    // `run_node.watchdog_interventions` counts every ladder rung the watchdog
+    // actually spent — rungs 1-3 included, and an undelivered rung counts too,
+    // because karvex did intervene. WI-R5 closed that gap (the column used to
+    // count only surfaced opinions, so a node nudged three times read `0`), so
+    // the label means what it says. Zero is the common case and is skipped,
+    // matching `growth_limited`/`delivery_failure` below.
     if let Some(interventions) = node["watchdog_interventions"].as_u64() {
         if interventions > 0 {
             println!("interventions: {interventions}");
