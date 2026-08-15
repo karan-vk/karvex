@@ -61,7 +61,9 @@ kvx workflow run start ship-feature --arg goal="add dark mode"
 ```
 
 :::note[为兼容性保留的字段]
-节点上的 `kind`、`runner`、`command`、`output_schema`、`max_attempts`、`timeout_ms`、`isolation`、`is_template`、`expand_allow`、`expand_max`,以及边上的 `kind`、`condition`、`payload`、`port`,现在仍然都能被解析——这次改造之前写的定义仍然能加载。文档级别的 `max_depth`/`max_nodes` 也仍然能被解析,而且经过等级收窄后的运行**实际生效**的上限仍然会被计算并记录在运行行上。但这些都不会改变负责人被告知的内容,也不会改变运行的行为——它们是这次发布中被移除的自定义执行引擎的词汇(经 schema 校验的节点完成、受增长上限约束的节点扩展、作为普通进程运行的 `runner = "command"` 节点、被强制执行的节点/运行预算),在新模型里都没有替代品——负责人可以按自己判断创建任意多的任务。从现在起你自己撰写的文档里应该去掉这些字段;一个工作流的整个计划现在只寄居在 `key`、`label`、`role`、`prompt_template`、`demand`,以及节点之间的边里。这份清单里唯一还在起作用的字段是 `demand`:它和运行的等级一起,决定了负责人为该节点得到的模型/精力提示。
+节点上的 `kind`、`runner`、`command`、`max_attempts`、`is_template`、`expand_allow`、`expand_max`,以及边上的 `kind`、`condition`、`payload`、`port`,现在仍然都能被解析,也仍然什么都不做——这次改造之前写的定义仍然能加载,但它们是这次发布中被移除的自定义执行引擎的词汇(经 schema 校验的节点完成、受增长上限约束的节点扩展、作为普通进程运行的 `runner = "command"` 节点),在新模型里都没有替代品。文档级别的 `max_depth`/`max_nodes` 也仍然能被解析,经过等级收窄后的运行**实际生效**的上限仍然会被计算并记录在运行行上,但没有任何东西会强制执行它——负责人可以按自己判断创建任意多的任务。从现在起你自己撰写的文档里应该去掉这些字段;一个工作流的整个计划现在只寄居在 `key`、`label`、`role`、`prompt_template`、`demand`,以及节点之间的边里。
+
+那份旧词汇里有三个字段又重新起作用了,是被读取而非被强制执行:`demand` 与运行的等级结合,决定了负责人为该节点得到的模型/精力提示。`output_schema` 在写了比空的默认值更多的内容时,会被渲染进负责人的提示词,作为任务结果应该匹配的形状——这只是参考信息,因为已经没有引擎会拿它去校验结果了。`timeout_ms` 会被渲染成该任务的时间预算;看门狗会把严重超时本身当作一个信号,可能会跳过通常的提醒,直接把该任务标记为需要关注。`isolation` 仍然默认是 `none`,在那里什么都不做,但 `isolation = "worktree"` 现在会在**创作时就被拒绝**,而不是被悄悄忽略——因为没有任何运行面板会被绑定到一个 worktree 上,接受它就等于承诺了一种运行永远无法兑现的隔离。
 :::
 
 ## 要求与限制
@@ -73,7 +75,7 @@ kvx workflow run start ship-feature --arg goal="add dark mode"
 - **任务状态可能滞后。** 上游文档对此说得很明白:队友有时不会把已经完成的任务标记为完成。因此 Herdr 的 DAG 视图并排展示两个信号——任务自身的状态,以及所有者面板的实时智能体状态——正是为了让你能在记录追上现实之前发现一个实际已经完成的任务。如果某次运行看起来卡住了,先看面板,再相信任务列表。
 - **一个会话只有一个团队,不允许嵌套团队。** 一个负责人会话恰好拥有一个团队;队友不能启动自己的队友。出于同样的原因,Herdr 每台服务器只运行一个负责人——在另一个运行仍然存活时启动新运行会被拒绝(`workflow_run_in_flight`),而不是得到第二个、无法管理的团队。
 - **不受信任的目录会悄悄吞掉负责人的计划。** Claude Code 的文件夹信任对话框不仅会阻止一个不受信任的 `cwd`,还会把负责人的初始提示词完全丢弃,于是在那里启动的运行会看起来健康地起来,却无事可做。Herdr 会预检 `~/.claude.json` 里的信任记录,并给出确切的解决办法后拒绝(`workflow_lead_unavailable`):在该目录里手动运行一次 `claude` 并接受对话框。
-- **跨会话消息需要 Claude Code 2.1.224 及以上版本,并且只支持 macOS 或 Linux。** Herdr 不会替你发消息——操作方式是点击面板并输入——但在该功能可用时,负责人和它的队友可以互相发消息,也可以给你的其他 Claude Code 会话发消息。在原生 Windows 上,无论 Claude Code 版本如何都不可用;而且只在 Claude Code 尚未缓存过功能开关的账号上才生效的环境变量,可能会悄悄禁用它。唯一值得信任的实时信号,是面板 `/status` 里的 `Peer address` 一行。
+- **跨会话消息需要 Claude Code 2.1.224 及以上版本,并且只支持 macOS 或 Linux。** 在该功能可用时,负责人和它的队友可以互相发消息,也可以给你的其他 Claude Code 会话发消息——而 Herdr 也能替你做同样的事:[防卡死看门狗](#防卡死看门狗)以及 `kvx workflow run message`(DAG 视图里的 `m`)都通过这同一条通道联系一次运行自己的会话,在没有这条通道时就退回到直接往面板里输入。在原生 Windows 上,无论 Claude Code 版本如何都不可用;而且只在 Claude Code 尚未缓存过功能开关的账号上才生效的环境变量,可能会悄悄禁用它。唯一值得信任的实时信号,是面板 `/status` 里的 `Peer address` 一行。
 - **运行按设计是有人值守的。** 没有无人值守模式。权限确认和计划批准请求都会出现在触发它们的那个面板里——通常是负责人的面板,因为队友的权限请求默认会上报给负责人——运行就在那里干等,直到有人回答。这是刻意为之的:v1 的整个交互模型就是"点一下面板"。
 
 ## 启动一次运行
@@ -92,27 +94,44 @@ kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VA
 
 ### DAG 视图
 
-用 `prefix+shift+F`,或从侧边栏启动器(**workflow dag**)打开一次运行的 DAG 视图。节点状态分两层展示:来自投影的任务自身状态,以及——通过任务的 `owner` 关联到 Herdr 常规的、按面板划分的智能体检测——该所有者的面板是 `working`、`idle` 还是 `needs input`。这就是对任务状态滞后问题的实际答案:当两者不一致时,相信面板而不是任务记录。
+用 `prefix+shift+F`,或从侧边栏启动器(**workflow dag**)打开一次运行的 DAG 视图。节点状态分两层展示:来自投影的任务自身状态,以及——通过任务的 `owner` 关联到 Herdr 常规的、按面板划分的智能体检测——该所有者的面板是 `working`、`idle` 还是 `needs input`。这就是对任务状态滞后问题的实际答案:当两者不一致时,相信面板而不是任务记录。一旦看门狗看过某个节点,详情条就会多出一行 `attention:`/`watchdog:`——看门狗自己的意见,以及它实际消耗过多少级——它不会取代任务自身的状态行,只是并排显示在旁边。
 
 | 输入 | 动作 |
 | --- | --- |
 | `h` / `j` / `k` / `l` 或方向键 | 移动选择 |
 | 点击某个节点 | 选中它 |
 | `Enter`,或双击某个节点 | 聚焦到该节点的面板 |
+| `m` | 不打开面板,直接给所选节点的所有者写一条消息(仅限当前存活的运行) |
+| `V` | 打开这次运行的[评审浮层](#评审一次运行) |
 | `Esc` | 离开 DAG 视图 |
 
-这就是现在页脚的全部内容——`enter focus pane · hjkl move · esc`。没有 `s` steer,没有 `i` interrogate,也没有 `Shift+I` reconstruct:那些是针对 Herdr 自己执行的节点的操作,而现在的节点是真正的队友自己的面板。要操作它,打开那个面板就行——见下一节。
+页脚会显示 `enter focus pane · m message owner · hjkl move · esc`,会随终端宽度收窄——`esc close` 是最后被去掉的一项。`m` 只会出现在存活的运行上,因为一次过去运行的 Claude Code 会话早已退出,已经没有可以联系的对象了;它会联系拥有所选节点的那个会话,如果任务还没人认领,就退回给负责人。`V` 不属于页脚提示之一——页头有它自己独立的被动提示(见下文)——但在这个视图里的任何地方都能用。没有 `s` steer,没有 `i` interrogate,也没有 `Shift+I` reconstruct:那些是针对 Herdr 自己执行的节点的操作,而现在的节点是真正的队友自己的面板。要操作它,打开那个面板就行——见下一节。
+
+一次运行结束之后,页头还会带一行评审提示:如果还没人评审过,就是 `review available (V)`;如果面谈还在进行,就是 `reviewing…`;如果有结论在等待决定,就是 `review ready (V)`。一个已经被采纳或拒绝的周期什么都不会显示——这条提示只针对尚未做出的决定,不是一枚永久徽章。按 `V` 就会打开[评审一次运行](#评审一次运行)所描述的那个浮层。
 
 ### 运行浏览器
 
 `prefix+shift+B` 会打开这台服务器知道的所有运行,跨越所有工作流,按最新排在最前。`Enter` 会在 DAG 视图里打开某次运行——如果还在运行就是实时的,否则就是只读的历史记录。详情条会显示所选运行的参数,以及(如果已经有的话)其摘要的结果和第一条要点。
+
+## 防卡死看门狗
+
+现在已经没有任何东西会调度一次运行了,所以也没有任何东西能重启、重新分配或重新启动一个队友——那些能力已经随执行引擎一起消失了。Karvex 现在还能做的,是观察、说明和记录。每隔 `workflow.watchdog_tick_secs`(默认 20 秒),它会对这次存活的运行取一次样:对团队仍然称为 `in_progress` 的每个任务,以及负责人自己,它都会读取 Karvex 自己的屏幕检测最后一次对该所有者面板说了什么、以及这个状态已经持续了多久。一个正在工作的面板,或者自上次取样以来哪怕有一点变化的面板,都会让一切重置。一个任务仍然是 `in_progress`、而面板却一直闲置的情况,才是值得处理的情形——Claude Code 自己的文档也提到,队友有时会完成工作却不去把任务标记为完成,所以滞后的状态本身从来都不能算证据;真正的证据,是状态和面板之间的*不一致*。
+
+在连续 `workflow.stuck_threshold` 次没有进展的取样(默认 3)之后,Karvex 会走完一个四级阶梯,在一次已送达的一级和下一级之间等待 `workflow.drift_threshold` 次取样(默认 5):**(1)** 给队友发一条提醒,点名它的任务、状态和测得的空闲时间;**(2)** 一条结构化的重新提示,点名这个不一致本身,要求它把任务标记为完成、说明它被阻塞了,或者说明接下来打算做什么;**(3)** 升级给*负责人*,附带测量结果和上游自己给出的两种补救办法——重新分配,或者重新启动——因为只有负责人能做到这两件事中的任何一件;**(4)** 浮现,这一级没有任何消息:节点的 `attention` 会变成 `stuck`,发出一条通知,`kvx workflow run show --json` 会报告它。第三级之所以存在,正是因为 Karvex 自己做不到这两件事——它不能重启、重新分配或重新启动一个队友,只有负责人可以。如果闲置的一方是负责人自己而不是某个队友,这个阶梯就会缩短为提醒→重新提示→浮现——没有第三级,因为把负责人升级给它自己等于什么人都联系不到——文案也会去掉任务文件相关的措辞,直接指向 `kvx workflow run finish`。运行会继续进行,不会有任何东西被杀死。
+
+每条消息都会带上 `[karvex · watchdog]` 这个框架标记,让接收方的智能体能分辨这是运行时的引导还是它的人类操作者发来的,而且每一条都通过 `kvx workflow run message` 所用的同两条通道发出:如果 Karvex 持有接收方会话的收件箱套接字就走它,否则就直接输入到它的面板里。**一级如果两条通道都没有送达,就不算被消耗**——它会带着原因被记录为未送达,并被重试,只有连续两次失败之后,这个阶梯才会停止尝试说话,转而去浮现。一条没人收到的提醒绝不能看起来像一条被无视的提醒,这在实践中很重要,因为一个会话的消息端点会随着学到它的那个 Karvex 进程一起消失。
+
+有三种情况永远不会走这个阶梯。一个在等人类的任务——它的面板停在一个权限确认上——或者在等另一个尚未完成的任务,会读作 `attention: needs_input`;一条提醒回答不了一个权限对话框。一个自己正在等待输入的负责人会读作 `lead_blocked`,而这次运行的每个成员都会继承这个状态,而不是各自独立地得出自己卡住了的结论。一个没有人可以提醒的任务——无人认领,或者由一个已经离开名册的队友拥有——会直接跳到第三级,浮现时读作 `unbound`。另外,一个严重超出其定义所写 `timeout_ms` 的任务会完全跳过这个阶梯,直接读作 `budget_exceeded`。
+
+`attention` 是 Karvex 对某个任务的自己的看法——永远不是任务自身的状态——它在每次取样时都会被重新评估,而不是锁定,所以一个重新开始动起来的节点会清除它。它被刻意设计成和节点的 `status` 不同的一列:`status` 始终是 Claude Code 自己投影出的事实,看门狗从不写入状态,而且团队标记为 `completed` 的任务根本不会被监视。`kvx workflow node show <run_id> <path>` 会在看门狗有意见时打印一行 `attention:`,并把它实际消耗过的每一级(包括未送达的一级——Karvex 确实介入了,只是消息没有送达)计入 `interventions:` 计数。DAG 视图的详情条会显示同样的两个事实,而一次运行结束之后,页头还会给出一个被动的评审提示(参见下面的[评审一次运行](#评审一次运行))。把 `workflow.watchdog_enabled` 设为 `false` 就能整个关掉它:不再分类,不再发消息,不再写入 `attention`,也不再取样。
 
 ## 操作一次运行
 
 节点的面板是一个完全独立的 Claude Code 会话——在分屏模式下,和 Claude Code 在其他地方启动的任何队友完全一样。不再有 Herdr 中介的 steer、interrupt、restart 了:
 
 - **要重新引导某一个队友**,打开它的面板(在 DAG 视图里按 `Enter`,或用 `kvx workflow node show <run_id> <path>` 找到它的 `pane_id`)并直接输入。你是在直接和那个 Claude 会话对话。
-- **要重新引导整次运行**——调整优先级、启动更多队友、放弃某个任务——打开负责人的面板(`kvx workflow run show <run_id> --json` 会以 `lead_pane_id` 的名义给出它)并告诉它你想要什么。只有负责人能重新分配工作,或者去催促一个卡住的队友;Herdr 自己都做不到这两件事。
+- **要在不切换面板的情况下发一条简短消息**,在 DAG 视图里按 `m`(或者在任何地方运行 `kvx workflow run message --run <run_id> --to <name> --text <text>`,`<name>` 是某个成员的名字或者 `team-lead`)——它会到达和 `m` 一样的那个会话,走的是看门狗自己使用的同一条收件箱套接字或直接输入面板的通道,并以同样诚实的方式被记录下来(送达了,还是没有,以及原因)。
+- **要重新引导整次运行**——调整优先级、启动更多队友、放弃某个任务——打开负责人的面板(`kvx workflow run show <run_id> --json` 会以 `lead_pane_id` 的名义给出它)并告诉它你想要什么,或者用同样的方式给它发消息。只有负责人能重新分配工作,或者去催促一个卡住的队友;Herdr 自己都做不到这两件事。
 - **负责人面板里的权限确认会阻塞整次运行。** 队友的权限请求默认会上报给负责人,所以一次看起来卡住的运行,很多时候只是在那一个面板里等待一个答案而已。
 
 早期版本有 `kvx workflow node steer|interrupt|restart|complete|expand|interrogate`。CLI 目前仍然能解析这全部六个命令,但服务器会对每一个都以 `workflow_node_verb_retired` 作答,并指向面板——因为它们操作的是 Herdr 已经不再执行的节点。`kvx workflow node show <run_id> <path> [--json]` 仍然有效;它是对投影的一次读取,和 `run show` 一样。
@@ -133,6 +152,24 @@ kvx workflow run cancel <run_id> [--json]
 
 如果负责人的面板自己关闭了——手动关闭、崩溃,或者服务器重启了——却从未调用过 `finish`,这次运行就会停留在 `failed`,并带着投影最后捕获到的内容:也就是最后一次轮询时的任务和成员快照。目前还没有 `run resume` 命令;Herdr 不会做任何事情去把一次掉线的运行捡回来。负责人的 `lead_session_id`(在 `kvx workflow run show <run_id> --json` 里)是一个真实的、可恢复的 Claude 会话,所以在一个普通面板里运行 `claude --resume <lead_session_id>` 就能把对话找回来——只是 Herdr 不会替你把这一步接好,而且这样做之后,运行自身的记录仍然停留在 `failed`。
 
+## 评审一次运行
+
+一次结束的运行可以评审它自己:`kvx workflow review start <run_id> [--json]` 会回顾 Karvex 实际测量到的内容,并在人类点头之后,把学到的东西变成一个新的定义版本——这是 Herdr 自己对什么有效、下次该改什么的记录,而不会被编辑进那个实际运行过的版本。评审是可选的,而且每次运行都可以重复做,只会触及**终态**的运行(`succeeded`、`failed`、`cancelled`):对一次仍在进行的运行发起评审会被拒绝(`workflow_review_run_not_terminal`);在第一个周期仍处于 `running` 或等待决定时发起第二个周期同样会被拒绝(`workflow_review_in_flight`);一次 Karvex 从未记录过团队的运行没有对象可以面谈,并会如实地这样回答(`workflow_review_no_interviewable_members`)。
+
+这次运行的每一个成员——每一个队友,以及负责人自己(在它专属的保留节点 `.lead` 上,因为只有它能解释一次重新规划)——都是候选人,按 Karvex 测量到的情况(任务结果、所有者变更、实际送达的看门狗介入)从最麻烦到最不麻烦排序;如果这次运行没有干净地结束,负责人会被优先排到最前面,因为一次糟糕的运行就是负责人的运行。`workflow.review_max_interviews`(默认 6)限定了最多面谈多少人;超出上限的成员会被直接跳过而不是降级——它们根本不会被问到。
+
+对于仍在范围内的每一个人,Karvex 会用一次**分叉重启**(`claude --resume <session id> --fork-session`)复活它们的 Claude Code 会话:一个全新的会话 ID 和记录文件,以它们原来的副本开始,在自己独立的面板里运行,原始会话和记录文件完全不会被触碰。Karvex 会把自己测量到的记录——它拥有过哪些任务、进展如何、它实际收到过的看门狗提醒(逐字引用)——提交给这个分叉,并要求它自己回答。一个 Karvex 从来无法用这种方式复活的成员(从未捕获到会话 ID,或者它的记录文件已经不可读)仍然值得测量,只是不值得替它说话,所以它会以**仅凭证据**的方式被面谈:Karvex 只根据测量到的内容进行推理,没有人来回答。
+
+**归属是这整个周期存在的意义所在,绝不会被模糊处理。** 只有当一次面谈确实被计划为"重启"、确实得到了回答、并且 Karvex 持有把两者关联起来的来源记录时,一条结论才会被算作某个重启后的队友自己的说法——其他任何路径,包括在权限确认上卡住、超时、或者在回答前面板就消失的面谈,都会降级为仅凭证据。一条被归属给无人、或者归属给 Karvex 从未面谈过的成员的结论,同样会是仅凭证据。任何展示结论的地方——`kvx workflow review show`、TUI 浮层、编译出的版本自己的 `change_summary`——都会清楚地保留这个区分,而不会把所有结论抹平成一份看不出差别的清单;一条仅凭证据的结论,永远不会被呈现得像是队友自己说的话。
+
+一旦所有面谈都尘埃落定——得到了回答,或者被放弃——一个整合面板会把这一切放在一起看,并针对每个定义节点提出一条结论:一个**级别**(`prompt` 表示该节点的指示写错了;`structural` 表示计划本身错了——错误的 `demand`、错误的预算、或者根本是错误的节点),一个**判定**(`keep` 表示情况良好,会被记录下来而不是被悄悄丢弃;`improve`;或者总是带着一份完整替代方案的 `replace`),一段理由,以及它所依据的证据。`kvx workflow review show <run_id> [--json]` 会打印这个周期的状态,以及(一旦有等待决定的内容)它的结论;一次从未被评审过的运行会回答"no review cycle for this run yet"——这是正常的回答,不是错误。
+
+做决定要用 `kvx workflow review apply <run_id> (--accept <node_key>... | --decline-all) [--json]`,只有在这个周期处于 `awaiting_user` 时才能到达。一条你没有接受的结论——没有列进 `--accept`,或者通过 `--decline-all` 拒绝了整个周期——完全不会留下痕迹:不会为它写入任何东西。被接受的结论要么一起被编译,要么完全不被编译:它们会被拿去对照和手写定义完全相同的创作标准检验(包括拒绝 `isolation = "worktree"`),所以只要有一条结论不合格,整次应用就会被拒绝,点名导致拒绝的那条结论,并且什么都不写入——不存在"应用了一半"的版本。一次成功的应用会生成一个新的、**不可变**的版本,打上 `origin: self_improvement` 标记,以这次运行自己的版本为父版本;这次运行实际执行过的那个版本永远不会被触碰。
+
+`kvx workflow review answer --file <path>` 和 `kvx workflow review report --file <path>` 本来就不是给人手动输入的——它们是面谈面板和整合面板自己运行的命令,它们从自己环境里的 `KARVEX_WORKFLOW_REVIEW_RUN_ID`/`_MEMBER`/`_CYCLE` 读取自己属于哪次运行、哪个成员、哪个周期,而不是通过某个参数,所以一个面谈面板永远不可能被指向它正在评审的运行之外的任何运行。
+
+在 TUI 里,在 DAG 视图里按 `V`(或者在任何地方使用 `keys.open_workflow_review`,默认是 `prefix+shift+v`)会为当前打开的运行打开评审浮层,如果没有打开的运行,就用当前存活的负责人运行。当周期处于 `awaiting_user` 时:`j`/`k` 移动选择,`Space` 切换所选结论的接受状态(共享同一个节点键的所有结论会一起切换,以匹配 `apply` 自己的粒度),`Enter` 提议应用当前已切换的内容,`d`/`D` 提议拒绝整个周期,两者都需要经过一次二次确认,`Esc` 不做任何决定直接关闭。每一行都会清楚地显示它的归属说明——要么是来自某次重启面谈、点名了姓名的队友自己的说法,要么是仅凭证据以及确切的原因——就在这条结论旁边。
+
 ## 运行历史与摘要
 
 ```bash
@@ -148,11 +185,11 @@ kvx workflow summary list [<name|id>] [--limit N] [--json]
 `workflow.retention_runs`(默认 50)仍然是一个公开的配置项,含义仍然是"每个工作流保留这么多次运行,更老的先被清理"——但现在已经没有任何东西会调用真正执行清理的代码了。旧引擎运行结束时的收尾环节曾是清理的唯一调用方,它已随引擎一起消失。这台服务器记录过的每一次运行都会完整保留,直到有人重新接管清理这件事。如果运行历史占用的磁盘空间在今天对你很重要,目前没有任何配置项能帮上忙。
 :::
 
-:::caution[恢复与追问已经名存实亡]
-运行浏览器里的 `r` 恢复操作,以及 `kvx workflow run start --restore-from <run_id> [--restore <selector>]... [--restore-allow-changed]`,现在仍然能被解析,也仍然会启动一次运行——但恢复一个节点原本意味着从过去某次运行的检查点为它播种,而现在已经没有任何东西会写入节点检查点了(那也曾是旧引擎的工作)。实际上,今天的 `--restore-from` 只是校验请求、把它记录在运行行上,然后启动一次使用相同工作流和相同参数的、普通的全新负责人运行:源运行里实际发生过什么,完全不会传达给新的负责人。同样,`kvx workflow node interrogate`——把过去某个节点的 Claude 会话 fork 进一个面板——现在也总是以 `workflow_node_verb_retired` 作答。**负责人**的会话可以手动恢复(参见上面的"结束一次运行"),但对于单个队友的会话,一旦它的面板消失,就没有对应的手段了。
+:::note[恢复已被兑现,追问仍然名存实亡]
+运行浏览器里的 `r` 恢复操作,以及 `kvx workflow run start --restore-from <run_id> [--restore <selector>]... [--restore-allow-changed]`,会解析源运行的节点检查点,并把它们渲染进新负责人自己的提示词,放在"Restored from a previous run"标题下:每个任务实际带来了什么,连同它的摘要和保存下来的结果。一个无法恢复的选择器——没有检查点、payload 被截断、或者在没有 `--restore-allow-changed` 的情况下提示词/schema 发生了变化——会出现在 CLI 打印的恢复报告里,并像其他普通任务一样被重新规划;负责人会被告知哪些节点确实带着结果一起来了,哪些没有,而不是让恢复悄悄失效,或者靠猜测。`kvx workflow node interrogate`——把过去某个节点的 Claude 会话 fork 进一个面板——现在仍然总是以 `workflow_node_verb_retired` 作答;**负责人**的会话可以手动恢复(参见上面的"结束一次运行"),但对于单个队友的会话,一旦它的面板消失,就没有对应的手段了。
 :::
 
-这次改造之前发布的另外三个 `[workflow]` 配置项——`summary_enabled`、`max_parallel_nodes`、`stuck_threshold`、`drift_threshold`——情况相同:仍然能被解析,仍然有默认值,但不会被任何东西读取。运行的摘要只要负责人调用 `finish` 就会被写入,与 `summary_enabled` 无关;既然现在完全不再调度任何节点,也就没有什么东西会去参考并发数上限或看门狗阈值。这一节里唯一还在起作用的旋钮是 `history_context_runs`。
+这次改造之前发布的另一个 `[workflow]` 配置项 `summary_enabled` 仍然是老样子:能被解析,有默认值,但目前还不会被任何东西读取——运行的摘要只要负责人调用 `finish` 就会被写入,与它无关。`stuck_threshold` 和 `drift_threshold` 已经不再属于那一组了:[看门狗](#防卡死看门狗)会读取这两个值。`max_parallel_nodes` 也不再属于那一组——参见上面关于并发提示的那一段。`history_context_runs` 是这一节里另一个还在起作用的旋钮,而 `review_max_interviews`(默认 6)是这次改造新增的旋钮——参见[评审一次运行](#评审一次运行)。
 
 ## 命令
 
@@ -161,14 +198,20 @@ kvx workflow list [--json]
 kvx workflow show <name|id> [--json]
 kvx workflow create --file <definition.toml|json> [--name <name>] [--json]
 kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
-kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--no-prior-summaries] [--json]
+kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--restore-from <run_id>] [--restore <selector>]... [--restore-allow-changed] [--no-prior-summaries] [--json]
 kvx workflow run list <name|id> [--limit N] [--json]
 kvx workflow run show <run_id> [--json]
+kvx workflow run message [--run <run_id>] --to <name> (--text <text> | --text-file <path>) [--priority now|next|later] [--json]
 kvx workflow run cancel <run_id> [--json]
 kvx workflow run finish [--run <run_id>] (--summary-file <path> | --summary <text>) [--outcome <word>] [--json]
 kvx workflow node show <run_id> <path> [--json]
 kvx workflow summary show <run_id> [--json]
 kvx workflow summary list [<name|id>] [--limit N] [--json]
+kvx workflow review start <run_id> [--json]
+kvx workflow review show <run_id> [--json]
+kvx workflow review apply <run_id> (--accept <node_key>... | --decline-all) [--json]
+kvx workflow review answer --file <path> [--json]
+kvx workflow review report --file <path> [--json]
 ```
 
-以上每条命令默认都打印人类可读的文本,加上 `--json` 会得到原始信封结构。在 Herdr 的 TUI 里,`prefix+f` 会打开**工作流启动器**:已保存工作流的列表、所选工作流每个必填参数对应的一行输入框,以及一个由该工作流自身 `default_tier` 初始化的等级行。`Enter` 启动运行;每一行都可以点击。用 `keys.open_workflow_launcher` 可以重新绑定它,DAG 视图对应 `keys.open_workflow_dag`,运行浏览器对应 `keys.open_workflow_runs`。
+以上每条命令默认都打印人类可读的文本,加上 `--json` 会得到原始信封结构。`review answer`/`review report` 是给面谈/整合面板自己运行的,不是给人手动输入的——参见[评审一次运行](#评审一次运行)。在 Herdr 的 TUI 里,`prefix+f` 会打开**工作流启动器**:已保存工作流的列表、所选工作流每个必填参数对应的一行输入框,以及一个由该工作流自身 `default_tier` 初始化的等级行。`Enter` 启动运行;每一行都可以点击。用 `keys.open_workflow_launcher` 可以重新绑定它,DAG 视图对应 `keys.open_workflow_dag`,运行浏览器对应 `keys.open_workflow_runs`,评审浮层对应 `keys.open_workflow_review`(默认 `prefix+shift+v`)。
