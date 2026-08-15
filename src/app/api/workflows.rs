@@ -2178,19 +2178,17 @@ fn parse_definition(
 /// authoring entry points (`workflow.create`, `workflow.version.create`)
 /// call this before their first write; `isolation = "none"` (the default)
 /// is unaffected.
+///
+/// The rule itself lives in `workflow::definition` — the pure layer — because
+/// `workflow.review.apply` compiles a definition with no document in hand and
+/// has to pass exactly the same gate (P11): a version karvex minted from a
+/// review must never be one it would have refused from a human.
 #[cfg(feature = "workflow")]
 fn reject_worktree_isolation(definition: &Definition) -> Result<(), String> {
-    if let Some(node) = definition
-        .node
-        .iter()
-        .find(|node| node.isolation == Isolation::Worktree)
-    {
-        return Err(format!(
-            "node {} sets isolation = \"worktree\", which the lead path cannot honour —              no run pane is bound to a worktree, so karvex would accept a promise it              cannot keep; use isolation = \"none\" (the default) or drop the field",
-            node.key
-        ));
+    match crate::workflow::definition::worktree_isolation_rejection(&definition.node) {
+        Some(rejection) => Err(rejection.message),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// `05-phase-plan.md` §4: `workflow.run` rejects a run that omits a required

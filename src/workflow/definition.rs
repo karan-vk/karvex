@@ -13,8 +13,8 @@
 use serde::Deserialize;
 
 use crate::workflow::model::{
-    ArgSpec, EdgeKind, GrowthLimits, Kvdag, KvdagEdge, KvdagError, KvdagNode, KvdagSpec, NodeKey,
-    WorkflowId,
+    ArgSpec, EdgeKind, GrowthLimits, Isolation, Kvdag, KvdagEdge, KvdagError, KvdagNode, KvdagSpec,
+    NodeKey, WorkflowId,
 };
 use crate::workflow::tier::Tier;
 
@@ -243,6 +243,56 @@ impl Definition {
     }
 }
 
+/// The authoring rule the lead path cannot honour, and the node that trips it.
+///
+/// D-6 (`.local/prd/phase4-retarget-plan.md` §6): `isolation = "worktree"`
+/// used to parse cleanly and then be a silent no-op — nothing in the lead
+/// path binds a node's pane to a worktree, so accepting it would author a
+/// promise the run can never keep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnhonourableIsolation {
+    pub node: NodeKey,
+    pub message: String,
+}
+
+/// Rejects `isolation = "worktree"` at authoring time (D-6).
+///
+/// Takes nodes rather than a whole [`Definition`] because a document is not
+/// the only thing that has to pass this gate: `workflow.review.apply`
+/// compiles accepted findings into a [`KvdagSpec`] with no `Definition`
+/// anywhere in sight, and a self-improved version must never be a definition
+/// karvex would have refused from a human
+/// (`workflow::compile_findings::apply_findings`). One authority for the rule,
+/// two callers, no chance of the two drifting.
+pub fn worktree_isolation_rejection(nodes: &[KvdagNode]) -> Option<UnhonourableIsolation> {
+    let node = nodes
+        .iter()
+        .find(|node| node.isolation == Isolation::Worktree)?;
+    Some(UnhonourableIsolation {
+        node: node.key.clone(),
+        message: format!(
+            "node {} sets isolation = \"worktree\", which the lead path cannot honour — \
+             no run pane is bound to a worktree, so karvex would accept a promise it \
+             cannot keep; use isolation = \"none\" (the default) or drop the field",
+            node.key
+        ),
+    })
+}
+
+/// Backfills the one mandatory-but-undocumented field a **node** document must
+/// carry, so a node written by hand and a node written by the review
+/// synthesiser (`compile_findings::apply_findings`'s `replace` verdict) are
+/// held to exactly the same standard.
+///
+/// See [`apply_authoring_defaults`], which calls this for every node in a
+/// document, for why `output_schema` defaults to `{}`.
+pub fn apply_node_authoring_defaults(node: &mut serde_json::Value) {
+    if let Some(node) = node.as_object_mut() {
+        node.entry("output_schema")
+            .or_insert_with(|| serde_json::json!({}));
+    }
+}
+
 /// Backfills the two mandatory-but-undocumented fields the kvdag model
 /// requires so a document that omits them reaches [`Definition::check`] and
 /// the graph validators beyond it (`workflow::model::Kvdag::try_new`'s
@@ -270,10 +320,7 @@ fn apply_authoring_defaults(value: &mut serde_json::Value) {
     for key in ["node", "nodes"] {
         if let Some(serde_json::Value::Array(nodes)) = object.get_mut(key) {
             for node in nodes.iter_mut() {
-                if let Some(node) = node.as_object_mut() {
-                    node.entry("output_schema")
-                        .or_insert_with(|| serde_json::json!({}));
-                }
+                apply_node_authoring_defaults(node);
             }
         }
     }
