@@ -13,14 +13,22 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::workflow::model::{Demand, Kvdag, KvdagNode, NodeKey, RunId};
+use crate::workflow::model::{Demand, Kvdag, KvdagNode, NodeKey, RestoredSeed, RunId};
 use crate::workflow::tier::{self, Assignment, HistoryIndex, Tier};
+use crate::workflow::watchdog::WATCHDOG_FRAME;
 
 /// Bumped whenever the rendered text changes in a way a lead would behave
 /// differently for. Recorded in the prompt itself so a stored run says which
 /// contract produced it, and asserted by the render tests so a change to the
 /// template is never silent.
-pub const LEAD_PROMPT_VERSION: u32 = 2;
+///
+/// v3 (`phase4-retarget-plan.md` P14): renders a node's authored
+/// `output_schema` and `timeout_ms` (D-6, previously silent no-ops), the
+/// server's `[workflow] max_parallel_nodes` as a concurrency hint (also
+/// D-6), what `--restore-from` resolved (WI-R1 — previously computed and
+/// discarded), and a heads-up about the watchdog so a rung-3 escalation does
+/// not arrive as an unexplained interruption.
+pub const LEAD_PROMPT_VERSION: u32 = 3;
 
 /// The separator between a node key and its label in a task subject. The
 /// projection (§3.4) matches Claude Code tasks back to definition nodes by
@@ -51,6 +59,34 @@ pub struct LeadPromptInput<'a> {
     /// history yet — karvex writes the file either way, so the lead has to be
     /// *told* it exists or the parameter does nothing at all.
     pub prior_runs_path: Option<&'a str>,
+    /// `[workflow] max_parallel_nodes` (config default 4). D-6: nothing
+    /// downstream of the launch path reads this any more — there is no
+    /// engine left to cap concurrency — so rendering it here as a hint is
+    /// the only way an authored/configured value does anything at all.
+    pub max_parallel_nodes: usize,
+    /// What `--restore-from` resolved, when this run asked for one (WI-R1).
+    /// `None` when the run did not ask. `Some` with empty seeds when it
+    /// asked and nothing was restorable — that is still told to the lead,
+    /// not silently collapsed into `None`, so "asked and got nothing" never
+    /// looks identical to "never asked".
+    pub restore: Option<RestoreContext<'a>>,
+}
+
+/// What a `--restore-from` request resolved to, for [`render_restore`].
+///
+/// Deliberately thin: the full skip taxonomy
+/// (`crate::api::schema::WorkflowRestoreSkipReason`) already reaches the
+/// caller in the `workflow.run` response's restore report, so the lead only
+/// needs the fact that some selectors were skipped, not why — and this type
+/// stays pure by not depending on the wire schema to say even that much.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreContext<'a> {
+    /// The run this run asked to restore from.
+    pub source_run: &'a RunId,
+    /// Nodes that resolved to a usable checkpoint, in resolution order.
+    pub seeds: &'a [RestoredSeed],
+    /// How many requested selectors did not resolve to a seed.
+    pub skipped: usize,
 }
 
 /// The task subject karvex asks the lead to use for a definition node, and
@@ -112,10 +148,12 @@ pub fn render_lead_prompt(input: &LeadPromptInput<'_>) -> String {
     out.push('\n');
 
     render_args(&mut out, input);
+    render_restore(&mut out, input);
     render_prior_runs(&mut out, input);
     render_contract(&mut out, kvdag);
     render_plan(&mut out, input);
     render_teammates(&mut out, input);
+    render_watchdog(&mut out);
     render_finish(&mut out, input);
     render_loose(&mut out);
 
@@ -154,6 +192,62 @@ fn render_args(out: &mut String, input: &LeadPromptInput<'_>) {
         }
     }
     out.push('\n');
+}
+
+/// WI-R1: `--restore-from` used to resolve a source run into seeds and then
+/// discard them (`app/api/workflows.rs`'s `let _ = (&assignments, &seeds, /// &context_runs, &restore_from_run);`) — a "restore" that silently started
+/// an ordinary fresh run. This renders what was actually resolved, so the
+/// lead is told what to carry forward instead of the selection vanishing
+/// between the resolver and the plan.
+fn render_restore(out: &mut String, input: &LeadPromptInput<'_>) {
+    let Some(restore) = &input.restore else {
+        return;
+    };
+    out.push_str("## Restored from a previous run\n\n");
+    if restore.seeds.is_empty() {
+        let _ = writeln!(
+            out,
+            "This run was started with `--restore-from {}`, but none of the requested selectors could be restored (see this run's restore report for why). Every task below is planned fresh, the same as any other run.",
+            restore.source_run.as_str(),
+        );
+        out.push('\n');
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "This run was started with `--restore-from {}`. The tasks below already have a result from that run — carry it forward instead of redoing the work, unless you have a specific reason to believe it is stale or wrong. Any planned task not listed here has nothing restored and should be planned normally.",
+        restore.source_run.as_str(),
+    );
+    out.push('\n');
+    for seed in restore.seeds {
+        let _ = writeln!(
+            out,
+            "### `{}` — restored from `{}` (checkpoint {})",
+            seed.node_key.as_str(),
+            seed.source.run.as_str(),
+            seed.source.checkpoint_seq,
+        );
+        out.push('\n');
+        if !seed.summary.trim().is_empty() {
+            let _ = writeln!(out, "Summary: {}", seed.summary.trim());
+            out.push('\n');
+        }
+        out.push_str("Result:\n\n");
+        push_json_block(out, &seed.payload);
+        if !seed.artifact_paths.is_empty() {
+            let _ = writeln!(out, "Artifacts: {}", seed.artifact_paths.join(", "));
+        }
+        out.push('\n');
+    }
+    if restore.skipped > 0 {
+        let _ = writeln!(
+            out,
+            "{} requested selector{} could not be restored and will be planned fresh like any other task (see this run's restore report for why).",
+            restore.skipped,
+            plural(restore.skipped),
+        );
+        out.push('\n');
+    }
 }
 
 fn render_prior_runs(out: &mut String, input: &LeadPromptInput<'_>) {
@@ -230,11 +324,13 @@ fn render_plan(out: &mut String, input: &LeadPromptInput<'_>) {
         if !node.role.trim().is_empty() {
             let _ = writeln!(out, "- Role: {}", node.role.trim());
         }
+        render_output_shape(out, node);
+        render_time_budget(out, node);
 
         out.push_str("- Description to give the teammate:\n\n");
         let body = interpolate(&node.prompt_template, input.args);
         for line in body.trim_end().lines() {
-            let _ = writeln!(out, "  > {line}");
+            let _ = writeln!(out, " > {line}");
         }
         out.push('\n');
     }
@@ -249,6 +345,42 @@ fn render_plan(out: &mut String, input: &LeadPromptInput<'_>) {
              place of the marker when you spawn it.\n\n",
         );
     }
+}
+
+/// D-6: an authored `output_schema` used to be a silent no-op — nothing
+/// read it once the engine that validated `result.json` against it was
+/// deleted (`phase4-retarget-plan.md` §1.2). Rendered only when the author
+/// wrote something beyond the unauthored default (`definition.rs`'s
+/// `apply_authoring_defaults` backfills the empty, accept-anything `{}`), so
+/// a node nobody put a schema on stays silent rather than showing an empty
+/// fence.
+fn render_output_shape(out: &mut String, node: &KvdagNode) {
+    let schema = node.output_schema.as_json();
+    if schema == &serde_json::json!({}) {
+        return;
+    }
+    out.push_str(
+        "- Result shape: this task's result should match this JSON Schema — karvex does not validate it any more (there is no engine left to enforce it), but downstream tasks and your own run summary depend on the shape being right:\n\n",
+    );
+    push_json_block(out, schema);
+}
+
+/// D-6: `timeout_ms` "becomes real in this phase (as a surfaced budget)" —
+/// the watchdog (P4, `workflow::watchdog::ObservedNode::budget_exceeded`)
+/// already treats an exceeded budget as a fact about the node, jumping
+/// straight to the silent rung-4 "surface" mark and skipping the usual
+/// nudge/re-prompt. This is the other half: telling the lead the number
+/// exists and what happens if it is blown, so the mark does not appear out
+/// of nowhere.
+fn render_time_budget(out: &mut String, node: &KvdagNode) {
+    let Some(timeout_ms) = node.timeout_ms else {
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "- Time budget: about {}. Karvex does not enforce this — nothing can stop the clock — but if this task badly overruns it, the watchdog skips its usual nudge-then-reprompt and silently marks the task as needing attention instead.",
+        human_duration(timeout_ms),
+    );
 }
 
 fn render_teammates(out: &mut String, input: &LeadPromptInput<'_>) {
@@ -299,6 +431,15 @@ fn render_teammates(out: &mut String, input: &LeadPromptInput<'_>) {
         let _ = writeln!(out, "- `{model}` for {}", keys.join(", "));
     }
     out.push('\n');
+    // D-6: `max_parallel_nodes` used to be unreachable — nothing downstream of
+    // the launch path reads it once a run starts (`WI-R2`). Rendered as a hint
+    // rather than dropped, per D-6's recommendation.
+    let _ = writeln!(
+        out,
+        "This server's configured concurrency guideline (`[workflow] max_parallel_nodes`) is **{}**: how many teammates to keep in flight at once as a starting point, not a hard cap karvex enforces — there is no engine watching your team's size.",
+        input.max_parallel_nodes,
+    );
+    out.push('\n');
 }
 
 fn render_finish(out: &mut String, input: &LeadPromptInput<'_>) {
@@ -328,6 +469,34 @@ fn render_finish(out: &mut String, input: &LeadPromptInput<'_>) {
     out.push_str(
         "Add a final task to the list for this (subject `finish: write the run summary \
          and report`), blocked by every other task, so it cannot be forgotten.\n\n",
+    );
+}
+
+/// P14 (b): the lead was never told karvex might message it, so a rung-3
+/// escalation about a stuck teammate — or a direct nudge/re-prompt about the
+/// lead's own pane — used to arrive as an unexplained interruption. Sourced
+/// from `workflow::watchdog`'s actual behaviour (P4, binding on this
+/// packet), not re-described from memory: the ladder order, what each rung
+/// can and cannot do, the lead's own shortened ladder (nudge, re-prompt,
+/// silent surface — no rung 3, escalating a lead to itself is a message to
+/// nobody), and the frame constant itself are all read from there so this
+/// paragraph cannot drift out of sync with the sentences karvex actually
+/// sends.
+fn render_watchdog(out: &mut String) {
+    out.push_str("## If karvex messages you\n\n");
+    out.push_str(
+        "Karvex watches this run passively: your team's shared task list, and what each teammate's pane is actually doing, on its own poll cadence. It never claims, retries, or restarts anything itself — but if a task stays `in_progress` while its owner's pane looks idle for a while, karvex escalates in steps: first it nudges that teammate directly, then it re-prompts them naming the exact disagreement between the task status and the pane, and only if neither lands does it tell **you** instead — with what it measured and the two things only you can do about it: reassign the task, or respawn the teammate. Karvex itself cannot restart, reassign, or respawn anyone; that is why it asks you.\n\n",
+    );
+    out.push_str(
+        "Karvex may nudge or re-prompt *you*, the lead, the same way if your own pane looks stuck — for example, if you have gone quiet without writing the summary and calling `kvx workflow run finish`. There is nobody above you to escalate to, so if you stay unresponsive after that karvex stops sending messages and simply marks the run as needing attention instead.\n\n",
+    );
+    let _ = writeln!(
+        out,
+        "A task or run that badly overruns its authored time budget can also be marked that way directly, skipping the nudges — see \"Time budget\" on the tasks that have one, above.\n",
+    );
+    let _ = writeln!(
+        out,
+        "Every message karvex sends this way opens with the line `{WATCHDOG_FRAME}`. It comes from the karvex runtime around this session, not from your human operator, and it is not a request you reply to — read it and act in your own session, the same way you would act on your own judgment.\n",
     );
 }
 
@@ -389,6 +558,34 @@ fn suggested_teammates(planned: &[&KvdagNode], kvdag: &Kvdag) -> usize {
         .min(planned.len().max(1))
 }
 
+/// A fenced ```json``` block, used for both a node's `output_schema` and a
+/// restored seed's `payload`.
+fn push_json_block(out: &mut String, value: &serde_json::Value) {
+    out.push_str("```json\n");
+    out.push_str(&serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+    out.push_str("\n```\n\n");
+}
+
+/// `900_000` → `"15m"`. Coarse on purpose: the lead needs an order of
+/// magnitude, not a stopwatch.
+fn human_duration(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let rest_minutes = minutes % 60;
+    if rest_minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h{rest_minutes}m")
+    }
+}
+
 fn quoted(value: &str) -> String {
     if value.contains('\n') {
         format!("\n\n```\n{}\n```\n", value.trim_end())
@@ -445,7 +642,7 @@ mod tests {
     use super::*;
     use crate::workflow::model::{
         ArgSpec, EdgeKind, EdgePayload, GrowthLimits, Isolation, KvdagEdge, KvdagSpec,
-        KvdagVersionId, NodeKind, OutputSchema, Runner, WorkflowId,
+        KvdagVersionId, NodeKind, OutputSchema, RestoredRef, Runner, WorkflowId,
     };
 
     fn schema() -> OutputSchema {
@@ -553,6 +750,8 @@ mod tests {
             history: &history,
             summary_path: "/runs/abc123/summary.md",
             prior_runs_path: None,
+            max_parallel_nodes: 4,
+            restore: None,
         })
     }
 
@@ -565,7 +764,7 @@ mod tests {
         assert!(text.contains("- Tier: `high`"));
         assert!(text.contains(&format!("- Lead prompt contract: `v{LEAD_PROMPT_VERSION}`")));
         assert_eq!(
-            LEAD_PROMPT_VERSION, 2,
+            LEAD_PROMPT_VERSION, 3,
             "bump the contract when the render changes"
         );
     }
@@ -655,6 +854,8 @@ mod tests {
             history: &history,
             summary_path: "/runs/abc123/summary.md",
             prior_runs_path: Some("/runs/abc123/context/prior-runs.md"),
+            max_parallel_nodes: 4,
+            restore: None,
         });
         assert!(text.contains("## What past runs of this workflow found"));
         assert!(text.contains("`/runs/abc123/context/prior-runs.md`"));
@@ -697,6 +898,8 @@ mod tests {
             history: &history,
             summary_path: "/runs/abc123/summary.md",
             prior_runs_path: None,
+            max_parallel_nodes: 4,
+            restore: None,
         });
         assert!(text.contains("This run was started with no arguments."));
         // The unfilled arg slot stays visible in the description.
@@ -747,6 +950,8 @@ mod tests {
             history: &history,
             summary_path: "/runs/abc123/summary.md",
             prior_runs_path: None,
+            max_parallel_nodes: 4,
+            restore: None,
         });
         assert!(!text.contains("shard: One shard"));
         assert!(text.contains("This plan has 3 tasks"));
@@ -790,5 +995,200 @@ mod tests {
             subject_node_key("build: something entirely different", &keys),
             Some(NodeKey::new("build")),
         );
+    }
+
+    #[test]
+    fn a_node_with_no_authored_output_schema_renders_no_result_shape_paragraph() {
+        // `definition.rs`'s `apply_authoring_defaults` backfills an omitted
+        // `output_schema` to the empty, accept-anything `{}` — the same shape
+        // as v2's silent no-op. P14 must add nothing for it.
+        let mut kvdag = fixture();
+        for node in &mut kvdag.nodes {
+            node.output_schema = OutputSchema::parse(serde_json::json!({})).unwrap();
+        }
+        let args = args();
+        let history = HistoryIndex::new();
+        let run = RunId::new("workflow_run:abc123");
+        let text = render_lead_prompt(&LeadPromptInput {
+            run_id: &run,
+            workflow_name: "parser-work",
+            kvdag: &kvdag,
+            tier: Tier::High,
+            args: &args,
+            history: &history,
+            summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: None,
+            max_parallel_nodes: 4,
+            restore: None,
+        });
+        assert!(!text.contains("Result shape:"));
+    }
+
+    #[test]
+    fn a_node_with_an_authored_output_schema_renders_it_as_a_result_shape() {
+        // The default `fixture()` nodes already carry `schema()` — a
+        // non-trivial `{"type": "object", "required": ["report"]}` — so this
+        // is exactly what an authored, unread `output_schema` looks like
+        // before this packet (D-6's third silent no-op).
+        let text = render(Tier::High);
+        assert!(text.contains("- Result shape: this task's result should match"));
+        assert!(text.contains("karvex does not validate it any more"));
+        assert!(text.contains("```json"));
+        assert!(text.contains("\"required\""));
+        assert!(text.contains("\"report\""));
+    }
+
+    #[test]
+    fn a_node_with_a_time_budget_renders_it_and_the_watchdog_consequence() {
+        let mut kvdag = fixture();
+        kvdag.nodes[0].timeout_ms = Some(15 * 60_000);
+        let args = args();
+        let history = HistoryIndex::new();
+        let run = RunId::new("workflow_run:abc123");
+        let text = render_lead_prompt(&LeadPromptInput {
+            run_id: &run,
+            workflow_name: "parser-work",
+            kvdag: &kvdag,
+            tier: Tier::High,
+            args: &args,
+            history: &history,
+            summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: None,
+            max_parallel_nodes: 4,
+            restore: None,
+        });
+        assert!(text.contains("- Time budget: about 15m."));
+        assert!(text.contains("skips its usual nudge-then-reprompt"));
+    }
+
+    #[test]
+    fn a_node_with_no_time_budget_renders_no_time_budget_line() {
+        let text = render(Tier::High);
+        assert!(!text.contains("Time budget:"));
+    }
+
+    #[test]
+    fn max_parallel_nodes_is_rendered_as_a_concurrency_hint() {
+        let kvdag = fixture();
+        let args = args();
+        let history = HistoryIndex::new();
+        let run = RunId::new("workflow_run:abc123");
+        let text = render_lead_prompt(&LeadPromptInput {
+            run_id: &run,
+            workflow_name: "parser-work",
+            kvdag: &kvdag,
+            tier: Tier::High,
+            args: &args,
+            history: &history,
+            summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: None,
+            max_parallel_nodes: 9,
+            restore: None,
+        });
+        assert!(text.contains("max_parallel_nodes"));
+        assert!(text.contains("**9**"));
+        assert!(text.contains("not a hard cap karvex enforces"));
+    }
+
+    #[test]
+    fn the_watchdog_paragraph_explains_the_ladder_and_uses_the_shared_frame() {
+        let text = render(Tier::High);
+        assert!(text.contains("## If karvex messages you"));
+        // The frame is the shared constant `watchdog::WATCHDOG_FRAME`, not a
+        // re-typed literal, so this and the sentences karvex actually sends
+        // cannot drift apart (`phase4-retarget-plan.md` P14's requirement
+        // that this prompt "must not contradict" P4's watchdog wording).
+        assert!(text.contains(&format!("`{WATCHDOG_FRAME}`")));
+        assert_eq!(WATCHDOG_FRAME, "[karvex \u{b7} watchdog]");
+        assert!(text.contains("cannot restart, reassign, or respawn anyone"));
+        assert!(text.contains("nobody above you to escalate to"));
+        assert!(text.contains("not from your human operator"));
+    }
+
+    #[test]
+    fn restore_is_absent_when_the_run_did_not_ask_for_one() {
+        let text = render(Tier::High);
+        assert!(!text.contains("Restored from a previous run"));
+        assert!(!text.contains("--restore-from"));
+    }
+
+    #[test]
+    fn restore_renders_the_carried_forward_seeds() {
+        let kvdag = fixture();
+        let args = args();
+        let history = HistoryIndex::new();
+        let run = RunId::new("workflow_run:abc123");
+        let source = RunId::new("workflow_run:source1");
+        let seeds = vec![RestoredSeed {
+            node_key: NodeKey::new("research"),
+            payload: serde_json::json!({"findings": "already surveyed"}),
+            summary: "Surveyed three approaches; picked the second.".to_string(),
+            artifact_paths: vec!["/runs/source1/research/notes.md".to_string()],
+            digest: "sha256:deadbeef".to_string(),
+            source: RestoredRef {
+                run: source.clone(),
+                node_key: NodeKey::new("research"),
+                checkpoint_seq: 2,
+            },
+        }];
+        let restore = RestoreContext {
+            source_run: &source,
+            seeds: &seeds,
+            skipped: 1,
+        };
+        let text = render_lead_prompt(&LeadPromptInput {
+            run_id: &run,
+            workflow_name: "parser-work",
+            kvdag: &kvdag,
+            tier: Tier::High,
+            args: &args,
+            history: &history,
+            summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: None,
+            max_parallel_nodes: 4,
+            restore: Some(restore),
+        });
+        assert!(text.contains("## Restored from a previous run"));
+        assert!(text.contains("--restore-from workflow_run:source1"));
+        assert!(
+            text.contains("### `research` — restored from `workflow_run:source1` (checkpoint 2)")
+        );
+        assert!(text.contains("Surveyed three approaches; picked the second."));
+        assert!(text.contains("\"already surveyed\""));
+        assert!(text.contains("/runs/source1/research/notes.md"));
+        assert!(text.contains("1 requested selector could not be restored"));
+        assert!(text.contains("carry it forward instead of redoing the work"));
+    }
+
+    #[test]
+    fn restore_says_so_honestly_when_nothing_was_restorable() {
+        let kvdag = fixture();
+        let args = args();
+        let history = HistoryIndex::new();
+        let run = RunId::new("workflow_run:abc123");
+        let source = RunId::new("workflow_run:source1");
+        let seeds: Vec<RestoredSeed> = Vec::new();
+        let restore = RestoreContext {
+            source_run: &source,
+            seeds: &seeds,
+            skipped: 3,
+        };
+        let text = render_lead_prompt(&LeadPromptInput {
+            run_id: &run,
+            workflow_name: "parser-work",
+            kvdag: &kvdag,
+            tier: Tier::High,
+            args: &args,
+            history: &history,
+            summary_path: "/runs/abc123/summary.md",
+            prior_runs_path: None,
+            max_parallel_nodes: 4,
+            restore: Some(restore),
+        });
+        assert!(text.contains("## Restored from a previous run"));
+        assert!(text.contains("none of the requested selectors could be restored"));
+        assert!(text.contains("planned fresh, the same as any other run"));
+        // Honest, not misleading: no per-node restore blocks were rendered.
+        assert!(!text.contains("### `research` — restored from"));
     }
 }
