@@ -521,6 +521,14 @@ impl App {
         if let Err(error) = definition.validate_graph() {
             return encode_error(id, INVALID_DEFINITION_CODE, error.to_string());
         }
+        // D-6: `isolation = "worktree"` has no lead-path implementation —
+        // nothing binds a node's pane to a worktree any more, so accepting it
+        // would author a promise the run can never keep. Rejected here, at
+        // authoring time, before either write, for the same "no orphaned
+        // write" reason `validate_graph` is hoisted in front of them.
+        if let Err(message) = reject_worktree_isolation(&definition) {
+            return encode_error(id, INVALID_DEFINITION_CODE, message);
+        }
 
         let name = definition.name.trim().to_string();
         // H5: this path holds the authored document, so the `workflow` row's
@@ -601,6 +609,14 @@ impl App {
             Ok(definition) => definition,
             Err(error) => return encode_error(id, INVALID_DEFINITION_CODE, error.to_string()),
         };
+        // D-6: same authoring-time rejection as `workflow.create` — see its
+        // comment. A new version is a single write, so there is no "orphaned
+        // workflow row" risk to hoist this in front of, but the document
+        // still must not reach the store with a promise the lead path cannot
+        // keep.
+        if let Err(message) = reject_worktree_isolation(&definition) {
+            return encode_error(id, INVALID_DEFINITION_CODE, message);
+        }
         let selector = params.workflow_id.trim().to_string();
         let change_summary = params.change_summary.clone();
         // H5, caller side. `kvdag_version` carries neither `description` nor
@@ -911,8 +927,20 @@ impl App {
         // engine's materialisation is deliberately not built: `create_run`
         // already wrote the planned `run_node` rows, and the projection
         // (§3.4) is what moves them.
-        let _ = (&assignments, &seeds, &context_runs, &restore_from_run);
         let _ = workspace_id;
+        // WI-R1 (`phase4-retarget-plan.md` amendment log, "Orchestrator
+        // findings"): `--restore-from` used to resolve `seeds` here and then
+        // discard them — `kvx workflow run --restore-from ...` and the run
+        // browser's `r` verb silently started an ordinary fresh run while
+        // still looking like a restore, because prior-run *summaries* still
+        // reached the lead via `context/prior-runs.md` regardless. Honoured,
+        // not refused: karvex owns the render contract, so the resolved
+        // selection is handed to the lead below instead of thrown away.
+        // Counted here, before `restore` is consumed by the response below.
+        let restore_skipped = restore
+            .as_ref()
+            .map(|plan| plan.report.skipped.len())
+            .unwrap_or(0);
 
         let ws_idx = match self.state.active.filter(|ws_idx| {
             self.state
@@ -952,6 +980,13 @@ impl App {
         let summary_path = spec.summary_path().to_string_lossy().into_owned();
         let ordered_args: std::collections::BTreeMap<String, String> =
             args.clone().into_iter().collect();
+        let restore_context = restore_from_run.as_ref().map(|source_run| {
+            crate::workflow::lead_prompt::RestoreContext {
+                source_run,
+                seeds: &seeds,
+                skipped: restore_skipped,
+            }
+        });
         let prompt = crate::workflow::lead_prompt::render_lead_prompt(
             &crate::workflow::lead_prompt::LeadPromptInput {
                 run_id: &run_id,
@@ -965,6 +1000,11 @@ impl App {
                 // not anything reads it, so naming it here is what makes the
                 // parameter mean something to a lead.
                 prior_runs_path: prior_runs_path.as_deref(),
+                // D-6: a concurrency hint, not a cap karvex enforces — there
+                // is no engine left to enforce it against.
+                max_parallel_nodes: self.workflow_policy.max_parallel_nodes,
+                // WI-R1: what `--restore-from` resolved, if anything.
+                restore: restore_context,
             },
         );
         if let Err(error) = self.write_lead_run_files(&spec, &prompt) {
@@ -2131,6 +2171,27 @@ fn parse_definition(
     }
 }
 
+/// D-6: `isolation = "worktree"` used to parse cleanly and then be a silent
+/// no-op — nothing in the lead path binds a node's pane to a worktree, so
+/// authoring it promised isolation the run could never deliver. Both
+/// authoring entry points (`workflow.create`, `workflow.version.create`)
+/// call this before their first write; `isolation = "none"` (the default)
+/// is unaffected.
+#[cfg(feature = "workflow")]
+fn reject_worktree_isolation(definition: &Definition) -> Result<(), String> {
+    if let Some(node) = definition
+        .node
+        .iter()
+        .find(|node| node.isolation == Isolation::Worktree)
+    {
+        return Err(format!(
+            "node {} sets isolation = \"worktree\", which the lead path cannot honour —              no run pane is bound to a worktree, so karvex would accept a promise it              cannot keep; use isolation = \"none\" (the default) or drop the field",
+            node.key
+        ));
+    }
+    Ok(())
+}
+
 /// `05-phase-plan.md` §4: `workflow.run` rejects a run that omits a required
 /// arg with no default. Declared args with a default are filled in here, so the
 /// prompt renderer never has to distinguish "absent" from "defaulted".
@@ -3092,6 +3153,100 @@ output_schema = { type = "object" }
         );
         // Not "either code": the graph validators run before the first write
         // now, so which of the two reported it is no longer a coin toss.
+        assert_eq!(error_code(&response), INVALID_DEFINITION_CODE, "{response}");
+    }
+
+    /// D-6: `isolation = "worktree"` has no lead-path implementation, so
+    /// authoring it must never reach the store — accepting it would promise
+    /// isolation the run can never deliver. Refused before the first write,
+    /// same as an invalid graph, and the name stays usable afterwards.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn worktree_isolation_is_rejected_at_authoring_time_on_create() {
+        let mut app = app();
+        let response = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: WorkflowDefinitionDocument {
+                    format: WorkflowDefinitionFormat::Toml,
+                    text: r#"
+name = "wants-a-worktree"
+[[node]]
+key = "only"
+label = "Only"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "do it"
+output_schema = { type = "object" }
+isolation = "worktree"
+"#
+                    .to_string(),
+                },
+            },
+        );
+        assert_eq!(error_code(&response), INVALID_DEFINITION_CODE, "{response}");
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("only"),
+            "names the offending node: {message}"
+        );
+        assert!(message.contains("worktree"), "{message}");
+
+        // The name is still usable: the rejection left no orphan row.
+        let retried = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: single_node_definition("wants-a-worktree", "do it"),
+            },
+        );
+        let retried: serde_json::Value = serde_json::from_str(&retried).unwrap();
+        assert_eq!(
+            retried["result"]["type"], "workflow_created",
+            "the burned name is still usable once isolation is fixed: {retried}"
+        );
+    }
+
+    /// Same rejection, the other authoring entry point: a new version of an
+    /// existing workflow must not adopt `isolation = "worktree"` either.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn worktree_isolation_is_rejected_at_authoring_time_on_version_create() {
+        let mut app = app();
+        let created = app.handle_workflow_create(
+            "req".into(),
+            WorkflowCreateParams {
+                definition: single_node_definition("isolation-version", "do it"),
+            },
+        );
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let workflow_id = created["result"]["workflow"]["workflow_id"]
+            .as_str()
+            .expect("the workflow was created")
+            .to_string();
+
+        let response = app.handle_workflow_version_create(
+            "req".into(),
+            WorkflowVersionCreateParams {
+                workflow_id,
+                definition: WorkflowDefinitionDocument {
+                    format: WorkflowDefinitionFormat::Toml,
+                    text: r#"
+name = "isolation-version"
+[[node]]
+key = "only"
+label = "Only"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "do it"
+output_schema = { type = "object" }
+isolation = "worktree"
+"#
+                    .to_string(),
+                },
+                change_summary: String::new(),
+            },
+        );
         assert_eq!(error_code(&response), INVALID_DEFINITION_CODE, "{response}");
     }
 

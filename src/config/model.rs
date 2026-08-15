@@ -1008,8 +1008,10 @@ pub struct ExperimentalConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct WorkflowConfig {
-    /// Maximum number of run nodes executing concurrently within a single
-    /// workflow run. Default: 4.
+    /// A concurrency hint rendered into the team lead's prompt as a
+    /// starting team size (`phase4-retarget-plan.md` D-6, P14): nothing
+    /// schedules nodes any more, so this is a suggestion the lead reads,
+    /// not a cap karvex enforces. Default: 4.
     pub max_parallel_nodes: usize,
     /// Number of most recent runs kept per workflow; older runs are pruned
     /// whole. Default: 50.

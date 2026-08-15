@@ -1181,7 +1181,7 @@
           "key": "workflow.max_parallel_nodes",
           "type": "integer",
           "default": "4",
-          "description": "Maximum number of run nodes executing concurrently within a single workflow run."
+          "description": "A concurrency hint rendered into the team lead's prompt as a starting team size; nothing schedules nodes any more, so this is a suggestion the lead reads, not a cap Herdr enforces."
         },
         {
           "key": "workflow.retention_runs",

@@ -66,6 +66,11 @@ pub(crate) struct WorkflowPolicy {
     /// `workflow.history_context_runs` (§4 D21, D22): how many past run
     /// summaries a new run may be given as context.
     pub(crate) history_context_runs: usize,
+    /// `workflow.max_parallel_nodes` (D-6, WI-R2): nothing schedules nodes any
+    /// more, so this cannot be a cap the app enforces. Carried through to the
+    /// lead prompt render as a concurrency hint instead of staying a value
+    /// `config::model` parses and nothing else ever reads.
+    pub(crate) max_parallel_nodes: usize,
 }
 
 impl Default for WorkflowPolicy {
@@ -74,6 +79,7 @@ impl Default for WorkflowPolicy {
     fn default() -> Self {
         Self {
             history_context_runs: 3,
+            max_parallel_nodes: 4,
         }
     }
 }
@@ -81,6 +87,7 @@ impl Default for WorkflowPolicy {
 pub(crate) fn workflow_policy(config: &crate::config::Config) -> WorkflowPolicy {
     WorkflowPolicy {
         history_context_runs: config.workflow.history_context_runs,
+        max_parallel_nodes: config.workflow.max_parallel_nodes,
     }
 }
 
@@ -343,6 +350,7 @@ mod tests {
             workflow_policy(&config),
             WorkflowPolicy {
                 history_context_runs: config.workflow.history_context_runs,
+                max_parallel_nodes: config.workflow.max_parallel_nodes,
             }
         );
         assert_eq!(workflow_policy(&config), WorkflowPolicy::default());
