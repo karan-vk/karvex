@@ -750,10 +750,53 @@ fn a_lead_run_spawns_an_agent_teams_claude_with_no_positional_prompt_and_is_seed
             .any(|pair| pair[0] == "--teammate-mode" && pair[1] == "tmux"),
         "the lead must be launched with `--teammate-mode tmux`, got {args:?}"
     );
-    assert!(
-        args.iter().any(|arg| arg == r#"{"teammateMode":"tmux"}"#),
+    // The settings payload is a file in the run directory now, because it also
+    // carries the run's `SessionStart` identity hook — and because Claude Code
+    // forwards the *value* of `--settings` to the teammates it spawns, so the
+    // hook reaches them too.
+    let settings_path = args
+        .windows(2)
+        .find(|pair| pair[0] == "--settings")
+        .map(|pair| pair[1].clone())
+        .expect("the lead must be launched with --settings");
+    let settings: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&settings_path).expect("the settings file exists"),
+    )
+    .expect("the settings file is JSON");
+    assert_eq!(
+        settings["teammateMode"], "tmux",
         "the lead must also carry the `teammateMode` settings snapshot — the flag is \
-         hidden and experimental, so neither spelling is load-bearing alone; got {args:?}"
+         hidden and experimental, so neither spelling is load-bearing alone; got {settings}"
+    );
+    // karvex is the lead's parent, not its child, so a karvex message is an
+    // ordinary peer message whose delivery would otherwise depend on the lead's
+    // permission mode. This is upstream's documented knob for that case.
+    assert_eq!(
+        settings["crossSessionInbound"], "accept",
+        "the run must accept messages from karvex; got {settings}"
+    );
+    let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0]["command"];
+    let hook = hook.as_str().unwrap_or_default();
+    assert!(
+        hook.contains("workflow run report-session"),
+        "the run's settings must carry the SessionStart identity hook; got {settings}"
+    );
+    assert!(
+        hook.contains("workflow_run"),
+        "the identity hook must name the run it reports for, because a teammate's pane \
+         never sees the lead's environment; got {hook}"
+    );
+
+    // `--name` is what makes the lead addressable: without it Claude Code
+    // derives a name from the cwd's folder, identical for every run in a repo.
+    let name = args
+        .windows(2)
+        .find(|pair| pair[0] == "--name")
+        .map(|pair| pair[1].clone())
+        .expect("the lead must be launched with --name");
+    assert!(
+        name.starts_with("karvex-run-"),
+        "the lead's session name must be run-scoped, got {name:?}"
     );
 
     // The absence assertion. A flags-only argv is an even number of arguments

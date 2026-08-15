@@ -915,8 +915,15 @@ pub struct DagViewState {
     /// Only the nodes this frame actually drew.
     pub nodes: Vec<DagNodeView>,
     pub selected: Option<crate::workflow::model::RunNodeIdx>,
-    /// `Some` while the steer input line is open; the pending text.
+    /// `Some` while the input line is open; the pending text.
+    ///
+    /// One buffer for both verbs on purpose: `s steer` and `m message owner`
+    /// are the same interaction — a one-line composer under the graph — and the
+    /// TUI's own convention is to reuse a pattern rather than invent a second
+    /// one. [`Self::input_kind`] says which of them is composing.
     pub steer: Option<String>,
+    /// What the open input line will do when submitted.
+    pub input_kind: DagInputKind,
     /// Whether the open run was executed by a Claude Code team lead rather
     /// than by karvex's own engine (§3.1). The engine verbs — steer,
     /// interrogate, reconstruct — are meaningless for such a run, so the
@@ -942,6 +949,22 @@ pub struct DagViewState {
     // Populated by WS-H's DAG compute path, step 2f; empty allocates zero rows.
     #[allow(dead_code)]
     pub interrogation_nodes: Vec<DagInterrogationView>,
+}
+
+/// Which verb the DAG overlay's one-line composer is composing for.
+///
+/// A lead run has no engine steer — karvex does not execute its nodes — but it
+/// does have a documented channel into the session that owns each node, so the
+/// composer serves `workflow.run.message` there instead
+/// (`09-agent-teams-rework.md` §3.5a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DagInputKind {
+    /// `workflow.node.steer`: karvex's own engine typing into a node's pane.
+    #[default]
+    NodeSteer,
+    /// `workflow.run.message`: text into the Claude Code session that owns the
+    /// selected node.
+    RunMessage,
 }
 
 /// One detached interrogation box in the DAG overlay's interrogation lane.

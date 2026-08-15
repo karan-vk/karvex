@@ -21,7 +21,8 @@ use super::tabs::TabInfo;
 use super::workflows::{
     KvdagVersionDetail, KvdagVersionSummary, WorkflowDetail, WorkflowExpandRejection,
     WorkflowInterrogationInfo, WorkflowRestoreReport, WorkflowRunGraph, WorkflowRunInfo,
-    WorkflowRunNodeInfo, WorkflowRunSummaryInfo, WorkflowSummary,
+    WorkflowRunMessageReceipt, WorkflowRunNodeInfo, WorkflowRunSummaryInfo, WorkflowSessionRole,
+    WorkflowSummary,
 };
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
@@ -294,6 +295,25 @@ pub enum ResponseResult {
     WorkflowRunFinished {
         run: WorkflowRunInfo,
         summary: WorkflowRunSummaryInfo,
+    },
+    /// A run session's self-report was recorded (`09-agent-teams-rework.md`
+    /// §3.1a). `role` says what the report was taken to be; an `Ignored` report
+    /// is a successful response, because a hook that fires for somebody else's
+    /// session is normal traffic rather than an error.
+    WorkflowRunSessionReported {
+        run_id: String,
+        role: WorkflowSessionRole,
+        /// The team the reporting lead's session id names, so a caller can see
+        /// the derivation karvex applied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        team_name: Option<String>,
+        /// Whether the session reported a usable inbox socket.
+        addressable: bool,
+    },
+    /// A message was written into a run session's inbox
+    /// (`09-agent-teams-rework.md` §3.5a).
+    WorkflowRunMessaged {
+        receipt: WorkflowRunMessageReceipt,
     },
     WorkflowNodeGet {
         node: WorkflowRunNodeInfo,

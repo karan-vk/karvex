@@ -304,6 +304,10 @@ impl App {
             }
             KeyCode::Enter => self.focus_workflow_dag_node(),
             KeyCode::Char('s') => self.open_workflow_dag_steer(),
+            // §3.5's deferred `m message` verb, un-deferred by §3.1a: the run's
+            // sessions now identify themselves, so karvex can address the one
+            // that owns this node instead of guessing at a channel.
+            KeyCode::Char('m') => self.open_workflow_dag_message(),
             // `i` resumes the source session; `Shift+I` reconstructs one from
             // the stored checkpoint. Two keys, not one key twice: escalation
             // into a session that is *not* the original teammate is always an
@@ -363,6 +367,7 @@ impl App {
         if self.refuse_engine_verb_on_a_lead_run("steer") {
             return;
         }
+        self.state.view.dag.input_kind = crate::app::state::DagInputKind::NodeSteer;
         // A past run is not the active run, so the server would answer the
         // not-the-active-run guard (`workflow_run_not_active`) — *not*
         // `workflow_run_closed`, which covers only the just-finished run that
@@ -398,7 +403,98 @@ impl App {
         self.state.view.dag.steer = Some(String::new());
     }
 
+    /// Opens the composer for `m`: a message to the Claude Code session that
+    /// owns the selected node (`09-agent-teams-rework.md` §3.5a).
+    ///
+    /// Only for a lead run. karvex's own engine no longer executes anything, so
+    /// on an engine-era run there is no Claude Code session to address and the
+    /// key does nothing rather than opening a line that could only be refused.
+    fn open_workflow_dag_message(&mut self) {
+        if !self.state.view.dag.lead_run || self.state.view.dag.run_id.is_empty() {
+            return;
+        }
+        if self.state.view.dag.historical {
+            self.show_workflow_notice(crate::workflow::model::UserNotice {
+                level: crate::workflow::model::NoticeLevel::Warning,
+                run: None,
+                path: None,
+                message: "a past run's Claude Code sessions have exited, so there is nothing \
+                          left to message"
+                    .to_string(),
+            });
+            return;
+        }
+        if self.state.view.dag.selected_node().is_none() {
+            return;
+        }
+        self.state.view.dag.input_kind = crate::app::state::DagInputKind::RunMessage;
+        self.state.view.dag.steer = Some(String::new());
+    }
+
+    /// Sends the composed text to the session that owns the selected node.
+    ///
+    /// An unclaimed node has no owner, so the message goes to the lead — which
+    /// is the right answer rather than a fallback: the lead is who would assign
+    /// that task anyway.
+    fn submit_workflow_dag_message(&mut self) {
+        let Some(text) = self.state.view.dag.steer.take() else {
+            return;
+        };
+        let text = text.trim().to_string();
+        let run_id = self.state.view.dag.run_id.clone();
+        let Some(node) = self.state.view.dag.selected_node() else {
+            return;
+        };
+        let path = node.path.clone();
+        let target = if node.owner.trim().is_empty() {
+            crate::workflow::binding::lead::LEAD_TARGET_NAME.to_string()
+        } else {
+            node.owner.clone()
+        };
+        if text.is_empty() || run_id.is_empty() {
+            return;
+        }
+        let response = self.dispatch_runtime_mutation(
+            "tui.workflow.run.message",
+            crate::api::schema::Method::WorkflowRunMessage(
+                crate::api::schema::WorkflowRunMessageParams {
+                    run_id,
+                    target: target.clone(),
+                    text,
+                    priority: None,
+                },
+            ),
+        );
+        // The same discipline the steer path uses, for the same reason: a write
+        // action that can fail must never fail in silence.
+        let notice = match serde_json::from_str::<crate::api::schema::ErrorResponse>(&response) {
+            Ok(error) => Some((
+                crate::workflow::model::NoticeLevel::Error,
+                format!("message not sent: {}", error.error.message),
+            )),
+            Err(_) => Some((
+                crate::workflow::model::NoticeLevel::Info,
+                format!("message handed to {target}"),
+            )),
+        };
+        if let Some((level, message)) = notice {
+            self.show_workflow_notice(crate::workflow::model::UserNotice {
+                level,
+                run: None,
+                path: Some(crate::workflow::model::InstancePath::new(path)),
+                message,
+            });
+        }
+    }
+
     fn submit_workflow_dag_steer(&mut self) {
+        if matches!(
+            self.state.view.dag.input_kind,
+            crate::app::state::DagInputKind::RunMessage
+        ) {
+            self.submit_workflow_dag_message();
+            return;
+        }
         let Some(text) = self.state.view.dag.steer.take() else {
             return;
         };
@@ -543,7 +639,8 @@ impl App {
             run: None,
             path,
             message: format!(
-                "{verb} does not apply to a team run — press enter to focus the node's pane and type there"
+                "{verb} does not apply to a team run — press enter to focus the node's pane and \
+                 type there, or m to message the session that owns it"
             ),
         });
         true

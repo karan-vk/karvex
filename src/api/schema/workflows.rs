@@ -249,6 +249,136 @@ pub struct WorkflowRunFinishParams {
     pub outcome: Option<String>,
 }
 
+/// One of a run's Claude Code sessions identifying itself
+/// (`09-agent-teams-rework.md` §3.1a).
+///
+/// Posted by the `SessionStart` hook karvex puts in the run's `--settings`, so
+/// the run's team is an assertion from the session rather than something karvex
+/// infers from file timestamps. Authorised the same way
+/// [`WorkflowRunFinishParams`] is — possession of the run id, which karvex bakes
+/// into the hook command — and checked against the pane id karvex itself put in
+/// the pane's environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunReportSessionParams {
+    pub run_id: String,
+    /// The Claude Code session id, from the hook payload.
+    pub session_id: String,
+    /// `KARVEX_PANE_ID`. The lead's pane binds the run; any other pane of this
+    /// run is a split-pane teammate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Claude Code's own word for why the session started: `startup`, `resume`,
+    /// `clear`, …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// `CLAUDE_CODE_MESSAGING_SOCKET`, the session's inbox. Absent when the
+    /// messaging feature flag had not resolved by the time the hook ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messaging_socket: Option<String>,
+    /// `CLAUDE_CODE_MESSAGING_TOKEN`, the session's own child token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messaging_token: Option<String>,
+    /// Set when the hook ran for an in-process subagent rather than for the
+    /// session itself, which is never an identity assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+/// What a session's self-report was taken to mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowSessionRole {
+    /// The run's team lead. Binds the run.
+    Lead,
+    /// Another session of the same run, in one of its panes.
+    Member,
+    /// Not this run's, or not a session.
+    Ignored,
+}
+
+/// Sending text into one of a live run's Claude Code sessions
+/// (`09-agent-teams-rework.md` §3.5a).
+///
+/// A runtime capability, not a UI feature: the target is named by the same
+/// roster `workflow.run.get` publishes, and the transport is Claude Code's own
+/// documented per-session inbox socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunMessageParams {
+    pub run_id: String,
+    /// The session to reach, by team-roster name. `team-lead` is the run's lead.
+    pub target: String,
+    pub text: String,
+    /// `now`, `next` (the default), or `later` — Claude Code's own queue
+    /// vocabulary for when the receiving session reads the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+/// What karvex knows after handing a message to a session's inbox.
+///
+/// Deliberately not "delivered": the receiving session's inbound controls
+/// decide between delivered, held, and refused *after* the write, and that
+/// verdict travels back only to another Claude Code session's reply address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunMessageReceipt {
+    pub run_id: String,
+    pub target: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    /// `inbox_socket` for Claude Code's own peer channel, `pane_input` when
+    /// karvex typed it into the session's pane instead. Not equivalent: an
+    /// inbox message arrives labelled as another session's and is subject to
+    /// the receiver's inbound controls, while pane input is indistinguishable
+    /// from the user typing. Pane input is the fallback for a session whose
+    /// messaging token karvex does not hold — including every session of a run
+    /// that outlived a karvex restart, because a teammate's token exists
+    /// nowhere but that teammate's own hook environment.
+    pub channel: String,
+}
+
+/// Whether this run's sessions can be messaged at all, and who is reachable.
+///
+/// Reported rather than assumed, because upstream is explicit that a kill
+/// switch leaves cross-session messaging off with no visible difference in the
+/// session — so a client that showed a message affordance regardless would be
+/// offering a verb that silently does nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunMessagingInfo {
+    pub supported: bool,
+    /// A stable word for why not: `claude_too_old`, `unsupported_platform`,
+    /// `kill_switch`. Absent when messaging is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The same reason as a sentence, for a client that has nowhere to put a
+    /// code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<WorkflowRunMessageTargetInfo>,
+}
+
+/// One session of a live run that karvex can address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowRunMessageTargetInfo {
+    /// The team-roster name, which is what `workflow.run.message` takes.
+    pub name: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    /// Whether the session reported an inbox socket, and therefore whether a
+    /// message to it travels over Claude Code's own peer channel. A session can
+    /// identify itself without one — the messaging feature flag had not
+    /// resolved when its hook ran — and is then reached by pane input instead.
+    pub addressable: bool,
+    /// Which channel a message to this target would use today: `inbox_socket`
+    /// or `pane_input`.
+    #[serde(default)]
+    pub channel: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowRunListParams {
     /// `None` lists runs across every workflow, newest first
@@ -696,6 +826,12 @@ pub struct WorkflowRunGraph {
     /// that predates the agent-teams rework.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<WorkflowRunMemberInfo>,
+    /// Whether the run's sessions can be messaged, and which of them have
+    /// identified themselves. Present only for the run that is live on this
+    /// server: a messaging socket belongs to a running process, so a stored run
+    /// has nothing to report here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messaging: Option<WorkflowRunMessagingInfo>,
 }
 
 // ── run history, summaries, interrogation, restore ─────────────────────────
@@ -1211,6 +1347,7 @@ pub(crate) mod tests {
                 first_seen_at_unix_ms: 1,
                 last_seen_at_unix_ms: 2,
             }],
+            messaging: None,
         };
 
         let response = SuccessResponse {

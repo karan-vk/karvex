@@ -174,12 +174,13 @@ pub(super) fn compute_workflow_dag_view(app: &AppState, area: Rect) -> DagViewSt
         }
     }
     view.selected = carried_selection(previous, &view);
-    // The steer line only survives while it still has a node to steer.
+    // The composer only survives while it still has a node to act on.
     view.steer = if view.selected.is_some() {
         previous.steer.clone()
     } else {
         None
     };
+    view.input_kind = previous.input_kind;
     view.last_click = previous.last_click;
     view
 }
@@ -1409,14 +1410,23 @@ const STEER_HINT: usize = 2;
 /// resumed by it, and there is no checkpoint to reconstruct from because the
 /// engine never wrote one. Steering a lead run is opening the pane that owns
 /// the node and typing in it, which is what `enter` now does.
-const LEAD_FOOTER_HINTS: [(&str, &str); 3] = [
+///
+/// `m message owner` is the one verb that came back. It was deferred in §3.5
+/// because the session-identity plumbing it needs did not exist and "a verb
+/// that silently no-ops is worse than no verb"; §3.1a's `SessionStart` identity
+/// hook is that plumbing, so the verb now addresses a session karvex knows by
+/// name and reports a refusal when it cannot.
+const LEAD_FOOTER_HINTS: [(&str, &str); 4] = [
     ("enter", " focus pane"),
+    ("m", " message owner"),
     ("hjkl/↑↓←→", " move"),
     ("esc", " close"),
 ];
 
 /// Index of the `enter focus pane` hint in [`LEAD_FOOTER_HINTS`].
 const LEAD_FOCUS_HINT: usize = 0;
+/// Index of the `m message owner` hint in [`LEAD_FOOTER_HINTS`].
+const LEAD_MESSAGE_HINT: usize = 1;
 
 /// Which hints fit in `width`, in display order.
 ///
@@ -1439,10 +1449,14 @@ fn footer_hints(
         /// Indices into [`LEAD_FOOTER_HINTS`], least useful first. `esc close`
         /// is last for the same reason it is last in the engine-era order: it
         /// is the only way out of a full-bleed overlay.
-        const DROP_ORDER: [usize; 3] = [1, 0, 2];
+        const DROP_ORDER: [usize; 4] = [2, 1, 0, 3];
 
         let mut keep = [true; LEAD_FOOTER_HINTS.len()];
         keep[LEAD_FOCUS_HINT] = focusable;
+        // A past run's sessions are gone, so `m` there could only ever refuse —
+        // and an offered key that can only refuse is the lie this whole gate
+        // exists to avoid. `steerable` is already "this is the live run".
+        keep[LEAD_MESSAGE_HINT] = steerable;
         return fit_hints(&LEAD_FOOTER_HINTS, &DROP_ORDER, &mut keep, width);
     }
 
@@ -1513,13 +1527,19 @@ fn render_footer(dag: &DagViewState, p: &Palette, frame: &mut Frame) {
 
     let line = if let Some(text) = &dag.steer {
         // The caret is what tells the user the line is live, so the text
-        // yields to it rather than the other way round.
-        let prefix = " steer › ";
+        // yields to it rather than the other way round. The label names the
+        // verb, because the two the composer serves are not interchangeable:
+        // one types into a node's pane, the other addresses the Claude Code
+        // session that owns it.
+        let label = match dag.input_kind {
+            crate::app::state::DagInputKind::NodeSteer => "steer",
+            crate::app::state::DagInputKind::RunMessage => "message",
+        };
         let budget = width
-            .saturating_sub(display_width(prefix))
+            .saturating_sub(display_width(label) + 4)
             .saturating_sub(1);
         Line::from(vec![
-            Span::styled(" steer", key),
+            Span::styled(format!(" {label}"), key),
             Span::styled(" › ", dim),
             Span::styled(truncate_end(text, budget), Style::default().fg(p.text)),
             Span::styled("▏", Style::default().fg(p.accent)),

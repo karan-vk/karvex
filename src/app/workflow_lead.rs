@@ -18,9 +18,12 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::api::schema::{EventData, EventEnvelope, EventKind};
-use crate::workflow::binding::lead::{
-    self, LeadBinding, LeadSpawnError, LeadSpawnSpec, MatchStrength,
+use crate::workflow::binding::identity::{
+    self, BindDecision, BindEvidence, BindInputs, IgnoredReason, ReportVerdict, RunExpectation,
+    SessionEndpoint, SessionReport,
 };
+use crate::workflow::binding::lead::{self, LeadBinding, LeadSpawnError, LeadSpawnSpec};
+use crate::workflow::binding::messaging::{self, MessagingSupport};
 use crate::workflow::binding::spawn;
 use crate::workflow::model::{Kvdag, NodeKey, NodeStatus, RunId, RunStatus, StoreWrite};
 use crate::workflow::projection::{
@@ -62,6 +65,28 @@ pub(crate) struct LiveLeadRun {
     pub(crate) spawned_at_unix_ms: u64,
     /// The team, once recognised. `None` while the lead is still starting.
     pub(crate) binding: Option<LeadBinding>,
+    /// How the team was recognised: the lead's own assertion, or one of the two
+    /// fallback inferences. Recorded so a log line and the API can say which,
+    /// and so a run bound by guesswork is visibly distinguishable from one bound
+    /// by identity.
+    pub(crate) bind_evidence: Option<BindEvidence>,
+    /// The lead's own `SessionStart` self-report, once its hook has fired.
+    /// Carries the messaging endpoint karvex steers the lead through.
+    pub(crate) lead_endpoint: Option<SessionEndpoint>,
+    /// Every other session of this run that has identified itself, by the
+    /// karvex pane it runs in. Split-pane teammates inherit the lead's
+    /// `--settings` and therefore the same hook, so they report themselves the
+    /// same way; the pane id is what joins them to the team config's
+    /// `tmuxPaneId` entries, which is where their *names* come from.
+    ///
+    /// Deliberately in memory rather than in the store: a messaging socket is
+    /// bound by a live process and unlinked when it exits, so a persisted one
+    /// would be a durable record of something that stopped being true.
+    pub(crate) member_endpoints: std::collections::BTreeMap<String, SessionEndpoint>,
+    /// Whether this machine can message the run's sessions at all, and why not
+    /// when it cannot. Resolved once at launch from the version, the platform,
+    /// and the documented kill switches.
+    pub(crate) messaging: MessagingSupport,
     /// Whether a teammate has ever been observed on a tmux backend. Latched:
     /// a teammate that finishes and goes inactive does not un-prove that
     /// split-pane mode took.
@@ -155,8 +180,54 @@ impl crate::app::App {
         }
     }
 
-    /// Writes the run directory and the rendered lead prompt (§3.1 step 2).
-    pub(crate) fn write_lead_prompt(
+    /// The messaging preflight.
+    ///
+    /// Not fatal: a run whose sessions cannot be messaged still runs, and the
+    /// user still steers it by clicking its pane. What this prevents is the
+    /// silent case — upstream is explicit that a kill switch leaves messaging
+    /// off with no visible difference — so the answer is recorded on the run and
+    /// reported to clients instead of a message verb quietly doing nothing.
+    pub(crate) fn preflight_messaging_for_lead(&self) -> MessagingSupport {
+        let executable = crate::detect::interactive_agent_executable(crate::detect::Agent::Claude);
+        let version = std::process::Command::new(executable)
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|output| {
+                lead::parse_claude_version(String::from_utf8_lossy(&output.stdout).trim())
+            });
+        let Some(version) = version else {
+            // `preflight_claude_for_lead` already refused a `claude` whose
+            // version cannot be read, so reaching here means the second read
+            // failed transiently. Reporting "too old" would be a lie; the
+            // launch has already been allowed, so report the honest floor.
+            return MessagingSupport::ClaudeTooOld {
+                found: "unknown".to_string(),
+                required: "2.1.224".to_string(),
+            };
+        };
+        // The pane inherits this process's environment, so this is exactly the
+        // environment the lead's `claude` will see.
+        let env: Vec<(String, String)> = messaging::MESSAGING_KILL_SWITCH_VARS
+            .iter()
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| ((*name).to_string(), value))
+            })
+            .collect();
+        messaging::classify_support(
+            version,
+            messaging::MessagingPlatform::current(),
+            env.iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+    }
+
+    /// Writes the run directory, the rendered lead prompt, and the run-scoped
+    /// Claude Code settings the lead and its teammates launch with
+    /// (§3.1 step 2, §3.1a).
+    pub(crate) fn write_lead_run_files(
         &self,
         spec: &LeadSpawnSpec,
         prompt: &str,
@@ -164,7 +235,15 @@ impl crate::app::App {
         std::fs::create_dir_all(&spec.run_dir)
             .map_err(|error| LeadSpawnError::RunDirUnwritable(error.to_string()))?;
         std::fs::write(spec.prompt_path(), prompt)
-            .map_err(|error| LeadSpawnError::RunDirUnwritable(error.to_string()))
+            .map_err(|error| LeadSpawnError::RunDirUnwritable(error.to_string()))?;
+        let hook_command = lead::identity_hook_command(&kvx_executable(), &spec.run_id);
+        let settings = lead::lead_settings_document(&hook_command);
+        std::fs::write(
+            spec.settings_path(),
+            serde_json::to_vec_pretty(&settings)
+                .map_err(|error| LeadSpawnError::RunDirUnwritable(error.to_string()))?,
+        )
+        .map_err(|error| LeadSpawnError::RunDirUnwritable(error.to_string()))
     }
 
     /// Spawns the lead's pane, using the same placement rule node panes used:
@@ -256,6 +335,7 @@ impl crate::app::App {
         lead_pane_id: String,
         lead_terminal_id: crate::terminal::TerminalId,
         spawned_at_unix_ms: u64,
+        messaging: MessagingSupport,
     ) {
         self.workflow_lead = Some(LiveLeadRun {
             run_id,
@@ -264,6 +344,10 @@ impl crate::app::App {
             lead_cwd: spec.cwd.clone(),
             spawned_at_unix_ms,
             binding: None,
+            bind_evidence: None,
+            lead_endpoint: None,
+            member_endpoints: std::collections::BTreeMap::new(),
+            messaging,
             split_pane_confirmed: false,
             snapshot: ProjectionSnapshot::default(),
             node_keys: kvdag.nodes.iter().map(|node| node.key.clone()).collect(),
@@ -317,37 +401,130 @@ impl crate::app::App {
         changed
     }
 
-    /// Recognises the team the lead created, once (§3.1 step 4).
+    // ── identity ───────────────────────────────────────────────────────────
+
+    /// Ingests one session's `SessionStart` self-report (§3.1a).
+    ///
+    /// The report is checked against two identifiers karvex minted itself — the
+    /// run id it baked into the hook command, and the pane id it put in the
+    /// pane's environment — so accepting one is not a guess about which team
+    /// belongs to which run. Returns whether anything changed.
+    pub(crate) fn record_run_session_report(&mut self, report: &SessionReport) -> bool {
+        let Some(run) = self.workflow_lead.as_ref() else {
+            debug!(run = %report.run_id, "a session self-report arrived with no live run");
+            return false;
+        };
+        if run.closed {
+            return false;
+        }
+        let expected = RunExpectation {
+            run_id: run.run_id.to_string(),
+            lead_pane_id: run.lead_pane_id.clone(),
+        };
+        let run_id = run.run_id.clone();
+        match identity::classify_report(report, &expected) {
+            ReportVerdict::Lead {
+                endpoint,
+                team_name,
+            } => {
+                debug!(
+                    run = %run_id,
+                    session = %endpoint.session_id,
+                    team = %team_name,
+                    addressable = endpoint.messaging_socket.is_some(),
+                    "the run's team lead identified itself"
+                );
+                let Some(run) = self.workflow_lead.as_mut() else {
+                    return false;
+                };
+                let changed = run.lead_endpoint.as_ref() != Some(&endpoint);
+                run.lead_endpoint = Some(endpoint);
+                changed
+            }
+            ReportVerdict::Member { pane_id, endpoint } => {
+                debug!(
+                    run = %run_id,
+                    pane = %pane_id,
+                    session = %endpoint.session_id,
+                    addressable = endpoint.messaging_socket.is_some(),
+                    "a run teammate identified itself"
+                );
+                let Some(run) = self.workflow_lead.as_mut() else {
+                    return false;
+                };
+                let changed = run.member_endpoints.get(&pane_id) != Some(&endpoint);
+                run.member_endpoints.insert(pane_id, endpoint);
+                changed
+            }
+            ReportVerdict::Ignored(reason) => {
+                // Never silent: "the hook fired and nothing happened" is the
+                // exact failure this path replaces.
+                if matches!(reason, IgnoredReason::Subagent) {
+                    debug!(run = %run_id, %reason, "ignoring a session self-report");
+                } else {
+                    warn!(run = %run_id, %reason, "ignoring a session self-report");
+                }
+                false
+            }
+        }
+    }
+
+    /// Recognises the run's team, once (§3.1 step 4, reworked by §3.1a).
+    ///
+    /// Assertion first, inference second, deadline last. The deadline is the
+    /// half the audit found missing: an unbound run used to poll forever, stay
+    /// `running`, and wedge the single-live-run guard for every later run.
     fn bind_run_team(&mut self, claude_dir: &Path) -> bool {
         let Some(run) = self.workflow_lead.as_ref() else {
             return false;
         };
-        if run.binding.is_some() {
+        if run.binding.is_some() || run.closed {
             return false;
         }
         let spawned_at = run.spawned_at_unix_ms;
         let lead_cwd = run.lead_cwd.clone();
         let run_id = run.run_id.clone();
+        let asserted = run.lead_endpoint.clone();
 
-        let teams = read_team_configs(&claude_dir.join("teams"));
+        let teams: Vec<ObservedTeam> = read_team_configs(&claude_dir.join("teams"))
+            .into_iter()
+            .map(|(_, team)| team)
+            .collect();
         let own_panes = self.public_pane_ids_for_projection();
-        let Some((binding, strength)) = lead::match_team(
-            teams.iter().map(|(_, team)| team),
-            spawned_at,
-            &lead_cwd,
-            &own_panes,
-            &[],
-        ) else {
-            return false;
+        let decision = identity::decide_binding(&BindInputs {
+            asserted: asserted.as_ref(),
+            teams: &teams,
+            spawned_at_unix_ms: spawned_at,
+            now_unix_ms: crate::app::workflow::current_unix_ms(),
+            lead_cwd: &lead_cwd,
+            own_pane_ids: &own_panes,
+            bound_elsewhere: &[],
+        });
+
+        let (binding, evidence) = match decision {
+            BindDecision::Bound { binding, evidence } => (binding, evidence),
+            BindDecision::Waiting => return false,
+            BindDecision::Expired { waited_ms } => {
+                return self.lead_run_failed_unbound(waited_ms);
+            }
         };
 
-        debug!(
-            run = %run_id,
-            team = %binding.team_name,
-            session = %binding.lead_session_id,
-            ?strength,
-            "bound the run to its Claude Code team"
-        );
+        if !evidence.is_asserted() {
+            warn!(
+                run = %run_id,
+                team = %binding.team_name,
+                evidence = evidence.as_str(),
+                "the run's lead never identified itself; falling back to matching a team by                  spawn window and cwd"
+            );
+        } else {
+            debug!(
+                run = %run_id,
+                team = %binding.team_name,
+                session = %binding.lead_session_id,
+                evidence = evidence.as_str(),
+                "bound the run to its Claude Code team"
+            );
+        }
         self.persist_workflow_write(StoreWrite::RunLeadBinding {
             run: run_id.clone(),
             lead_session_id: binding.lead_session_id.clone(),
@@ -358,13 +535,263 @@ impl crate::app::App {
         });
         if let Some(run) = self.workflow_lead.as_mut() {
             run.binding = Some(binding);
-        }
-        if matches!(strength, MatchStrength::OwnPane) {
-            if let Some(run) = self.workflow_lead.as_mut() {
+            run.bind_evidence = Some(evidence);
+            if matches!(evidence, BindEvidence::InferredOwnPane) {
                 run.split_pane_confirmed = true;
             }
         }
         true
+    }
+
+    /// The bind deadline passed with nothing recognised.
+    ///
+    /// Closes the run as terminal with an explicit reason rather than leaving it
+    /// `running`. The lead's pane is deliberately left open: whatever went wrong
+    /// is visible in it, and closing it would destroy the evidence.
+    fn lead_run_failed_unbound(&mut self, waited_ms: u64) -> bool {
+        let Some(run) = self.workflow_lead.as_ref() else {
+            return false;
+        };
+        let run_id = run.run_id.clone();
+        let reason = identity::unbound_failure_reason(waited_ms);
+        warn!(run = %run_id, waited_ms, "{reason}");
+        self.persist_workflow_write(StoreWrite::RunFailed {
+            run: run_id,
+            ended_at_unix_ms: crate::app::workflow::current_unix_ms(),
+            failure: serde_json::json!({
+                "kind": "lead_unbound",
+                "detail": reason,
+                "waited_ms": waited_ms,
+                "resumable": false,
+            }),
+        });
+        if let Some(run) = self.workflow_lead.as_mut() {
+            run.closed = true;
+        }
+        true
+    }
+
+    // ── messaging ──────────────────────────────────────────────────────────
+
+    /// Every session of the live run karvex can address, newest observation
+    /// wins. The lead is always first.
+    pub(crate) fn run_message_targets(&self) -> Vec<RunMessageTarget> {
+        let Some(run) = self.workflow_lead.as_ref().filter(|run| !run.closed) else {
+            return Vec::new();
+        };
+        let mut targets = Vec::new();
+        if let Some(endpoint) = run.lead_endpoint.as_ref() {
+            targets.push(RunMessageTarget {
+                name: lead::LEAD_TARGET_NAME.to_string(),
+                pane_id: Some(run.lead_pane_id.clone()),
+                endpoint: endpoint.clone(),
+            });
+        }
+        for (pane_id, endpoint) in &run.member_endpoints {
+            targets.push(RunMessageTarget {
+                // The team config is where a teammate's *name* lives; the
+                // endpoint is keyed by pane. Joining them here keeps the
+                // addressing vocabulary the same one `workflow.run.get`
+                // already publishes.
+                name: self
+                    .member_name_for_pane(pane_id)
+                    .unwrap_or_else(|| pane_id.clone()),
+                pane_id: Some(pane_id.clone()),
+                endpoint: endpoint.clone(),
+            });
+        }
+        targets
+    }
+
+    /// Sends one message into a run session's documented inbox socket.
+    ///
+    /// Delivery is the receiving session's decision, not karvex's: upstream's
+    /// inbound controls can deliver, hold, or refuse, and the socket write
+    /// succeeding only means the frame was accepted for that decision. The
+    /// answer here says exactly that, rather than claiming the message was read.
+    pub(crate) fn message_run_session(
+        &mut self,
+        target_name: &str,
+        text: &str,
+        priority: messaging::Priority,
+    ) -> Result<RunMessageReceipt, RunMessageError> {
+        let Some(run) = self.workflow_lead.as_ref().filter(|run| !run.closed) else {
+            return Err(RunMessageError::NoLiveRun);
+        };
+        // Only the two checkable facts refuse. A *suspected* kill switch never
+        // does: probed live, the same variable that kills messaging on an
+        // account with no cached feature flags changes nothing on one that has
+        // them, so refusing on the suspicion would break messaging on every
+        // machine that merely exports `DO_NOT_TRACK`.
+        if run.messaging.blocks_messaging() {
+            return Err(RunMessageError::Unsupported(run.messaging.clone()));
+        }
+        let run_id = run.run_id.clone();
+        let targets = self.run_message_targets();
+        if targets.is_empty() {
+            return Err(RunMessageError::NoAddressableSessions);
+        }
+        let Some(target) = targets
+            .iter()
+            .find(|target| target.name.eq_ignore_ascii_case(target_name))
+            .cloned()
+        else {
+            return Err(RunMessageError::UnknownTarget {
+                requested: target_name.to_string(),
+                known: targets.iter().map(|target| target.name.clone()).collect(),
+            });
+        };
+
+        let channel = match target.endpoint.messaging_socket.as_deref() {
+            Some(socket) => {
+                let envelope = messaging::Envelope {
+                    session_id: target.endpoint.session_id.clone(),
+                    from: messaging::sender_name(&run_id),
+                    priority,
+                    text: text.to_string(),
+                };
+                let frames = messaging::encode_message(
+                    &envelope,
+                    target.endpoint.messaging_token.as_deref(),
+                )
+                .map_err(|error| RunMessageError::BadMessage(error.to_string()))?;
+                write_inbox_frames(Path::new(socket), &frames)
+                    .map_err(|error| RunMessageError::WriteFailed(error.to_string()))?;
+                messaging::DeliveryChannel::InboxSocket
+            }
+            // No socket, but karvex owns the pane. Typing into it is how karvex
+            // steers every other agent, and it is the only channel left after a
+            // server restart: a teammate's token exists nowhere but that
+            // teammate's own hook environment, so an in-memory endpoint lost to
+            // a restart cannot be recovered from disk.
+            None => {
+                let Some(pane_id) = target.pane_id.clone() else {
+                    return Err(RunMessageError::TargetNotAddressable {
+                        name: target.name.clone(),
+                    });
+                };
+                let response = self.dispatch_runtime_mutation(
+                    "workflow.run.message",
+                    crate::api::schema::Method::AgentPrompt(
+                        crate::api::schema::AgentPromptParams {
+                            target: pane_id,
+                            text: text.to_string(),
+                            wait: None,
+                        },
+                    ),
+                );
+                if let Ok(error) =
+                    serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+                {
+                    return Err(RunMessageError::WriteFailed(error.error.message));
+                }
+                messaging::DeliveryChannel::PaneInput
+            }
+        };
+
+        debug!(
+            run = %run_id,
+            target = %target.name,
+            session = %target.endpoint.session_id,
+            channel = channel.as_str(),
+            "handed a message to a run session"
+        );
+        Ok(RunMessageReceipt {
+            target: target.name.clone(),
+            session_id: target.endpoint.session_id.clone(),
+            pane_id: target.pane_id.clone(),
+            channel,
+        })
+    }
+
+    /// What the live run made of a session that just reported itself, read back
+    /// from the run rather than re-derived, so a response cannot claim a role
+    /// the server did not record.
+    pub(crate) fn run_session_report_outcome(
+        &self,
+        session_id: &str,
+    ) -> (
+        crate::api::schema::WorkflowSessionRole,
+        Option<String>,
+        bool,
+    ) {
+        use crate::api::schema::WorkflowSessionRole;
+
+        let Some(run) = self.workflow_lead.as_ref() else {
+            return (WorkflowSessionRole::Ignored, None, false);
+        };
+        if let Some(endpoint) = run
+            .lead_endpoint
+            .as_ref()
+            .filter(|endpoint| endpoint.session_id == session_id)
+        {
+            return (
+                WorkflowSessionRole::Lead,
+                identity::team_name_for_session(&endpoint.session_id),
+                endpoint.messaging_socket.is_some(),
+            );
+        }
+        if let Some(endpoint) = run
+            .member_endpoints
+            .values()
+            .find(|endpoint| endpoint.session_id == session_id)
+        {
+            return (
+                WorkflowSessionRole::Member,
+                None,
+                endpoint.messaging_socket.is_some(),
+            );
+        }
+        (WorkflowSessionRole::Ignored, None, false)
+    }
+
+    /// The messaging half of `workflow.run.get`, for the run live on this
+    /// server. `None` for any other run: an inbox socket belongs to a running
+    /// process, so reporting one for a stored run would be a durable record of
+    /// something that stopped being true.
+    pub(crate) fn run_messaging_info(
+        &self,
+        run_id: &RunId,
+    ) -> Option<crate::api::schema::WorkflowRunMessagingInfo> {
+        let run = self
+            .workflow_lead
+            .as_ref()
+            .filter(|run| !run.closed && &run.run_id == run_id)?;
+        let supported = run.messaging.is_available();
+        Some(crate::api::schema::WorkflowRunMessagingInfo {
+            supported,
+            reason: (!supported).then(|| run.messaging.code().to_string()),
+            detail: (!supported).then(|| run.messaging.to_string()),
+            targets: self
+                .run_message_targets()
+                .into_iter()
+                .map(|target| {
+                    let addressable = target.endpoint.messaging_socket.is_some();
+                    crate::api::schema::WorkflowRunMessageTargetInfo {
+                        name: target.name,
+                        session_id: target.endpoint.session_id,
+                        channel: if addressable {
+                            messaging::DeliveryChannel::InboxSocket
+                        } else {
+                            messaging::DeliveryChannel::PaneInput
+                        }
+                        .as_str()
+                        .to_string(),
+                        pane_id: target.pane_id,
+                        addressable,
+                    }
+                })
+                .collect(),
+        })
+    }
+
+    /// The team-config name of whichever member occupies this pane.
+    fn member_name_for_pane(&self, pane_id: &str) -> Option<String> {
+        self.workflow_lead
+            .as_ref()?
+            .snapshot
+            .member_name_for_pane(pane_id)
+            .map(str::to_string)
     }
 
     /// Hands the lead its plan, once.
@@ -639,10 +1066,15 @@ impl crate::app::App {
             team = ?team_name,
             "the run's team lead exited without reporting; closing the run with its last snapshot"
         );
-        self.persist_workflow_write(StoreWrite::RunStatus {
+        self.persist_workflow_write(StoreWrite::RunFailed {
             run: run_id.clone(),
-            status: RunStatus::Failed,
-            ended_at_unix_ms: Some(ended_at_unix_ms),
+            ended_at_unix_ms,
+            failure: serde_json::json!({
+                "kind": "lead_exited",
+                "detail": "the run's team lead exited without calling `kvx workflow run finish`",
+                "resumable": true,
+                "team_name": team_name,
+            }),
         });
         if let Some(run) = self.workflow_lead.as_mut() {
             run.closed = true;
@@ -909,6 +1341,10 @@ impl crate::app::App {
             "w1:p1".to_string(),
             crate::terminal::TerminalId::alloc(),
             started_at_unix_ms,
+            // The preflight execs `claude --version`, which a unit test has no
+            // business doing; a live run whose machine can message its sessions
+            // is the ordinary case this fixture stands in for.
+            MessagingSupport::Available,
         );
         self.mark_lead_run_running(&run_id);
         run_id
@@ -978,6 +1414,122 @@ impl crate::app::App {
     }
 }
 
+/// One session of a live run that karvex can address by name.
+///
+/// Server-owned runtime fact: the name is the one the team roster publishes,
+/// not a UI label, and the same vocabulary `workflow.run.get`'s member rows
+/// already use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunMessageTarget {
+    pub(crate) name: String,
+    pub(crate) pane_id: Option<String>,
+    pub(crate) endpoint: SessionEndpoint,
+}
+
+/// What karvex knows after writing a message into a session's inbox.
+///
+/// Deliberately not "delivered": upstream's inbound controls decide between
+/// delivered, held, and refused *after* the write, and the only receipt that
+/// travels back over the socket is one addressed to another Claude Code
+/// session's reply address, which karvex does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunMessageReceipt {
+    pub(crate) target: String,
+    pub(crate) session_id: String,
+    pub(crate) pane_id: Option<String>,
+    /// Which of the two channels carried it. Journalled because they are not
+    /// equivalent: an inbox-socket message arrives labelled as another
+    /// session's and is subject to the receiver's inbound controls, while pane
+    /// input is indistinguishable from the user typing.
+    pub(crate) channel: messaging::DeliveryChannel,
+}
+
+/// Why a message could not be written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RunMessageError {
+    NoLiveRun,
+    /// This machine cannot message Claude Code sessions at all.
+    Unsupported(MessagingSupport),
+    /// The run is live but nothing has identified itself yet.
+    NoAddressableSessions,
+    UnknownTarget {
+        requested: String,
+        known: Vec<String>,
+    },
+    /// The session identified itself but its messaging endpoint was absent —
+    /// the feature-flag fetch had not completed when its hook ran.
+    TargetNotAddressable {
+        name: String,
+    },
+    BadMessage(String),
+    WriteFailed(String),
+}
+
+impl std::fmt::Display for RunMessageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoLiveRun => f.write_str("no workflow run is live on this server"),
+            Self::Unsupported(support) => write!(f, "{support}"),
+            Self::NoAddressableSessions => f.write_str(
+                "the run has not identified any session yet, so there is nothing to message.                  Its lead reports itself through a SessionStart hook a second or two after the                  pane starts.",
+            ),
+            Self::UnknownTarget { requested, known } => write!(
+                f,
+                "this run has no session called {requested:?}; it can address: {}",
+                if known.is_empty() {
+                    "nothing yet".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ),
+            Self::TargetNotAddressable { name } => write!(
+                f,
+                "{name} identified itself without a messaging socket, so Claude Code's                  cross-session messaging was not on in that session"
+            ),
+            Self::BadMessage(detail) => write!(f, "{detail}"),
+            Self::WriteFailed(detail) => write!(
+                f,
+                "the session's inbox socket could not be written: {detail}"
+            ),
+        }
+    }
+}
+
+/// Writes one already-encoded frame pair into a session's inbox socket.
+///
+/// Short timeouts on purpose: this runs on the server's event loop, and a
+/// session that is not reading its socket must cost a render frame at worst.
+/// The half-close is what tells Claude Code the connection is complete — it
+/// processes the trailing buffer on `end`.
+fn write_inbox_frames(socket: &Path, frames: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let mut stream = UnixStream::connect(socket)?;
+        stream.set_write_timeout(Some(INBOX_WRITE_TIMEOUT))?;
+        stream.write_all(frames)?;
+        stream.flush()?;
+        // Half-close rather than a plain drop: Claude Code parses whatever is
+        // left in its buffer when the peer ends, so this is what makes a frame
+        // without a trailing newline still land.
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket, frames);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Claude Code does not offer cross-session messaging on native Windows",
+        ))
+    }
+}
+
+/// How long a write to a session's inbox may block the server loop.
+const INBOX_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Claude Code's task status vocabulary → karvex's node status.
 ///
 /// `Unknown` maps to `Pending` rather than failing: an unrecognised status from
@@ -1024,6 +1576,16 @@ fn read_tasks(dir: &Path) -> Vec<ObservedTask> {
 fn read_team_config(path: &Path) -> Option<ObservedTeam> {
     let bytes = std::fs::read(path).ok()?;
     projection::parse_team_config(&bytes).ok()
+}
+
+/// The `kvx` binary the run's hook should call back into.
+///
+/// The running executable rather than the `kvx` on `PATH`: a run must report
+/// itself to *this* server, and a machine mid-upgrade can easily have a
+/// different `kvx` first on the path. Falls back to the bare command only when
+/// the current executable cannot be resolved at all.
+fn kvx_executable() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kvx"))
 }
 
 /// Every readable team config, for the one-time binding hunt.

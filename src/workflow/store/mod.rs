@@ -946,6 +946,11 @@ impl WorkflowStore {
                 status,
                 ended_at_unix_ms,
             } => self.write_run_status(run, status, ended_at_unix_ms).await,
+            StoreWrite::RunFailed {
+                run,
+                ended_at_unix_ms,
+                failure,
+            } => self.write_run_failure(run, ended_at_unix_ms, failure).await,
             StoreWrite::RunNode {
                 run,
                 path,
@@ -2206,6 +2211,36 @@ impl WorkflowStore {
     /// describe the same run as ending at two different times. `time::now()`
     /// stays as the fallback so a terminal status that somehow arrives without
     /// a stamp still records *an* end time rather than none.
+    /// Closes a run as `failed` and records *why* on the run row's `failure`
+    /// column, which `workflow.run.get` already publishes.
+    ///
+    /// Separate from [`Self::write_run_status`] rather than an extra parameter
+    /// on it: a status write happens on every ordinary transition and carries no
+    /// reason, and threading an always-`None` argument through all of them would
+    /// make the one case that *does* have a reason harder to find, not easier.
+    async fn write_run_failure(
+        &self,
+        run: RunId,
+        ended_at_unix_ms: u64,
+        failure: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let response = self
+            .db
+            .query(
+                "UPDATE $run SET status = \"failed\", failure = $failure, \
+                 ended_at = time::from_millis($ended_at_ms)",
+            )
+            .bind(("run", run_id))
+            .bind(("failure", failure))
+            .bind(("ended_at_ms", ended_at_unix_ms as i64))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
     async fn write_run_status(
         &self,
         run: RunId,

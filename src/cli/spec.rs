@@ -962,6 +962,35 @@ fn workflow_run_command() -> Command {
                 .arg(option("outcome", "WORD").help("One-word verdict; defaults to succeeded"))
                 .arg(json_flag()),
         )
+        .subcommand(
+            Command::new("message")
+                .about("Send text into one of a live run's Claude Code sessions")
+                .arg(option("run", "RUN_ID").help(
+                    "Defaults to KARVEX_WORKFLOW_RUN_ID, which is exported in the lead's pane",
+                ))
+                .arg(
+                    option("to", "NAME")
+                        .help("The session to reach, by team-roster name; the lead is `team-lead`"),
+                )
+                .arg(option("text", "TEXT").help("The message itself"))
+                .arg(option("text-file", "PATH").help("Read the message from a file"))
+                .arg(
+                    option("priority", "WHEN")
+                        .help("now, next (the default), or later — when the session reads it"),
+                )
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("report-session")
+                .about(
+                    "Report a run session's identity (Claude Code SessionStart hook; \
+                     reads the hook payload on stdin)",
+                )
+                .arg(option("run", "RUN_ID").help(
+                    "Defaults to KARVEX_WORKFLOW_RUN_ID, which is exported in the lead's pane",
+                ))
+                .arg(json_flag()),
+        )
 }
 
 fn workflow_summary_command() -> Command {

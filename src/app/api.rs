@@ -1206,6 +1206,12 @@ impl App {
             Method::WorkflowRunFinish(params) => {
                 return self.handle_workflow_run_finish(request.id, params);
             }
+            Method::WorkflowRunReportSession(params) => {
+                return self.handle_workflow_run_report_session(request.id, params);
+            }
+            Method::WorkflowRunMessage(params) => {
+                return self.handle_workflow_run_message(request.id, params);
+            }
             Method::WorkflowNodeGet(target) => {
                 return self.handle_workflow_node_get(request.id, target);
             }

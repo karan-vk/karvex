@@ -682,6 +682,7 @@ mod tests {
                 fired: true,
             }],
             members: Vec::new(),
+            messaging: None,
         }
     }
 

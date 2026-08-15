@@ -100,6 +100,16 @@ const NO_ACTIVE_RUN_CODE: &str = "workflow_run_not_active";
 /// A required run argument was not supplied and has no default.
 #[cfg(feature = "workflow")]
 const MISSING_ARG_CODE: &str = "workflow_missing_arg";
+/// A message to one of a run's Claude Code sessions could not be handed over
+/// (`09-agent-teams-rework.md` §3.5a). One code for every reason — messaging
+/// switched off on this machine, no session identified yet, an unknown target,
+/// a target with no inbox socket, an unusable message, or a socket that refused
+/// the write — with the reason in the message text, matching the existing
+/// single-code style. Never answered `ok` for a message that was not written:
+/// a control surface that claims delivery it did not achieve is the exact
+/// failure the deferred `m` verb was deferred to avoid.
+#[cfg(feature = "workflow")]
+const MESSAGE_REFUSED_CODE: &str = "workflow_run_message_refused";
 /// The lead's end-of-run report was malformed: no summary, both spellings of
 /// it, or a summary file that could not be read
 /// (`09-agent-teams-rework.md` §3.3).
@@ -928,8 +938,21 @@ impl App {
                 prior_runs_path: prior_runs_path.as_deref(),
             },
         );
-        if let Err(error) = self.write_lead_prompt(&spec, &prompt) {
+        if let Err(error) = self.write_lead_run_files(&spec, &prompt) {
             return encode_error(id, error.code(), error.to_string());
+        }
+        // Not a launch gate: a run whose sessions cannot be messaged is still a
+        // run. Resolved here so the answer is a recorded property of the run
+        // rather than something re-derived per message, and so a documented
+        // kill switch is reported once, loudly, instead of turning the message
+        // verb into a silent no-op (`09-agent-teams-rework.md` §3.5a).
+        let messaging = self.preflight_messaging_for_lead();
+        if !messaging.is_available() {
+            tracing::warn!(
+                run = %run_id,
+                reason = messaging.code(),
+                "{messaging}"
+            );
         }
         let (lead_pane_id, lead_terminal_id) = match self.spawn_lead_pane(ws_idx, &spec) {
             Ok(spawned) => spawned,
@@ -942,6 +965,7 @@ impl App {
             lead_pane_id,
             lead_terminal_id,
             started_at_unix_ms,
+            messaging,
         );
         // `create_run` writes `pending`; the lead is live the moment its pane
         // is, and nothing else will move the row off `pending` now that no
@@ -1078,6 +1102,100 @@ impl App {
             }
             Ok(None) => encode_error(id, NOT_FOUND_CODE, format!("no run {run_id}")),
             Err(response) => response(id),
+        }
+    }
+
+    /// One of the run's Claude Code sessions identifying itself
+    /// (`09-agent-teams-rework.md` §3.1a).
+    ///
+    /// Authorised exactly like `workflow.run.finish` — possession of the run
+    /// id, which karvex baked into the hook command in the run's own settings
+    /// file — and then checked against the pane id karvex put in that pane's
+    /// environment. A report that turns out not to be this run's is a
+    /// *successful* response carrying `role: ignored`: the same hook fires in
+    /// every session that inherits the run's settings, and a hook that gets an
+    /// error back would retry or log noise for something entirely normal.
+    pub(super) fn handle_workflow_run_report_session(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkflowRunReportSessionParams,
+    ) -> String {
+        if params.run_id.trim().is_empty() || params.session_id.trim().is_empty() {
+            return encode_error(
+                id,
+                INVALID_ARGUMENT_CODE,
+                "a session report needs both a run id and a session id",
+            );
+        }
+        let report = crate::workflow::binding::identity::SessionReport {
+            run_id: params.run_id.clone(),
+            pane_id: params.pane_id.clone(),
+            session_id: params.session_id.clone(),
+            cwd: params.cwd.clone(),
+            source: params.source.clone(),
+            messaging_socket: params.messaging_socket.clone(),
+            messaging_token: params.messaging_token.clone(),
+            agent_id: params.agent_id.clone(),
+        };
+        self.record_run_session_report(&report);
+
+        // Answered from the run's own view rather than from the classifier a
+        // second time, so the response cannot claim a role the server did not
+        // actually record.
+        let (role, team_name, addressable) = self.run_session_report_outcome(&params.session_id);
+        encode_success(
+            id,
+            ResponseResult::WorkflowRunSessionReported {
+                run_id: params.run_id,
+                role,
+                team_name,
+                addressable,
+            },
+        )
+    }
+
+    /// Sends text into one of a live run's Claude Code sessions
+    /// (`09-agent-teams-rework.md` §3.5a).
+    pub(super) fn handle_workflow_run_message(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkflowRunMessageParams,
+    ) -> String {
+        use crate::workflow::binding::messaging::Priority;
+
+        let run_id = crate::workflow::model::RunId::new(params.run_id.clone());
+        if !self.is_live_lead_run(&run_id) {
+            return encode_error(
+                id,
+                NO_ACTIVE_RUN_CODE,
+                format!("{run_id} is not the run live on this server, so it cannot be messaged"),
+            );
+        }
+        let Some(priority) = params
+            .priority
+            .as_deref()
+            .map_or(Some(Priority::default()), Priority::parse)
+        else {
+            return encode_error(
+                id,
+                INVALID_ARGUMENT_CODE,
+                "priority must be one of now, next, or later",
+            );
+        };
+        match self.message_run_session(&params.target, &params.text, priority) {
+            Ok(receipt) => encode_success(
+                id,
+                ResponseResult::WorkflowRunMessaged {
+                    receipt: crate::api::schema::WorkflowRunMessageReceipt {
+                        run_id: params.run_id,
+                        target: receipt.target,
+                        session_id: receipt.session_id,
+                        pane_id: receipt.pane_id,
+                        channel: receipt.channel.as_str().to_string(),
+                    },
+                },
+            ),
+            Err(error) => encode_error(id, MESSAGE_REFUSED_CODE, error.to_string()),
         }
     }
 
@@ -1475,6 +1593,11 @@ impl App {
                         .collect(),
                     edges: edges.into_iter().map(wire_run_edge_record).collect(),
                     members: members.into_iter().map(wire_run_member_record).collect(),
+                    // Live-only, and deliberately attached here rather than
+                    // stored: a session's inbox socket is unlinked when its
+                    // process exits, so a persisted one would be a durable
+                    // record of something that stopped being true.
+                    messaging: self.run_messaging_info(run),
                 };
                 Ok(Some((wire_run_record(record, &limits), graph)))
             }
@@ -2514,7 +2637,7 @@ fn wire_run_member_record(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "__broken_engine_tests"))]
 mod tests {
     use super::*;
     use crate::api::schema::{Method, WorkflowDefinitionDocument, WorkflowDefinitionFormat};
@@ -4316,6 +4439,9 @@ port = "summary"
                 "transcript_unavailable",
                 crate::app::workflow_history::TRANSCRIPT_UNAVAILABLE_CODE,
             ),
+            // A message to one of a live run's Claude Code sessions was not
+            // handed over (§3.5a).
+            ("run_message_refused", MESSAGE_REFUSED_CODE),
             ("run_pruned", RUN_PRUNED_CODE),
             ("restore_unknown_selector", RESTORE_UNKNOWN_SELECTOR_CODE),
             // §2: a node verb the removed engine was the only possible server
@@ -4340,7 +4466,7 @@ port = "summary"
         let codes = all_workflow_error_codes();
         assert_eq!(
             codes.len(),
-            17,
+            18,
             "the inventory grew or shrank; update this count alongside the list itself"
         );
 

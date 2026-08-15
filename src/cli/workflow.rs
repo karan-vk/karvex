@@ -10,9 +10,9 @@ use crate::api::schema::{
     Method, Request, WorkflowCreateParams, WorkflowDefinitionDocument, WorkflowDefinitionFormat,
     WorkflowInterrogationMode, WorkflowNodeExpandParams, WorkflowNodeInterrogateParams,
     WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRestoreRequest,
-    WorkflowRunFinishParams, WorkflowRunListParams, WorkflowRunParams, WorkflowRunTarget,
-    WorkflowSummaryListParams, WorkflowTarget, WorkflowTier, WorkflowVersionCreateParams,
-    WorkflowVersionTarget,
+    WorkflowRunFinishParams, WorkflowRunListParams, WorkflowRunMessageParams, WorkflowRunParams,
+    WorkflowRunReportSessionParams, WorkflowRunTarget, WorkflowSummaryListParams, WorkflowTarget,
+    WorkflowTier, WorkflowVersionCreateParams, WorkflowVersionTarget,
 };
 
 /// Env karvex injects into a node's pane
@@ -42,6 +42,8 @@ pub(super) const VERB_PATHS: &[&[&str]] = &[
     &["run", "show"],
     &["run", "cancel"],
     &["run", "finish"],
+    &["run", "message"],
+    &["run", "report-session"],
     &["node", "show"],
     &["node", "steer"],
     &["node", "interrupt"],
@@ -90,6 +92,8 @@ fn run_workflow_run_command(args: &[String]) -> std::io::Result<i32> {
         "show" => workflow_run_show(&args[1..]),
         "cancel" => workflow_run_cancel(&args[1..]),
         "finish" => workflow_run_finish(&args[1..]),
+        "report-session" => workflow_run_report_session(&args[1..]),
+        "message" => workflow_run_message(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workflow_run_help();
             Ok(0)
@@ -918,6 +922,208 @@ fn parse_workflow_run_finish_args(
             summary,
             summary_file,
             outcome,
+        },
+        json,
+    ))
+}
+
+/// `kvx workflow run report-session` — a run session identifying itself
+/// (`09-agent-teams-rework.md` §3.1a).
+///
+/// The `SessionStart` hook karvex writes into the run's `--settings` runs this
+/// with nothing but `--run`. Everything else comes from the hook's own inputs:
+/// the payload Claude Code writes to stdin, and the two variables Claude Code
+/// exports to every hook before any of them runs.
+///
+/// A shipped `kvx` verb rather than a shell asset like
+/// `assets/claude/karvex-agent-state.sh`: that asset pattern exists because the
+/// agent-state hook is *installed* into user settings and has to keep working
+/// across karvex upgrades, which is what the `KARVEX_INTEGRATION_VERSION`
+/// migration rule governs. This hook is written fresh into the run directory on
+/// every launch, so there is no installed copy to migrate — and putting the
+/// payload parsing here means it is unit tested and behaves identically on
+/// Windows with no second PowerShell implementation to keep in step.
+///
+/// Always exits 0. A hook that fails a session's startup because karvex was not
+/// listening would be a far worse failure than a run that falls back to the
+/// documented `createdAt`/cwd inference.
+fn workflow_run_report_session(args: &[String]) -> std::io::Result<i32> {
+    use std::io::Read;
+
+    let mut run_id: Option<String> = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--run" | "--run-id" => {
+                run_id = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            _ => {
+                eprintln!(
+                    "usage: kvx workflow run report-session [--run <run_id>] [--json]\n\
+                     (reads Claude Code's SessionStart hook payload on stdin)"
+                );
+                return Ok(2);
+            }
+        }
+    }
+    let run_id = run_id
+        .or_else(|| std::env::var(NODE_ENV_RUN_ID).ok())
+        .filter(|value| !value.trim().is_empty());
+    let Some(run_id) = run_id else {
+        // Not an error: the same hook runs in every session that inherits the
+        // run's settings, and one that is not a run's session has nothing to
+        // report.
+        return Ok(0);
+    };
+
+    let mut payload = String::new();
+    let _ = std::io::stdin().read_to_string(&mut payload);
+    let Some(hook) = crate::workflow::binding::identity::parse_hook_input(&payload) else {
+        return Ok(0);
+    };
+
+    let params = WorkflowRunReportSessionParams {
+        run_id,
+        session_id: hook.session_id,
+        pane_id: env_value(crate::integration::KARVEX_PANE_ID_ENV_VAR),
+        cwd: hook.cwd,
+        source: hook.source,
+        messaging_socket: env_value(MESSAGING_SOCKET_ENV_VAR),
+        messaging_token: env_value(MESSAGING_TOKEN_ENV_VAR),
+        agent_id: hook.agent_id,
+    };
+    match super::send_request(&Request {
+        id: "cli:workflow:run:report-session".into(),
+        method: Method::WorkflowRunReportSession(params),
+    }) {
+        Ok(response) => {
+            if json {
+                return super::print_response(&response);
+            }
+            Ok(0)
+        }
+        // A hook must never fail a session's startup because karvex was not
+        // reachable. The run falls back to inference and says so in its log.
+        Err(_) => Ok(0),
+    }
+}
+
+/// Claude Code exports these to every hook and Bash command, before any hook
+/// runs, and each session exports its own rather than an inherited one.
+const MESSAGING_SOCKET_ENV_VAR: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
+const MESSAGING_TOKEN_ENV_VAR: &str = "CLAUDE_CODE_MESSAGING_TOKEN";
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// `kvx workflow run message` — send text into one of a live run's Claude Code
+/// sessions (`09-agent-teams-rework.md` §3.5a).
+fn workflow_run_message(args: &[String]) -> std::io::Result<i32> {
+    match parse_workflow_run_message_args(args, std::env::var(NODE_ENV_RUN_ID).ok()) {
+        Ok((params, json)) => send_workflow_mutation(
+            "cli:workflow:run:message",
+            Method::WorkflowRunMessage(params),
+            json,
+        ),
+        Err(message) => {
+            eprintln!("{message}");
+            Ok(2)
+        }
+    }
+}
+
+fn parse_workflow_run_message_args(
+    args: &[String],
+    env_run_id: Option<String>,
+) -> Result<(WorkflowRunMessageParams, bool), String> {
+    let usage = "usage: kvx workflow run message [--run <run_id>] --to <name> \
+                 (--text <text> | --text-file <path>) [--priority now|next|later] [--json]";
+    let mut run_id: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut text_file: Option<String> = None;
+    let mut priority: Option<String> = None;
+    let mut json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let take_value = |slot: &mut Option<String>| -> Result<(), String> {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{arg} needs a value\n{usage}"))?;
+            *slot = Some(value.clone());
+            Ok(())
+        };
+        match arg {
+            "--run" | "--run-id" => {
+                take_value(&mut run_id)?;
+                index += 2;
+            }
+            "--to" | "--target" => {
+                take_value(&mut target)?;
+                index += 2;
+            }
+            "--text" => {
+                take_value(&mut text)?;
+                index += 2;
+            }
+            "--text-file" => {
+                take_value(&mut text_file)?;
+                index += 2;
+            }
+            "--priority" => {
+                take_value(&mut priority)?;
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            _ => return Err(usage.into()),
+        }
+    }
+
+    let run_id = run_id
+        .or(env_run_id)
+        .filter(|run_id| !run_id.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "no run to message: pass --run <run_id>, or run this from the run's lead pane \
+                 where {NODE_ENV_RUN_ID} is exported\n{usage}"
+            )
+        })?;
+    let target = target.ok_or_else(|| {
+        format!("name the session to reach with --to (the run's lead is `team-lead`)\n{usage}")
+    })?;
+    if text.is_some() && text_file.is_some() {
+        return Err(format!(
+            "pass either --text or --text-file, not both\n{usage}"
+        ));
+    }
+    let text = match (text, text_file) {
+        (Some(text), _) => text,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|error| format!("{path} could not be read: {error}\n{usage}"))?,
+        (None, None) => return Err(format!("a message needs --text or --text-file\n{usage}")),
+    };
+
+    Ok((
+        WorkflowRunMessageParams {
+            run_id,
+            target,
+            text,
+            priority,
         },
         json,
     ))
@@ -2421,6 +2627,10 @@ fn print_workflow_run_help() {
     eprintln!(
         "  kvx workflow run finish [--run <run_id>] (--summary-file <path> | --summary <text>) [--outcome <word>] [--json]"
     );
+    eprintln!(
+        "  kvx workflow run message [--run <run_id>] --to <name> (--text <text> | --text-file <path>) [--priority now|next|later] [--json]"
+    );
+    eprintln!("  kvx workflow run report-session [--run <run_id>] [--json]");
 }
 
 fn print_workflow_node_help() {

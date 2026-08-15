@@ -22,20 +22,24 @@
 //! experimental and hidden, the settings key is the stable spelling, and
 //! neither is load-bearing alone.
 //!
-//! ## Why the binding is a search rather than an assignment
+//! ## Why the binding is an assertion rather than a search
 //!
-//! Verified live against 2.1.226, contradicting the design doc's assumption:
-//! `claude --session-id <uuid>` does **not** determine the lead session id the
-//! team is named after, and `~/.claude/sessions/<pid>.json` is not written for
-//! a plain interactive launch. So karvex cannot know the team name up front
-//! and cannot look it up by pid; it has to recognise the team the lead created.
-//! [`match_team`] is that recognition, and it is pure so the rule is testable.
+//! Verified live against 2.1.226: `claude --session-id <uuid>` does **not**
+//! determine the lead session id the team is named after, so karvex cannot know
+//! the team name up front. It used to *guess* it, from a `createdAt` inside a
+//! slack window plus a matching cwd.
+//!
+//! It no longer has to. Claude Code exports each session's identity and inbox
+//! to its hooks before any hook runs, so the run's own `--settings` carries a
+//! `SessionStart` hook that reports the session id back — and the team name
+//! follows from it by a documented derivation. That decision lives in
+//! [`super::identity`], which also keeps the old search as a documented
+//! fallback for a lead whose hook never fired.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::workflow::model::RunId;
-use crate::workflow::projection::ObservedTeam;
 use crate::workflow::tier::Assignment;
 
 /// The first Claude Code release with both agent teams and cross-session
@@ -56,12 +60,35 @@ pub const LEAD_PROMPT_FILE: &str = "lead-prompt.md";
 /// `kvx workflow run finish`.
 pub const LEAD_SUMMARY_FILE: &str = "summary.md";
 
+/// The name the run's lead is addressed by in karvex's own messaging surface.
+///
+/// Deliberately the role rather than the Claude Code session name: a client
+/// steering "the lead" should not have to know what karvex called the session,
+/// and the team roster already uses `team-lead` for the same member.
+pub const LEAD_TARGET_NAME: &str = "team-lead";
+
 /// How far before karvex's own spawn instant a team's `createdAt` may sit and
 /// still be believed to be this run's. Absorbs clock granularity and the gap
 /// between karvex stamping the spawn and the pane's `claude` actually starting;
 /// deliberately small, because the whole point is to not adopt a team that was
 /// already there.
+///
+/// Only the *fallback* binding rule uses this. The primary rule is the lead's
+/// own `SessionStart` assertion, in [`super::identity`], which needs no window
+/// at all. The matching ceiling lives there too, beside the bind deadline it is
+/// derived from.
 pub const TEAM_MATCH_SLACK_MS: u64 = 15_000;
+
+/// The run-scoped Claude Code settings payload, written into the run directory
+/// and passed as `--settings`.
+///
+/// A file rather than the inline JSON this used to be, because it now carries
+/// the run's `SessionStart` identity hook as well as the teammate mode, and
+/// because Claude Code forwards the *value* of `--settings` to the teammates it
+/// spawns — verified in the 2.1.232 bundle's teammate argv builder, which
+/// re-emits `--settings <value>`. A path forwards cleanly; a multi-line JSON
+/// blob through a shell command string does not.
+pub const LEAD_SETTINGS_FILE: &str = "claude-settings.json";
 
 /// Everything the lead's pane needs, resolved. Pure data, so the argv and env
 /// are testable without a workspace.
@@ -86,6 +113,16 @@ impl LeadSpawnSpec {
 
     pub fn summary_path(&self) -> PathBuf {
         self.run_dir.join(LEAD_SUMMARY_FILE)
+    }
+
+    pub fn settings_path(&self) -> PathBuf {
+        self.run_dir.join(LEAD_SETTINGS_FILE)
+    }
+
+    /// The name this run's lead answers to, for `/list-agents` and for a human
+    /// looking at a pane title.
+    pub fn session_name(&self) -> String {
+        super::identity::lead_session_name(&self.run_id)
     }
 
     /// The pane's manual label. The sidebar renders this, and teammates get
@@ -264,9 +301,91 @@ pub fn cwd_is_trusted(claude_json: Option<&str>, cwd: &Path) -> bool {
 
 // ── argv and env ───────────────────────────────────────────────────────────
 
-/// The `--settings` payload that forces split-pane teammates. Kept beside the
-/// flag rather than instead of it: see the module doc.
-pub const TEAMMATE_MODE_SETTINGS: &str = r#"{"teammateMode":"tmux"}"#;
+/// The subcommand the run's `SessionStart` hook calls back with.
+///
+/// Deliberately a `kvx` verb rather than a shipped shell asset like
+/// `assets/claude/karvex-agent-state.sh`. The asset pattern exists because that
+/// hook is *installed once* into the user's settings and has to keep working
+/// across karvex upgrades, which is what the `KARVEX_INTEGRATION_VERSION`
+/// migration rule governs. This hook is written fresh into the run directory on
+/// every launch, so there is no installed copy to migrate; and routing it
+/// through `kvx` — the same binary that is already on the lead's `PATH` for
+/// `kvx workflow run finish` — means the payload parsing lives in Rust, is unit
+/// tested, and behaves identically on Windows without a second PowerShell
+/// implementation to keep in step.
+pub const IDENTITY_HOOK_VERB: &str = "workflow run report-session";
+
+/// The hook command string Claude Code will run through a shell.
+///
+/// The run id is baked into the command rather than read from the environment
+/// on purpose: Claude Code forwards `--settings` to the teammates it spawns,
+/// but a teammate's pane is created by karvex's tmux shim and carries karvex's
+/// own base environment, *not* the lead's — so `KARVEX_WORKFLOW_RUN_ID` does
+/// not reach a teammate. Baking the run id into the settings file is what makes
+/// a teammate's self-report land on the right run.
+pub fn identity_hook_command(kvx_executable: &Path, run_id: &RunId) -> String {
+    format!(
+        "{} {IDENTITY_HOOK_VERB} --run {}",
+        quote_for_hook_shell(&kvx_executable.display().to_string()),
+        quote_for_hook_shell(&run_id.0),
+    )
+}
+
+#[cfg(not(windows))]
+fn quote_for_hook_shell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn quote_for_hook_shell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+/// The run-scoped `--settings` document.
+///
+/// Three keys, each load-bearing and each verified live against 2.1.232:
+///
+/// * `teammateMode: "tmux"` — the default is `in-process` even inside tmux, and
+///   in-process teammates do not survive `/resume`. Passed here *and* as
+///   `--teammate-mode`, because the flag is experimental and hidden while the
+///   settings key is the stable spelling, and neither is load-bearing alone.
+/// * `hooks.SessionStart` — the identity assertion. Hook entries from a
+///   `--settings` payload are *added* to the user's own hooks rather than
+///   replacing them: the probe's hook ran as `sessionstart-hook-3.sh`, third of
+///   the three registered, so karvex's own agent-state hook keeps working in
+///   the lead's pane.
+/// * `crossSessionInbound: "accept"` — karvex is the lead's parent, not its
+///   child, so a karvex message is an ordinary peer message and its delivery
+///   would otherwise depend on the lead's permission mode. This is upstream's
+///   documented knob for exactly this case.
+pub fn lead_settings_document(hook_command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "teammateMode": "tmux",
+        "crossSessionInbound": "accept",
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": IDENTITY_HOOK_TIMEOUT_SECONDS,
+                        }
+                    ]
+                }
+            ]
+        }
+    })
+}
+
+/// How long Claude Code will wait for the identity hook.
+///
+/// The hook writes one line to a Unix socket karvex is already listening on;
+/// the live probe's whole `SessionStart` hook chain took under 10 ms. Ten
+/// seconds is the same budget the installed agent-state hook uses and leaves
+/// room for a loaded machine without holding a session's startup open.
+pub const IDENTITY_HOOK_TIMEOUT_SECONDS: u32 = 10;
 
 /// The lead's argv.
 ///
@@ -279,13 +398,20 @@ pub const TEAMMATE_MODE_SETTINGS: &str = r#"{"teammateMode":"tmux"}"#;
 /// The lead is therefore seeded once through `agent.prompt` after its session
 /// is up, which is how karvex steers every other agent and is observable when
 /// it fails.
+///
+/// `--name` is what makes the run's lead addressable: it is the name
+/// `/list-agents` lists and `SendMessage` routes by, and without it Claude Code
+/// derives one from the cwd's folder name — identical for every run in the same
+/// repository.
 pub fn lead_argv(spec: &LeadSpawnSpec) -> Vec<String> {
     vec![
         crate::detect::interactive_agent_executable(crate::detect::Agent::Claude).to_string(),
+        "--name".to_string(),
+        spec.session_name(),
         "--teammate-mode".to_string(),
         "tmux".to_string(),
         "--settings".to_string(),
-        TEAMMATE_MODE_SETTINGS.to_string(),
+        spec.settings_path().to_string_lossy().into_owned(),
         "--model".to_string(),
         spec.assignment.model.as_str().to_string(),
         "--effort".to_string(),
@@ -329,117 +455,10 @@ pub struct LeadBinding {
     pub lead_session_id: String,
 }
 
-/// How a candidate team was recognised, so the caller can prefer the stronger
-/// evidence and so a log line can say which rule fired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MatchStrength {
-    /// The team's leader member started in the lead pane's cwd, inside the
-    /// spawn window. True of every fresh lead, and the only evidence available
-    /// before the first teammate exists.
-    LeadCwd,
-    /// A teammate of this team occupies a pane karvex created for this run.
-    /// karvex's own identifiers coming back through Claude Code's team state
-    /// is proof, not inference, so it outranks the cwd rule.
-    OwnPane,
-}
-
-/// Picks the team a freshly spawned lead created, from every team config
-/// currently on disk.
-///
-/// `spawned_at_unix_ms` is when karvex launched the pane; `lead_cwd` is what it
-/// launched into; `own_pane_ids` are the panes this karvex knows about, used
-/// for the strong rule. `bound_elsewhere` names teams already claimed by
-/// another run, which are never re-adopted.
-///
-/// Returns the best candidate, preferring [`MatchStrength::OwnPane`] and then
-/// the earliest `createdAt`, so the choice is deterministic.
-pub fn match_team<'a>(
-    teams: impl IntoIterator<Item = &'a ObservedTeam>,
-    spawned_at_unix_ms: u64,
-    lead_cwd: &Path,
-    own_pane_ids: &[String],
-    bound_elsewhere: &[String],
-) -> Option<(LeadBinding, MatchStrength)> {
-    let floor = spawned_at_unix_ms.saturating_sub(TEAM_MATCH_SLACK_MS);
-    let mut best: Option<(MatchStrength, u64, LeadBinding)> = None;
-
-    for team in teams {
-        if bound_elsewhere.iter().any(|name| name == &team.name) {
-            continue;
-        }
-        // Freshness is mandatory, not one signal among several. karvex pane
-        // ids are per-server, so a long-dead karvex's team config can name
-        // `w1:p2` while this server also has a `w1:p2` — verified live, where
-        // that collision made an unrelated team look like proof. Only teams
-        // created around this spawn can be this run's, and the pane rule is a
-        // preference *within* that set rather than a way out of it.
-        if team.created_at_unix_ms < floor {
-            continue;
-        }
-        let claims_our_pane = team
-            .members
-            .iter()
-            .filter_map(|member| member.tmux_pane_id())
-            .any(|pane| own_pane_ids.iter().any(|own| own == pane));
-        let cwd_matches = team
-            .lead_cwd()
-            .is_some_and(|cwd| Path::new(cwd) == lead_cwd);
-
-        let strength = if claims_our_pane {
-            MatchStrength::OwnPane
-        } else if cwd_matches {
-            MatchStrength::LeadCwd
-        } else {
-            continue;
-        };
-
-        let candidate = LeadBinding {
-            team_name: team.name.clone(),
-            lead_session_id: team.lead_session_id.clone(),
-        };
-        let better = match &best {
-            None => true,
-            Some((best_strength, best_created, _)) => {
-                strength > *best_strength
-                    || (strength == *best_strength && team.created_at_unix_ms < *best_created)
-            }
-        };
-        if better {
-            best = Some((strength, team.created_at_unix_ms, candidate));
-        }
-    }
-
-    best.map(|(strength, _, binding)| (binding, strength))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::projection::{ObservedMember, ObservedTeam};
     use crate::workflow::tier::{Effort, ModelAlias};
-
-    fn member(name: &str, pane: &str, backend: &str, cwd: &str) -> ObservedMember {
-        ObservedMember {
-            name: name.to_string(),
-            agent_id: Some(format!("{name}@session-abc")),
-            agent_type: "Explore".to_string(),
-            model: Some("sonnet".to_string()),
-            pane_id: Some(pane.to_string()),
-            backend_type: backend.to_string(),
-            is_active: true,
-            cwd: Some(cwd.to_string()),
-            joined_at_unix_ms: Some(1),
-        }
-    }
-
-    fn team(name: &str, session: &str, created: u64, members: Vec<ObservedMember>) -> ObservedTeam {
-        ObservedTeam {
-            name: name.to_string(),
-            lead_session_id: session.to_string(),
-            created_at_unix_ms: created,
-            members,
-        }
-    }
 
     fn spec() -> LeadSpawnSpec {
         LeadSpawnSpec {
@@ -552,7 +571,70 @@ mod tests {
             .iter()
             .position(|arg| arg == "--settings")
             .expect("the settings key is passed");
-        assert_eq!(argv[settings + 1], r#"{"teammateMode":"tmux"}"#);
+        assert_eq!(argv[settings + 1], "/runs/abc/claude-settings.json");
+        assert_eq!(
+            lead_settings_document("kvx")["teammateMode"],
+            serde_json::json!("tmux")
+        );
+    }
+
+    #[test]
+    fn the_argv_names_the_run_so_the_lead_is_addressable() {
+        let argv = lead_argv(&spec());
+        let name = argv
+            .iter()
+            .position(|arg| arg == "--name")
+            .expect("the lead is named");
+        assert_eq!(argv[name + 1], "karvex-run-abc");
+        assert_eq!(argv[name + 1], spec().session_name());
+    }
+
+    #[test]
+    fn the_settings_document_carries_the_identity_hook_and_the_inbound_policy() {
+        let command = identity_hook_command(
+            Path::new("/usr/local/bin/kvx"),
+            &RunId::new("workflow_run:abc"),
+        );
+        let document = lead_settings_document(&command);
+        // Upstream's own knob for a session that should take messages without
+        // its permission mode deciding: karvex is a peer, not a child.
+        assert_eq!(document["crossSessionInbound"], serde_json::json!("accept"));
+        let hook = &document["hooks"]["SessionStart"][0]["hooks"][0];
+        assert_eq!(hook["type"], serde_json::json!("command"));
+        assert_eq!(
+            hook["timeout"],
+            serde_json::json!(IDENTITY_HOOK_TIMEOUT_SECONDS)
+        );
+        let command = hook["command"].as_str().expect("a command string");
+        assert!(command.contains("workflow run report-session"));
+        // The run id rides in the command, not the environment: teammate panes
+        // are made by karvex's shim and never see the lead's environment.
+        assert!(command.contains("workflow_run:abc"));
+        assert_eq!(document["hooks"]["SessionStart"][0]["matcher"], "*");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_hook_command_quotes_a_path_a_shell_would_otherwise_split() {
+        let command = identity_hook_command(
+            Path::new("/home/some one/bin/kvx"),
+            &RunId::new("workflow_run:abc"),
+        );
+        assert!(command.starts_with("'/home/some one/bin/kvx'"));
+        // A quote inside the path cannot end the quoting.
+        let nasty = identity_hook_command(
+            Path::new("/home/o'brien/kvx"),
+            &RunId::new("workflow_run:abc"),
+        );
+        assert!(nasty.starts_with(r#"'/home/o'"'"'brien/kvx'"#), "{nasty}");
+    }
+
+    #[test]
+    fn the_settings_file_lives_in_the_run_directory() {
+        assert_eq!(
+            spec().settings_path(),
+            PathBuf::from("/runs/abc/claude-settings.json")
+        );
     }
 
     #[test]
@@ -599,182 +681,5 @@ mod tests {
             PathBuf::from("/runs/abc/lead-prompt.md")
         );
         assert_eq!(spec.summary_path(), PathBuf::from("/runs/abc/summary.md"));
-    }
-
-    #[test]
-    fn a_fresh_team_in_the_lead_cwd_is_matched() {
-        let teams = vec![team(
-            "session-aaaa1111",
-            "aaaa1111-0000-0000-0000-000000000000",
-            1_000_000,
-            vec![member(
-                "team-lead",
-                "leader",
-                "in-process",
-                "/home/dev/project",
-            )],
-        )];
-        let (binding, strength) =
-            match_team(&teams, 1_000_000, Path::new("/home/dev/project"), &[], &[])
-                .expect("the fresh team matches");
-        assert_eq!(binding.team_name, "session-aaaa1111");
-        assert_eq!(
-            binding.lead_session_id,
-            "aaaa1111-0000-0000-0000-000000000000"
-        );
-        assert_eq!(strength, MatchStrength::LeadCwd);
-    }
-
-    #[test]
-    fn a_team_created_before_the_spawn_window_is_not_adopted() {
-        let teams = vec![team(
-            "session-old00000",
-            "old00000-0000-0000-0000-000000000000",
-            1_000_000,
-            vec![member(
-                "team-lead",
-                "leader",
-                "in-process",
-                "/home/dev/project",
-            )],
-        )];
-        // Spawned a full minute after that team was created.
-        assert!(match_team(&teams, 1_060_000, Path::new("/home/dev/project"), &[], &[]).is_none());
-    }
-
-    #[test]
-    fn a_team_in_another_cwd_is_not_adopted() {
-        let teams = vec![team(
-            "session-other000",
-            "other000-0000-0000-0000-000000000000",
-            1_000_000,
-            vec![member(
-                "team-lead",
-                "leader",
-                "in-process",
-                "/somewhere/else",
-            )],
-        )];
-        assert!(match_team(&teams, 1_000_000, Path::new("/home/dev/project"), &[], &[]).is_none());
-    }
-
-    #[test]
-    fn a_team_holding_one_of_our_panes_beats_a_cwd_match() {
-        let teams = vec![
-            team(
-                "session-cwdonly0",
-                "cwdonly0-0000-0000-0000-000000000000",
-                1_000_000,
-                vec![member(
-                    "team-lead",
-                    "leader",
-                    "in-process",
-                    "/home/dev/project",
-                )],
-            ),
-            team(
-                "session-ourpane0",
-                "ourpane0-0000-0000-0000-000000000000",
-                1_000_500,
-                vec![
-                    member("team-lead", "leader", "in-process", "/elsewhere"),
-                    member("research", "w1:p4", "tmux", "/elsewhere"),
-                ],
-            ),
-        ];
-        let (binding, strength) = match_team(
-            &teams,
-            1_000_000,
-            Path::new("/home/dev/project"),
-            &["w1:p4".to_string()],
-            &[],
-        )
-        .expect("our own pane id is proof");
-        assert_eq!(binding.team_name, "session-ourpane0");
-        assert_eq!(strength, MatchStrength::OwnPane);
-    }
-
-    /// The live regression this rule exists for: karvex pane ids are per
-    /// server, so a stale team config from a long-dead karvex can name a pane
-    /// id this server also uses. Before the freshness gate became mandatory,
-    /// that collision alone was enough to bind a run to an unrelated team —
-    /// observed end to end, where a run adopted a months-old test team purely
-    /// because both had a `w1:p2`.
-    #[test]
-    fn a_stale_team_naming_a_colliding_pane_id_is_not_adopted() {
-        let teams = vec![team(
-            "session-stale000",
-            "stale000-0000-0000-0000-000000000000",
-            1,
-            vec![
-                member("team-lead", "leader", "in-process", "/somewhere/else"),
-                member("gate-mate", "w1:p2", "tmux", "/somewhere/else"),
-            ],
-        )];
-        assert!(
-            match_team(
-                &teams,
-                9_999_999,
-                Path::new("/home/dev/project"),
-                &["w1:p2".to_string()],
-                &[]
-            )
-            .is_none(),
-            "a pane id is not a globally unique identifier and must not override freshness"
-        );
-    }
-
-    #[test]
-    fn a_team_already_bound_to_another_run_is_never_re_adopted() {
-        let teams = vec![team(
-            "session-taken000",
-            "taken000-0000-0000-0000-000000000000",
-            1_000_000,
-            vec![member(
-                "team-lead",
-                "leader",
-                "in-process",
-                "/home/dev/project",
-            )],
-        )];
-        assert!(match_team(
-            &teams,
-            1_000_000,
-            Path::new("/home/dev/project"),
-            &[],
-            &["session-taken000".to_string()]
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn two_equally_plausible_teams_resolve_to_the_earlier_one_deterministically() {
-        let teams = vec![
-            team(
-                "session-later000",
-                "later000-0000-0000-0000-000000000000",
-                1_000_900,
-                vec![member(
-                    "team-lead",
-                    "leader",
-                    "in-process",
-                    "/home/dev/project",
-                )],
-            ),
-            team(
-                "session-first000",
-                "first000-0000-0000-0000-000000000000",
-                1_000_100,
-                vec![member(
-                    "team-lead",
-                    "leader",
-                    "in-process",
-                    "/home/dev/project",
-                )],
-            ),
-        ];
-        let (binding, _) = match_team(&teams, 1_000_000, Path::new("/home/dev/project"), &[], &[])
-            .expect("one of them matches");
-        assert_eq!(binding.team_name, "session-first000");
     }
 }

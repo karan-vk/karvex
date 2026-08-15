@@ -1766,6 +1766,19 @@ pub enum StoreWrite {
     /// The run's lead binding, learned once the spawned `claude` pane registers
     /// its session (`09-agent-teams-rework.md` §3.1 step 4).
     ///
+    /// Closes a run as `failed` with a machine-readable reason on the run row.
+    ///
+    /// `09-agent-teams-rework.md` §3.3 asks for this shape rather than a new
+    /// wire status: the protocol's `WorkflowRunStatus` cannot gain a variant
+    /// before the next bump, and a `failure` payload says more than a status
+    /// word would anyway. Two kinds use it today — `lead_exited`, when the
+    /// lead's pane went away without a `finish`, and `lead_unbound`, when the
+    /// bind deadline passed with no team recognised.
+    RunFailed {
+        run: RunId,
+        ended_at_unix_ms: u64,
+        failure: serde_json::Value,
+    },
     /// Not part of `create_run`: the run row exists before the pane does, and
     /// the session id only appears in `~/.claude/sessions/` after the lead has
     /// started. An `UPDATE`, and idempotent — the projection may re-learn the

@@ -400,6 +400,27 @@ impl ProjectionSnapshot {
         Self::default()
     }
 
+    /// Which member is running in a given karvex pane, by the name the team
+    /// config gave it.
+    ///
+    /// The join between the two identity spaces a run has: Claude Code names a
+    /// teammate, karvex names a pane, and the team config's `tmuxPaneId` is the
+    /// only place the two meet. `None` for a pane no member occupies, and for
+    /// the in-process lead, whose `tmuxPaneId` is the `"leader"` sentinel rather
+    /// than a pane.
+    pub fn member_name_for_pane(&self, pane_id: &str) -> Option<&str> {
+        if pane_id.is_empty() || pane_id == LEAD_PANE_SENTINEL {
+            return None;
+        }
+        self.members
+            .iter()
+            .find(|(_, fingerprint)| {
+                fingerprint.backend_type == "tmux"
+                    && fingerprint.pane_id.as_deref() == Some(pane_id)
+            })
+            .map(|(name, _)| name.as_str())
+    }
+
     /// Folds one poll's observations in, returning only what changed.
     ///
     /// Deterministic by contract, because the caller turns the result straight
