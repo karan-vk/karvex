@@ -81,6 +81,7 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
             help_entry(keybind_label(&kb.open_workflow_dag), "workflow dag"),
             help_entry(keybind_label(&kb.open_workflow_launcher), "run a workflow"),
             help_entry(keybind_label(&kb.open_workflow_runs), "run history"),
+            help_entry(keybind_label(&kb.open_workflow_review), "workflow review"),
         ],
     ));
 

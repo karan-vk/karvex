@@ -464,6 +464,9 @@ pub struct KeysConfig {
     pub open_workflow_launcher: BindingConfig,
     /// Open the run browser: a list-and-detail overlay over past and pruned runs. Default: "prefix+shift+b".
     pub open_workflow_runs: BindingConfig,
+    /// Open the workflow review overlay: forked-session interviews and findings over a terminal
+    /// run (`.local/prd/phase4-retarget-plan.md` §3.5). Default: "prefix+shift+v".
+    pub open_workflow_review: BindingConfig,
     /// Optional indexed shortcuts expanded over number keys 1-9.
     pub indexed: IndexedKeysConfig,
     /// Prefix-mode custom command bindings.
@@ -589,6 +592,8 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     open_workflow_runs: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    open_workflow_review: Option<BindingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     indexed: Option<IndexedKeysConfig>,
     #[serde(skip_serializing)]
     command: Option<Vec<CommandKeybindConfig>>,
@@ -667,6 +672,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(open_workflow_dag);
         apply_field!(open_workflow_launcher);
         apply_field!(open_workflow_runs);
+        apply_field!(open_workflow_review);
         apply_field!(indexed);
         apply_field!(command);
 
@@ -768,6 +774,7 @@ impl KeysConfig {
         copy_effective_action_field!(open_workflow_dag, keybinds.open_workflow_dag);
         copy_effective_action_field!(open_workflow_launcher, keybinds.open_workflow_launcher);
         copy_effective_action_field!(open_workflow_runs, keybinds.open_workflow_runs);
+        copy_effective_action_field!(open_workflow_review, keybinds.open_workflow_review);
         copy_user_field!(indexed);
 
         profile
@@ -1083,6 +1090,7 @@ impl Default for KeysConfig {
             open_workflow_dag: BindingConfig::one("prefix+shift+f"),
             open_workflow_launcher: BindingConfig::one("prefix+f"),
             open_workflow_runs: BindingConfig::one("prefix+shift+b"),
+            open_workflow_review: BindingConfig::one("prefix+shift+v"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
             user_fields: BTreeSet::new(),
@@ -1305,6 +1313,7 @@ mod tests {
             field!(open_workflow_dag),
             field!(open_workflow_launcher),
             field!(open_workflow_runs),
+            field!(open_workflow_review),
         ];
 
         let mut seen: std::collections::HashMap<String, &'static str> =

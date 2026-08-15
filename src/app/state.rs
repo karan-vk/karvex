@@ -1083,6 +1083,27 @@ pub struct ViewState {
     pub dag: DagViewState,
     pub workflow_launch: WorkflowLaunchState,
     pub workflow_runs: WorkflowRunsState,
+    pub workflow_review: WorkflowReviewState,
+}
+
+/// The workflow review overlay's state
+/// (`.local/prd/phase4-retarget-plan.md` §3.5, packet P2).
+///
+/// Landed as an inert stub: this packet owns every exhaustive `Mode` match
+/// once so the review/self-improvement behaviour (P10/P13) never has to
+/// fight match-arm churn across the tree again. There is no
+/// `workflow.review.*` wire method yet (that lands in P3/P10), so this holds
+/// only client-owned geometry — never a guess at a domain shape nobody has
+/// designed yet. It lives beside [`DagViewState`], [`WorkflowLaunchState`]
+/// and [`WorkflowRunsState`] on [`ViewState`] for the same reason they do:
+/// selection/scroll/hit-geometry are client concerns, carried across frames
+/// because `ViewState` is rebuilt wholesale every pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowReviewState {
+    // ── geometry, stored by the view-computation pass and read by both the
+    // renderer and the mouse hit-test, so what is clickable can never
+    // disagree with what was drawn — same rule as every other overlay here.
+    pub modal_rect: Rect,
 }
 
 /// The run browser overlay's state: a list of a workflow's runs — plus
@@ -1304,6 +1325,13 @@ pub enum Mode {
     // the mode-dispatch arms it needs are already in place.
     #[allow(dead_code)]
     WorkflowRuns,
+    /// The workflow review overlay: forked-session interviews and findings
+    /// over a terminal run (`.local/prd/phase4-retarget-plan.md` §3.5).
+    /// Opened by `keys.open_workflow_review`. Landed as an inert stub by
+    /// packet P2 — the TUI-shape packet that owns every exhaustive `Mode`
+    /// match once — so review behaviour (P10/P13) can be added without
+    /// touching match-arm dispatch across the tree again.
+    WorkflowReview,
 }
 
 impl Mode {
@@ -1316,6 +1344,7 @@ impl Mode {
                 | Self::WorkflowDag
                 | Self::WorkflowLaunch
                 | Self::WorkflowRuns
+                | Self::WorkflowReview
         )
     }
 
@@ -1346,6 +1375,7 @@ impl Mode {
                 | Mode::WorkflowDag
                 | Mode::WorkflowLaunch
                 | Mode::WorkflowRuns
+                | Mode::WorkflowReview
         )
     }
 }
@@ -2627,6 +2657,7 @@ impl AppState {
                 dag: DagViewState::default(),
                 workflow_launch: WorkflowLaunchState::default(),
                 workflow_runs: WorkflowRunsState::default(),
+                workflow_review: WorkflowReviewState::default(),
             },
             drag: None,
             workspace_press: None,
@@ -3188,6 +3219,28 @@ mod tests {
         assert!(
             state.historical_run().is_none(),
             "nothing opens a historical run yet"
+        );
+
+        state.mode = initial;
+        assert_eq!(state.mode, initial);
+    }
+
+    /// Packet P2's gate: the review overlay mode exists and round-trips, is
+    /// a member of the two `Mode` predicates every overlay depends on, and
+    /// starts empty (`.local/prd/phase4-retarget-plan.md` §3.5, P2).
+    #[test]
+    fn workflow_review_mode_round_trips() {
+        let mut state = AppState::test_new();
+        let initial = state.mode;
+
+        state.mode = Mode::WorkflowReview;
+        assert_eq!(state.mode, Mode::WorkflowReview);
+        assert!(Mode::WorkflowReview.mouse_motion_changes_view());
+        assert!(Mode::WorkflowReview.wants_ascii_input());
+        assert_eq!(
+            state.view.workflow_review,
+            WorkflowReviewState::default(),
+            "the review overlay starts empty — no wire method to seed it yet"
         );
 
         state.mode = initial;

@@ -628,6 +628,7 @@ impl App {
                 dag: state::DagViewState::default(),
                 workflow_launch: state::WorkflowLaunchState::default(),
                 workflow_runs: state::WorkflowRunsState::default(),
+                workflow_review: state::WorkflowReviewState::default(),
             },
             drag: None,
             workspace_press: None,
@@ -1953,6 +1954,9 @@ impl App {
             }
             Mode::WorkflowRuns => {
                 self.handle_workflow_runs_key(key_event);
+            }
+            Mode::WorkflowReview => {
+                self.handle_workflow_review_key(key_event);
             }
             Mode::Terminal => {
                 // Should not be called in terminal mode.

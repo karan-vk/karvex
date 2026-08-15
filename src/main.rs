@@ -218,6 +218,7 @@ const DEFAULT_CONFIG: &str = r##"# karvex configuration
 # open_workflow_dag = "prefix+shift+f" # live DAG view of the run this server is executing
 # open_workflow_launcher = "prefix+f"  # pick a workflow, fill its arguments, pick a tier, run it
 # open_workflow_runs = "prefix+shift+b" # browse past and pruned runs, restore-all
+# open_workflow_review = "prefix+shift+v" # forked-session interviews and findings over a run
 
 # Navigate-mode movement. These local shortcuts win while navigate mode is open.
 # They are independent from focus_pane_*. Do not include prefix+, esc, enter, tab, or 1..9 here.

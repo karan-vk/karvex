@@ -445,6 +445,13 @@ impl App {
                     leave_navigate_mode(&mut self.state);
                 }
             }
+            // No runtime call needed — P2 lands the overlay as an inert
+            // stub with no wire method behind it yet
+            // (`.local/prd/phase4-retarget-plan.md` §3.5), so opening it
+            // always succeeds, exactly like `open_workflow_review`.
+            NavigateAction::OpenWorkflowReview => {
+                super::modal::open_workflow_review(&mut self.state);
+            }
         }
 
         finish_action_context(&mut self.state, context, previous_mode);
@@ -1406,6 +1413,7 @@ pub(crate) enum NavigateAction {
     OpenWorkflowDag,
     OpenWorkflowLauncher,
     OpenWorkflowRuns,
+    OpenWorkflowReview,
 }
 
 fn copy_mode_survives_prefix_action(action: NavigateAction) -> bool {
@@ -1554,6 +1562,7 @@ fn non_indexed_action_for_key(
             NavigateAction::OpenWorkflowLauncher,
         ),
         (&kb.open_workflow_runs, NavigateAction::OpenWorkflowRuns),
+        (&kb.open_workflow_review, NavigateAction::OpenWorkflowReview),
     ] {
         if action_matches(bindings, key, dispatch) {
             return Some(action);
@@ -1823,6 +1832,13 @@ pub(super) fn execute_navigate_action_in_context(
         // `workflow.summary.list`, which need the runtime this `&mut
         // AppState`-only path does not have.
         NavigateAction::OpenWorkflowRuns => leave_navigate_mode(state),
+        // Unlike the launcher/browser this needs no runtime call at all — P2
+        // lands the overlay with no wire method behind it yet
+        // (`.local/prd/phase4-retarget-plan.md` §3.5) — so both dispatch
+        // paths open it the same way.
+        NavigateAction::OpenWorkflowReview => {
+            super::modal::open_workflow_review(state);
+        }
     }
 
     finish_action_context(state, context, previous_mode);
@@ -2752,6 +2768,24 @@ last_pane = "prefix+tab"
         }));
         execute_navigate_action(&mut state, NavigateAction::OpenWorkflowDag);
         assert_eq!(state.mode, Mode::WorkflowDag);
+    }
+
+    /// The review overlay (`.local/prd/phase4-retarget-plan.md` §3.5, packet
+    /// P2) is a real keybind action, and unlike the DAG/launcher it always
+    /// opens — there is no wire method yet to gate on.
+    #[test]
+    fn the_workflow_review_is_a_real_keybind_action() {
+        let mut state = state_with_workspaces(&["one"]);
+
+        let action = action_for_key(
+            &state,
+            TerminalKey::new(KeyCode::Char('v'), KeyModifiers::SHIFT),
+            BindingDispatch::Prefix,
+        );
+        assert_eq!(action, Some(NavigateAction::OpenWorkflowReview));
+
+        execute_navigate_action(&mut state, NavigateAction::OpenWorkflowReview);
+        assert_eq!(state.mode, Mode::WorkflowReview);
     }
 
     /// The launcher's binding is a peer of the DAG's, on the unshifted key
