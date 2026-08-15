@@ -7,6 +7,16 @@
 //! of the model's enums and of a stored run summary, the workspace cwd a
 //! workflow pane is opened in, and the one place a workflow notice reaches the
 //! user.
+//!
+//! Almost everything here is reachable only through the `workflow.*` API
+//! surface, which is stubbed out when the `workflow` feature is off (the MSVC
+//! cross-lint and slim source builds). The wire types these projections produce
+//! are declared unconditionally — that is what keeps the published schema
+//! artifact single-valued on both legs — so the projections have to *compile*
+//! without the feature even though nothing can call them. Hence the
+//! feature-scoped allow: the shipped configuration still lints every item below
+//! for real, and only the feature-off leg is quiet.
+#![cfg_attr(not(feature = "workflow"), allow(dead_code))]
 
 use std::path::PathBuf;
 
@@ -18,9 +28,10 @@ use crate::api::schema::{
 };
 use crate::app::state::{ToastKind, ToastNotification};
 use crate::app::App;
+#[cfg(feature = "workflow")]
+use crate::workflow::model::InstancePath;
 use crate::workflow::model::{
-    Demand, EdgeKind, Evidence, InstancePath, NodeStatus, NoticeLevel, RunStatus, Succession,
-    UserNotice,
+    Demand, EdgeKind, Evidence, NodeStatus, NoticeLevel, RunStatus, Succession, UserNotice,
 };
 use crate::workflow::tier::Tier;
 

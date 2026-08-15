@@ -167,9 +167,15 @@ pub struct App {
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
     /// The app-enforced half of the `[workflow]` config block.
+    ///
+    /// Read only by the `workflow.*` handlers, which the slim build stubs out;
+    /// the field itself stays unconditional so `App`'s shape does not fork
+    /// between the two feature legs.
+    #[cfg_attr(not(feature = "workflow"), allow(dead_code))]
     pub(crate) workflow_policy: workflow::WorkflowPolicy,
     /// Whether a durable workflow write has already failed on this server, so
     /// the degradation is surfaced once rather than once per write.
+    #[cfg_attr(not(feature = "workflow"), allow(dead_code))]
     pub(crate) workflow_persistence_degraded: bool,
     /// The workflow database, opened lazily on first `workflow.*` use
     /// (`03-storage-schema.md` §2).
