@@ -1,32 +1,28 @@
 ---
 title: Workflows
-description: Define multi-agent kvdags, run every node as a Karvex-managed teammate, and watch execution live in the DAG view.
+description: Define a multi-agent plan once, launch it as a Claude Code team lead, and watch the team's own task list turn into a run record.
 ---
 
-A workflow is a saved, versioned **kvdag**: a directed acyclic graph of nodes, each one a task, connected by edges that pass results between them. Running a workflow spawns every node as a real terminal pane — usually a `claude` teammate — and coordinates them until every branch resolves.
+A **workflow** is a saved, versioned plan: named nodes, their dependencies, and per-node model demands. A **run** hands that plan to one interactive **Claude Code team lead** in a Herdr pane and steps back. The lead reads the plan, creates Claude Code's shared task list, spawns teammates as their own Herdr panes, and decides retries, reassignment, and completion itself. Herdr does not execute the plan — it defines it, launches the lead, watches the team's own task list and turns it into a run record, and saves what happened.
 
-Workflows are for multi-step, multi-agent work you want to define once and run repeatedly, like plan → implement → review. For one-off scripted coordination between agents you already have running, see [Agent automation](/docs/agent-automation/) instead.
+Workflows are for multi-step, multi-agent work you want to define once and run repeatedly, like plan → implement → review. For one-off parallel coordination between agents you already have running, see [Agent automation](/docs/agent-automation/) instead. And because a run is a real Claude Code agent team, read [Claude Agent Teams](/docs/integrations/#claude-agent-teams) alongside this page — everything a team can and can't do there is true of a Herdr-launched run too.
 
 ## What a workflow is
 
 A **workflow** is a named container for one or more **kvdag versions** — immutable graph definitions. `kvx workflow create` makes the first version; `kvx workflow update` authors a new version on top of it. Editing never mutates a version in place; it always produces a new one, so a past run stays reproducible against the version it actually ran.
 
-A **run** takes one kvdag version, fills its declared run arguments, and executes the graph. Each node becomes a **run node** — an instance with its own status, model/effort assignment, pane binding, and result. Nodes start as soon as every inbound edge resolves, and independent nodes run in parallel up to the configured concurrency limit. A conditional edge whose condition evaluates false is dead; a node all of whose inbound edges are dead becomes `skipped` rather than blocking the rest of the graph — this is how a workflow branches without a scripting language.
-
-A run only finishes once every node has resolved and recorded what happens next, not simply once nothing is left to schedule. If a node ends without a successor edge resolved, a blocker recorded, or explicit evidence that nothing follows, the run pauses and names the exact node responsible instead of silently reporting success.
+Starting a run does five things, in order: it resolves the definition version and its args, renders them into a **lead prompt** — a markdown plan telling the lead which tasks to create, in what order, and with which `blockedBy` dependencies — spawns an interactive `claude` in a new pane running that plan, recognizes the Claude Code team the lead creates, and then watches. Everything that used to be Herdr's job — scheduling, claiming, retrying, judging a result against a schema — is the lead's job now, done through Claude Code's own shared task list and its own judgment. A run only finishes when the lead says so, by calling `kvx workflow run finish`.
 
 ## Definition format
 
-`kvx workflow create` and `kvx workflow update` read a definition document in TOML or JSON — the file extension selects the format. TOML is the easier one to hand-edit:
+`kvx workflow create` and `kvx workflow update` read a definition document in TOML or JSON — the file extension selects the format. The format itself hasn't changed; what changed is what a run does with it. This is a complete example of what actually matters now:
 
 ```toml
 name = "ship-feature"
 description = "plan → implement → review"
 contract = """
-Reply only through result.json. Never edit files outside your node dir unless the task says so.
+Read the codebase before proposing changes. Keep commits small and reviewable.
 """
-max_depth = 3
-max_nodes = 24
 
 # Declared run-argument namespace. Without this, `{{goal}}` below has no inbound
 # edge port to resolve against and workflow.create rejects the document.
@@ -38,379 +34,141 @@ description = "what to build"
 [[node]]
 key = "plan"
 label = "Plan"
-kind = "agent"
-runner = "agent"          # `claude` teammate; "command" runs `command` as a plain process
 demand = "critical"
 prompt_template = "Produce an implementation plan for: {{goal}}"
-output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
 
 [[node]]
 key = "implement"
 label = "Implement"
-kind = "agent"
 demand = "peak"
 prompt_template = "Implement this plan:\n{{plan}}"
-output_schema = { type = "object", required = ["changed_files","report"], properties = { changed_files = { type = "array" }, report = { type = "string" } } }
 
 [[edge]]
 from = "plan"
 to = "implement"
-kind = "data"
-payload = "summary"
-port = "plan"
 ```
 
-`contract` is prepended to every node's system prompt — put cross-cutting rules here instead of repeating them per node.
+`contract` is prepended to the standing instructions the lead is told to repeat to every teammate it spawns — put cross-cutting rules here instead of repeating them per node. `default_tier` (`auto`, `max`, `high`, `medium`, or `low`; default `high`) is the tier runs of this workflow start at when `kvx workflow run start` is given no `--tier`. A tier now does exactly one thing: it narrows the model/effort hints the lead is given per `demand` (`--tier low` suggests sonnet at low effort throughout; `--tier max` suggests the strongest available model at max effort) — hints, not rules, and the lead is free to spend more if a task deserves it. The growth ceilings a tier used to narrow (`max_nodes`, `max_depth`) belong to the retired engine; see the note below.
 
-`max_depth` and `max_nodes` are the run's growth ceiling, and they bind because a node can propose new nodes while the run is executing — see Templates and expansion, below. `max_nodes` (default `24`) counts every node the run has materialised regardless of how it ended: a failed or skipped child does not hand its budget back, so a node cannot fan out forever by failing. `max_depth` (default `3`) counts *generations of expansion*, not graph layers — every node written in the document is depth 0, a child proposed by one of them is depth 1, so `max_depth = 3` permits three generations. The run's tier narrows both further; see Tiers and growth ceilings, below.
+Each `[[arg]]` declares one entry in the run-argument namespace, filled at run time with `--arg name=value`. Each `[[node]]` needs a unique `key`, a `label`, and a `prompt_template`; `role`, if given, becomes one more line the lead is told about the node. `demand` (`peak`, `critical`, `standard`, or `light`, default `standard`) is a hint towards the model and effort the lead is told to use for that node — nothing enforces it, and the lead can spend more if a task turns out to deserve it. Each `[[edge]]` just needs a `from` and a `to`: it becomes one `blockedBy` relationship in the task plan the lead is told to create, full stop.
 
-`default_tier` (`auto`, `max`, `high`, `medium`, or `low`; default `high`) is the tier runs of this workflow start at when `kvx workflow run start` is given no `--tier`. It is a document-level key like `name` and `contract`, so changing it means authoring a new version.
+`{{name}}` placeholders in a `prompt_template` must resolve to either a declared arg or an inbound edge's `port` name — `workflow.create` still rejects a document with an unresolved placeholder, and a cyclic or unreachable graph is still refused at authoring time. A placeholder filled from a declared arg is substituted before the lead ever sees it. A placeholder naming an edge `port` is **not** substituted any more — Herdr doesn't execute nodes, so there is no upstream checkpoint to fill it with. It is left in the rendered plan exactly as written, and the lead is told which task descriptions still contain a `{{slot}}` marker and asked to fill it from the blocking task's actual result itself, when it spawns that teammate.
 
-Each `[[arg]]` declares one entry in the run-argument namespace, filled at run time with `--arg name=value`. Every `{{name}}` placeholder in a `prompt_template` must resolve to either a declared arg or an inbound edge `port` — `workflow.create` rejects a document with an unresolved placeholder before it is ever run, and starting a run separately rejects a missing required arg that has no default.
-
-Each `[[node]]` needs a unique `key`, a `label`, a `prompt_template`, and an `output_schema` — a JSON Schema the node's result must validate against before it can succeed. Omit `output_schema` and the node gets the empty schema `{}` (accepts any object) rather than a rejected document; declare it explicitly once you know the shape you want validated. `kind` defaults to `"agent"`; the other kinds (`internal`, `gate`, `monitor`) are accepted today but their scheduling behavior ships in a later release. `runner` selects how the node's process is bound — see Node runners, below. `demand` (`peak`, `critical`, `standard`, or `light`, default `standard`) feeds the run's tier into a per-node model and effort assignment.
-
-Each `[[edge]]` connects a `from` node to a `to` node and needs a `kind`: `sequence` (source must succeed), `data` (source must succeed *and* its result validate), or `conditional` (evaluates a `condition` against the source's result; false makes the edge dead). Omit `kind` and the edge defaults to `sequence`. A `conditional` edge must declare a `condition` — one with none is rejected at authoring time rather than accepted and silently never resolving. `payload` controls how much of the source's checkpoint the target receives: `none`, `summary` (default), or `full`. `port` names the `{{slot}}` in the target's `prompt_template` that the edge's payload fills; a `port` that names no `{{slot}}` actually present in the target's `prompt_template` is also rejected at authoring time, since it would otherwise produce a workflow whose data silently goes nowhere.
-
-A rejected definition writes nothing at all: the whole document, graph validators included, is checked before the workflow is created, so a create that fails leaves no workflow behind and the `name` it was rejected under stays free. `name` is unique across workflows — creating one under a name another workflow already holds is refused with `workflow_name_taken`, and revising that workflow with `kvx workflow update` is what you want instead.
-
-Run it with the declared args:
+A rejected definition writes nothing at all, and `name` is unique across workflows — see `workflow_name_taken` and `kvx workflow update` if you hit it. Run it with the declared args:
 
 ```bash
 kvx workflow run start ship-feature --arg goal="add dark mode"
 ```
 
-To hand-edit a saved workflow, run `kvx workflow update` with a new definition file. That authors a new kvdag version rather than mutating the one you started from, so every past run stays reproducible against the version it actually ran.
-
-## Node runners
-
-`runner` selects how a node's process is bound, independent of `kind`:
-
-| `runner` | Process | Confirmation | Steering | Completion |
-| --- | --- | --- | --- | --- |
-| `agent` (default) | `claude` in a pane, launched with the run's resolved model and effort | must come up as a detected agent inside the launch window, or the spawn fails outright | delivered through the same verified path as `agent.prompt` | any of the three signals in The node contract, below |
-| `command` | the node's own `command` argv, run as a plain process | none — the pane is just a process that started | delivered as raw pane text | self-report only |
-
-A `command` node needs `command = ["...", ...]` — an argv list, never a shell string. It gets the same `KARVEX_WORKFLOW_*` environment as an `agent` node, so it can call `kvx workflow node complete` the same way, but it has no turn-end hook and no screen detection: the only thing that finishes it is the node reporting itself.
-
-## Templates and expansion
-
-Some work only reveals its shape once it starts: you know you want one node per shard, but not how many shards there are until something has looked. A node can therefore ask for new nodes while it runs. It cannot create them — **it proposes, and Karvex decides** — which is what keeps the graph's growth ceiling a ceiling rather than a suggestion.
-
-Expansion has two halves in the definition. A **template** is a node marked `is_template = true`: it is never scheduled directly and does not appear in a run until something instantiates it. A node that may instantiate templates declares which ones, and how many children it may create in total:
-
-```toml
-[[node]]
-key = "fanout"
-label = "Fan out"
-prompt_template = "Split this into shards: {{goal}}"
-output_schema = { type = "object", required = ["plan"], properties = { plan = { type = "string" } } }
-expand_allow = ["worker"]   # which templates this node may instantiate
-expand_max = 8              # how many children it may create in this run, in total
-
-[[node]]
-key = "worker"
-label = "Worker"
-is_template = true
-prompt_template = "Work one shard of: {{goal}}"
-output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }
-
-[[node]]
-key = "collect"
-label = "Collect"
-prompt_template = "Collect the shard reports:\n{{shard}}"
-output_schema = { type = "object", required = ["report"], properties = { report = { type = "string" } } }
-
-# The fan-in edge is drawn from `fanout`, not from `worker`.
-[[edge]]
-from = "fanout"
-to = "collect"
-kind = "data"
-payload = "summary"
-port = "shard"
-```
-
-`expand_max` defaults to `0`, so expansion is opt-in per node, and it counts cumulatively across every proposal that node makes in the run rather than per proposal. `expand_allow` is checked at authoring time: a key naming a node that does not exist, or one that is not a template, is rejected by `workflow.create`.
-
-Draw the fan-in edge **from the proposing node**, as above. A template's own edges are dropped when the run graph is built, so a node reachable only through a template is rejected at authoring time as unreachable. What connects the children instead is inheritance: every accepted child gets a copy of its parent's outbound edges, so each `worker` also gets an edge into `collect`, and `collect` waits for the whole generation rather than for `fanout` alone. A template's `{{slot}}`s therefore have to resolve to declared run args, since it has no inbound edge ports of its own.
-
-Inheritance means more than one child's edge can settle on the same port of the same downstream node — the fan-in case above has every `worker` landing on `collect`'s `shard` port. A port is therefore a **list of contributions**, never one payload. A port with exactly one settled edge is unchanged: `inputs/<port>.json` is that payload and the `{{slot}}` renders it exactly as it always has. Once several edges settle on one port, each contributor gets its own file at `inputs/<port>/<source>.json`, `inputs/<port>.json` becomes the ordered index of them (`[{from, label, file, payload}, …]` in child-creation order), and the `{{slot}}` renders one attributed block per contribution:
-
-```text
-[from fanout/worker/1 · Shard 1]
-auth shard reviewed, two findings
-
-[from fanout/worker/2 · Shard 2]
-ui shard reviewed, no findings
-```
-
-So `collect`'s `{{shard}}` sees every `worker`'s report and knows whose is whose, rather than the last child to finish silently overwriting the rest.
-
-A node proposes from inside its own pane, before it completes:
-
-```bash
-kvx workflow node expand <run_id> <path> --template worker --label "Shard" --count 4
-kvx workflow node expand <run_id> <path> --template worker --label "Shard" --input goal="just src/ui" --json
-```
-
-Like `node complete`, it reads `KARVEX_WORKFLOW_NODE_TOKEN` from the node's own environment, so a node can only propose on its own behalf. `--count` defaults to 1. `--input KEY=VALUE` overrides one `{{slot}}` in the template's `prompt_template` for the children this proposal creates; a key naming no declared slot is refused rather than quietly ignored, so the dynamic channel stays strictly narrower than the authored one. The override beats a run argument of the same name, and it is filled into the child's own `task.md` — which is what lets one parent give each child different work. `--label` names the children this proposal creates: it is the title of their `task.md`, their box in the DAG view, their pane title, and their `claude --name`. Each child gets the instance path `<parent>/<template>/<n>` — `fanout/worker/1`, `fanout/worker/2` — numbered from 1 per parent and template, and starts only once its parent has settled.
-
-One proposal describes one batch, so `--count 4` creates four children that share its label and its overrides. To fan out into differently-tasked children, make one proposal per child:
-
-```bash
-kvx workflow node expand "$KARVEX_WORKFLOW_RUN_ID" "$KARVEX_WORKFLOW_NODE_PATH" \
-  --template worker --label "Shard 1" --input goal="just src/auth"
-kvx workflow node expand "$KARVEX_WORKFLOW_RUN_ID" "$KARVEX_WORKFLOW_NODE_PATH" \
-  --template worker --label "Shard 2" --input goal="just src/ui"
-```
-
-A proposal is judged against four guardrails, in order: the proposing node's `expand_allow`, its `expand_max`, the run's `max_depth`, and the run's `max_nodes`.
-
-:::note[A refusal is never silent]
-If a proposal for four children only has room for two, **two are created and the shortfall is reported**. Accepting all four would break the ceiling; refusing all four would waste the room that was there. Partial acceptance is only legitimate because the truncation is reported, so it is reported on every surface that describes the run:
-
-| Surface | What it carries |
-| --- | --- |
-| `workflow.growth.limited` on the JSON API event stream | the proposing node, the template, which guardrail, that guardrail's value, and the requested/accepted counts |
-| `kvx workflow run show` | the run's current growth state and which guardrail was last hit, without the requested/accepted counts — see Commands, below |
-| `kvx workflow node show` | the proposing node's own last rejection: the guardrail, its value, and the requested/accepted counts |
-| The DAG view | a banner across the run, and a notice on the node that proposed, both with the requested/accepted counts |
-| A notice toast | the same message, if notices are enabled in `config.toml` |
+:::note[Fields kept for compatibility]
+`kind`, `runner`, `command`, `output_schema`, `max_attempts`, `timeout_ms`, `isolation`, `is_template`, `expand_allow`, `expand_max` on a node, and `kind`, `condition`, `payload`, `port` on an edge, all still parse — a definition written before this rework still loads. `max_depth`/`max_nodes` at the document level still parse too, and a run's *effective* ceiling, narrowed by tier, is still computed and recorded on the run row. None of it changes what the lead is told or what a run does: they were the vocabulary of the custom execution engine this release removed (schema-validated node completion, growth-guarded expansion into new nodes, a `runner = "command"` node run as a plain process, an enforced node/run budget), and none of it has a replacement in the new model — the lead can create as many tasks as it judges the work needs. Drop them from documents you author from here on; a workflow's whole plan now lives in `key`, `label`, `role`, `prompt_template`, `demand`, and the edges between nodes. `demand` is the one field from this list still doing something: paired with the run's tier, it is what decides the model/effort hint the lead is given for that node.
 :::
 
-The response to `kvx workflow node expand` carries the same verdict back to the node that asked, so it learns exactly what it got. A refused proposal is a **successful** command, not an error: only a bad run, path, or token — or a run that has already closed — exits non-zero. A node that has already finished cannot propose, since its children would hang off an edge from a node that has already settled.
+## Requirements and constraints
 
-## Tiers and growth ceilings
+A run is a real, experimental Claude Code feature running inside Herdr, not a Herdr-only mechanism, so its constraints are largely Claude Code's own. `kvx workflow run start` preflights what it can and refuses with a clear message rather than launching a lead that quietly can't do its job:
 
-A run's **tier** is the one dial for how expensive it is allowed to be. It picks each node's model and reasoning effort, together with that node's `demand`, and it narrows how far the graph may grow. There are two places to set it, most specific first:
+- **Agent teams are experimental and version-gated.** They need Claude Code 2.1.224 or newer; older ships as normal, agent-team-less `claude`. Herdr checks `claude --version` before spawning a lead and refuses (`workflow_lead_unavailable`) below that floor. Herdr also sets `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the lead's own pane, so you don't need to set the flag yourself for a Herdr-launched run.
+- **Split-pane teammates need Herdr's tmux shim.** Every run is launched with `--teammate-mode tmux`, which is what makes each teammate a real Herdr pane instead of an invisible in-process session sharing the lead's terminal — this is also why teammates never survive `/resume`. See [Claude Agent Teams](/docs/integrations/#claude-agent-teams) for how the shim works and what can shadow it.
+- **Task status can lag.** Upstream documents this plainly: a teammate sometimes doesn't mark its task complete even though the work is done. Herdr's DAG view therefore shows two signals side by side — the task's own status and the owning pane's live agent state — precisely so you can catch a task that finished in reality before its record catches up. If a run looks stuck, check the pane before you believe the task list.
+- **One team per session, no nested teams.** A lead session has exactly one team; a teammate cannot spawn its own teammates. Herdr runs exactly one lead per server for the same reason — starting a run while another is live is refused (`workflow_run_in_flight`) rather than getting a second, unmanageable team.
+- **Untrusted directories silently eat the lead's plan.** Claude Code's folder-trust dialog doesn't just block an untrusted `cwd` — it discards the lead's initial prompt entirely, so a run started there comes up looking healthy with nothing to do. Herdr preflights `~/.claude.json`'s trust record and refuses (`workflow_lead_unavailable`) with the exact remedy: run `claude` in that directory once and accept the dialog.
+- **Cross-session messaging needs Claude Code 2.1.224+ and macOS or Linux.** Herdr doesn't send messages on your behalf — steering is clicking a pane and typing — but the lead and its teammates can message each other and your other Claude Code sessions using this feature, when it's available. It is unavailable on native Windows regardless of Claude Code version, and can be silently disabled by environment variables that only take effect on an account Claude Code hasn't already cached feature flags for; the `Peer address` row in a pane's `/status` is the one live signal worth trusting.
+- **Runs are attended by design.** There is no unattended mode. Permission prompts and plan-approval requests all surface in the pane that raised them — usually the lead's, since teammate permission requests bubble up to the lead — and a run just sits there until a human answers. This is deliberate: v1's whole interaction model is "click on the pane."
 
-```bash
-kvx workflow run start ship-feature --tier low   # this run only
-```
-
-```toml
-default_tier = "medium"                          # every run of this workflow
-```
-
-`auto`, `max`, and `high` leave the document's ceilings alone; `medium` and `low` narrow them:
-
-| Tier | Effective `max_nodes` | Effective `max_depth` | Models |
-| --- | --- | --- | --- |
-| `max` | as authored | as authored | the strongest model at `peak` demand, opus otherwise, at `max` effort throughout |
-| `high` (default) | as authored | as authored | opus, dropping to sonnet at `light` demand |
-| `auto` | as authored | as authored | chosen per node from that node's own history, starting from the `high` row |
-| `medium` | at most 24 | as authored | opus at `peak`/`critical`, sonnet otherwise |
-| `low` | at most 12 | as authored | sonnet at every demand, `low` effort throughout |
-
-The narrowing only ever tightens: a tier cannot raise a ceiling the document set lower, and running the same workflow at `low` twice gives the same limits both times. What the run enforces is what `kvx workflow run show` and the JSON API report — its `limits:` line, below — so a run's growth ceiling never contradicts its own record.
-
-## The node contract
-
-Every node runs inside its own directory, `<run dir>/<instance path>/`:
-
-| File | Written by | Contents |
-| --- | --- | --- |
-| `task.md` | Karvex | rendered prompt: workflow contract, node role, task, and the paths of any `inputs/` files |
-| `inputs/<port>.json` | Karvex | upstream checkpoint payloads, one file per inbound edge port; a port with more than one settled edge (fan-in from expansion) holds the ordered index of its contributions |
-| `inputs/<port>/<source>.json` | Karvex | one file per contributor, named after the contributing node's instance path — written only for a fanned-in port |
-| `output_schema.json` | Karvex | the JSON Schema `result.json` must satisfy |
-| `result.json` | the node | its structured result |
-| `artifacts/` | the node | files referenced from `result.json`'s `artifacts` array |
-
-Finish a node by writing `result.json` and running:
+## Launching a run
 
 ```bash
-kvx workflow node complete
-kvx workflow node complete --result-file <path>   # defaults to ./result.json in the node directory
+kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--json]
 ```
 
-It reads `KARVEX_WORKFLOW_RUN_ID`, `KARVEX_WORKFLOW_NODE_PATH`, `KARVEX_WORKFLOW_NODE_DIR`, and `KARVEX_WORKFLOW_NODE_TOKEN` from the environment already set on the node's pane, so the command takes no positional arguments. Give `result.json` a `summary` string — it is what downstream nodes and run history see — and, for anything too large to inline, an `artifacts` array of paths under `./artifacts/`.
+Starting a run spawns a split of the focused pane in the active workspace, running an interactive `claude` with no positional prompt — a prompt handed to a fresh `claude` on argv is silently lost, the same failure mode Herdr already knew for other agent panes. Instead, Herdr waits for the pane's session to come up and then seeds it once, through the same mechanism as `kvx agent prompt`, with one instruction: read the rendered plan file and follow it. From there the lead is on its own: it reads the plan, creates tasks with the exact subjects and `blockedBy` structure the plan names (a task subject is `<node-id>: <label>`, and the `node-id:` prefix is what lets Herdr match a task back to its node later), and spawns teammates named after the nodes they own.
 
-This self-report is the strongest of three completion signals, in precedence order:
+Herdr recognizes the run's team once Claude Code's team config appears — matched by the lead pane's `cwd` and the team's creation time, bound once and never re-derived. The run's status becomes `running` at that point, and `kvx workflow run show <run_id> --json` reports `lead_pane_id`, `lead_session_id`, and `team_name` once bound; the human-readable default output doesn't print them, so reach for `--json` when you need the lead's own pane id rather than its owner's.
 
-| Precedence | Signal | Applies to | Recorded as |
-| --- | --- | --- | --- |
-| 1 | Self-report — the node calls `kvx workflow node complete` | `agent` and `command` nodes | `self_report` |
-| 2 | Turn end — the bundled Claude hook reports the pane's turn ended, then Karvex reads `result.json` | `agent` nodes only | `hook` |
-| 3 | Detection — the pane reads idle for several consecutive checks and a valid `result.json` exists | `agent` nodes only | `detection` |
+## Watching a run
 
-:::caution[Idle is never enough on its own]
-A node whose pane goes idle without ever producing a `result.json` that validates against `output_schema.json` does not complete. It moves to `needs_attention` instead, and the run does not report success while it sits there. Always finish through `kvx workflow node complete`, or make sure the last thing your agent does is write a valid result.
-:::
+Every run is projected, not tracked: a small poller reads Claude Code's own state every two seconds — `~/.claude/tasks/<team>/*.json` for tasks and `~/.claude/teams/<team>/config.json` for the team roster — and turns it into run records. A task whose subject starts with a definition node's `<node-id>:` prefix updates that node; a task the lead created that matches no node is recorded as an **emergent** node under the reserved path `.task/<n>` rather than dropped, because the lead is allowed to split, merge, or add work the plan didn't ask for. A projected node's status is one of exactly three values — `pending`, `running` (Claude Code's `in_progress`), `succeeded` (`completed`) — mirroring the task list's own three-state vocabulary; the richer statuses an older, engine-executed run can carry (`failed`, `blocked`, `needs_attention`, `skipped`, `restored`) belong to runs from before this rework and never appear on a new one. Team membership is snapshotted on every observed change rather than read live, because Claude Code deletes the team config directory the moment the lead's session ends.
 
-An invalid result gets one automatic corrective re-prompt quoting the schema errors; still invalid, and the node moves to `needs_attention` the same way.
+### The DAG view
 
-:::caution[`maxLength` is enforced from 0.12.0]
-The schema subset Karvex validates `result.json` against — `type`, `required`, `properties`, `items` — now also enforces `maxLength` on strings. A result whose string field is longer than the `maxLength` its `output_schema` declares now fails validation, gets the one corrective re-prompt, and then moves to `needs_attention`, where earlier releases accepted it. If one of your nodes declares a `maxLength` it never really meant, drop it from the schema rather than letting the node fail on it.
-:::
-
-## Run history and summaries
-
-Every finished run — succeeded **or** failed — gets an end-of-run **summary**: a short, budgeted account of what the run did, written by a real summariser node you can watch, and readable long after the run's panes are gone.
-
-The summariser is an **epilogue**, not part of the graph. It starts only once the run's terminal status has already been decided, so it can never change it. `workflow.run.finished` fires exactly when it always did; the summariser then runs as a visible pane under the reserved instance path `.summary`; and `workflow.run.summarized` follows when the summary lands. Every way the summariser can fail — output that fails its schema twice, a spawn failure, a pane that died, a cancelled run, summaries switched off — converges on the same outcome: the failure is journalled, you get one notice, the pane closes, and **the run's own status is untouched**. A run with no summary is a normal run, and `kvx workflow summary show` saying there is none is a normal answer, not an error.
-
-The `.summary` node is excluded from `nodes_total` and `nodes_done`, which count the run's declared work: those counts read complete at the instant the run reports finished, and the summariser is still visible in the graph beside them.
-
-:::note[What clients may assume]
-`workflow.run.finished` is the durable terminal signal — safe to script against for "the run is over and its outcome will not change". Wait for `workflow.run.summarized` only when you want the summary's content. Two consequences for anything reading the event stream: clients must tolerate reserved-node (`.`-prefixed) events arriving after `run.finished`, and `workflow.run.summarized` remains the only run-level follow-up — there is no second `run.finished` and no `run.updated` for the summary.
-
-Karvex executes one run at a time, and the epilogue is part of that run: between `run.finished` and the summary resolving, starting the next run may answer `workflow_run_in_flight`. That refusal is retryable — the message names the pending summary, and the next run starts once the summariser has finished or given up.
-:::
-
-A new run of the same workflow is given the most recent summaries as **context**, so it can start from what the last runs left open:
-
-```bash
-kvx workflow run start ship-feature --arg goal="add dark mode"                     # reads prior summaries
-kvx workflow run start ship-feature --arg goal="add dark mode" --no-prior-summaries # ignores them
-```
-
-The summaries are a pointer, not a payload. The run gets one file — `<run dir>/context/prior-runs.md`, one section per prior run with its outcome, text, highlights, and open gaps — and every node's `task.md` gets a two-line `## Prior runs` section naming that path and saying to read it if the task benefits from history. A node that does not need history pays two lines of prompt rather than several thousand characters, and a run with no history renders its `task.md` exactly as it did before this existed. Which runs a run was given is recorded on the run itself (`context_runs` on the JSON API).
-
-Read summaries back with:
-
-```bash
-kvx workflow summary show <run_id> [--json]
-kvx workflow summary list [<name|id>] [--limit N] [--json]
-```
-
-`summary show` prints the outcome, the summary text, highlights, open gaps, and one line per node. `summary list` is newest-first across a workflow, or across every workflow when given no target, and marks a row `(pruned)` when only the summary survives — see below.
-
-Three `[workflow]` config keys govern all of this: `summary_enabled` (default `true`) turns the summariser off entirely — off means no summariser node is created at all, not one that runs and discards its output; `history_context_runs` (default `3`) is how many prior summaries a run is offered, where `0` disables the injection without disabling summaries; and `retention_runs` (default `50`) is how many runs are kept per workflow.
-
-**Pruned runs.** Once a workflow has more than `retention_runs` runs, the oldest are pruned whole: the run, its nodes, its checkpoints, and its journal go, and **the summary stays**. A pruned run therefore still appears in `kvx workflow summary list` — flagged `run_pruned` — and in the run browser, while `kvx workflow run show` and restore both refuse it with `workflow_run_pruned`, whose message points at `kvx workflow summary show` as the surface that survived. Pruning happens after a run closes and its summary resolves, never on a read path: opening the run browser never deletes anything.
-
-:::note[Testing and scripting]
-`KARVEX_WORKFLOW_SUMMARY_COMMAND` binds the summariser to a command of your own instead of `claude`, as a JSON array of argv strings (`["/usr/bin/env","python3","summarise.py"]`). It is a declared binding override, not a debug hook: the summariser then behaves like any `command` node — it reads its `task.md`, writes `result.json`, and calls `kvx workflow node complete`. A value that is not a JSON array of strings switches summaries off for that server and says so on the first run that would have summarised, rather than silently running `claude` instead. `KARVEX_WORKFLOW_DB_PATH` points the workflow database somewhere other than the default, which is what keeps a test's runs out of your real history.
-:::
-
-## Restoring from a past run
-
-A run can start with some of its nodes already done, seeded from a past run's checkpoints instead of executed again:
-
-```bash
-kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id>
-kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id> --restore plan
-kvx workflow run start ship-feature --arg goal="add dark mode" --restore-from <run_id> --restore plan --restore-allow-changed
-```
-
-Bare `--restore-from` means *every restorable node* of that run — the common case, "re-run this, keeping what succeeded". Repeat `--restore` to narrow it to named nodes.
-
-A restored node is `restored`: it has the source run's result, it fires its outbound edges exactly like a succeeded node — so downstream nodes receive the source run's payload — and **it never gets a pane**, because nothing runs. Its timestamps are the restore instant, not the source run's, so the new run's timeline stays honest; its provenance (source run, node key, checkpoint) is on `kvx workflow node show`, the JSON API, and the DAG view's detail strip.
-
-Whether a node *can* be restored is decided per node, by comparing the source version's node against the target version's on two things: its `prompt_template` and its `output_schema`. Equal on both, and the checkpoint still describes the same work; different, and it does not. So restoring into an edited workflow works, and only the nodes you actually changed re-run.
-
-Starting a run with `--restore-from` is a **successful start that carries a report**, never an error — every node is either restored or skipped with a reason:
-
-| Skip reason | Meaning | Bypass |
-| --- | --- | --- |
-| `definition_changed` | the node's `prompt_template` or `output_schema` differs from the source version's | `--restore-allow-changed` |
-| `no_checkpoint` | the node has no validated result checkpoint in the source run | none |
-| `payload_truncated` | the checkpoint's payload was over the store's size budget and was not kept | none |
-
-The human output prints both sets — `restored: plan, implement · skipped: review (definition changed)` — so a bare `--restore-from` is never silent about what it did not restore.
-
-Two things are refused rather than reported: a `--restore` selector naming no node in the target version fails with `workflow_restore_unknown_selector` and creates no run at all, since a typo must not quietly re-run a node you believed restored; and a source run that has been pruned fails with `workflow_run_pruned`, since only its summary survives and a summary is not a checkpoint.
-
-## Interrogating a past node
-
-When a node has finished, its work is in its result — but the reasoning behind it is in its Claude session. Interrogation revives that session so you can ask:
-
-```bash
-kvx workflow node interrogate <run_id> <path> [--reconstructed] [--note <text>] [--json]
-```
-
-This forks the node's session (`claude --resume <session> --fork-session`) into a new pane, in the directory the node ran in. **The source transcript is never modified** — a fork writes its own — so the run's record stays exactly as it was, and you can interrogate the same node again later. The pane is titled `interrogate · <workflow> · <path>`, and it holds no node token: an interrogation cannot report, complete, or expand anything on the original node's behalf.
-
-Interrogations are not run nodes. They do not appear in the graph, do not count toward any total, and do not change the run — they are their own record, listed in the DAG view's own lane, with their own start and end times.
-
-When the session cannot be revived — the node ran as a `command` and never had one, the transcript file is gone, or its working directory no longer exists — you get `workflow_transcript_unavailable` naming which of those it was, and **no pane is created**. A refusal is never a pane that quietly does nothing. From there the degraded path is explicit: `--reconstructed` (`Shift+I` in the DAG view) seeds a *fresh* session from the node's stored checkpoint and its original task, in a pane labelled `reconstructed`, whose first instruction says it is a reconstruction from stored outputs and not the original teammate. It is offered, never substituted.
-
-The other answers you can get: `workflow_interrogation_active` — one live interrogation per node at a time, so close the open one first (sequential re-interrogation is fine, and each is its own record); `workflow_interrogation_spawn_failed` — the session was resumable but the pane could not be created, so nothing was recorded; and `workflow_run_pruned` — the run's history is gone, and a summary cannot be interrogated.
-
-Interrogating a node of a run you are viewing from history adds it to that run's stored record immediately; the DAG view's interrogation lane shows it once the historical snapshot is reloaded.
-
-## Commands
-
-`kvx workflow` also appears in `kvx --help`'s command list. Every `kvx workflow` command prints human-readable text by default and takes `--json` for the machine-readable envelope instead — including `run cancel`, `run list`, `node steer`, `node interrupt`, `node restart`, and `workflow list`, which did not accept the flag before 0.12.0. Under `--json` a refusal prints the raw error envelope rather than the humanized message; the exit code is the same either way. The one exception is `node complete`, the node-side reporting verb, whose contract is its exit code and its environment rather than an output envelope.
-
-```bash
-kvx workflow list
-kvx workflow show <name|id> [--json]
-kvx workflow create --file <definition.toml|json> [--name <name>] [--json]
-kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
-```
-
-`create` and `update` read the definition document described above from `--file`; the extension selects TOML or JSON. `update` authors a new kvdag version rather than editing the current one — unless the definition is byte-for-byte equivalent to the current head version, in which case nothing new is created and the human output says `(unchanged — this definition matches the current version; no new version was created)` instead of claiming a version was created. The human default for `show` renders the workflow summary, its version history with formatted timestamps, and the head version's nodes (key, label, runner, demand), edges (from/to/kind/port), and declared args — everything you need to find a node's `<path>` for `node show`/`steer`/`restart` or an `--arg` name for `run start`, without going back to the original definition file.
-
-```bash
-kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]...
-                                 [--restore-from <run_id>] [--restore <selector>]...
-                                 [--restore-allow-changed] [--no-prior-summaries] [--json]
-kvx workflow run list <name|id> [--limit N] [--json]
-kvx workflow run show <run_id> [--json]
-kvx workflow run cancel <run_id> [--json]
-kvx workflow summary show <run_id> [--json]
-kvx workflow summary list [<name|id>] [--limit N] [--json]
-```
-
-From the Karvex TUI, `prefix+f` opens the **workflow launcher** instead: a modal listing the saved workflows, one input line per required argument of the selected one, and a tier row seeded from that workflow's own `default_tier`. `Enter` starts the run, `Esc` closes it, and every row is clickable. Rebind it with `keys.open_workflow_launcher`.
-
-`run` is a namespace, not a workflow selector: `start`, `list`, `show`, and `cancel` each take their own arguments, so a workflow can be named `list` without colliding with the subcommand. `--tier` defaults to the workflow's own `default_tier`; repeat `--arg` for every declared run argument — an `--arg` key the workflow never declared is rejected before the run starts, naming every key that *is* declared, rather than being silently dropped. `run cancel` cancels the run's remaining nodes and closes their panes; a run reaching `succeeded` does **not** close its nodes' panes on its own — they stay open so you can read a teammate's final output or keep talking to it. `run cancel` is what tears panes down, and `node restart` (below) tears down just the one node's pane before respawning it.
-
-The human default for `run show` always prints a `limits:` line naming the run's enforced ceilings — `limits:  max_nodes=12 · max_depth=3` — right after `tier:`, so what the run enforces is never only in `--json`. It also names the node responsible when the run is `paused` or a node is stuck: the `status` line reads `paused (node "lint": needs_attention)`, followed by that node's `blocked:`/`reason:`/`resume:` lines carrying its blocker reason and resume condition, and then every node's path, status, and label — an expansion child's label is its accepted `--label`, which is the only thing that tells one child of a generation from another, since they all share the template's key. When the run has ever hit a growth guardrail it also prints a `growth:` line reporting the run's current growth state and which guardrail was last hit — `growth:  3 of 12 nodes · limited: max_nodes reached at 14:22 UTC` — not the requested/accepted counts for that rejection; those are on `kvx workflow node show`, below, and in the DAG banner. Times are always rendered in `UTC`, named explicitly so a terminal in a different timezone cannot misread the clock as local time.
-
-```bash
-kvx workflow node show <run_id> <path> [--json]
-kvx workflow node steer <run_id> <path> <text> [--json]
-kvx workflow node interrupt <run_id> <path> [--json]
-kvx workflow node restart <run_id> <path> [--json]
-kvx workflow node complete [--result-file <path>]
-kvx workflow node expand <run_id> <path> --template <key> --label <text> [--input KEY=VALUE]... [--count N] [--json]
-kvx workflow node interrogate <run_id> <path> [--reconstructed] [--note <text>] [--json]
-```
-
-`<path>` is the node's instance path, such as `plan` or `fanout/worker/2` — shown by `run show` and `workflow show`, and in the DAG view. `steer` injects text into a running node the same way steering in the DAG view, below, does. `interrupt` sends an escape to stop the node's current turn without ending the node. Both need the node to hold a pane; a node that has not been spawned yet, or that is between attempts, answers `workflow_node_not_running` rather than accepting text nothing would receive. `restart` closes the node's pane, increments its attempt count, and respawns it from `task.md`. `node complete` and `node expand` are the two commands a node runs on itself, both authenticated by the node token already in its environment; see The node contract and Templates and expansion, above. The human default for `node show` includes the node's blocker as `blocker:`/`resume:` lines — reason and resume condition — for a node that has entered `needs_attention`, and, when this node has proposed into a guardrail, a `growth_limited:` line naming the guardrail, its value, and the requested/accepted counts (`growth_limited: max_nodes reached at 14:22 UTC (2 of 4 accepted)`), alongside `path`/`label`/`status`/`model`/`effort`/`pane_id`, plus a `transcript:` line saying whether the node's session transcript is still on disk and a `restored from:` line when the node was seeded from a past run. `node interrogate` prints the interrogation's pane id and whether it resumed the original session or reconstructed one — see Interrogating a past node, above.
-
-## The DAG view
-
-Open a run's DAG view from the Karvex TUI to watch it execute live: node boxes laid out by graph layer, edges drawn between them, and a detail strip for whichever node is selected showing its status, model, usage, last checkpoint summary, and any blocker.
-
-Open it with `prefix+shift+F`, or from the global menu — the launcher at the bottom of the sidebar — and pick **workflow dag**. The menu entry appears only while this server is executing a run, since there is otherwise no graph to draw. The key is more forgiving: with no run to show, `prefix+shift+F` falls through to the workflow launcher instead of dead-ending there, since starting a run is the obvious next step from "there is nothing to view yet." It only reports `no workflow run on this server — start one with kvx workflow run start` when there is nothing to launch either — no saved workflows on this server. Rebind it with `keys.open_workflow_dag`.
+Open a run's DAG view with `prefix+shift+F`, or from the sidebar launcher (**workflow dag**). Node status is shown two layers deep: the task's own status from the projection, and — from Herdr's ordinary per-pane agent detection, joined by the task's `owner` — whether that owner's pane is `working`, `idle`, or `needs input`. This is the practical answer to task status lag: trust the pane over the task record when the two disagree.
 
 | Input | Action |
 | --- | --- |
-| `h` / `j` / `k` / `l` or the arrow keys | move the selection to the adjacent node in that direction |
-| Click a node | select it, without leaving the view |
-| `Enter`, or double-click a node | focus that node's pane, leaving the DAG view |
-| `s` | open a steer line for the selected node; type, then `Enter` to send it as `kvx workflow node steer` |
-| `i` | interrogate the selected node — fork its Claude session into a new pane |
-| `Shift+I` | reconstruct a session for the selected node from its stored checkpoint, for when the original is gone |
-| `Esc` (with the steer line open) | close the steer line without sending |
-| `Esc` (otherwise) | leave the DAG view |
-| Move the mouse | selection follows the pointer |
+| `h` / `j` / `k` / `l` or the arrow keys | move the selection |
+| Click a node | select it |
+| `Enter`, or double-click a node | focus that node's pane |
+| `Esc` | leave the DAG view |
 
-`i` and `Shift+I` are two keys rather than one key pressed twice: opening a session that is *not* the original teammate is always an explicit choice, so when `i` answers `transcript unavailable` the notice tells you `Shift+I` will reconstruct one, and nothing happens until you ask. Interrogation panes are drawn in their own lane below the graph — a `⌕` box per interrogation, teal while live and dimmed once it ends — rather than as nodes, because an interrogation is not part of the run. Selecting one focuses its pane.
-
-A run opened from history is read-only: the footer drops the hints for what it cannot do, `s` reports that a past run is not the active run, and `Enter` focuses a pane only for nodes that still have one. Restored nodes have none by construction, and so does the summariser once it has closed.
-
-Nodes created by an accepted expand proposal appear in the graph as they are created, laid out by the edges they inherited rather than by their generation number. When a proposal is refused or truncated, a banner across the top of the view names the guardrail and the requested/accepted counts, and the node that proposed carries the same notice in its box — so the run says what it was not allowed to do, not only what it did.
-
-The end-of-run summariser appears in the graph like any other node, labelled `summary`, and the run's status line says where it is: `· summarising…` while it works, `· summary failed` if it gave up. The run's own status beside it does not change either way.
-
-The view is a read-only projection of the run: node status, position, and edges all come from the same run graph the CLI and JSON API report. Focusing a node's pane goes through the same path as focusing any other pane in Karvex, so leaving the DAG view leaves you looking at the teammate you selected.
+That's the whole footer now — `enter focus pane · hjkl move · esc`. There is no `s` steer, no `i` interrogate, no `Shift+I` reconstruct: those operated on a node Herdr executed itself, and a node is a real teammate's own pane now. Steering it is opening that pane, below.
 
 ### The run browser
 
-`prefix+shift+B` opens the **run browser**: every run this server knows about, newest first, across every workflow — not only the one executing now. Rebind it with `keys.open_workflow_runs`.
+`prefix+shift+B` opens every run this server knows about, newest first, across every workflow. `Enter` opens a run in the DAG view — live if it is still running, read-only from history otherwise. The detail strip shows the selected run's args and, once it has one, its summary's outcome and first highlight.
 
-Each row carries the run's status glyph, its workflow's name, its tier, when it started, and its `done/total`, plus a marker when it has a summary. Runs whose history has been pruned still appear, dimmed and tagged `pruned`, built from the summary that outlived them. The detail strip below the list shows the selected run's args, limits, and failure or blocker line, together with its summary's outcome and first highlight; for a pruned run it shows the summary text and the fixed line `history pruned — restore and interrogation unavailable`, so a row that cannot be acted on says why.
+## Steering a run
 
-| Input | Action |
-| --- | --- |
-| `↑` / `↓` (or `j` / `k`) | move the selection |
-| `Enter` | open the selected run in the DAG view — live if it is still running, read-only from history otherwise |
-| `r` | restore that run into a new run: every restorable node, behind a confirmation (`Enter` starts it, `Esc` backs out) |
-| `Esc` | close the browser |
+A node's pane is a full, independent Claude Code session — in split-pane mode, exactly the same as any teammate Claude Code spawns anywhere else. There is no Herdr-mediated steer, interrupt, or restart any more:
 
-`r` is restore-all with a confirm; per-node restore is `--restore` on the CLI. It is unavailable — with the reason on screen — for a pruned run, and while another run is in flight, since Karvex executes one run at a time. Per-node interrogation deliberately lives in the DAG view rather than here, on the node it is about.
+- **To redirect one teammate**, open its pane (`Enter` in the DAG view, or find its `pane_id` on `kvx workflow node show <run_id> <path>`) and type. You're talking to that Claude session directly.
+- **To redirect the run as a whole** — reprioritize, spawn more teammates, abandon a task — open the lead's pane (`kvx workflow run show <run_id> --json` names it as `lead_pane_id`) and tell it what you want. The lead is the one thing that can reassign work or nudge a stalled teammate; Herdr can't do either on its own behalf.
+- **A permission prompt in the lead's pane blocks the entire run.** Teammate permission requests bubble up to the lead by default, so a run that looks stuck is very often just waiting on an answer in that one pane.
+
+Earlier releases had `kvx workflow node steer|interrupt|restart|complete|expand|interrogate`. The CLI still parses all six for now, but the server answers every one of them with `workflow_node_verb_retired` and points you at the pane — they executed a node Herdr no longer executes. `kvx workflow node show <run_id> <path> [--json]` still works; it's a read of the projection, same as `run show`.
+
+## Finishing a run
+
+```bash
+kvx workflow run finish [--run <run_id>] (--summary-file <path> | --summary <text>) [--outcome <word>] [--json]
+```
+
+The plan tells the lead to do exactly this once every task is done, or once it has concluded the run can't go further: write a run summary to a file, then call `run finish` with it. `KARVEX_WORKFLOW_RUN_ID` is already exported in the lead's own pane, so it needs nothing but the summary. This one call replaces the entire old summariser subsystem — there is no engine-judged verdict any more. If the run genuinely failed, the lead still calls `finish` and says so: the run's own status becomes `succeeded` regardless (there's no other terminal status a self-report can reach), and the truth — what actually happened, and whether it worked — lives in the `outcome` word and the summary text, one `kvx workflow summary show` away.
+
+```bash
+kvx workflow run cancel <run_id> [--json]
+```
+
+Cancelling marks the run `cancelled` and closes the lead's pane. There's no task-level teardown to do: teammates belong to the lead, not to Herdr, so nothing walks the team closing panes one by one.
+
+If the lead's pane closes on its own — closed by hand, crashed, or the server restarted — without ever calling `finish`, the run is left `failed` with whatever the projection last captured: the task and member snapshots as of the last poll. There is no `run resume` command yet; there is nothing Herdr does to pick a dropped run back up. The lead's `lead_session_id` (on `kvx workflow run show <run_id> --json`) is a real, resumable Claude session, so `claude --resume <lead_session_id>` in a plain pane gets the conversation back — Herdr just doesn't wire that up for you, and doing it this way leaves the run's own record `failed`.
+
+## Run history and summaries
+
+```bash
+kvx workflow summary show <run_id> [--json]
+kvx workflow summary list [<name|id>] [--limit N] [--json]
+```
+
+`summary show` prints the outcome, the summary text, and the run it belongs to; `summary list` is newest-first across a workflow, or across every workflow when given no target. A run with no summary — cancelled, or the lead never called `finish` — is a normal run, and `summary show` saying there is none is a normal answer, not an error.
+
+A new run of the same workflow is offered its most recent predecessors' summaries as context automatically: `workflow.history_context_runs` (default 3) is how many, written to `<run dir>/context/prior-runs.md` and pointed at from the lead's own plan, so it can start from what previous runs left open. Opt out with `kvx workflow run start --no-prior-summaries`.
+
+:::caution[`retention_runs` doesn't prune]
+`workflow.retention_runs` (default 50) is still a published config key, and it still means "keep this many runs per workflow, oldest pruned first" — but nothing calls the code that prunes any more. The old engine's end-of-run epilogue was retention's only caller, and it went with the engine. Every run this server has ever recorded stays, in full, until something is given ownership of pruning again. If disk use from run history matters to you today, there's no config knob that helps.
+:::
+
+:::caution[Restore and interrogate are vestigial]
+The run browser's `r` restore action and `kvx workflow run start --restore-from <run_id> [--restore <selector>]... [--restore-allow-changed]` still parse and still start a run — but restoring a node meant seeding it from a past run's checkpoint, and nothing writes a node checkpoint any more (that was the old engine's job too). In practice `--restore-from` today validates the request, records it on the run row, and then launches an ordinary fresh lead run of the same workflow and args: nothing about what actually happened in the source run reaches the new lead. Likewise `kvx workflow node interrogate` — forking a past node's Claude session into a pane — always answers `workflow_node_verb_retired` now; a *lead's* session is resumable by hand (see Finishing a run, above), but there is no equivalent for a single teammate's session once its pane is gone.
+:::
+
+The other three `[workflow]` keys published before this rework — `summary_enabled`, `max_parallel_nodes`, `stuck_threshold`, `drift_threshold` — are the same story: still parsed, still defaulted, and read by nothing. A run's summary is written whenever the lead calls `finish`, regardless of `summary_enabled`; nothing schedules nodes at all any more, so nothing consults a parallelism cap or a watchdog threshold. `history_context_runs` is the one working knob left in the section.
+
+## Commands
+
+```bash
+kvx workflow list [--json]
+kvx workflow show <name|id> [--json]
+kvx workflow create --file <definition.toml|json> [--name <name>] [--json]
+kvx workflow update <name|id> --file <definition.toml|json> [--change-summary <text>] [--json]
+kvx workflow run start <name|id> [--tier auto|max|high|medium|low] [--arg KEY=VALUE]... [--no-prior-summaries] [--json]
+kvx workflow run list <name|id> [--limit N] [--json]
+kvx workflow run show <run_id> [--json]
+kvx workflow run cancel <run_id> [--json]
+kvx workflow run finish [--run <run_id>] (--summary-file <path> | --summary <text>) [--outcome <word>] [--json]
+kvx workflow node show <run_id> <path> [--json]
+kvx workflow summary show <run_id> [--json]
+kvx workflow summary list [<name|id>] [--limit N] [--json]
+```
+
+Every command above prints human-readable text by default and takes `--json` for the raw envelope. From the Herdr TUI, `prefix+f` opens the **workflow launcher**: saved workflows, one input line per required argument, a tier row seeded from the workflow's `default_tier`. `Enter` starts the run; every row is clickable. Rebind it with `keys.open_workflow_launcher`, the DAG view with `keys.open_workflow_dag`, and the run browser with `keys.open_workflow_runs`.
