@@ -923,12 +923,24 @@ output_schema = {{ type = "object" }}
         assert_eq!(launch.args[1].value, "everything");
     }
 
+    /// The launcher's own gate: a required arg with no default refuses the
+    /// confirm client-side, names the field, and moves focus to it — and once
+    /// it is filled, the launcher stops being the thing that refuses.
+    ///
+    /// This used to run on to assert that the run started and that the tier
+    /// row reached the start call. `workflow.run` execs a real `claude` and
+    /// preflights its version now (`09-agent-teams-rework.md` §3.1 step 3), so
+    /// whether the confirm succeeds depends on the machine and cannot be
+    /// asserted in process. The launch path end to end belongs to
+    /// `tests/workflow_lead_headless.rs`, which has a stub on `PATH`; that
+    /// suite starts its runs over the API rather than through this modal, so
+    /// the tier the row carries reaching `WorkflowRunParams` is currently
+    /// uncovered on both sides.
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn confirm_is_refused_until_the_required_arg_is_filled_then_starts_the_run() {
+    fn confirm_is_refused_until_the_required_arg_is_filled() {
         let mut app = test_app();
-        let workflow_id = create_workflow(&mut app, "ship-feature", "high");
+        create_workflow(&mut app, "ship-feature", "high");
         assert!(app.open_workflow_launcher());
 
         app.handle_workflow_launch_key(key(KeyCode::Enter));
@@ -953,26 +965,19 @@ output_schema = {{ type = "object" }}
         app.state.view.workflow_launch.tier = Some(Tier::Low);
         app.handle_workflow_launch_key(key(KeyCode::Enter));
 
-        assert_ne!(app.state.mode, Mode::WorkflowLaunch, "the run started");
-        assert_eq!(
-            app.state.view.workflow_launch,
-            WorkflowLaunchState::default(),
-            "the form is not left behind for the next open"
+        // Whatever happens next is the server's answer — on a machine with no
+        // agent-teams `claude` it is `workflow_lead_unavailable`, on one with
+        // it the run starts — so the assertion is only that the refusal is no
+        // longer *ours*. A client-side gate that kept firing after the field
+        // was filled would be the bug this half is here for.
+        assert_ne!(
+            app.state.view.workflow_launch.error.as_deref(),
+            Some("goal is required"),
+            "a filled required arg must not still be refused by the launcher"
         );
-
-        // The tier the row was on is the tier the run was started with.
-        let listed = app.dispatch_api_request(
-            "test.workflow.run.list",
-            Method::WorkflowRunList(crate::api::schema::WorkflowRunListParams {
-                workflow_id: Some(workflow_id),
-                limit: None,
-            }),
-        );
-        let listed: serde_json::Value =
-            serde_json::from_str(&listed).expect("the response is json");
-        assert_eq!(
-            listed["result"]["runs"][0]["tier"], "low",
-            "the launcher's tier reached the start call: {listed}"
+        assert!(
+            !app.state.view.workflow_launch.submitting,
+            "the confirm is not left mid-flight whichever way the server answered"
         );
     }
 }

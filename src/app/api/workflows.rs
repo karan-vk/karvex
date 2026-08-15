@@ -4076,6 +4076,119 @@ port = "summary"
         );
     }
 
+    /// A pruned run's own row is gone, but its `run_summary` outlives it
+    /// (`03-storage-schema.md` §9), so `workflow.run.get` and a restore that
+    /// names it must say **pruned**, not not-found: the caller is told which of
+    /// "gone" and "never existed" happened, and the surviving surface is named
+    /// rather than implied. Ported down from the engine-era headless suite,
+    /// which had to run a whole workflow to reach a prunable run.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_pruned_run_answers_pruned_rather_than_not_found() {
+        let (mut app, run_id) = app_with_a_live_lead_run();
+        // Finish it, which is what writes the `run_summary` that survives the
+        // prune, and closes the run so a second start is not refused.
+        app.handle_workflow_run_finish(
+            "req".into(),
+            WorkflowRunFinishParams {
+                run_id: run_id.clone(),
+                summary: Some("did the thing".into()),
+                summary_file: None,
+                outcome: None,
+            },
+        );
+
+        let workflow = WorkflowId::new(
+            serde_json::from_str::<serde_json::Value>(&app.handle_workflow_list("req".into()))
+                .unwrap()["result"]["workflows"][0]["workflow_id"]
+                .as_str()
+                .expect("the workflow exists")
+                .to_string(),
+        );
+        let pruned = app
+            .workflow_store
+            .call(move |cx| cx.block_on(cx.store().prune_run_history(&workflow, 0)))
+            .expect("the in-memory store is available")
+            .expect("the prune runs");
+        assert_eq!(pruned, 1, "the finished run is the one that was pruned");
+
+        let response = app.handle_workflow_run_get(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+        );
+        assert_eq!(error_code(&response), RUN_PRUNED_CODE, "{response}");
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let message = value["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("summary"),
+            "the refusal names the surface that survived: {message}"
+        );
+
+        // The summary itself still answers, which is what makes that message
+        // true rather than merely encouraging.
+        let summary = app.handle_workflow_summary_get(
+            "req".into(),
+            WorkflowRunTarget {
+                run_id: run_id.clone(),
+            },
+        );
+        let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(summary["result"]["summary"]["text"], "did the thing");
+
+        // And a restore naming it is refused as pruned too — its checkpoints
+        // went with the run.
+        let response = app.handle_workflow_run(
+            "req".into(),
+            WorkflowRunParams {
+                workflow_id: "lead-run".into(),
+                version: None,
+                tier: None,
+                args: HashMap::new(),
+                restore_from: Some(crate::api::schema::WorkflowRestoreRequest {
+                    run_id,
+                    nodes: Vec::new(),
+                    allow_changed: false,
+                }),
+                include_prior_summaries: None,
+            },
+        );
+        assert_eq!(error_code(&response), RUN_PRUNED_CODE, "{response}");
+    }
+
+    /// **Known gap, not a passing test.** `workflow.retention_runs` is a
+    /// documented, published config knob (`website/src/data/config-reference
+    /// .json`) and `WorkflowStore::prune_run_history` implements it correctly —
+    /// but the engine's epilogue was the only thing that ever called it, so on
+    /// this branch nothing prunes and the knob is a silent no-op. That is the
+    /// same shape of dishonesty the rework audit's §2.4 catalogues, newly
+    /// created rather than inherited.
+    ///
+    /// The natural owner is `workflow.run.finish`, which is where a run's
+    /// history last changes — but retention deletes user data, so wiring it
+    /// blind is not the right move inside a lint-and-test pass. Named here so
+    /// the next change to this file has to decide.
+    #[cfg(feature = "workflow")]
+    #[test]
+    #[ignore = "gap: workflow.retention_runs is published but nothing calls prune_run_history since the engine's epilogue went; needs an owner, probably run.finish"]
+    fn finishing_a_run_prunes_history_past_the_retention_limit() {
+        let (mut app, run_id) = app_with_a_live_lead_run();
+        app.handle_workflow_run_finish(
+            "req".into(),
+            WorkflowRunFinishParams {
+                run_id: run_id.clone(),
+                summary: Some("did the thing".into()),
+                summary_file: None,
+                outcome: None,
+            },
+        );
+        // With `retention_runs` honoured at all, a limit of zero would leave no
+        // `workflow_run` row behind.
+        let response = app.handle_workflow_run_get("req".into(), WorkflowRunTarget { run_id });
+        assert_eq!(error_code(&response), RUN_PRUNED_CODE, "{response}");
+    }
+
     /// Restoring from a run that has neither a row nor a surviving summary is
     /// a plain not-found, told apart from `workflow_run_pruned` — "gone" and
     /// "never existed" are different answers to the caller.

@@ -821,6 +821,23 @@ fn a_lead_run_spawns_an_agent_teams_claude_with_no_positional_prompt_and_is_seed
         event["data"]["pane"]["pane_id"] == lead_pane.as_str()
     });
 
+    // And the run itself is announced. The engine used to publish this from
+    // its own event funnel; that funnel went with it, and for a while nothing
+    // published `workflow.run.started` at all — a subscriber watching for runs
+    // saw a server that never started one. Asserted here because the only way
+    // to see it is from outside the process, on a real subscription.
+    let started_event = wait_for_event_matching(
+        &mut events,
+        &mut seen,
+        "workflow_run_started",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        started_event["data"]["run"]["status"], "running",
+        "the started event carries the row as it reads back: {started_event}"
+    );
+
     // The single-live-run guard. §3.1's binding is a *search* over team configs
     // filtered by a freshness window and the lead pane's cwd, and its one
     // documented race is two runs launched into the same cwd inside that
@@ -1291,6 +1308,7 @@ fn the_lead_finishes_its_own_run_through_the_cli_and_an_empty_finish_is_refused(
 fn cancelling_a_lead_run_closes_the_lead_pane_and_reports_cancelled() {
     let server = spawn_lead_server("cancel");
     let socket = server.socket().to_path_buf();
+    let mut events = subscribe(&socket);
     let (_workflow_id, run_id) = launch_lead_run(&server);
     let bound = wait_for_team_binding(&socket, &run_id);
 
@@ -1329,6 +1347,22 @@ fn cancelling_a_lead_run_closes_the_lead_pane_and_reports_cancelled() {
         || (!pane_ids(&socket).contains(&lead_pane)).then_some(()),
     );
 
+    // A cancel is terminal, so subscribers hear `run.finished` — there is no
+    // cancelled event kind on the wire, and a client watching only for
+    // finishes must not miss the run that ended because it was cancelled.
+    let mut seen = Vec::new();
+    let finished_event = wait_for_event_matching(
+        &mut events,
+        &mut seen,
+        "workflow_run_finished",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        finished_event["data"]["run"]["status"], "cancelled",
+        "the finish event carries the cancelled row: {finished_event:#}"
+    );
+
     server.shutdown();
 }
 
@@ -1361,6 +1395,7 @@ fn cancelling_a_lead_run_closes_the_lead_pane_and_reports_cancelled() {
 fn a_lead_pane_closed_without_finishing_closes_the_run_and_keeps_its_snapshot() {
     let server = spawn_lead_server("lead-exit");
     let socket = server.socket().to_path_buf();
+    let mut events = subscribe(&socket);
     let (_workflow_id, run_id) = launch_lead_run(&server);
     let bound = wait_for_team_binding(&socket, &run_id);
 
@@ -1419,6 +1454,22 @@ fn a_lead_pane_closed_without_finishing_closes_the_run_and_keeps_its_snapshot() 
             .as_u64()
             .is_some_and(|at| at > 0),
         "the close-out must stamp when the run ended: {closed:#}"
+    );
+
+    // Nobody asked for this close-out, which is exactly why it has to be
+    // announced: a subscriber that only ever polls would otherwise show the
+    // run as live until something unrelated moved it.
+    let mut seen = Vec::new();
+    let finished_event = wait_for_event_matching(
+        &mut events,
+        &mut seen,
+        "workflow_run_finished",
+        SETTLE,
+        |event| event["data"]["run"]["run_id"] == run_id.as_str(),
+    );
+    assert_eq!(
+        finished_event["data"]["run"]["status"], "failed",
+        "the unasked-for close-out is announced with the row it wrote: {finished_event:#}"
     );
 
     // The retention guarantee. Read back after the run is terminal, from the
