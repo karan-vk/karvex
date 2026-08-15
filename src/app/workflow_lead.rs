@@ -27,7 +27,7 @@ use crate::workflow::binding::messaging::{self, MessagingSupport};
 use crate::workflow::binding::spawn;
 use crate::workflow::model::{Kvdag, NodeKey, NodeStatus, RunId, RunStatus, StoreWrite};
 use crate::workflow::projection::{
-    self, ObservedTask, ObservedTeam, ProjectionSnapshot, TaskStatus,
+    self, ObservedMemberIdentity, ObservedTask, ObservedTeam, ProjectionSnapshot, TaskStatus,
 };
 
 /// How often the run projection re-reads Claude Code's task and team files.
@@ -39,6 +39,12 @@ use crate::workflow::projection::{
 /// unlike the git-status refresh, there is no slow subprocess to get off the
 /// loop.
 pub(crate) const RUN_PROJECTION_INTERVAL: Duration = Duration::from_secs(2);
+
+/// What the DAG calls the run's reserved `.lead` node.
+///
+/// The label a node shows is normally the author's; this one has no author, so
+/// it says plainly what the node is rather than borrowing a workflow name.
+const LEAD_NODE_LABEL: &str = "team lead";
 
 /// Upper bound on how many task files one poll will read, so a runaway lead
 /// cannot make the loop quadratic in its own task count.
@@ -63,6 +69,11 @@ pub(crate) struct LiveLeadRun {
     /// [`identity::match_team_window`] recognises the team by when the lead's
     /// own assertion never arrives.
     pub(crate) lead_cwd: PathBuf,
+    /// The run's own directory, where its prompt, its `--settings`, and its
+    /// prior-run context live. Held because the `.lead` node records it as the
+    /// closest true answer to "where does this agent's work live" — the node
+    /// directories that used to answer that went with the engine.
+    pub(crate) run_dir: PathBuf,
     pub(crate) spawned_at_unix_ms: u64,
     /// The team, once recognised. `None` while the lead is still starting.
     pub(crate) binding: Option<LeadBinding>,
@@ -363,6 +374,7 @@ impl crate::app::App {
             lead_pane_id: lead_pane_id.clone(),
             lead_terminal_id: lead_terminal_id.clone(),
             lead_cwd: spec.cwd.clone(),
+            run_dir: spec.run_dir.clone(),
             spawned_at_unix_ms,
             binding: None,
             bind_evidence: None,
@@ -379,10 +391,140 @@ impl crate::app::App {
             next_poll_at: None,
         });
         self.persist_workflow_write(StoreWrite::RunLeadPane {
-            run: run_id,
+            run: run_id.clone(),
             lead_pane_id,
             lead_terminal_id: lead_terminal_id.to_string(),
             lead_prompt_version: crate::workflow::lead_prompt::LEAD_PROMPT_VERSION,
+        });
+        self.mint_lead_node(&run_id, spawned_at_unix_ms);
+    }
+
+    /// Mints the run's reserved `.lead` node (§3.3, D-9).
+    ///
+    /// Created here rather than on first observation because the lead is a fact
+    /// about the run from the instant its pane exists — the same reasoning
+    /// [`Self::bind_lead_run`] persists the pane on — and because every later
+    /// write against `.lead` is an `UPDATE` that needs the row to already be
+    /// there. `Running` from the start: karvex just launched it, and a node that
+    /// claimed to be `pending` while a `claude` was live in a pane would be the
+    /// kind of lie this whole rework exists to remove.
+    fn mint_lead_node(&mut self, run_id: &RunId, started_at_unix_ms: u64) {
+        self.persist_workflow_write(StoreWrite::RunNodeCreated {
+            run: run_id.clone(),
+            key: NodeKey::new(crate::workflow::model::LEAD_INSTANCE_PATH),
+            path: crate::workflow::model::InstancePath::new(
+                crate::workflow::model::LEAD_INSTANCE_PATH,
+            ),
+            label: LEAD_NODE_LABEL.to_string(),
+            inputs: std::collections::BTreeMap::new(),
+            parent: None,
+            depth: 0,
+            status: NodeStatus::Running,
+            demand: crate::workflow::model::Demand::Standard,
+            assignment: crate::workflow::tier::resolve(
+                crate::workflow::tier::Tier::Auto,
+                crate::workflow::model::Demand::Critical,
+                None,
+            ),
+            assignment_reason: "the run's team lead".to_string(),
+            attempt: 1,
+            proposal_id: String::new(),
+        });
+        // `RunNodeCreated` has no `started_at`; the update that carries it is
+        // also the one that will carry the lead's identity, so the row is
+        // never left claiming it started at no particular time.
+        self.write_lead_node(
+            run_id,
+            NodeStatus::Running,
+            None,
+            Some(started_at_unix_ms),
+            None,
+        );
+    }
+
+    /// Copies the lead's own session identity onto the `.lead` node.
+    ///
+    /// The same three facts `run_member` records for every other member, on the
+    /// row an interview addresses. Written only when the identity actually
+    /// carries a session id: `run_node`'s binding columns are all-or-nothing,
+    /// and a binding with an empty session id would read back as a lead karvex
+    /// had identified when it had not.
+    fn record_lead_node_identity(
+        &mut self,
+        run_id: &RunId,
+        identity: &crate::workflow::projection::MemberIdentity,
+        observed_at_unix_ms: u64,
+    ) {
+        let Some(session_id) = identity.session_id.clone() else {
+            return;
+        };
+        let Some(run) = self.workflow_lead.as_ref() else {
+            return;
+        };
+        let binding = crate::workflow::model::NodeBinding {
+            pane_id: crate::workflow::model::PublicPaneId::new(run.lead_pane_id.clone()),
+            terminal_id: run.lead_terminal_id.clone(),
+            agent_session_id: session_id,
+            transcript_path: identity
+                .transcript_path
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            // The lead has no node directory: the node contract that owned that
+            // idea was deleted with the engine. Its run directory is the
+            // closest true answer and is where its prompt actually lives.
+            node_dir: run.run_dir.clone(),
+            cwd: run.lead_cwd.clone(),
+        };
+        let _ = observed_at_unix_ms;
+        self.write_lead_node(run_id, NodeStatus::Running, Some(binding), None, None);
+    }
+
+    /// Settles the `.lead` node when the run closes.
+    ///
+    /// Without this the DAG would show a lead still running inside a run that
+    /// ended — and the watchdog, which samples the lead, would keep finding a
+    /// live node to have an opinion about. The status mirrors the run's own,
+    /// because the lead *is* the run: karvex never decided anything else about
+    /// how it ended.
+    fn close_lead_node(&mut self, run_id: &RunId, status: RunStatus, ended_at_unix_ms: u64) {
+        let node_status = match status {
+            RunStatus::Succeeded => NodeStatus::Succeeded,
+            RunStatus::Cancelled => NodeStatus::Cancelled,
+            _ => NodeStatus::Failed,
+        };
+        self.write_lead_node(run_id, node_status, None, None, Some(ended_at_unix_ms));
+    }
+
+    /// The one `StoreWrite::RunNode` builder for `.lead`, so the node's
+    /// unwritten columns are unwritten in exactly one place.
+    ///
+    /// `usage` is zeroed on every write and that is correct rather than lazy:
+    /// nothing samples the lead's tokens or tool uses (the transcript-delta
+    /// sampler is a later packet), and the honest record of an unmeasured
+    /// quantity is zero, not a number carried over from somewhere else.
+    fn write_lead_node(
+        &mut self,
+        run_id: &RunId,
+        status: NodeStatus,
+        binding: Option<crate::workflow::model::NodeBinding>,
+        started_at_unix_ms: Option<u64>,
+        ended_at_unix_ms: Option<u64>,
+    ) {
+        self.persist_workflow_write(StoreWrite::RunNode {
+            run: run_id.clone(),
+            path: crate::workflow::model::InstancePath::new(
+                crate::workflow::model::LEAD_INSTANCE_PATH,
+            ),
+            status,
+            attempt: 1,
+            binding,
+            usage: crate::workflow::model::NodeUsage::default(),
+            evidence: None,
+            succession: None,
+            started_at_unix_ms,
+            ended_at_unix_ms,
+            restored_from: None,
         });
     }
 
@@ -398,9 +540,29 @@ impl crate::app::App {
 
     // ── projection ─────────────────────────────────────────────────────────
 
-    /// One projection tick. Returns whether anything changed, so the caller
-    /// knows whether to re-render.
+    /// One workflow tick.
+    ///
+    /// Two pollers with two different lifetimes hang off this one call, which is
+    /// why it is split (`phase4-retarget-plan.md` §5 P8):
+    ///
+    /// * the lead-run projection, which only exists while a run is live in this
+    ///   server, and
+    /// * the review cycles, which are started over runs that have *already*
+    ///   ended and must keep ticking with no live run at all.
+    ///
+    /// Returns whether anything changed, so the caller knows whether to
+    /// re-render.
     pub(crate) fn poll_run_projection(&mut self, now: Instant) -> bool {
+        let mut changed = self.poll_lead_run(now);
+        // Deliberately outside the live-run gate: a review interviews a run
+        // that is over, so gating it on `workflow_lead` would mean it never
+        // ticked at all.
+        changed |= self.poll_review_cycles(now);
+        changed
+    }
+
+    /// The live lead run's own tick.
+    fn poll_lead_run(&mut self, now: Instant) -> bool {
         let Some(run) = self.workflow_lead.as_ref() else {
             return false;
         };
@@ -426,6 +588,10 @@ impl crate::app::App {
         let mut changed = self.bind_run_team(&claude_dir);
         changed |= self.seed_lead_if_ready();
         changed |= self.absorb_run_projection(&claude_dir);
+        // Layered on this poll rather than given a timer of its own (§3.4): the
+        // watchdog samples at `watchdog_tick_secs`, which is a multiple of this
+        // cadence, and it needs exactly the state the projection just refreshed.
+        changed |= self.poll_run_watchdog(now);
         changed
     }
 
@@ -603,10 +769,11 @@ impl crate::app::App {
         };
         let run_id = run.run_id.clone();
         let reason = identity::unbound_failure_reason(waited_ms);
+        let ended_at_unix_ms = crate::app::workflow::current_unix_ms();
         warn!(run = %run_id, waited_ms, "{reason}");
         self.persist_workflow_write(StoreWrite::RunFailed {
-            run: run_id,
-            ended_at_unix_ms: crate::app::workflow::current_unix_ms(),
+            run: run_id.clone(),
+            ended_at_unix_ms,
             failure: serde_json::json!({
                 "kind": "lead_unbound",
                 "detail": reason,
@@ -614,6 +781,7 @@ impl crate::app::App {
                 "resumable": false,
             }),
         });
+        self.close_lead_node(&run_id, RunStatus::Failed, ended_at_unix_ms);
         if let Some(run) = self.workflow_lead.as_mut() {
             run.closed = true;
         }
@@ -893,6 +1061,150 @@ impl crate::app::App {
         })
     }
 
+    // ── member identity (§3.3) ─────────────────────────────────────────────
+
+    /// What karvex knows about each team member's own Claude Code session,
+    /// keyed by the name the team config gave it.
+    ///
+    /// This is the packet's whole reason for existing. Claude Code's team state
+    /// carries `agentId` (`<name>@<team>`) and `leadSessionId`, and nothing else
+    /// that identifies a teammate's session (`phase4-retarget-plan.md` §1.4c) —
+    /// so a review cycle run tomorrow, over panes that closed today, would have
+    /// nothing to resume. Karvex already *holds* the missing fact: spike S1
+    /// proved the bundled `SessionStart` hook fires inside every split-pane
+    /// teammate and lands its session id on that teammate's karvex pane, and
+    /// that the team config's `tmuxPaneId` **is** karvex's own public pane id.
+    /// All this does is copy it somewhere durable.
+    ///
+    /// The ladder, per member, is S1's — not the plan's, which S1 corrected:
+    ///
+    /// 1. the run-scoped `--settings` self-report karvex already collects
+    ///    (`member_endpoints`, keyed by pane), which is the only source that
+    ///    also carries Claude Code's own `transcript_path`;
+    /// 2. the bundled hook's report, already on the pane's terminal as
+    ///    `persisted_agent_session` — the source that works with no new code;
+    /// 3. for the **lead only**, the team config's `leadSessionId`.
+    ///
+    /// The plan's fourth rung — `~/.claude/sessions/<pid>.json` — is *not* here:
+    /// S1 sampled a live teammate 164 times over its whole life and it never
+    /// registered, so that registry is lead-only, and for the lead the team
+    /// config already answers with no IO at all. Nor is "the newest transcript
+    /// under the cwd's project slug": lead and teammates share one project slug,
+    /// so it cannot tell two teammates apart. A member this resolves nothing for
+    /// records `None` and is `evidence_only` in a review — which is honest, and
+    /// visible on the wire.
+    fn member_identities(
+        &self,
+        claude_dir: &Path,
+        team: &ObservedTeam,
+    ) -> std::collections::BTreeMap<String, ObservedMemberIdentity> {
+        let mut identities = std::collections::BTreeMap::new();
+        let Some(run) = self.workflow_lead.as_ref() else {
+            return identities;
+        };
+        for member in &team.members {
+            let (pane_id, reported) = if member.is_lead() {
+                // The lead has no pane in the *team's* accounting (its
+                // `tmuxPaneId` is the `"leader"` sentinel), but it very much has
+                // one in karvex's: the pane karvex launched it into.
+                (Some(run.lead_pane_id.as_str()), run.lead_endpoint.as_ref())
+            } else {
+                match member.tmux_pane_id() {
+                    Some(pane) => (Some(pane), run.member_endpoints.get(pane)),
+                    // An in-process teammate is a session inside the lead's
+                    // process with no pane of its own, so karvex can observe
+                    // nothing about it. Recorded as unresolved rather than
+                    // guessed at.
+                    None => (None, None),
+                }
+            };
+            let session_id = reported
+                .map(|endpoint| endpoint.session_id.clone())
+                .or_else(|| pane_id.and_then(|pane| self.pane_claude_session_id(pane)))
+                .or_else(|| {
+                    member
+                        .is_lead()
+                        .then(|| run.binding.as_ref().map(|b| b.lead_session_id.clone()))
+                        .flatten()
+                });
+            let cwd = member.cwd.clone().or_else(|| {
+                member
+                    .is_lead()
+                    .then(|| run.lead_cwd.to_string_lossy().into_owned())
+            });
+            let transcript_path = reported
+                .and_then(|endpoint| endpoint.transcript_path.clone())
+                .or_else(|| {
+                    derived_transcript_path(claude_dir, cwd.as_deref(), session_id.as_deref())
+                });
+            let last_state = pane_id
+                .and_then(|pane| self.pane_member_state(pane))
+                .map(|state| state.as_str().to_string());
+            identities.insert(
+                member.name.clone(),
+                ObservedMemberIdentity {
+                    session_id,
+                    transcript_path,
+                    last_state,
+                },
+            );
+        }
+        identities
+    }
+
+    /// The claude session id karvex's own per-pane hook already recorded for a
+    /// public pane id.
+    ///
+    /// The bundled `SessionStart` hook posts it, `agent_resume` validates it,
+    /// and the pane's terminal has held it since long before this packet
+    /// (`terminal/state.rs`, `phase4-retarget-plan.md` §1.3). Only a claude
+    /// session counts: a pane that has been re-purposed for another agent must
+    /// not lend its id to a Claude Code teammate.
+    fn pane_claude_session_id(&self, pane_id: &str) -> Option<String> {
+        let session = self
+            .terminal_for_public_pane(pane_id)?
+            .persisted_agent_session
+            .as_ref()?;
+        (session.agent == "claude"
+            && session.session_ref.kind == crate::agent_resume::AgentSessionRefKind::Id)
+            .then(|| session.session_ref.value.clone())
+    }
+
+    /// What karvex's own detection says the member's pane is doing, in the
+    /// vocabulary `workflow.run.get` publishes.
+    ///
+    /// The same read the DAG overlay already does (`ui/workflow_dag.rs`), moved
+    /// behind the server boundary so it is recorded rather than only rendered:
+    /// a pane's state is gone the moment the pane is, and "this teammate sat
+    /// idle for forty minutes while its task said `in_progress`" is the single
+    /// most useful thing a review can put to it.
+    fn pane_member_state(&self, pane_id: &str) -> Option<crate::api::schema::WorkflowMemberState> {
+        let terminal = self.terminal_for_public_pane(pane_id)?;
+        Some(match terminal.state {
+            crate::detect::AgentState::Working => crate::api::schema::WorkflowMemberState::Working,
+            crate::detect::AgentState::Idle => crate::api::schema::WorkflowMemberState::Idle,
+            crate::detect::AgentState::Blocked => {
+                crate::api::schema::WorkflowMemberState::NeedsInput
+            }
+            crate::detect::AgentState::Unknown => crate::api::schema::WorkflowMemberState::Unknown,
+        })
+    }
+
+    /// The terminal behind a **public** pane id — the id Claude Code hands back
+    /// through `tmuxPaneId`. `None` once the pane is gone, which is the normal
+    /// answer for a finished run.
+    fn terminal_for_public_pane(&self, pane_id: &str) -> Option<&crate::terminal::TerminalState> {
+        let (ws_idx, pane) = self.parse_current_public_pane_id(pane_id)?;
+        let attached = self
+            .state
+            .workspaces
+            .get(ws_idx)?
+            .pane_state(pane)?
+            .attached_terminal_id
+            .clone();
+        self.state.terminals.get(&attached)
+    }
+
     /// The team-config name of whichever member occupies this pane.
     fn member_name_for_pane(&self, pane_id: &str) -> Option<String> {
         self.workflow_lead
@@ -977,8 +1289,23 @@ impl crate::app::App {
             }
         }
 
+        // Resolved before the fold, because a member whose session id has just
+        // arrived is a member whose durable record changed even though the team
+        // config's bytes did not — and the snapshot is the only thing that can
+        // tell those two apart cheaply enough to keep an unchanged poll silent.
+        let identities = match team.as_ref() {
+            Some(team) => self.member_identities(claude_dir, team),
+            None => std::collections::BTreeMap::new(),
+        };
+        let observed_at_unix_ms = crate::app::workflow::current_unix_ms();
         let delta = match self.workflow_lead.as_mut() {
-            Some(run) => run.snapshot.absorb(&tasks, team.as_ref(), &node_keys),
+            Some(run) => run.snapshot.absorb(
+                &tasks,
+                team.as_ref(),
+                &node_keys,
+                &identities,
+                observed_at_unix_ms,
+            ),
             None => return false,
         };
         if delta.tasks.is_empty() && delta.members.is_empty() {
@@ -1006,7 +1333,8 @@ impl crate::app::App {
                 observed_at_unix_ms: crate::app::workflow::current_unix_ms(),
             });
         }
-        for member in &delta.members {
+        for projected in &delta.members {
+            let member = &projected.member;
             self.persist_workflow_write(StoreWrite::RunMemberSnapshot {
                 run: run_id.clone(),
                 name: member.name.clone(),
@@ -1016,14 +1344,19 @@ impl crate::app::App {
                 backend_type: member.backend_type.clone(),
                 is_active: member.is_active,
                 cwd: member.cwd.clone(),
-                // Learned by P8; P1 only lands the shape, not the behaviour
-                // (`phase4-retarget-plan.md`).
-                session_id: None,
-                transcript_path: None,
-                last_state: None,
-                last_state_at_unix_ms: None,
-                observed_at_unix_ms: crate::app::workflow::current_unix_ms(),
+                session_id: projected.identity.session_id.clone(),
+                transcript_path: projected.identity.transcript_path.clone(),
+                last_state: projected.identity.last_state.clone(),
+                last_state_at_unix_ms: projected.identity.last_state_at_unix_ms,
+                observed_at_unix_ms,
             });
+            // The lead is a member like any other in the team config, and the
+            // `.lead` node is the run-node face of that same row: it is what
+            // gives `interrogation.run_node` — a *required* link — something to
+            // point at when the lead itself is interviewed (D-9).
+            if member.is_lead() {
+                self.record_lead_node_identity(&run_id, &projected.identity, observed_at_unix_ms);
+            }
         }
 
         self.emit_projected_node_events(&run_id, &delta, &created_paths);
@@ -1086,6 +1419,7 @@ impl crate::app::App {
             status: RunStatus::Succeeded,
             ended_at_unix_ms: Some(ended_at_unix_ms),
         });
+        self.close_lead_node(run_id, RunStatus::Succeeded, ended_at_unix_ms);
         if let Some(run) = self.workflow_lead.as_mut() {
             if &run.run_id == run_id {
                 run.closed = true;
@@ -1190,6 +1524,7 @@ impl crate::app::App {
                 "team_name": team_name,
             }),
         });
+        self.close_lead_node(&run_id, RunStatus::Failed, ended_at_unix_ms);
         if let Some(run) = self.workflow_lead.as_mut() {
             run.closed = true;
         }
@@ -1371,6 +1706,7 @@ impl crate::app::App {
             status: RunStatus::Cancelled,
             ended_at_unix_ms: Some(ended_at_unix_ms),
         });
+        self.close_lead_node(run_id, RunStatus::Cancelled, ended_at_unix_ms);
         if let Some(run) = self.workflow_lead.as_mut() {
             run.closed = true;
         }
@@ -1694,6 +2030,25 @@ fn read_tasks(dir: &Path) -> Vec<ObservedTask> {
     tasks
 }
 
+/// Claude Code's own transcript path for a session, when the session never
+/// told karvex where it was writing one.
+///
+/// Two guards, both deliberate. The path is only reported when the file is
+/// actually there, so a derivation upstream has since changed reads back as
+/// "not resolved" instead of as a path to nothing — the honest answer, and the
+/// one that lets the *next* poll resolve it properly. And the check is a single
+/// `stat` per unresolved member per poll, which is what keeps the 2 s
+/// projection tick as cheap as it was (§5 P8's contract: `stat`-bounded, no
+/// transcript reads).
+fn derived_transcript_path(
+    claude_dir: &Path,
+    cwd: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<String> {
+    let path = identity::transcript_path_for(claude_dir, cwd?, session_id?)?;
+    path.is_file().then(|| path.to_string_lossy().into_owned())
+}
+
 fn read_team_config(path: &Path) -> Option<ObservedTeam> {
     let bytes = std::fs::read(path).ok()?;
     projection::parse_team_config(&bytes).ok()
@@ -1833,6 +2188,14 @@ output_schema = { type = "object" }
     }
 
     fn lead_reports_itself(app: &mut crate::app::App, socket: Option<&str>) {
+        lead_reports_itself_with_transcript(app, socket, None)
+    }
+
+    fn lead_reports_itself_with_transcript(
+        app: &mut crate::app::App,
+        socket: Option<&str>,
+        transcript: Option<&str>,
+    ) {
         let pane_id = app
             .workflow_lead
             .as_ref()
@@ -1847,12 +2210,445 @@ output_schema = { type = "object" }
             run_id,
             pane_id: Some(pane_id),
             session_id: "51ea857f-cb96-4372-ae75-bab1640c8428".to_string(),
+            transcript_path: transcript.map(str::to_string),
             cwd: Some("/repo".to_string()),
             source: Some("startup".to_string()),
             messaging_socket: socket.map(str::to_string),
             messaging_token: socket.map(|_| "50093985aaaabbbbccccddddeeeeffff".to_string()),
             agent_id: None,
         });
+    }
+
+    // ── member identity (§3.3, packet P8) ──────────────────────────────────
+
+    /// A real two-member config, from `projection.rs`'s own live fixture: the
+    /// lead is in-process behind the `"leader"` sentinel, and only the teammate
+    /// proves split-pane mode took.
+    const TEAM_CONFIG: &str = r#"{
+  "name": "session-3cb241fe",
+  "createdAt": 1786376746139,
+  "leadSessionId": "3cb241fe-2c3a-4dd8-b8a0-5dd83dfc5aa2",
+  "members": [
+    { "agentId": "team-lead@session-3cb241fe", "name": "team-lead", "agentType": "team-lead",
+      "joinedAt": 1786376746139, "tmuxPaneId": "leader",
+      "cwd": "/repo", "backendType": "in-process" },
+    { "agentId": "research@session-3cb241fe", "name": "research",
+      "joinedAt": 1786376797068, "tmuxPaneId": "w1:p4",
+      "agentType": "Explore", "model": "sonnet",
+      "cwd": "/repo", "backendType": "tmux", "isActive": true }
+  ]
+}"#;
+
+    const TEAM_NAME: &str = "session-3cb241fe";
+    const LEAD_SESSION_ID: &str = "3cb241fe-2c3a-4dd8-b8a0-5dd83dfc5aa2";
+    const TEAMMATE_PANE: &str = "w1:p4";
+    const TEAMMATE_SESSION_ID: &str = "7694e312-4ac2-41d7-90ec-1277e61689df";
+
+    /// A throwaway `CLAUDE_CONFIG_DIR`-shaped tree holding one team config.
+    ///
+    /// Written to disk rather than mocked because the poller's whole job is to
+    /// read Claude Code's own files, and the read is what the empty-delta
+    /// discipline has to survive.
+    struct ClaudeDir(PathBuf);
+
+    impl ClaudeDir {
+        fn with_team(label: &str, config: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "karvex-p8-{label}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ));
+            let team = root.join("teams").join(TEAM_NAME);
+            std::fs::create_dir_all(&team).expect("the fixture team directory is writable");
+            std::fs::write(team.join("config.json"), config).expect("the team config is writable");
+            std::fs::create_dir_all(root.join("tasks").join(TEAM_NAME))
+                .expect("the fixture task directory is writable");
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ClaudeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Puts the run in the state `bind_run_team` would have left it in, without
+    /// a `claude` to bind to. The binding is the only thing `absorb_run_projection`
+    /// needs that the launch path does not already provide.
+    fn bind_run_to_the_fixture_team(app: &mut crate::app::App) {
+        let run = app.workflow_lead.as_mut().expect("a live run");
+        run.binding = Some(LeadBinding {
+            team_name: TEAM_NAME.to_string(),
+            lead_session_id: LEAD_SESSION_ID.to_string(),
+        });
+    }
+
+    fn teammate_reports_itself(app: &mut crate::app::App, transcript: Option<&str>) {
+        let run_id = app
+            .workflow_lead
+            .as_ref()
+            .map(|run| run.run_id.to_string())
+            .expect("a live run");
+        app.record_run_session_report(&SessionReport {
+            run_id,
+            pane_id: Some(TEAMMATE_PANE.to_string()),
+            session_id: TEAMMATE_SESSION_ID.to_string(),
+            transcript_path: transcript.map(str::to_string),
+            cwd: Some("/repo".to_string()),
+            source: Some("startup".to_string()),
+            messaging_socket: None,
+            messaging_token: None,
+            agent_id: None,
+        });
+    }
+
+    fn stored_members(
+        app: &mut crate::app::App,
+        run: &RunId,
+    ) -> Vec<crate::workflow::store::RunMemberRecord> {
+        let wanted = run.clone();
+        app.workflow_store
+            .call(move |cx| cx.block_on(cx.store().list_run_members(&wanted)))
+            .expect("the in-memory store is available")
+            .expect("the run's members read back")
+    }
+
+    fn stored_member(
+        app: &mut crate::app::App,
+        run: &RunId,
+        name: &str,
+    ) -> crate::workflow::store::RunMemberRecord {
+        stored_members(app, run)
+            .into_iter()
+            .find(|member| member.name == name)
+            .unwrap_or_else(|| panic!("the run has a member called {name}"))
+    }
+
+    fn stored_node(
+        app: &mut crate::app::App,
+        run: &RunId,
+        path: &str,
+    ) -> Option<crate::workflow::store::RunNodeRecord> {
+        let wanted = run.clone();
+        app.workflow_store
+            .call(move |cx| cx.block_on(cx.store().list_run_nodes(&wanted)))
+            .expect("the in-memory store is available")
+            .expect("the run's nodes read back")
+            .into_iter()
+            .find(|node| node.instance_path.as_str() == path)
+    }
+
+    #[test]
+    fn a_teammate_that_reported_its_session_keeps_it_after_its_pane_is_gone() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let claude = ClaudeDir::with_team("teammate-identity", TEAM_CONFIG);
+        bind_run_to_the_fixture_team(&mut app);
+        teammate_reports_itself(
+            &mut app,
+            Some("/home/dev/.claude/projects/-repo/7694e312.jsonl"),
+        );
+
+        assert!(app.absorb_run_projection(claude.path()));
+        let research = stored_member(&mut app, &run_id, "research");
+        assert_eq!(research.session_id.as_deref(), Some(TEAMMATE_SESSION_ID));
+        assert_eq!(
+            research.transcript_path.as_deref(),
+            Some("/home/dev/.claude/projects/-repo/7694e312.jsonl")
+        );
+        assert_eq!(research.pane_id.as_deref(), Some(TEAMMATE_PANE));
+
+        // The pane closes and its endpoint goes with it — a socket path stops
+        // being true when the process exits. The session id must not: a review
+        // that runs tomorrow is the entire reason it was captured.
+        app.workflow_lead
+            .as_mut()
+            .expect("a live run")
+            .member_endpoints
+            .clear();
+        app.absorb_run_projection(claude.path());
+        let research = stored_member(&mut app, &run_id, "research");
+        assert_eq!(
+            research.session_id.as_deref(),
+            Some(TEAMMATE_SESSION_ID),
+            "a closed pane must not erase what it reported while it was open"
+        );
+    }
+
+    #[test]
+    fn a_member_whose_hook_never_fired_records_none_and_the_run_still_projects() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let claude = ClaudeDir::with_team("no-report", TEAM_CONFIG);
+        bind_run_to_the_fixture_team(&mut app);
+
+        assert!(app.absorb_run_projection(claude.path()));
+        let research = stored_member(&mut app, &run_id, "research");
+        assert_eq!(
+            research.session_id, None,
+            "an unresolved member is recorded as unresolved, never guessed at"
+        );
+        assert_eq!(research.transcript_path, None);
+        // The rest of the projection is unaffected: the roster is still there,
+        // and so is the member's placement.
+        assert_eq!(stored_members(&mut app, &run_id).len(), 2);
+        assert_eq!(research.backend_type, "tmux");
+    }
+
+    #[test]
+    fn the_lead_gets_a_reserved_node_carrying_its_own_session_id() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let claude = ClaudeDir::with_team("lead-node", TEAM_CONFIG);
+
+        // Minted the instant the lead's pane exists, so the DAG shows the node
+        // the run actually starts at even before any team config is on disk.
+        let node = stored_node(&mut app, &run_id, ".lead").expect("the lead node is minted");
+        assert_eq!(node.status, NodeStatus::Running);
+        assert_eq!(node.label, LEAD_NODE_LABEL);
+        assert!(
+            node.agent_session_id.is_none(),
+            "nothing has identified itself yet"
+        );
+
+        // Bound but silent: the lead is the one member whose session id the
+        // team config does carry (`leadSessionId`), and S1 killed the
+        // `~/.claude/sessions` registry the plan named as the fallback, so this
+        // *is* the fallback.
+        bind_run_to_the_fixture_team(&mut app);
+        app.absorb_run_projection(claude.path());
+        let node = stored_node(&mut app, &run_id, ".lead").expect("the lead node is still there");
+        assert_eq!(
+            node.agent_session_id.as_deref(),
+            Some(LEAD_SESSION_ID),
+            "the lead's identity reached its own node"
+        );
+        assert_eq!(node.pane_id.as_deref(), Some("w1:p1"));
+        assert_eq!(
+            node.transcript_path, None,
+            "an unwritten transcript is nothing, not an empty path"
+        );
+        // The same identity is on the lead's `run_member` row, which is what a
+        // review reads when it ranks who is worth interviewing.
+        let lead = stored_member(&mut app, &run_id, "team-lead");
+        assert_eq!(lead.session_id.as_deref(), Some(LEAD_SESSION_ID));
+    }
+
+    #[test]
+    fn the_leads_own_report_outranks_the_team_config_and_brings_its_transcript() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let claude = ClaudeDir::with_team("lead-report", TEAM_CONFIG);
+        bind_run_to_the_fixture_team(&mut app);
+
+        let run = app
+            .workflow_lead
+            .as_ref()
+            .map(|run| (run.run_id.to_string(), run.lead_pane_id.clone()))
+            .expect("a live run");
+        app.record_run_session_report(&SessionReport {
+            run_id: run.0,
+            pane_id: Some(run.1),
+            session_id: LEAD_SESSION_ID.to_string(),
+            transcript_path: Some("/home/dev/.claude/projects/-repo/3cb241fe.jsonl".to_string()),
+            cwd: Some("/repo".to_string()),
+            source: Some("startup".to_string()),
+            messaging_socket: None,
+            messaging_token: None,
+            agent_id: None,
+        });
+        app.absorb_run_projection(claude.path());
+
+        let node = stored_node(&mut app, &run_id, ".lead").expect("the lead node is there");
+        assert_eq!(
+            node.transcript_path.as_deref(),
+            Some("/home/dev/.claude/projects/-repo/3cb241fe.jsonl"),
+            "the session's own answer is the authority, and \
+             `interrogation.run_node` needs a node whose transcript is recorded"
+        );
+        let lead = stored_member(&mut app, &run_id, "team-lead");
+        assert_eq!(
+            lead.transcript_path.as_deref(),
+            Some("/home/dev/.claude/projects/-repo/3cb241fe.jsonl"),
+            "karvex used to throw this away for claude (S1); a review cannot \
+             interview a member whose transcript was never recorded"
+        );
+    }
+
+    #[test]
+    fn the_lead_node_is_excluded_from_the_runs_own_node_counters() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let run = app
+            .workflow_store
+            .call({
+                let wanted = run_id.clone();
+                move |cx| cx.block_on(cx.store().get_run(&wanted))
+            })
+            .expect("the in-memory store is available")
+            .expect("the run row reads back")
+            .expect("the run exists");
+        assert_eq!(
+            run.nodes_total, 1,
+            "the reserved lead node is karvex's, not the author's, so it does \
+             not move the run's progress denominator"
+        );
+    }
+
+    #[test]
+    fn the_lead_node_settles_when_the_run_does() {
+        let (mut app, run_id) = app_with_a_live_run();
+        app.finish_lead_run(&run_id, 1_700_000_000_000);
+        let node = stored_node(&mut app, &run_id, ".lead").expect("the lead node is there");
+        assert_eq!(
+            node.status,
+            NodeStatus::Succeeded,
+            "a lead still `running` inside a finished run is the kind of lie \
+             this rework exists to remove"
+        );
+        assert_eq!(node.ended_at_unix_ms, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn a_poll_that_observed_nothing_new_writes_nothing() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let claude = ClaudeDir::with_team("quiet-poll", TEAM_CONFIG);
+        bind_run_to_the_fixture_team(&mut app);
+        teammate_reports_itself(&mut app, None);
+
+        assert!(app.absorb_run_projection(claude.path()));
+        let before = stored_member(&mut app, &run_id, "research");
+        // The 2 s poller runs forever; a tick that saw no change must not touch
+        // the store at all (`projection.rs`'s empty-delta discipline).
+        assert!(!app.absorb_run_projection(claude.path()));
+        assert!(!app.absorb_run_projection(claude.path()));
+        let after = stored_member(&mut app, &run_id, "research");
+        assert_eq!(before.last_seen_at_unix_ms, after.last_seen_at_unix_ms);
+    }
+
+    #[test]
+    fn a_members_session_id_reaches_workflow_run_get() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let claude = ClaudeDir::with_team("wire", TEAM_CONFIG);
+        bind_run_to_the_fixture_team(&mut app);
+        teammate_reports_itself(&mut app, None);
+        app.absorb_run_projection(claude.path());
+
+        let response = app.dispatch_api_request(
+            "test.workflow.run.get",
+            Method::WorkflowRunGet(crate::api::schema::WorkflowRunTarget {
+                run_id: run_id.to_string(),
+            }),
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&response).expect("the response is JSON");
+        let members = value["result"]["graph"]["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the run's members are on the wire: {response}"));
+        let research = members
+            .iter()
+            .find(|member| member["name"] == "research")
+            .expect("the teammate is on the wire");
+        assert_eq!(research["session_id"], TEAMMATE_SESSION_ID);
+    }
+
+    #[test]
+    fn a_teammate_is_resolved_from_the_pane_state_the_bundled_hook_already_fills() {
+        let (mut app, run_id) = app_with_a_live_run();
+        // Two workspaces: the first stands in for the lead's own pane, the
+        // second for the split pane Claude Code put the teammate in.
+        for label in ["lead-pane", "teammate-pane"] {
+            app.state
+                .workspaces
+                .push(crate::workspace::Workspace::test_new(label));
+        }
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let lead_pane = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .expect("the lead's pane has a public id");
+        let teammate_pane = app
+            .public_pane_id(1, app.state.workspaces[1].tabs[0].root_pane)
+            .expect("the teammate's pane has a public id");
+        assert_ne!(lead_pane, teammate_pane);
+
+        // What the bundled `SessionStart` hook already lands on a teammate's
+        // pane today, with no new code at all (spike S1). This packet's whole
+        // job is to copy it somewhere that outlives the pane.
+        let teammate_terminal = app.state.workspaces[1]
+            .terminal_id(app.state.workspaces[1].tabs[0].root_pane)
+            .expect("the teammate's pane has a terminal")
+            .clone();
+        {
+            let terminal = app
+                .state
+                .terminals
+                .get_mut(&teammate_terminal)
+                .expect("the teammate's terminal exists");
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "karvex:claude".to_string(),
+                agent: "claude".to_string(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(TEAMMATE_SESSION_ID)
+                    .expect("a real session id"),
+            });
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+        app.workflow_lead
+            .as_mut()
+            .expect("a live run")
+            .lead_pane_id
+            .clone_from(&lead_pane);
+
+        let claude = ClaudeDir::with_team(
+            "pane-state",
+            &TEAM_CONFIG.replace(TEAMMATE_PANE, &teammate_pane),
+        );
+        // The transcript Claude Code would have written for that session. The
+        // derivation is only trusted when the file is actually there.
+        let project = claude.path().join("projects").join("-repo");
+        std::fs::create_dir_all(&project).expect("the fixture project dir is writable");
+        std::fs::write(project.join(format!("{TEAMMATE_SESSION_ID}.jsonl")), "{}\n")
+            .expect("the fixture transcript is writable");
+        bind_run_to_the_fixture_team(&mut app);
+
+        assert!(app.absorb_run_projection(claude.path()));
+        let research = stored_member(&mut app, &run_id, "research");
+        assert_eq!(
+            research.session_id.as_deref(),
+            Some(TEAMMATE_SESSION_ID),
+            "the session id karvex already holds per pane is the primary source"
+        );
+        assert_eq!(
+            research.transcript_path,
+            Some(
+                project
+                    .join(format!("{TEAMMATE_SESSION_ID}.jsonl"))
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "derived from the session id and cwd, and only once the file exists"
+        );
+        assert_eq!(research.last_state.as_deref(), Some("idle"));
+        assert!(research.last_state_at_unix_ms.is_some());
+    }
+
+    #[test]
+    fn a_derived_transcript_that_is_not_on_disk_is_recorded_as_nothing() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let claude = ClaudeDir::with_team("no-transcript", TEAM_CONFIG);
+        bind_run_to_the_fixture_team(&mut app);
+        teammate_reports_itself(&mut app, None);
+
+        app.absorb_run_projection(claude.path());
+        let research = stored_member(&mut app, &run_id, "research");
+        assert_eq!(research.session_id.as_deref(), Some(TEAMMATE_SESSION_ID));
+        assert_eq!(
+            research.transcript_path, None,
+            "a path to a file that is not there would be worse than no path: \
+             the review would plan a resumed interview it cannot run"
+        );
     }
 
     fn journalled_messages(app: &mut crate::app::App, run: &RunId) -> Vec<serde_json::Value> {

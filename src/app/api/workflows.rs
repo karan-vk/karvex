@@ -1209,6 +1209,7 @@ impl App {
             run_id: params.run_id.clone(),
             pane_id: params.pane_id.clone(),
             session_id: params.session_id.clone(),
+            transcript_path: params.transcript_path.clone(),
             cwd: params.cwd.clone(),
             source: params.source.clone(),
             messaging_socket: params.messaging_socket.clone(),
@@ -2738,12 +2739,17 @@ fn wire_run_member_record(
         cwd: record.cwd,
         first_seen_at_unix_ms: record.first_seen_at_unix_ms,
         last_seen_at_unix_ms: record.last_seen_at_unix_ms,
-        // Wave-0 shape only (`.local/prd/phase4-retarget-plan.md` §5 packet
-        // P3): `RunMemberRecord` carries neither field yet — P1's
-        // `RunMemberSnapshot` extension and P8's identity capture land them.
-        // Honestly `None` rather than a guess until then.
-        session_id: None,
-        last_state: None,
+        // Captured while the run was alive by the projection poll
+        // (`.local/prd/phase4-retarget-plan.md` §3.3, packet P8) and read
+        // straight off the row, so a run whose panes are long gone still
+        // answers with the session ids that make it interviewable. `None`
+        // means karvex never resolved one — an honest, visible outcome that
+        // makes that member `evidence_only` in a review.
+        session_id: record.session_id,
+        last_state: record
+            .last_state
+            .as_deref()
+            .map(crate::api::schema::WorkflowMemberState::from_stored),
     }
 }
 
@@ -3023,6 +3029,7 @@ mod tests {
             Method::WorkflowRunReportSession(crate::api::schema::WorkflowRunReportSessionParams {
                 run_id: "workflow_run:1".into(),
                 session_id: "51ea857f-cb96-4372-ae75-bab1640c8428".into(),
+                transcript_path: None,
                 pane_id: Some("w1:p2".into()),
                 cwd: None,
                 source: Some("startup".into()),

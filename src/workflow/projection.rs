@@ -340,11 +340,101 @@ pub struct TaskProjection {
     pub blocked_by: Vec<InstancePath>,
 }
 
+/// What karvex's own per-pane knowledge adds to a team member, as one poll
+/// observed it.
+///
+/// Everything here is a fact about the member's *session*, and none of it
+/// exists in Claude Code's own team state: `members[]` carries `agentId`
+/// (`<name>@<team>`) and nothing else that identifies a session
+/// (`phase4-retarget-plan.md` §1.4c). Karvex learns it from the pane the
+/// member runs in — its own `SessionStart` self-report, or the bundled hook's
+/// report that karvex already lands on `PaneState.agent_session` (S1) — and
+/// this is the shape the adapter hands in.
+///
+/// Every field is optional and *absence means "not resolved this poll"*, never
+/// "resolved to nothing": [`ProjectionSnapshot::absorb`] merges an observation
+/// over what it already knew rather than replacing it, so a pane that has
+/// closed cannot erase the session id captured while it was alive. That
+/// durability is the entire reason this packet exists — a review that happens
+/// tomorrow needs the session id of a pane that died today.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedMemberIdentity {
+    /// The member's own Claude Code session id.
+    pub session_id: Option<String>,
+    /// Where Claude Code writes this session's transcript. Recorded rather
+    /// than re-derived on read because the derivation rule is Claude Code's,
+    /// not karvex's, and it can change under us.
+    pub transcript_path: Option<String>,
+    /// The member pane's agent state right now, in the vocabulary the caller
+    /// publishes. Free text here on purpose: this module has no opinion about
+    /// karvex's own detection vocabulary and must not acquire one.
+    pub last_state: Option<String>,
+}
+
+/// [`ObservedMemberIdentity`] as the snapshot has accumulated it: best known
+/// value per field, plus the moment `last_state` was first seen to hold its
+/// current value.
+///
+/// `last_state_at_unix_ms` is stamped here rather than by the caller because
+/// this is where the previous state lives — the caller would have to keep a
+/// second copy of the snapshot to know whether the state it just read is a
+/// change or a repeat.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberIdentity {
+    pub session_id: Option<String>,
+    pub transcript_path: Option<String>,
+    pub last_state: Option<String>,
+    pub last_state_at_unix_ms: Option<u64>,
+}
+
+impl MemberIdentity {
+    /// Folds one poll's observation over what is already known.
+    ///
+    /// Never regresses a resolved field to `None`, which is the same rule the
+    /// store's `run_member` writer enforces on its own side (P7). Two layers
+    /// hold it on purpose: the store's rule protects the row from a write, and
+    /// this one stops the write from being *made*, which is what keeps an
+    /// unchanged poll silent.
+    fn merged(&self, observed: &ObservedMemberIdentity, now_unix_ms: u64) -> Self {
+        let last_state = observed
+            .last_state
+            .clone()
+            .or_else(|| self.last_state.clone());
+        // Only a *changed* state re-stamps the clock. A member observed idle
+        // for forty minutes must read as one forty-minute idle, not as the
+        // most recent two-second poll.
+        let last_state_at_unix_ms = if last_state == self.last_state {
+            self.last_state_at_unix_ms
+        } else {
+            Some(now_unix_ms)
+        };
+        Self {
+            session_id: observed
+                .session_id
+                .clone()
+                .or_else(|| self.session_id.clone()),
+            transcript_path: observed
+                .transcript_path
+                .clone()
+                .or_else(|| self.transcript_path.clone()),
+            last_state,
+            last_state_at_unix_ms,
+        }
+    }
+}
+
+/// One member, resolved against what karvex knows about the pane it runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberProjection {
+    pub member: ObservedMember,
+    pub identity: MemberIdentity,
+}
+
 /// What one poll observed, relative to what karvex last recorded.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProjectionDelta {
     pub tasks: Vec<TaskProjection>,
-    pub members: Vec<ObservedMember>,
+    pub members: Vec<MemberProjection>,
 }
 
 impl ProjectionDelta {
@@ -374,6 +464,12 @@ struct TaskFingerprint {
 
 /// The comparable half of a member: identity, placement, and liveness. The
 /// lead's `prompt` and `subscriptions` are not projected at all.
+///
+/// `identity` is here for the same reason the rest of it is: a teammate whose
+/// session id has just been resolved is a member whose durable record changed,
+/// even though the team config's bytes did not. Carrying it in the fingerprint
+/// is what makes that resolution produce exactly one store write instead of
+/// either none or one per poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MemberFingerprint {
     agent_type: String,
@@ -382,7 +478,15 @@ struct MemberFingerprint {
     backend_type: String,
     is_active: bool,
     cwd: Option<String>,
+    identity: MemberIdentity,
 }
+
+/// A member karvex resolved nothing new about on this poll.
+const EMPTY_IDENTITY: ObservedMemberIdentity = ObservedMemberIdentity {
+    session_id: None,
+    transcript_path: None,
+    last_state: None,
+};
 
 /// Everything karvex has already recorded, so a poll that observed nothing new
 /// produces an empty delta and therefore no store writes and no events.
@@ -432,11 +536,19 @@ impl ProjectionSnapshot {
     /// A task that vanishes from the source directory produces no delta entry.
     /// Deletion is not part of the projection — the run record is append-only,
     /// and a deleted task is still something the team did.
+    ///
+    /// `identities` is keyed by member name and carries what karvex knows about
+    /// each member's *session* — the half Claude Code's files never hold
+    /// (§1.4c). A name the map does not mention is a member karvex has resolved
+    /// nothing new about this poll, which is not the same as a member it has
+    /// resolved nothing about: see [`MemberIdentity::merged`].
     pub fn absorb(
         &mut self,
         tasks: &[ObservedTask],
         team: Option<&ObservedTeam>,
         node_keys: &[NodeKey],
+        identities: &BTreeMap<String, ObservedMemberIdentity>,
+        now_unix_ms: u64,
     ) -> ProjectionDelta {
         let mut delta = ProjectionDelta::default();
 
@@ -480,6 +592,15 @@ impl ProjectionSnapshot {
             let mut members: Vec<&ObservedMember> = team.members.iter().collect();
             members.sort_by(|left, right| left.name.cmp(&right.name));
             for member in members {
+                let known = self.members.get(&member.name).cloned();
+                let identity = known
+                    .as_ref()
+                    .map(|fingerprint| fingerprint.identity.clone())
+                    .unwrap_or_default()
+                    .merged(
+                        identities.get(&member.name).unwrap_or(&EMPTY_IDENTITY),
+                        now_unix_ms,
+                    );
                 let fingerprint = MemberFingerprint {
                     agent_type: member.agent_type.clone(),
                     model: member.model.clone(),
@@ -487,12 +608,17 @@ impl ProjectionSnapshot {
                     backend_type: member.backend_type.clone(),
                     is_active: member.is_active,
                     cwd: member.cwd.clone(),
+                    identity,
                 };
-                if self.members.get(&member.name) == Some(&fingerprint) {
+                if known.as_ref() == Some(&fingerprint) {
                     continue;
                 }
+                let identity = fingerprint.identity.clone();
                 self.members.insert(member.name.clone(), fingerprint);
-                delta.members.push(member.clone());
+                delta.members.push(MemberProjection {
+                    member: member.clone(),
+                    identity,
+                });
             }
         }
 
@@ -791,7 +917,7 @@ mod tests {
     fn absorb_matches_planned_tasks_and_first_classes_the_emergent_one() {
         let tasks = vec![task(TASK_CLAIMED), task(TASK_BLOCKED), task(TASK_UNCLAIMED)];
         let mut snapshot = ProjectionSnapshot::new();
-        let delta = snapshot.absorb(&tasks, None, &keys());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
 
         assert_eq!(delta.tasks.len(), 3);
         assert!(delta.members.is_empty());
@@ -819,7 +945,7 @@ mod tests {
     fn absorb_resolves_blocked_by_to_instance_paths() {
         let tasks = vec![task(TASK_CLAIMED), task(TASK_BLOCKED), task(TASK_UNCLAIMED)];
         let mut snapshot = ProjectionSnapshot::new();
-        let delta = snapshot.absorb(&tasks, None, &keys());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
 
         assert!(delta.tasks[0].blocked_by.is_empty());
         assert_eq!(
@@ -834,7 +960,7 @@ mod tests {
         // The lead deleted task 1; task 2 still names it.
         let tasks = vec![task(TASK_BLOCKED)];
         let mut snapshot = ProjectionSnapshot::new();
-        let delta = snapshot.absorb(&tasks, None, &keys());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
         assert_eq!(delta.tasks.len(), 1);
         assert!(delta.tasks[0].blocked_by.is_empty());
     }
@@ -845,15 +971,15 @@ mod tests {
         let team = team(TEAM_CONFIG);
         let mut snapshot = ProjectionSnapshot::new();
 
-        let first = snapshot.absorb(&tasks, Some(&team), &keys());
+        let first = snapshot.absorb(&tasks, Some(&team), &keys(), &BTreeMap::new(), 0);
         assert_eq!(first.tasks.len(), 3);
         assert_eq!(first.members.len(), 2);
 
         // This is what stops the 2s poller writing to the store forever.
-        let second = snapshot.absorb(&tasks, Some(&team), &keys());
+        let second = snapshot.absorb(&tasks, Some(&team), &keys(), &BTreeMap::new(), 0);
         assert_eq!(second, ProjectionDelta::default());
         assert!(second.is_empty());
-        let third = snapshot.absorb(&tasks, Some(&team), &keys());
+        let third = snapshot.absorb(&tasks, Some(&team), &keys(), &BTreeMap::new(), 0);
         assert!(third.is_empty());
     }
 
@@ -861,10 +987,16 @@ mod tests {
     fn absorb_reports_only_the_task_whose_status_changed() {
         let mut tasks = vec![task(TASK_CLAIMED), task(TASK_BLOCKED), task(TASK_UNCLAIMED)];
         let mut snapshot = ProjectionSnapshot::new();
-        assert_eq!(snapshot.absorb(&tasks, None, &keys()).tasks.len(), 3);
+        assert_eq!(
+            snapshot
+                .absorb(&tasks, None, &keys(), &BTreeMap::new(), 0)
+                .tasks
+                .len(),
+            3
+        );
 
         tasks[1].status = TaskStatus::Completed;
-        let delta = snapshot.absorb(&tasks, None, &keys());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
         assert_eq!(delta.tasks.len(), 1);
         assert_eq!(delta.tasks[0].task.id, "2");
         assert_eq!(delta.tasks[0].task.status, TaskStatus::Completed);
@@ -875,21 +1007,35 @@ mod tests {
     fn absorb_ignores_a_description_only_edit() {
         let mut tasks = vec![task(TASK_CLAIMED)];
         let mut snapshot = ProjectionSnapshot::new();
-        assert_eq!(snapshot.absorb(&tasks, None, &keys()).tasks.len(), 1);
+        assert_eq!(
+            snapshot
+                .absorb(&tasks, None, &keys(), &BTreeMap::new(), 0)
+                .tasks
+                .len(),
+            1
+        );
 
         tasks[0].description = "reworded by the lead".to_string();
         tasks[0].active_form = Some("Rewording".to_string());
-        assert!(snapshot.absorb(&tasks, None, &keys()).is_empty());
+        assert!(snapshot
+            .absorb(&tasks, None, &keys(), &BTreeMap::new(), 0)
+            .is_empty());
     }
 
     #[test]
     fn absorb_reports_a_task_whose_owner_appeared() {
         let mut tasks = vec![task(TASK_UNCLAIMED)];
         let mut snapshot = ProjectionSnapshot::new();
-        assert_eq!(snapshot.absorb(&tasks, None, &keys()).tasks.len(), 1);
+        assert_eq!(
+            snapshot
+                .absorb(&tasks, None, &keys(), &BTreeMap::new(), 0)
+                .tasks
+                .len(),
+            1
+        );
 
         tasks[0].owner = Some("cleanup".to_string());
-        let delta = snapshot.absorb(&tasks, None, &keys());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
         assert_eq!(delta.tasks.len(), 1);
         assert_eq!(delta.tasks[0].task.owner.as_deref(), Some("cleanup"));
     }
@@ -900,16 +1046,19 @@ mod tests {
         let mut team = team(TEAM_CONFIG);
         let mut snapshot = ProjectionSnapshot::new();
         assert_eq!(
-            snapshot.absorb(&tasks, Some(&team), &keys()).members.len(),
+            snapshot
+                .absorb(&tasks, Some(&team), &keys(), &BTreeMap::new(), 0)
+                .members
+                .len(),
             2
         );
 
         team.members[1].is_active = true;
-        let delta = snapshot.absorb(&tasks, Some(&team), &keys());
+        let delta = snapshot.absorb(&tasks, Some(&team), &keys(), &BTreeMap::new(), 0);
         assert!(delta.tasks.is_empty());
         assert_eq!(delta.members.len(), 1);
-        assert_eq!(delta.members[0].name, "research");
-        assert!(delta.members[0].is_active);
+        assert_eq!(delta.members[0].member.name, "research");
+        assert!(delta.members[0].member.is_active);
     }
 
     #[test]
@@ -917,14 +1066,161 @@ mod tests {
         let tasks = Vec::new();
         let mut snapshot = ProjectionSnapshot::new();
         let lead_only = team(TEAM_CONFIG_LEAD_ONLY);
-        let delta = snapshot.absorb(&tasks, Some(&lead_only), &keys());
+        let delta = snapshot.absorb(&tasks, Some(&lead_only), &keys(), &BTreeMap::new(), 0);
         assert_eq!(delta.members.len(), 1);
-        assert_eq!(delta.members[0].name, "team-lead");
+        assert_eq!(delta.members[0].member.name, "team-lead");
 
         let full = team(TEAM_CONFIG);
-        let delta = snapshot.absorb(&tasks, Some(&full), &keys());
+        let delta = snapshot.absorb(&tasks, Some(&full), &keys(), &BTreeMap::new(), 0);
         assert_eq!(delta.members.len(), 1);
-        assert_eq!(delta.members[0].name, "research");
+        assert_eq!(delta.members[0].member.name, "research");
+    }
+
+    // ── member identity (§3.3, packet P8) ──────────────────────────────────
+
+    fn identity(session: Option<&str>, state: Option<&str>) -> ObservedMemberIdentity {
+        ObservedMemberIdentity {
+            session_id: session.map(str::to_string),
+            transcript_path: session.map(|id| format!("/home/dev/.claude/projects/-p/{id}.jsonl")),
+            last_state: state.map(str::to_string),
+        }
+    }
+
+    fn identities(
+        entries: &[(&str, ObservedMemberIdentity)],
+    ) -> BTreeMap<String, ObservedMemberIdentity> {
+        entries
+            .iter()
+            .map(|(name, identity)| ((*name).to_string(), identity.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_members_session_id_reaches_the_delta_that_persists_it() {
+        let tasks = Vec::new();
+        let team = team(TEAM_CONFIG);
+        let mut snapshot = ProjectionSnapshot::new();
+        let delta = snapshot.absorb(
+            &tasks,
+            Some(&team),
+            &keys(),
+            &identities(&[("research", identity(Some("7694e312"), Some("working")))]),
+            5_000,
+        );
+        let research = delta
+            .members
+            .iter()
+            .find(|member| member.member.name == "research")
+            .expect("the teammate is in the delta");
+        assert_eq!(research.identity.session_id.as_deref(), Some("7694e312"));
+        assert_eq!(
+            research.identity.transcript_path.as_deref(),
+            Some("/home/dev/.claude/projects/-p/7694e312.jsonl")
+        );
+        assert_eq!(research.identity.last_state.as_deref(), Some("working"));
+        assert_eq!(research.identity.last_state_at_unix_ms, Some(5_000));
+        // The lead was observed in the same poll and resolved nothing, which is
+        // recorded as unresolved rather than borrowed from the teammate.
+        let lead = delta
+            .members
+            .iter()
+            .find(|member| member.member.name == "team-lead")
+            .expect("the lead is in the delta");
+        assert_eq!(lead.identity, MemberIdentity::default());
+    }
+
+    #[test]
+    fn a_session_id_that_arrives_late_is_one_write_and_then_silence() {
+        let tasks = Vec::new();
+        let team = team(TEAM_CONFIG);
+        let mut snapshot = ProjectionSnapshot::new();
+        // The team config lands before the teammate's hook has fired.
+        assert_eq!(
+            snapshot
+                .absorb(&tasks, Some(&team), &keys(), &BTreeMap::new(), 1_000)
+                .members
+                .len(),
+            2
+        );
+
+        let resolved = identities(&[("research", identity(Some("7694e312"), Some("idle")))]);
+        let delta = snapshot.absorb(&tasks, Some(&team), &keys(), &resolved, 2_000);
+        assert_eq!(delta.members.len(), 1);
+        assert_eq!(delta.members[0].member.name, "research");
+        assert_eq!(
+            delta.members[0].identity.session_id.as_deref(),
+            Some("7694e312")
+        );
+
+        // The same identity re-observed is not news. This is the discipline the
+        // 2 s poller depends on: without it every tick would write a row.
+        assert!(snapshot
+            .absorb(&tasks, Some(&team), &keys(), &resolved, 3_000)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_closed_pane_cannot_erase_the_session_id_it_reported() {
+        let tasks = Vec::new();
+        let team = team(TEAM_CONFIG);
+        let mut snapshot = ProjectionSnapshot::new();
+        snapshot.absorb(
+            &tasks,
+            Some(&team),
+            &keys(),
+            &identities(&[("research", identity(Some("7694e312"), Some("working")))]),
+            1_000,
+        );
+
+        // The teammate's pane is gone, so karvex observes nothing about it. The
+        // whole packet exists so that a review tomorrow can still resume a pane
+        // that died today.
+        let delta = snapshot.absorb(&tasks, Some(&team), &keys(), &BTreeMap::new(), 9_000);
+        assert!(delta.is_empty(), "an unresolvable member writes nothing");
+        let delta = snapshot.absorb(
+            &tasks,
+            Some(&team),
+            &keys(),
+            &identities(&[("research", identity(None, None))]),
+            9_000,
+        );
+        assert!(delta.is_empty());
+    }
+
+    #[test]
+    fn last_state_at_is_stamped_when_the_state_changes_and_not_when_it_repeats() {
+        let tasks = Vec::new();
+        let team = team(TEAM_CONFIG);
+        let mut snapshot = ProjectionSnapshot::new();
+        snapshot.absorb(
+            &tasks,
+            Some(&team),
+            &keys(),
+            &identities(&[("research", identity(Some("7694e312"), Some("idle")))]),
+            1_000,
+        );
+        // Idle again, four seconds later: the same idle, not a new one. A
+        // teammate that has sat idle for forty minutes has to read as forty
+        // minutes, which is the number the watchdog and the review both use.
+        assert!(snapshot
+            .absorb(
+                &tasks,
+                Some(&team),
+                &keys(),
+                &identities(&[("research", identity(Some("7694e312"), Some("idle")))]),
+                5_000,
+            )
+            .is_empty());
+
+        let delta = snapshot.absorb(
+            &tasks,
+            Some(&team),
+            &keys(),
+            &identities(&[("research", identity(Some("7694e312"), Some("working")))]),
+            9_000,
+        );
+        assert_eq!(delta.members.len(), 1);
+        assert_eq!(delta.members[0].identity.last_state_at_unix_ms, Some(9_000));
     }
 
     #[test]
@@ -953,11 +1249,15 @@ mod tests {
 
         let team = team(TEAM_CONFIG);
         let mut snapshot = ProjectionSnapshot::new();
-        let delta = snapshot.absorb(&tasks, Some(&team), &keys());
+        let delta = snapshot.absorb(&tasks, Some(&team), &keys(), &BTreeMap::new(), 0);
 
         let ids: Vec<&str> = delta.tasks.iter().map(|t| t.task.id.as_str()).collect();
         assert_eq!(ids, vec!["1", "2", "3", "10", "alpha"]);
-        let names: Vec<&str> = delta.members.iter().map(|m| m.name.as_str()).collect();
+        let names: Vec<&str> = delta
+            .members
+            .iter()
+            .map(|m| m.member.name.as_str())
+            .collect();
         assert_eq!(names, vec!["research", "team-lead"]);
     }
 
@@ -1001,7 +1301,7 @@ mod tests {
             blocked_by: Vec::new(),
         }];
         let mut snapshot = ProjectionSnapshot::new();
-        let delta = snapshot.absorb(&tasks, None, &keys());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
         assert_eq!(delta.tasks.len(), 1);
         assert!(delta.tasks[0].emergent);
         assert_eq!(delta.tasks[0].path, InstancePath::new(".task/___research"));
@@ -1014,10 +1314,15 @@ mod tests {
     fn a_resubjected_task_moves_between_planned_and_emergent() {
         let mut tasks = vec![task(TASK_CLAIMED)];
         let mut snapshot = ProjectionSnapshot::new();
-        assert!(!snapshot.absorb(&tasks, None, &keys()).tasks[0].emergent);
+        assert!(
+            !snapshot
+                .absorb(&tasks, None, &keys(), &BTreeMap::new(), 0)
+                .tasks[0]
+                .emergent
+        );
 
         tasks[0].subject = "the lead reworded the prefix away".to_string();
-        let delta = snapshot.absorb(&tasks, None, &keys());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
         assert_eq!(delta.tasks.len(), 1);
         assert!(delta.tasks[0].emergent);
         assert_eq!(delta.tasks[0].path, InstancePath::new(".task/1"));
@@ -1027,12 +1332,18 @@ mod tests {
     fn a_blockers_re_subjecting_re_reports_the_task_that_names_it() {
         let mut tasks = vec![task(TASK_CLAIMED), task(TASK_BLOCKED)];
         let mut snapshot = ProjectionSnapshot::new();
-        assert_eq!(snapshot.absorb(&tasks, None, &keys()).tasks.len(), 2);
+        assert_eq!(
+            snapshot
+                .absorb(&tasks, None, &keys(), &BTreeMap::new(), 0)
+                .tasks
+                .len(),
+            2
+        );
 
         // Task 1 loses its prefix, so its path — and therefore task 2's edge —
         // changes even though task 2's own bytes did not.
         tasks[0].subject = "reworded".to_string();
-        let delta = snapshot.absorb(&tasks, None, &keys());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
         let ids: Vec<&str> = delta.tasks.iter().map(|t| t.task.id.as_str()).collect();
         assert_eq!(ids, vec!["1", "2"]);
         assert_eq!(

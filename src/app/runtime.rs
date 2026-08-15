@@ -619,6 +619,12 @@ impl App {
             // projection is a shared runtime fact served over the API, so a
             // headless server has to keep it current on its own.
             self.run_projection_deadline(),
+            // A review cycle outlives the run it reviews, so it has its own
+            // deadline rather than riding the projection's: by the time a cycle
+            // is running there is no live run left to schedule it
+            // (`.local/prd/phase4-retarget-plan.md` §3.5). Not gated on a
+            // connected client, for the same reason the two arms above are not.
+            self.review_cycle_deadline(),
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,

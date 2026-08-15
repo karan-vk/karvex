@@ -5891,6 +5891,13 @@
                 "string",
                 "null"
               ]
+            },
+            "transcript_path": {
+              "description": "`transcript_path` from the same hook payload: where Claude Code is\nwriting this session's transcript. Optional because it is a foreign,\nexperimental payload, and because karvex can derive the same path from\nthe session id and cwd when it is missing — but the session's own answer\nis the authority, and a review cycle cannot interview a member whose\ntranscript karvex never recorded\n(`.local/prd/phase4-retarget-plan.md` §3.3).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

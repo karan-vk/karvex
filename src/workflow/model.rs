@@ -136,6 +136,21 @@ pub const RESERVED_PATH_PREFIX: &str = ".";
 /// and from growth accounting, and it has no kvdag node behind it.
 pub const SUMMARY_INSTANCE_PATH: &str = ".summary";
 
+/// The team lead's own instance path (`phase4-retarget-plan.md` §3.3, D-9).
+///
+/// The lead is the one agent in a run that no task file ever describes: it
+/// plans, delegates, and re-plans, and Claude Code records none of that as a
+/// task. Minting it a reserved `run_node` costs the same reserved-path create
+/// `.task/` emergent nodes already use, and buys two things — the DAG gains the
+/// node the run actually starts at, and `interrogation.run_node` (a **required**
+/// `record<run_node>`) gains a target, which is what makes interviewing the lead
+/// possible at all. It is the cheapest, highest-value interview in the feature:
+/// the lead is the only agent that knows why it re-planned.
+///
+/// Excluded from `nodes_total`/`nodes_done` and from growth accounting for the
+/// same reason `.summary` is: it is karvex's node, not the author's.
+pub const LEAD_INSTANCE_PATH: &str = ".lead";
+
 /// Whether an instance path names an engine-owned node rather than a node the
 /// author declared. The one predicate every counter, selector, and sweep filters
 /// on, so the rule lives in exactly one place.

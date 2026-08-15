@@ -93,6 +93,59 @@ fn run_slug(run_id: &crate::workflow::model::RunId) -> String {
         .to_ascii_lowercase()
 }
 
+/// Where Claude Code writes a session's transcript, derived the way Claude
+/// Code derives it: `<claude dir>/projects/<slug of cwd>/<session id>.jsonl`.
+///
+/// The rule is upstream's, and it is captured live in this module's own
+/// fixture: session `93fd3b8e-…` in `/home/karan/code/karvex` wrote
+/// `~/.claude/projects/-home-karan-code-karvex/93fd3b8e-….jsonl`. Spike S1
+/// re-verified it for a *teammate* as well as a lead — both write into the same
+/// project slug, which is precisely why "the newest transcript under this cwd's
+/// slug" is not a usable identity fallback and why this needs the session id.
+///
+/// Derived rather than trusted: this is the last resort for a member whose own
+/// self-report never reached karvex (the report carries Claude Code's own
+/// `transcript_path` and is always preferred). The caller is expected to check
+/// that the file exists before recording it, so a derivation upstream has since
+/// changed reads back as "not resolved" rather than as a path to nothing.
+///
+/// `None` for a session id that could escape the projects directory, on the
+/// same reasoning as [`team_name_for_session`].
+pub fn transcript_path_for(
+    claude_dir: &Path,
+    cwd: &str,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return None;
+    }
+    let slug = project_slug(cwd);
+    if slug.is_empty() {
+        return None;
+    }
+    Some(
+        claude_dir
+            .join("projects")
+            .join(slug)
+            .join(format!("{session_id}.jsonl")),
+    )
+}
+
+/// Claude Code's directory name for a project: the absolute cwd with every
+/// character outside `[A-Za-z0-9]` replaced by `-`, leading separator included.
+///
+/// Captured live in both spikes: `/home/karan/code/karvex` →
+/// `-home-karan-code-karvex`, `/var/tmp/s1-probe/work` → `-var-tmp-s1-probe-work`.
+fn project_slug(cwd: &str) -> String {
+    cwd.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
+}
+
 /// The team a session id leads, derived rather than searched for.
 ///
 /// `None` for a session id too short to name a team: karvex would rather have
@@ -165,6 +218,12 @@ pub struct SessionReport {
     /// The karvex pane the session is running in, from `KARVEX_PANE_ID`.
     pub pane_id: Option<String>,
     pub session_id: String,
+    /// Claude Code's own `transcript_path` from the hook payload — the session's
+    /// durable record, and the one thing a review cycle cannot reconstruct once
+    /// the pane is gone. Karvex used to drop it on the floor here
+    /// (`agent_resume::session_ref_from_report` keeps a path only for `pi`/`omp`,
+    /// spike S1), which left an interviewable teammate uninterviewable.
+    pub transcript_path: Option<String>,
     pub cwd: Option<String>,
     pub source: Option<String>,
     /// `CLAUDE_CODE_MESSAGING_SOCKET`. Absent when the messaging feature flag
@@ -186,9 +245,17 @@ pub struct RunExpectation {
 }
 
 /// How karvex resolved to send to, or observe, a session.
+///
+/// The two messaging fields stop being true when the process exits, which is
+/// why the adapter holds this in memory and never stores it. `transcript_path`
+/// is the opposite — it is the durable half, and the adapter copies it onto
+/// `run_member` on every poll (`phase4-retarget-plan.md` §3.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEndpoint {
     pub session_id: String,
+    /// Claude Code's own transcript path for this session, when its report
+    /// carried one.
+    pub transcript_path: Option<String>,
     pub messaging_socket: Option<String>,
     pub messaging_token: Option<String>,
 }
@@ -271,6 +338,7 @@ pub fn classify_report(report: &SessionReport, expected: &RunExpectation) -> Rep
     }
     let endpoint = SessionEndpoint {
         session_id: report.session_id.clone(),
+        transcript_path: non_empty(report.transcript_path.as_deref()),
         messaging_socket: non_empty(report.messaging_socket.as_deref()),
         messaging_token: non_empty(report.messaging_token.as_deref()),
     };
@@ -533,6 +601,9 @@ mod tests {
             run_id: "workflow_run:abc".to_string(),
             pane_id: Some("w1:p2".to_string()),
             session_id: "51ea857f-cb96-4372-ae75-bab1640c8428".to_string(),
+            transcript_path: Some(
+                "/home/dev/.claude/projects/-home-dev-project/51ea857f.jsonl".to_string(),
+            ),
             cwd: Some("/home/dev/project".to_string()),
             source: Some("startup".to_string()),
             messaging_socket: Some("/run/user/1000/cc-socks/266617.sock".to_string()),
@@ -548,6 +619,65 @@ mod tests {
             team_name_for_session("51ea857f-cb96-4372-ae75-bab1640c8428").as_deref(),
             Some("session-51ea857f")
         );
+    }
+
+    #[test]
+    fn the_transcript_path_is_the_derivation_both_spikes_captured_live() {
+        // S1, byte-for-byte: session 93fd3b8e-… in /home/karan/code/karvex wrote
+        // ~/.claude/projects/-home-karan-code-karvex/93fd3b8e-….jsonl.
+        assert_eq!(
+            transcript_path_for(
+                Path::new("/home/karan/.claude"),
+                "/home/karan/code/karvex",
+                "93fd3b8e-c050-46bf-820b-c4a20762d1a5",
+            ),
+            Some(std::path::PathBuf::from(
+                "/home/karan/.claude/projects/-home-karan-code-karvex/93fd3b8e-c050-46bf-820b-c4a20762d1a5.jsonl"
+            ))
+        );
+        // The teammate probe's cwd, which is the case that matters: a teammate
+        // writes into the *same* project slug as its lead, which is exactly why
+        // "newest transcript under this slug" is not an identity source and
+        // this needs the session id.
+        assert_eq!(
+            transcript_path_for(
+                Path::new("/home/karan/.claude"),
+                "/var/tmp/s1-probe/work",
+                "23b8665d-263d-4285-ba0c-87899cd22c1e",
+            )
+            .as_deref()
+            .and_then(Path::to_str),
+            Some(
+                "/home/karan/.claude/projects/-var-tmp-s1-probe-work/23b8665d-263d-4285-ba0c-87899cd22c1e.jsonl"
+            )
+        );
+    }
+
+    #[test]
+    fn a_transcript_path_cannot_be_derived_from_a_hostile_session_id_or_an_empty_cwd() {
+        for hostile in ["../../etc/passwd", "a/b", "", "a b"] {
+            assert_eq!(
+                transcript_path_for(Path::new("/home/dev/.claude"), "/repo", hostile),
+                None,
+                "{hostile} must not name a file outside the projects directory"
+            );
+        }
+        assert_eq!(
+            transcript_path_for(Path::new("/home/dev/.claude"), "", "51ea857f"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reported_transcript_path_survives_classification() {
+        match classify_report(&lead_report(), &expectation()) {
+            ReportVerdict::Lead { endpoint, .. } => assert_eq!(
+                endpoint.transcript_path.as_deref(),
+                Some("/home/dev/.claude/projects/-home-dev-project/51ea857f.jsonl"),
+                "the session's own answer is the authority, not karvex's derivation"
+            ),
+            other => panic!("expected the lead, got {other:?}"),
+        }
     }
 
     #[test]
@@ -702,6 +832,7 @@ mod tests {
     fn an_assertion_binds_without_any_team_config_on_disk() {
         let endpoint = SessionEndpoint {
             session_id: "51ea857f-cb96-4372-ae75-bab1640c8428".to_string(),
+            transcript_path: None,
             messaging_socket: None,
             messaging_token: None,
         };
@@ -731,6 +862,7 @@ mod tests {
         )];
         let endpoint = SessionEndpoint {
             session_id: "51ea857f-cb96-4372-ae75-bab1640c8428".to_string(),
+            transcript_path: None,
             messaging_socket: None,
             messaging_token: None,
         };

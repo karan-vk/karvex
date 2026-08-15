@@ -991,6 +991,7 @@ fn workflow_run_report_session(args: &[String]) -> std::io::Result<i32> {
     let params = WorkflowRunReportSessionParams {
         run_id,
         session_id: hook.session_id,
+        transcript_path: hook.transcript_path,
         pane_id: env_value(crate::integration::KARVEX_PANE_ID_ENV_VAR),
         cwd: hook.cwd,
         source: hook.source,
