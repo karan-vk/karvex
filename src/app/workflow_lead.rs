@@ -1620,6 +1620,10 @@ fn write_inbox_frames(socket: &Path, frames: &[u8]) -> std::io::Result<()> {
 }
 
 /// How long a write to a session's inbox may block the server loop.
+///
+/// Unix-only, like the socket it bounds: upstream offers no cross-session
+/// messaging on native Windows, so a Windows build has no writer to time out.
+#[cfg(unix)]
 const INBOX_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Claude Code's task status vocabulary → karvex's node status.

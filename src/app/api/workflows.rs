@@ -241,6 +241,35 @@ impl App {
         self.workflow_unavailable(id)
     }
 
+    /// The identity hook's callback, with no runs to report to.
+    ///
+    /// Answers the same `workflow_unavailable` every other workflow method
+    /// does, rather than a success: a hook that got a cheerful `role: ignored`
+    /// from a server with no workflow subsystem would look like a session that
+    /// was considered and rejected, which is a different fact. The hook itself
+    /// exits 0 regardless — it must never fail a session's startup.
+    pub(super) fn handle_workflow_run_report_session(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkflowRunReportSessionParams,
+    ) -> String {
+        if let Some(error) = require_non_empty(&id, "run_id", &params.run_id) {
+            return error;
+        }
+        self.workflow_unavailable(id)
+    }
+
+    pub(super) fn handle_workflow_run_message(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkflowRunMessageParams,
+    ) -> String {
+        if let Some(error) = require_non_empty(&id, "run_id", &params.run_id) {
+            return error;
+        }
+        self.workflow_unavailable(id)
+    }
+
     pub(super) fn handle_workflow_run_get(
         &mut self,
         id: String,
@@ -2888,6 +2917,26 @@ mod tests {
             Method::WorkflowSummaryList(WorkflowSummaryListParams {
                 workflow_id: None,
                 limit: None,
+            }),
+            // The agent-teams rework's two run-session methods (§3.1a, §3.5a).
+            // The identity hook in particular reaches a server karvex did not
+            // choose the build of, so its answer here has to be the documented
+            // code rather than the catch-all.
+            Method::WorkflowRunReportSession(crate::api::schema::WorkflowRunReportSessionParams {
+                run_id: "workflow_run:1".into(),
+                session_id: "51ea857f-cb96-4372-ae75-bab1640c8428".into(),
+                pane_id: Some("w1:p2".into()),
+                cwd: None,
+                source: Some("startup".into()),
+                messaging_socket: None,
+                messaging_token: None,
+                agent_id: None,
+            }),
+            Method::WorkflowRunMessage(crate::api::schema::WorkflowRunMessageParams {
+                run_id: "workflow_run:1".into(),
+                target: "team-lead".into(),
+                text: "rebase before you continue".into(),
+                priority: None,
             }),
         ];
 
