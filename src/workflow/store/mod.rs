@@ -36,20 +36,22 @@ pub use error::StoreError;
 // its own the way it would in a published library.
 #[allow(unused_imports)]
 pub use queries::{
-    CheckpointRecord, InterrogationRecord, RestorableCheckpoint, RunEdgeRecord, RunEventRecord,
-    RunMemberRecord, RunNodeRecord, RunRecord, RunSummaryRecord, StoredGrowthLimit,
-    StoredGrowthLimits, VersionRecord, WorkflowSummary, DEFAULT_NODE_HISTORY_RUNS,
+    CheckpointRecord, InterrogationRecord, NodeEvidence, RestorableCheckpoint, ReviewCycleRecord,
+    ReviewFindingRecord, RunEdgeRecord, RunEventRecord, RunMemberRecord, RunNodeRecord, RunRecord,
+    RunSummaryRecord, StoredGrowthLimit, StoredGrowthLimits, VersionRecord, WorkflowSummary,
+    DEFAULT_NODE_HISTORY_RUNS,
 };
 use sha2::{Digest, Sha256};
 use surrealdb::engine::local::{Db, Mem, SurrealKv};
 use surrealdb::Surreal;
 
 use crate::workflow::model::{
-    canonical, is_reserved_path, CheckpointKind, Demand, EdgeKind, EdgePayload, Evidence,
-    GrowthLimits, InstancePath, InterrogationId, Isolation, Kvdag, KvdagEdge, KvdagNode, KvdagSpec,
-    KvdagVersionId, NodeAssignment, NodeBinding, NodeKey, NodeKind, NodeStatus, NodeUsage,
-    OutputSchema, RestoredRef, RestoredSeed, RunEventKind, RunId, RunStatus, StoreWrite,
-    Succession, SummaryNodeLine, WorkflowId, RESERVED_PATH_PREFIX,
+    canonical, is_reserved_path, Attention, CheckpointKind, Demand, EdgeKind, EdgePayload,
+    Evidence, GrowthLimits, InstancePath, InterrogationId, InterviewMode, Isolation, Kvdag,
+    KvdagEdge, KvdagNode, KvdagSpec, KvdagVersionId, NodeAssignment, NodeBinding, NodeKey,
+    NodeKind, NodeStatus, NodeUsage, OutputSchema, RestoredRef, RestoredSeed, ReviewCycleId,
+    ReviewCycleStatus, ReviewFindingSeed, RunEventKind, RunId, RunStatus, StoreWrite, Succession,
+    SummaryNodeLine, WorkflowId, RESERVED_PATH_PREFIX,
 };
 use crate::workflow::tier::Assignment;
 use crate::workflow::tier::Tier;
@@ -72,6 +74,7 @@ const TABLE_WORKFLOW_RUN: &str = "workflow_run";
 const TABLE_RUN_NODE: &str = "run_node";
 const TABLE_INTERROGATION: &str = "interrogation";
 const TABLE_RUN_MEMBER: &str = "run_member";
+const TABLE_REVIEW_CYCLE: &str = "review_cycle";
 
 /// Every statically materialised `run_node` sits at expansion depth 0; see
 /// [`WorkflowStore::materialise_run_nodes`] for why this is not topological
@@ -116,6 +119,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0005_lead_binding_and_projection",
         include_str!("migrations/0005_lead_binding_and_projection.surql"),
+    ),
+    (
+        "0006_member_identity_and_review",
+        include_str!("migrations/0006_member_identity_and_review.surql"),
     ),
 ];
 
@@ -299,10 +306,9 @@ struct MemberSnapshot {
     backend_type: String,
     is_active: bool,
     cwd: Option<String>,
-    /// Carried through from [`StoreWrite::RunMemberSnapshot`] but not yet
-    /// written: `run_member.session_id`/`transcript_path`/`last_state`/
-    /// `last_state_at` don't exist until migration `0006` (P7). This packet
-    /// only lands the mechanical shape (`phase4-retarget-plan.md` P1).
+    /// The teammate identity migration `0006` (P7) added columns for
+    /// (`phase4-retarget-plan.md` §3.3, S1); written with the
+    /// never-regress-to-unknown idiom `write_run_member_snapshot` documents.
     session_id: Option<String>,
     transcript_path: Option<String>,
     last_state: Option<String>,
@@ -1221,27 +1227,23 @@ impl WorkflowStore {
                 })
                 .await
             }
-            // Mechanical seam only (`phase4-retarget-plan.md` P1: "write-arm
-            // destructuring only — no queries, no behaviour"). `run_node.attention`
-            // and the review tables' writers land in P7, once migration `0006`
-            // exists and `workflow::review`/`workflow::watchdog` have producers.
+            // Landed in `phase4-retarget-plan.md` P7, once migration `0006`
+            // gave `run_node.attention` a column to write and the review
+            // tables (schema present since `0001_init.surql`) a writer.
             StoreWrite::RunNodeAttention {
                 run,
                 path,
                 attention,
-                observed_at_unix_ms,
-            } => {
-                let _ = (run, path, attention, observed_at_unix_ms);
-                Ok(())
-            }
+                observed_at_unix_ms: _,
+            } => self.write_run_node_attention(run, path, attention).await,
             StoreWrite::ReviewCycleStarted {
                 id,
                 run,
                 kvdag_version,
                 started_at_unix_ms,
             } => {
-                let _ = (id, run, kvdag_version, started_at_unix_ms);
-                Ok(())
+                self.write_review_cycle_started(id, run, kvdag_version, started_at_unix_ms)
+                    .await
             }
             StoreWrite::ReviewCycleUpdate {
                 id,
@@ -1249,12 +1251,11 @@ impl WorkflowStore {
                 ended_at_unix_ms,
                 resulting_version,
             } => {
-                let _ = (id, status, ended_at_unix_ms, resulting_version);
-                Ok(())
+                self.write_review_cycle_update(id, status, ended_at_unix_ms, resulting_version)
+                    .await
             }
             StoreWrite::ReviewFindings { cycle, findings } => {
-                let _ = (cycle, findings);
-                Ok(())
+                self.write_review_findings(cycle, findings).await
             }
         }
     }
@@ -1674,6 +1675,40 @@ pub(super) fn parse_evidence(value: &str) -> Result<Evidence, StoreError> {
         "detection" => Ok(Evidence::Detection),
         "restored" => Ok(Evidence::Restored),
         other => Err(StoreError::Decode(format!("unknown evidence {other:?}"))),
+    }
+}
+
+pub(super) fn parse_attention(value: &str) -> Result<Attention, StoreError> {
+    match value {
+        "stuck" => Ok(Attention::Stuck),
+        "budget_exceeded" => Ok(Attention::BudgetExceeded),
+        "needs_input" => Ok(Attention::NeedsInput),
+        "lead_blocked" => Ok(Attention::LeadBlocked),
+        "unbound" => Ok(Attention::Unbound),
+        other => Err(StoreError::Decode(format!("unknown attention {other:?}"))),
+    }
+}
+
+pub(super) fn parse_review_cycle_status(value: &str) -> Result<ReviewCycleStatus, StoreError> {
+    match value {
+        "running" => Ok(ReviewCycleStatus::Running),
+        "awaiting_user" => Ok(ReviewCycleStatus::AwaitingUser),
+        "applied" => Ok(ReviewCycleStatus::Applied),
+        "declined" => Ok(ReviewCycleStatus::Declined),
+        "failed" => Ok(ReviewCycleStatus::Failed),
+        other => Err(StoreError::Decode(format!(
+            "unknown review_cycle status {other:?}"
+        ))),
+    }
+}
+
+pub(super) fn parse_interview_mode(value: &str) -> Result<InterviewMode, StoreError> {
+    match value {
+        "resumed" => Ok(InterviewMode::Resumed),
+        "evidence_only" => Ok(InterviewMode::EvidenceOnly),
+        other => Err(StoreError::Decode(format!(
+            "unknown interview_mode {other:?}"
+        ))),
     }
 }
 
@@ -3454,10 +3489,20 @@ impl WorkflowStore {
     /// `observed_at_unix_ms`. The database never mints one: a `time::now()`
     /// here would be the flush-time second clock migrations `0002` and `0004`
     /// exist to keep out of this schema.
+    ///
+    /// `session_id`/`transcript_path`/`last_state`/`last_state_at_unix_ms`
+    /// (migration `0006`) follow the same non-regressing idiom
+    /// [`Self::write_interrogation_update`] uses for `forked_session_id`:
+    /// `None` on an incoming observation leaves the stored value untouched
+    /// rather than clearing it. A poll that has not (yet) resolved a
+    /// teammate's session id must never erase one an earlier poll already
+    /// learned — S1's "absent ⇒ evidence_only forever" is about the identity
+    /// never having been resolvable at all, not about one poll's silence.
     async fn write_run_member_snapshot(&self, member: MemberSnapshot) -> Result<(), StoreError> {
         let run_id = parse_record_id(TABLE_WORKFLOW_RUN, member.run.as_str())
             .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {}", member.run)))?;
         let observed_ms = member.observed_at_unix_ms as i64;
+        let last_state_at_ms = member.last_state_at_unix_ms.map(|ms| ms as i64);
 
         let mut response = self
             .db
@@ -3475,6 +3520,14 @@ impl WorkflowStore {
                         "UPDATE $id SET agent_type = $agent_type, model = $model, \
                          pane_id = $pane_id, backend_type = $backend_type, \
                          is_active = $is_active, cwd = $cwd, \
+                         session_id = IF $session_id = NONE THEN session_id \
+                                       ELSE $session_id END, \
+                         transcript_path = IF $transcript_path = NONE THEN transcript_path \
+                                            ELSE $transcript_path END, \
+                         last_state = IF $last_state = NONE THEN last_state \
+                                       ELSE $last_state END, \
+                         last_state_at = IF $last_state_at_ms = NONE THEN last_state_at \
+                                          ELSE time::from_millis($last_state_at_ms) END, \
                          last_seen_at = time::from_millis($observed_ms)",
                     )
                     .bind(("id", id))
@@ -3484,6 +3537,10 @@ impl WorkflowStore {
                     .bind(("backend_type", member.backend_type))
                     .bind(("is_active", member.is_active))
                     .bind(("cwd", member.cwd))
+                    .bind(("session_id", member.session_id))
+                    .bind(("transcript_path", member.transcript_path))
+                    .bind(("last_state", member.last_state))
+                    .bind(("last_state_at_ms", last_state_at_ms))
                     .bind(("observed_ms", observed_ms))
                     .await
             }
@@ -3493,6 +3550,10 @@ impl WorkflowStore {
                         "CREATE run_member SET run = $run, name = $name, \
                          agent_type = $agent_type, model = $model, pane_id = $pane_id, \
                          backend_type = $backend_type, is_active = $is_active, cwd = $cwd, \
+                         session_id = $session_id, transcript_path = $transcript_path, \
+                         last_state = $last_state, \
+                         last_state_at = IF $last_state_at_ms = NONE THEN NONE \
+                                          ELSE time::from_millis($last_state_at_ms) END, \
                          first_seen_at = time::from_millis($observed_ms), \
                          last_seen_at = time::from_millis($observed_ms)",
                     )
@@ -3504,6 +3565,10 @@ impl WorkflowStore {
                     .bind(("backend_type", member.backend_type))
                     .bind(("is_active", member.is_active))
                     .bind(("cwd", member.cwd))
+                    .bind(("session_id", member.session_id))
+                    .bind(("transcript_path", member.transcript_path))
+                    .bind(("last_state", member.last_state))
+                    .bind(("last_state_at_ms", last_state_at_ms))
                     .bind(("observed_ms", observed_ms))
                     .await
             }
@@ -3511,6 +3576,291 @@ impl WorkflowStore {
         .map_err(query_error)?;
         response.check().map_err(query_error)?;
         Ok(())
+    }
+
+    /// Karvex's own opinion about one node's need for intervention (§3.6,
+    /// D-10). `attention` is written unconditionally, `None` included — this
+    /// is a re-evaluation on every watchdog tick, not a one-way escalation,
+    /// and the caller (the watchdog adapter) decides a node has stopped
+    /// needing attention.
+    ///
+    /// `watchdog_interventions` accumulates by exactly one on every write
+    /// that carries `Some(attention)` — the bind audit
+    /// `phase4-retarget-plan.md` P7 asks for first: before this write-arm
+    /// existed, nothing on this branch ever bound the column at all
+    /// (`write_run_node` never has), so every `run_node.watchdog_interventions`
+    /// value in the field today is a stale `0` from `DEFAULT 0`. Written here
+    /// rather than in `write_run_node` because attention and status are
+    /// evaluated on two different cadences (§3.1: a 20s watchdog sample over
+    /// the 2s projection poll) and must stay two independent writes. A write
+    /// that only clears attention (`None`) does not count as an
+    /// intervention — clearing is the watchdog observing the node moving
+    /// again, not karvex acting on it.
+    ///
+    /// `observed_at_unix_ms` is not persisted by this write: migration
+    /// `0006` adds no timestamp column for `attention`, on purpose (§3.7:
+    /// "nothing else"). The moment of observation is what the `watchdog`
+    /// journal's own `run_event.at` already records, via the sibling
+    /// `StoreWrite::RunEvent` write the watchdog adapter issues alongside
+    /// this one for a rung it actually walks.
+    async fn write_run_node_attention(
+        &self,
+        run: RunId,
+        path: InstancePath,
+        attention: Option<Attention>,
+    ) -> Result<(), StoreError> {
+        let run_node_id = self.find_run_node_id(&run, &path).await?;
+        let attention_str = attention.map(|value| value.as_str().to_string());
+        let response = self
+            .db
+            .query(
+                "UPDATE $id SET attention = $attention, \
+                 watchdog_interventions = IF $attention = NONE THEN watchdog_interventions \
+                                           ELSE watchdog_interventions + 1 END",
+            )
+            .bind(("id", run_node_id))
+            .bind(("attention", attention_str))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    // ── the agent-teams rework: self-improvement review (`phase4-retarget-plan.md` P7) ──
+
+    /// Starts a review cycle. A create, so the app's bounded `pending_writes`
+    /// queue must never evict it — [`Self::write_review_cycle_update`] and
+    /// [`Self::write_review_findings`] address this row by id and would have
+    /// nothing to update (the same rule [`Self::write_interrogation_started`]
+    /// follows).
+    async fn write_review_cycle_started(
+        &self,
+        id: ReviewCycleId,
+        run: RunId,
+        kvdag_version: KvdagVersionId,
+        started_at_unix_ms: u64,
+    ) -> Result<(), StoreError> {
+        let cycle_id = parse_record_id(TABLE_REVIEW_CYCLE, id.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a review_cycle id: {id}")))?;
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let version_id =
+            parse_record_id(TABLE_KVDAG_VERSION, kvdag_version.as_str()).ok_or_else(|| {
+                StoreError::Decode(format!("not a kvdag_version id: {kvdag_version}"))
+            })?;
+        let response = self
+            .db
+            .query(
+                "CREATE $id SET run = $run, kvdag_version = $kvdag_version, \
+                 status = \"running\", started_at = time::from_millis($started_ms)",
+            )
+            .bind(("id", cycle_id))
+            .bind(("run", run_id))
+            .bind(("kvdag_version", version_id))
+            .bind(("started_ms", started_at_unix_ms as i64))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    /// What changes on a review cycle after it starts. `None` on any field
+    /// means "no change", the same convention
+    /// [`Self::write_interrogation_update`] uses: a status that never
+    /// regresses to unknown, an end stamp that is never un-set, a resulting
+    /// version that is never un-linked once compiled.
+    async fn write_review_cycle_update(
+        &self,
+        id: ReviewCycleId,
+        status: Option<ReviewCycleStatus>,
+        ended_at_unix_ms: Option<u64>,
+        resulting_version: Option<KvdagVersionId>,
+    ) -> Result<(), StoreError> {
+        let cycle_id = parse_record_id(TABLE_REVIEW_CYCLE, id.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a review_cycle id: {id}")))?;
+        let resulting_version_id = match &resulting_version {
+            Some(version) => Some(
+                parse_record_id(TABLE_KVDAG_VERSION, version.as_str()).ok_or_else(|| {
+                    StoreError::Decode(format!("not a kvdag_version id: {version}"))
+                })?,
+            ),
+            None => None,
+        };
+        let response = self
+            .db
+            .query(
+                "UPDATE $id SET \
+                 status = IF $status = NONE THEN status ELSE $status END, \
+                 ended_at = IF $ended_ms = NONE THEN ended_at \
+                            ELSE time::from_millis($ended_ms) END, \
+                 resulting_version = IF $resulting_version = NONE THEN resulting_version \
+                                      ELSE $resulting_version END",
+            )
+            .bind(("id", cycle_id))
+            .bind(("status", status.map(|value| value.as_str().to_string())))
+            .bind(("ended_ms", ended_at_unix_ms.map(|ms| ms as i64)))
+            .bind(("resulting_version", resulting_version_id))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
+
+    /// Writes one review cycle's findings and append-merges the interviews
+    /// they cite into `review_cycle.interviews` — the same append-merge shape
+    /// [`Self::write_interrogation_update`] uses for a single field, widened
+    /// here to a whole batch landing in one call (§3.5: findings are written
+    /// together once every interview, or its `evidence_only` fallback, is
+    /// in).
+    ///
+    /// `review_finding.run_node` is resolved against the cycle's own run
+    /// (read back from the `review_cycle` row itself, so this write does not
+    /// need the caller to carry `RunId` a second time). A `verdict =
+    /// "replace"` finding with no `replacement` is rejected by the schema's
+    /// own `review_finding_replace_requires_replacement` event
+    /// (`0001_init.surql`) — `query_error` surfaces that as a typed
+    /// [`StoreError`], never a panic, satisfying this packet's own contract.
+    async fn write_review_findings(
+        &self,
+        cycle: ReviewCycleId,
+        findings: Vec<ReviewFindingSeed>,
+    ) -> Result<(), StoreError> {
+        let cycle_id = parse_record_id(TABLE_REVIEW_CYCLE, cycle.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a review_cycle id: {cycle}")))?;
+        let mut run_response = self
+            .db
+            .query("SELECT VALUE run FROM $cycle")
+            .bind(("cycle", cycle_id.clone()))
+            .await
+            .map_err(query_error)?;
+        let runs: Vec<surrealdb_types::RecordId> = run_response.take(0).map_err(query_error)?;
+        let run_id = runs
+            .into_iter()
+            .next()
+            .ok_or_else(|| StoreError::Decode(format!("review_cycle {cycle} has no run")))?;
+
+        let mut interview_ids: Vec<surrealdb_types::RecordId> = Vec::new();
+        for seed in findings {
+            let run_node_id = match &seed.run_node {
+                Some(path) => self
+                    .select_run_node_row(&run_id, path)
+                    .await?
+                    .map(|row| row.id),
+                None => None,
+            };
+            let interview_id = match &seed.interview {
+                Some(interview) => {
+                    let id = parse_record_id(TABLE_INTERROGATION, interview.as_str()).ok_or_else(
+                        || StoreError::Decode(format!("not an interrogation id: {interview}")),
+                    )?;
+                    interview_ids.push(id.clone());
+                    Some(id)
+                }
+                None => None,
+            };
+            let response = self
+                .db
+                .query(
+                    "CREATE review_finding SET cycle = $cycle, run_node = $run_node, \
+                     node_key = $node_key, interview = $interview, \
+                     interview_mode = $interview_mode, level = $level, verdict = $verdict, \
+                     rationale = $rationale, evidence = $evidence, \
+                     proposed_change = $proposed_change, replacement = $replacement",
+                )
+                .bind(("cycle", cycle_id.clone()))
+                .bind(("run_node", run_node_id))
+                .bind(("node_key", seed.node_key.to_string()))
+                .bind(("interview", interview_id))
+                .bind(("interview_mode", seed.interview_mode.as_str().to_string()))
+                .bind(("level", seed.level))
+                .bind(("verdict", seed.verdict))
+                .bind(("rationale", seed.rationale))
+                .bind(("evidence", seed.evidence))
+                .bind(("proposed_change", seed.proposed_change))
+                .bind(("replacement", seed.replacement))
+                .await
+                .map_err(query_error)?;
+            response.check().map_err(query_error)?;
+        }
+
+        if !interview_ids.is_empty() {
+            let response = self
+                .db
+                .query(
+                    "UPDATE $cycle SET \
+                     interviews = array::distinct(array::concat(interviews, $new_interviews))",
+                )
+                .bind(("cycle", cycle_id))
+                .bind(("new_interviews", interview_ids))
+                .await
+                .map_err(query_error)?;
+            response.check().map_err(query_error)?;
+        }
+        Ok(())
+    }
+
+    /// Accepts a set of findings out of a review cycle: `accepted = true` and
+    /// `applied_in = version` for every `review_finding` in `cycle` whose
+    /// `node_key` is in `keys`. Returns how many findings were marked, so the
+    /// caller can tell "nothing matched" from "the apply happened" without a
+    /// second read.
+    pub async fn finding_mark_applied(
+        &self,
+        cycle: &ReviewCycleId,
+        keys: &[NodeKey],
+        version: &KvdagVersionId,
+    ) -> Result<u64, StoreError> {
+        let cycle_id = parse_record_id(TABLE_REVIEW_CYCLE, cycle.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a review_cycle id: {cycle}")))?;
+        let version_id = parse_record_id(TABLE_KVDAG_VERSION, version.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a kvdag_version id: {version}")))?;
+        let key_strings: Vec<String> = keys.iter().map(NodeKey::to_string).collect();
+        let mut response = self
+            .db
+            .query(
+                "UPDATE review_finding SET accepted = true, applied_in = $version \
+                 WHERE cycle = $cycle AND node_key IN $keys RETURN AFTER",
+            )
+            .bind(("cycle", cycle_id))
+            .bind(("version", version_id))
+            .bind(("keys", key_strings))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::ReviewFindingRow> = response.take(0).map_err(query_error)?;
+        Ok(rows.len() as u64)
+    }
+
+    /// Marks every `running` `review_cycle` `failed` at store open, sparing
+    /// `awaiting_user` — the review-cycle sibling of
+    /// [`Self::mark_interrupted_runs`], for the identical reason: a server
+    /// restart drops the in-memory interview machinery (the interview panes,
+    /// the synthesis step), so a `running` cycle left over from the previous
+    /// process is a lie the moment the new server starts. An `awaiting_user`
+    /// cycle is different: nothing was in flight, a human's per-finding
+    /// accept is the only thing that was ever going to move it, and that
+    /// decision is still there to make through the same row after a restart
+    /// — sweeping it would destroy real, still-actionable work for no
+    /// reason.
+    ///
+    /// `review_cycle` has no `failure`/`detail` column of its own (`0006`
+    /// added none — §3.7's own "nothing else"), so `status = "failed"` is the
+    /// most honest terminal state this schema can currently express; a human
+    /// reading the run's review history sees a cycle that did not reach a
+    /// resolution, which is the truthful summary of "the server that was
+    /// running it restarted".
+    pub async fn mark_interrupted_reviews(&self, now_unix_ms: u64) -> Result<u64, StoreError> {
+        let mut response = self
+            .db
+            .query(
+                "UPDATE review_cycle SET status = \"failed\", \
+                 ended_at = time::from_millis($now_ms) \
+                 WHERE status = \"running\" RETURN AFTER",
+            )
+            .bind(("now_ms", now_unix_ms as i64))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::ReviewCycleRow> = response.take(0).map_err(query_error)?;
+        Ok(rows.len() as u64)
     }
 }
 

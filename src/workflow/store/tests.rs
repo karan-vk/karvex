@@ -396,6 +396,7 @@ async fn migrations_apply_cleanly_and_reapplying_is_a_noop() {
             "0003_node_identity".to_string(),
             "0004_journal_time_and_interrogation".to_string(),
             "0005_lead_binding_and_projection".to_string(),
+            "0006_member_identity_and_review".to_string(),
         ])
     );
 
@@ -2453,7 +2454,7 @@ async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_colu
     store
         .migrate()
         .await
-        .expect("0002 through 0005 apply on top of 0001");
+        .expect("0002 through 0006 apply on top of 0001");
     assert_eq!(
         store.applied_migrations().await.expect("read schema_meta"),
         std::collections::BTreeSet::from([
@@ -2462,6 +2463,7 @@ async fn migration_0002_applies_over_a_0001_only_database_and_backfills_its_colu
             "0003_node_identity".to_string(),
             "0004_journal_time_and_interrogation".to_string(),
             "0005_lead_binding_and_projection".to_string(),
+            "0006_member_identity_and_review".to_string(),
         ])
     );
 
@@ -2625,7 +2627,7 @@ async fn migration_0004_applies_over_a_0001_to_0003_database() {
     store
         .migrate()
         .await
-        .expect("0004 and 0005 apply on top of 0001..0003, including over existing rows");
+        .expect("0004 through 0006 apply on top of 0001..0003, including over existing rows");
     assert_eq!(
         store.applied_migrations().await.expect("read schema_meta"),
         std::collections::BTreeSet::from([
@@ -2634,6 +2636,7 @@ async fn migration_0004_applies_over_a_0001_to_0003_database() {
             "0003_node_identity".to_string(),
             "0004_journal_time_and_interrogation".to_string(),
             "0005_lead_binding_and_projection".to_string(),
+            "0006_member_identity_and_review".to_string(),
         ])
     );
 
@@ -4348,7 +4351,7 @@ async fn migration_0005_applies_over_a_0001_to_0004_database() {
     store
         .migrate()
         .await
-        .expect("0005 applies on top of 0001..0004, including over existing rows");
+        .expect("0005 and 0006 apply on top of 0001..0004, including over existing rows");
     assert_eq!(
         store.applied_migrations().await.expect("read schema_meta"),
         std::collections::BTreeSet::from([
@@ -4357,6 +4360,7 @@ async fn migration_0005_applies_over_a_0001_to_0004_database() {
             "0003_node_identity".to_string(),
             "0004_journal_time_and_interrogation".to_string(),
             "0005_lead_binding_and_projection".to_string(),
+            "0006_member_identity_and_review".to_string(),
         ])
     );
 
@@ -4413,4 +4417,972 @@ async fn migration_0005_applies_over_a_0001_to_0004_database() {
             .len(),
         1
     );
+}
+
+// ── the agent-teams rework: migration 0006, review, attention, sweeps
+//     (`phase4-retarget-plan.md` P7) ─────────────────────────────────────────
+
+async fn setup_run_with_spec(store: &WorkflowStore, spec: KvdagSpec) -> (WorkflowId, Kvdag, RunId) {
+    let workflow = store
+        .create_workflow("demo", "a demo workflow", Tier::Auto)
+        .await
+        .expect("create_workflow");
+    let kvdag = store
+        .create_version(&workflow, VersionOrigin::Authored, "v1", spec)
+        .await
+        .expect("create_version");
+    store
+        .set_head_version(&workflow, &kvdag.version_id)
+        .await
+        .expect("set_head_version");
+    let run = create_run_in_workspace(store, &workflow, &kvdag, None).await;
+    (workflow, kvdag, run)
+}
+
+#[tokio::test]
+async fn migration_0006_applies_over_a_0001_to_0005_database() {
+    let store = WorkflowStore::open_with_migrations(StoreLocation::Memory, 5)
+        .await
+        .expect("a 0001..0005 database opens");
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
+            "0004_journal_time_and_interrogation".to_string(),
+            "0005_lead_binding_and_projection".to_string(),
+        ])
+    );
+
+    // A run, its node, and a member snapshot, written the way a pre-`0006`
+    // karvex wrote them: no session identity, no attention.
+    let (workflow, kvdag) = setup_workflow(&store).await;
+    let run = create_run_row_directly(&store, &workflow, &kvdag).await;
+    let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id");
+    let response = store
+        .db
+        .query(
+            "CREATE run_member SET run = $run, name = \"solo-worker\", agent_type = \"Explore\", \
+             model = \"opus\", is_active = true, \
+             first_seen_at = time::from_millis(1700000000000), \
+             last_seen_at = time::from_millis(1700000000000)",
+        )
+        .bind(("run", run_id))
+        .await
+        .expect("create pre-0006 run_member");
+    response
+        .check()
+        .expect("pre-0006 run_member insert succeeds");
+
+    store
+        .migrate()
+        .await
+        .expect("0006 applies on top of 0001..0005, including over existing rows");
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
+            "0004_journal_time_and_interrogation".to_string(),
+            "0005_lead_binding_and_projection".to_string(),
+            "0006_member_identity_and_review".to_string(),
+        ])
+    );
+
+    // The point of the test: rows written before 0006 still decode through
+    // the widened `RunNodeRow`/`RunMemberRow`. The new `option` columns read
+    // back as `None`, not as a decode error.
+    let nodes = store
+        .list_run_nodes(&run)
+        .await
+        .expect("a pre-0006 run_node row still decodes");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].attention, None);
+
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("a pre-0006 run_member row still decodes");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].session_id, None);
+    assert_eq!(members[0].transcript_path, None);
+    assert_eq!(members[0].last_state, None);
+    assert_eq!(members[0].last_state_at_unix_ms, None);
+
+    // And the new write paths work against the migrated database.
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: InstancePath::new("solo"),
+            attention: Some(Attention::Stuck),
+            observed_at_unix_ms: 1_700_000_500_000,
+        })
+        .await
+        .expect("attention is writable after 0006");
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(nodes[0].attention, Some(Attention::Stuck));
+}
+
+/// The real upgrade path: an on-disk `SurrealKv` store opened at `0001..0005`,
+/// closed, then reopened by a binary that also knows `0006`. `kv-mem` (every
+/// other migration test in this file) never touches a real file at all, so it
+/// cannot prove migration `0006` survives the boundary an actual karvex
+/// upgrade crosses — a fresh `Surreal<Db>` handle over the same on-disk
+/// `SurrealKv` directory, not the same in-process handle picking up a second
+/// migration batch.
+#[tokio::test]
+#[ignore = "touches disk"]
+async fn an_on_disk_store_applies_migration_0006_over_close_and_reopen() {
+    let dir = unique_temp_dir("migration-0006-upgrade");
+
+    let (run, member_row_existed) = {
+        let store = WorkflowStore::open_with_migrations(StoreLocation::OnDisk(dir.clone()), 5)
+            .await
+            .expect("a 0001..0005 on-disk database opens");
+        let (workflow, kvdag) = setup_workflow(&store).await;
+        let run = create_run_row_directly(&store, &workflow, &kvdag).await;
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id");
+        let response = store
+            .db
+            .query(
+                "CREATE run_member SET run = $run, name = \"solo-worker\", \
+                 agent_type = \"Explore\", model = \"opus\", is_active = true, \
+                 first_seen_at = time::from_millis(1700000000000), \
+                 last_seen_at = time::from_millis(1700000000000)",
+            )
+            .bind(("run", run_id))
+            .await
+            .expect("create pre-0006 run_member");
+        response
+            .check()
+            .expect("pre-0006 run_member insert succeeds");
+        (run, true)
+    };
+    assert!(member_row_existed);
+
+    // A fresh handle over the same directory. `WorkflowStore::open` always
+    // migrates before returning, so this is production's exact upgrade path
+    // — not `open_with_migrations` again.
+    let store = open_with_retry(&dir).await;
+    assert_eq!(
+        store.applied_migrations().await.expect("read schema_meta"),
+        std::collections::BTreeSet::from([
+            "0001_init".to_string(),
+            "0002_growth_and_history".to_string(),
+            "0003_node_identity".to_string(),
+            "0004_journal_time_and_interrogation".to_string(),
+            "0005_lead_binding_and_projection".to_string(),
+            "0006_member_identity_and_review".to_string(),
+        ])
+    );
+
+    let nodes = store
+        .list_run_nodes(&run)
+        .await
+        .expect("a pre-0006 run_node row survives a real close/reopen");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].attention, None);
+
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("a pre-0006 run_member row survives a real close/reopen");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].session_id, None);
+
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: InstancePath::new("solo"),
+            attention: Some(Attention::NeedsInput),
+            observed_at_unix_ms: 1_700_000_500_000,
+        })
+        .await
+        .expect("attention is writable after a real 0006 upgrade");
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(nodes[0].attention, Some(Attention::NeedsInput));
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn run_member_identity_columns_round_trip_through_the_production_writer() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run(&store).await;
+
+    store
+        .write(StoreWrite::RunMemberSnapshot {
+            run: run.clone(),
+            name: "solo-worker".to_string(),
+            agent_type: "Explore".to_string(),
+            model: "opus".to_string(),
+            pane_id: Some("w1:p2".to_string()),
+            backend_type: "tmux".to_string(),
+            is_active: true,
+            cwd: Some("/home/karan/code/karvex".to_string()),
+            session_id: Some("sess-abc".to_string()),
+            transcript_path: Some("/home/u/.claude/projects/-repo/sess-abc.jsonl".to_string()),
+            last_state: Some("idle".to_string()),
+            last_state_at_unix_ms: Some(1_700_000_000_000),
+            observed_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("write_run_member_snapshot with identity fields");
+
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("list_run_members");
+    assert_eq!(members.len(), 1);
+    let member = &members[0];
+    assert_eq!(member.session_id, Some("sess-abc".to_string()));
+    assert_eq!(
+        member.transcript_path,
+        Some("/home/u/.claude/projects/-repo/sess-abc.jsonl".to_string())
+    );
+    assert_eq!(member.last_state, Some("idle".to_string()));
+    assert_eq!(member.last_state_at_unix_ms, Some(1_700_000_000_000));
+
+    // A later poll that has not (yet) resolved the session id must not erase
+    // one an earlier poll already learned (S1's "absent \u21d2 evidence_only
+    // forever" is about resolvability, not about one poll's silence).
+    store
+        .write(StoreWrite::RunMemberSnapshot {
+            run: run.clone(),
+            name: "solo-worker".to_string(),
+            agent_type: "Explore".to_string(),
+            model: "opus".to_string(),
+            pane_id: Some("w1:p2".to_string()),
+            backend_type: "tmux".to_string(),
+            is_active: true,
+            cwd: Some("/home/karan/code/karvex".to_string()),
+            session_id: None,
+            transcript_path: None,
+            last_state: Some("working".to_string()),
+            last_state_at_unix_ms: Some(1_700_000_030_000),
+            observed_at_unix_ms: 1_700_000_030_000,
+        })
+        .await
+        .expect("a silent poll does not clear a known identity");
+
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("list_run_members");
+    let member = &members[0];
+    assert_eq!(
+        member.session_id,
+        Some("sess-abc".to_string()),
+        "session_id never regresses to unknown"
+    );
+    assert_eq!(
+        member.transcript_path,
+        Some("/home/u/.claude/projects/-repo/sess-abc.jsonl".to_string())
+    );
+    assert_eq!(
+        member.last_state,
+        Some("working".to_string()),
+        "last_state does advance when a poll carries a new value"
+    );
+    assert_eq!(member.last_state_at_unix_ms, Some(1_700_000_030_000));
+}
+
+#[tokio::test]
+async fn run_node_attention_round_trips_and_watchdog_interventions_accumulate_monotonically() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run(&store).await;
+    let path = InstancePath::new("solo");
+
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(
+        nodes[0].attention, None,
+        "a node has no attention before the watchdog ever evaluates it"
+    );
+
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: path.clone(),
+            attention: Some(Attention::Stuck),
+            observed_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("first attention write");
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(nodes[0].attention, Some(Attention::Stuck));
+
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: path.clone(),
+            attention: Some(Attention::BudgetExceeded),
+            observed_at_unix_ms: 1_700_000_020_000,
+        })
+        .await
+        .expect("second attention write");
+
+    let mut response = store
+        .db
+        .query("SELECT VALUE watchdog_interventions FROM run_node WHERE run = $run")
+        .bind((
+            "run",
+            parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id"),
+        ))
+        .await
+        .expect("select watchdog_interventions");
+    let interventions: Vec<i64> = response.take(0).expect("decode watchdog_interventions");
+    assert_eq!(
+        interventions,
+        vec![2],
+        "two Some(_) writes accumulate to two interventions"
+    );
+
+    // Clearing attention is the watchdog observing the node moving again, not
+    // an intervention: the counter must not move.
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: path.clone(),
+            attention: None,
+            observed_at_unix_ms: 1_700_000_040_000,
+        })
+        .await
+        .expect("clearing write");
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(nodes[0].attention, None, "None clears a prior attention");
+
+    let mut response = store
+        .db
+        .query("SELECT VALUE watchdog_interventions FROM run_node WHERE run = $run")
+        .bind((
+            "run",
+            parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id"),
+        ))
+        .await
+        .expect("select watchdog_interventions");
+    let interventions: Vec<i64> = response.take(0).expect("decode watchdog_interventions");
+    assert_eq!(
+        interventions,
+        vec![2],
+        "a clearing write is not itself an intervention"
+    );
+}
+
+#[tokio::test]
+async fn review_cycle_and_findings_round_trip_through_the_production_writer() {
+    let store = open_mem_store().await;
+    let (_, kvdag, run) = setup_run_with_spec(&store, fanout_spec(2)).await;
+    let second_version = store
+        .create_version(
+            &kvdag.workflow_id,
+            VersionOrigin::SelfImprovement,
+            "self-improvement pass",
+            fanout_spec(3),
+        )
+        .await
+        .expect("create a resulting version to link the cycle to");
+
+    let interview_1 = InterrogationId::new("interrogation:review-1");
+    store
+        .write(StoreWrite::InterrogationStarted {
+            id: interview_1.clone(),
+            run: run.clone(),
+            path: InstancePath::new("child0"),
+            source_session_id: "sess-child0".to_string(),
+            forked_session_id: Some("sess-child0-fork".to_string()),
+            transcript_path: None,
+            cwd: "/tmp/work".to_string(),
+            pane_id: crate::workflow::model::PublicPaneId::new("pane-1"),
+            reconstructed: false,
+            seeded_from_seq: None,
+            note: String::new(),
+            started_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("seed the first interview");
+    let interview_2 = InterrogationId::new("interrogation:review-2");
+    store
+        .write(StoreWrite::InterrogationStarted {
+            id: interview_2.clone(),
+            run: run.clone(),
+            path: InstancePath::new("child1"),
+            source_session_id: "sess-child1".to_string(),
+            forked_session_id: Some("sess-child1-fork".to_string()),
+            transcript_path: None,
+            cwd: "/tmp/work".to_string(),
+            pane_id: crate::workflow::model::PublicPaneId::new("pane-2"),
+            reconstructed: false,
+            seeded_from_seq: None,
+            note: String::new(),
+            started_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("seed the second interview");
+
+    let cycle_id = ReviewCycleId::new("review_cycle:t1");
+    store
+        .write(StoreWrite::ReviewCycleStarted {
+            id: cycle_id.clone(),
+            run: run.clone(),
+            kvdag_version: kvdag.version_id.clone(),
+            started_at_unix_ms: 1_700_000_100_000,
+        })
+        .await
+        .expect("write_review_cycle_started");
+
+    let started = store
+        .get_review_cycle(&run)
+        .await
+        .expect("get_review_cycle")
+        .expect("the cycle exists");
+    assert_eq!(started.id, cycle_id);
+    assert_eq!(started.run, run);
+    assert_eq!(started.kvdag_version, kvdag.version_id);
+    assert_eq!(started.status, ReviewCycleStatus::Running);
+    assert_eq!(started.started_at_unix_ms, 1_700_000_100_000);
+    assert_eq!(started.ended_at_unix_ms, None);
+    assert_eq!(started.resulting_version, None);
+    assert!(started.interviews.is_empty());
+
+    store
+        .write(StoreWrite::ReviewFindings {
+            cycle: cycle_id.clone(),
+            findings: vec![
+                ReviewFindingSeed {
+                    node_key: NodeKey::new("child0"),
+                    run_node: Some(InstancePath::new("child0")),
+                    interview: Some(interview_1.clone()),
+                    interview_mode: InterviewMode::Resumed,
+                    level: "prompt".to_string(),
+                    verdict: "keep".to_string(),
+                    rationale: "did fine".to_string(),
+                    evidence: serde_json::json!({"attempts": 1}),
+                    proposed_change: serde_json::json!({}),
+                    replacement: None,
+                },
+                ReviewFindingSeed {
+                    node_key: NodeKey::new("child1"),
+                    run_node: Some(InstancePath::new("child1")),
+                    interview: Some(interview_2.clone()),
+                    interview_mode: InterviewMode::EvidenceOnly,
+                    level: "structural".to_string(),
+                    verdict: "improve".to_string(),
+                    rationale: "kept getting stuck".to_string(),
+                    evidence: serde_json::json!({"watchdog_interventions": 3}),
+                    proposed_change: serde_json::json!({"prompt": "be more specific"}),
+                    replacement: None,
+                },
+            ],
+        })
+        .await
+        .expect("write_review_findings");
+
+    let findings = store
+        .list_review_findings(&cycle_id)
+        .await
+        .expect("list_review_findings");
+    assert_eq!(findings.len(), 2, "ordered by node_key: child0 then child1");
+    assert_eq!(findings[0].node_key, NodeKey::new("child0"));
+    assert_eq!(findings[0].run_node, Some(InstancePath::new("child0")));
+    assert_eq!(findings[0].interview, Some(interview_1.clone()));
+    assert_eq!(findings[0].interview_mode, InterviewMode::Resumed);
+    assert_eq!(findings[0].level, "prompt");
+    assert_eq!(findings[0].verdict, "keep");
+    assert_eq!(findings[0].rationale, "did fine");
+    assert_eq!(findings[0].evidence, serde_json::json!({"attempts": 1}));
+    assert!(!findings[0].accepted);
+    assert_eq!(findings[0].applied_in, None);
+
+    assert_eq!(findings[1].node_key, NodeKey::new("child1"));
+    assert_eq!(findings[1].interview_mode, InterviewMode::EvidenceOnly);
+    assert_eq!(findings[1].verdict, "improve");
+
+    let after_findings = store
+        .get_review_cycle(&run)
+        .await
+        .expect("get_review_cycle")
+        .expect("the cycle exists");
+    let mut interviews = after_findings.interviews.clone();
+    interviews.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let mut expected = vec![interview_1.clone(), interview_2.clone()];
+    expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    assert_eq!(interviews, expected, "both interviews are merged in");
+
+    // Re-citing an already-known interview against a third finding must not
+    // grow the interviews array — the merge is a set, not a log.
+    store
+        .write(StoreWrite::ReviewFindings {
+            cycle: cycle_id.clone(),
+            findings: vec![ReviewFindingSeed {
+                node_key: NodeKey::new("root"),
+                run_node: Some(InstancePath::new("root")),
+                interview: Some(interview_1.clone()),
+                interview_mode: InterviewMode::Resumed,
+                level: "prompt".to_string(),
+                verdict: "keep".to_string(),
+                rationale: "also fine".to_string(),
+                evidence: serde_json::json!({}),
+                proposed_change: serde_json::json!({}),
+                replacement: None,
+            }],
+        })
+        .await
+        .expect("write_review_findings a second batch");
+    let after_second = store
+        .get_review_cycle(&run)
+        .await
+        .expect("get_review_cycle")
+        .expect("the cycle exists");
+    assert_eq!(
+        after_second.interviews.len(),
+        2,
+        "re-citing a known interview does not duplicate it"
+    );
+
+    store
+        .write(StoreWrite::ReviewCycleUpdate {
+            id: cycle_id.clone(),
+            status: Some(ReviewCycleStatus::AwaitingUser),
+            ended_at_unix_ms: None,
+            resulting_version: None,
+        })
+        .await
+        .expect("write_review_cycle_update to awaiting_user");
+    let awaiting = store
+        .get_review_cycle(&run)
+        .await
+        .expect("get_review_cycle")
+        .expect("the cycle exists");
+    assert_eq!(awaiting.status, ReviewCycleStatus::AwaitingUser);
+    assert_eq!(awaiting.ended_at_unix_ms, None, "not yet ended");
+    assert_eq!(
+        awaiting.started_at_unix_ms, 1_700_000_100_000,
+        "an update never rewrites the start stamp"
+    );
+
+    store
+        .write(StoreWrite::ReviewCycleUpdate {
+            id: cycle_id.clone(),
+            status: Some(ReviewCycleStatus::Applied),
+            ended_at_unix_ms: Some(1_700_000_200_000),
+            resulting_version: Some(second_version.version_id.clone()),
+        })
+        .await
+        .expect("write_review_cycle_update to applied");
+    let applied = store
+        .get_review_cycle(&run)
+        .await
+        .expect("get_review_cycle")
+        .expect("the cycle exists");
+    assert_eq!(applied.status, ReviewCycleStatus::Applied);
+    assert_eq!(applied.ended_at_unix_ms, Some(1_700_000_200_000));
+    assert_eq!(
+        applied.resulting_version,
+        Some(second_version.version_id.clone())
+    );
+
+    let marked = store
+        .finding_mark_applied(
+            &cycle_id,
+            &[NodeKey::new("child1")],
+            &second_version.version_id,
+        )
+        .await
+        .expect("finding_mark_applied");
+    assert_eq!(marked, 1);
+
+    let findings = store
+        .list_review_findings(&cycle_id)
+        .await
+        .expect("list_review_findings");
+    let child0 = findings
+        .iter()
+        .find(|f| f.node_key == NodeKey::new("child0"))
+        .expect("child0");
+    let child1 = findings
+        .iter()
+        .find(|f| f.node_key == NodeKey::new("child1"))
+        .expect("child1");
+    assert!(!child0.accepted, "only the named key is marked applied");
+    assert_eq!(child0.applied_in, None);
+    assert!(child1.accepted);
+    assert_eq!(child1.applied_in, Some(second_version.version_id.clone()));
+}
+
+#[tokio::test]
+async fn review_finding_replace_without_replacement_is_a_typed_error_not_a_panic() {
+    let store = open_mem_store().await;
+    let (_, kvdag, run) = setup_run(&store).await;
+    let cycle_id = ReviewCycleId::new("review_cycle:replace-guard");
+    store
+        .write(StoreWrite::ReviewCycleStarted {
+            id: cycle_id.clone(),
+            run: run.clone(),
+            kvdag_version: kvdag.version_id.clone(),
+            started_at_unix_ms: 1_700_000_100_000,
+        })
+        .await
+        .expect("write_review_cycle_started");
+
+    let error = store
+        .write(StoreWrite::ReviewFindings {
+            cycle: cycle_id.clone(),
+            findings: vec![ReviewFindingSeed {
+                node_key: NodeKey::new("solo"),
+                run_node: Some(InstancePath::new("solo")),
+                interview: None,
+                interview_mode: InterviewMode::EvidenceOnly,
+                level: "structural".to_string(),
+                verdict: "replace".to_string(),
+                rationale: "never followed the contract".to_string(),
+                evidence: serde_json::json!({}),
+                proposed_change: serde_json::json!({}),
+                replacement: None,
+            }],
+        })
+        .await
+        .expect_err("verdict=replace with no replacement must not write");
+    assert!(
+        matches!(error, StoreError::Query(_)),
+        "a schema-event refusal surfaces as a typed StoreError, not a panic: {error:?}"
+    );
+
+    let findings = store
+        .list_review_findings(&cycle_id)
+        .await
+        .expect("list_review_findings");
+    assert!(findings.is_empty(), "the refused finding was not written");
+}
+
+#[tokio::test]
+async fn mark_interrupted_reviews_sweeps_running_and_spares_awaiting_user() {
+    let store = open_mem_store().await;
+    let (_, kvdag, run) = setup_run(&store).await;
+
+    let running = ReviewCycleId::new("review_cycle:running");
+    store
+        .write(StoreWrite::ReviewCycleStarted {
+            id: running.clone(),
+            run: run.clone(),
+            kvdag_version: kvdag.version_id.clone(),
+            started_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("seed a running cycle");
+
+    let awaiting = ReviewCycleId::new("review_cycle:awaiting");
+    store
+        .write(StoreWrite::ReviewCycleStarted {
+            id: awaiting.clone(),
+            run: run.clone(),
+            kvdag_version: kvdag.version_id.clone(),
+            started_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("seed a second cycle");
+    store
+        .write(StoreWrite::ReviewCycleUpdate {
+            id: awaiting.clone(),
+            status: Some(ReviewCycleStatus::AwaitingUser),
+            ended_at_unix_ms: None,
+            resulting_version: None,
+        })
+        .await
+        .expect("move it to awaiting_user");
+
+    let swept = store
+        .mark_interrupted_reviews(1_700_000_900_000)
+        .await
+        .expect("mark_interrupted_reviews");
+    assert_eq!(swept, 1, "only the running cycle is swept");
+
+    // `get_review_cycle` returns the most recent by `started_at`; both cycles
+    // share a stamp, so read each by id directly rather than relying on order.
+    let mut response = store
+        .db
+        .query("SELECT VALUE status FROM $id")
+        .bind((
+            "id",
+            parse_record_id(TABLE_REVIEW_CYCLE, running.as_str()).expect("id"),
+        ))
+        .await
+        .expect("select running status");
+    let status: Vec<String> = response.take(0).expect("decode status");
+    assert_eq!(
+        status,
+        vec!["failed".to_string()],
+        "running is swept honestly"
+    );
+
+    let mut response = store
+        .db
+        .query("SELECT VALUE status FROM $id")
+        .bind((
+            "id",
+            parse_record_id(TABLE_REVIEW_CYCLE, awaiting.as_str()).expect("id"),
+        ))
+        .await
+        .expect("select awaiting status");
+    let status: Vec<String> = response.take(0).expect("decode status");
+    assert_eq!(
+        status,
+        vec!["awaiting_user".to_string()],
+        "awaiting_user survives the sweep: a human can still resolve it"
+    );
+    // Idempotent: a second call finds nothing left to sweep.
+    let swept_again = store
+        .mark_interrupted_reviews(1_700_000_950_000)
+        .await
+        .expect("mark_interrupted_reviews again");
+    assert_eq!(swept_again, 0);
+}
+
+#[tokio::test]
+async fn node_evidence_matches_a_hand_built_journal() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run_with_spec(&store, fanout_spec(1)).await;
+
+    // The blocker: an emergent `.task/1`, and `child0` observed to be blocked
+    // on it — exercises the same `run_edge` `project_blocked_by` writes
+    // (`a_projected_blocked_by_becomes_one_run_edge_once_both_tasks_exist`).
+    store
+        .write(task_projection(
+            &run,
+            ".task/1",
+            "task-1",
+            "1",
+            "1. The blocker",
+            "lead",
+            NodeStatus::Running,
+            true,
+            1_700_000_000_000,
+        ))
+        .await
+        .expect("project the blocker");
+    store
+        .write(StoreWrite::RunTaskProjected {
+            run: run.clone(),
+            path: InstancePath::new("child0"),
+            node_key: NodeKey::new("child0"),
+            task_id: "2".to_string(),
+            subject: "2. Child".to_string(),
+            owner: "teammate-2".to_string(),
+            status: NodeStatus::Running,
+            emergent: false,
+            blocked_by: vec![InstancePath::new(".task/1")],
+            observed_at_unix_ms: 1_700_000_010_000,
+        })
+        .await
+        .expect("project child0, blocked and started");
+
+    store
+        .write(StoreWrite::RunNode {
+            run: run.clone(),
+            path: InstancePath::new("child0"),
+            status: NodeStatus::Running,
+            attempt: 1,
+            binding: None,
+            usage: crate::workflow::model::NodeUsage {
+                total_tokens: 500,
+                tool_uses: 7,
+                duration_ms: 0,
+            },
+            evidence: None,
+            succession: None,
+            started_at_unix_ms: None,
+            ended_at_unix_ms: None,
+            restored_from: None,
+        })
+        .await
+        .expect("record usage without disturbing the projected timestamps");
+
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: InstancePath::new("child0"),
+            attention: Some(Attention::Stuck),
+            observed_at_unix_ms: 1_700_000_020_000,
+        })
+        .await
+        .expect("first attention write");
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: InstancePath::new("child0"),
+            attention: Some(Attention::Stuck),
+            observed_at_unix_ms: 1_700_000_040_000,
+        })
+        .await
+        .expect("second attention write");
+
+    // Hand-built journal: two "task" transitions, two "watchdog" rungs.
+    for (seq, kind, payload) in [
+        (
+            0u64,
+            RunEventKind::Task,
+            serde_json::json!({"status": "in_progress"}),
+        ),
+        (
+            1u64,
+            RunEventKind::Task,
+            serde_json::json!({"status": "completed"}),
+        ),
+        (
+            2u64,
+            RunEventKind::Watchdog,
+            serde_json::json!({"class": "local_loop", "rung": 2, "streak": 3}),
+        ),
+        (
+            3u64,
+            RunEventKind::Watchdog,
+            serde_json::json!({"class": "local_loop", "rung": 4, "streak": 5}),
+        ),
+    ] {
+        store
+            .write(StoreWrite::RunEvent {
+                run: run.clone(),
+                seq,
+                kind,
+                path: Some(InstancePath::new("child0")),
+                payload,
+                at_unix_ms: 1_700_000_020_000 + seq * 1000,
+            })
+            .await
+            .expect("journal write");
+    }
+
+    let evidence = store
+        .node_evidence(&run, &InstancePath::new("child0"), 1_700_000_110_000, 20)
+        .await
+        .expect("node_evidence")
+        .expect("child0 exists");
+
+    assert_eq!(evidence.watchdog_interventions, 2);
+    assert_eq!(evidence.rung_reached, 4, "the highest rung ever journalled");
+    assert_eq!(evidence.task_status_transitions, 2);
+    assert_eq!(evidence.owner, "teammate-2");
+    assert_eq!(
+        evidence.time_in_progress_ms, 100_000,
+        "now (110_000) minus started_at (10_000), in ms since the fixture's epoch offset"
+    );
+    assert_eq!(
+        evidence.idle_while_in_progress_ms,
+        (3 + 5) * 20 * 1000,
+        "summed streak times watchdog_tick_secs"
+    );
+    assert_eq!(evidence.tool_uses, 7);
+    assert_eq!(evidence.tokens, 500);
+    assert!(!evidence.emergent);
+    assert_eq!(evidence.blocked_by, vec![InstancePath::new(".task/1")]);
+
+    let missing = store
+        .node_evidence(
+            &run,
+            &InstancePath::new("does-not-exist"),
+            1_700_000_110_000,
+            20,
+        )
+        .await
+        .expect("node_evidence for a missing path is not an error");
+    assert_eq!(missing, None);
+}
+
+/// WI-R4 (`phase4-retarget-plan.md`, "Orchestrator findings — round 2"): a
+/// run row must not stay `running` forever after a server restart, and this
+/// packet owns making that honest for the agent-teams shape specifically.
+///
+/// [`WorkflowStore::mark_interrupted_runs`] already sweeps *any* non-terminal
+/// `workflow_run` row at store open (`app/workflow_store.rs`'s
+/// `worker_main`, landed for the retired engine's §4 D13 well before this
+/// phase) — it is generic over `status`, not over which subsystem produced
+/// the row, so an agent-teams run with a lead binding and live members is
+/// already caught by it today. Nothing in the plan's WI-R4 finding is false
+/// about the *symptom* (no live endpoint survives a restart); the sweep that
+/// closes it out was simply already there, from Phase 3. This test is the
+/// regression lock that was missing: no existing test exercised
+/// `mark_interrupted_runs` against a row carrying `lead_session_id`/
+/// `team_name`/`run_member` rows, so nothing would have caught this
+/// machinery quietly stopping to apply to the agent-teams shape.
+#[tokio::test]
+async fn mark_interrupted_runs_reconciles_an_orphaned_agent_teams_run_honestly() {
+    let store = open_mem_store().await;
+    let (_, _, run) = setup_run(&store).await;
+
+    store
+        .write(StoreWrite::RunLeadBinding {
+            run: run.clone(),
+            lead_session_id: "lead-sess-1".to_string(),
+            team_name: "session-lead-sess-1".to_string(),
+            lead_pane_id: Some("w1:p1".to_string()),
+            lead_terminal_id: Some("t1".to_string()),
+            lead_prompt_version: 3,
+        })
+        .await
+        .expect("bind the lead");
+    store
+        .write(member_snapshot(
+            &run,
+            "teammate-1",
+            "opus",
+            1_700_000_000_000,
+        ))
+        .await
+        .expect("snapshot a teammate");
+    // `create_run` starts a run `pending`; the lead binding above is what a
+    // real run does once the lead pane is live, but the run only reaches
+    // `running` on the lead's first self-report. Advance it explicitly so
+    // this test exercises WI-R4's literal scenario ("a run row stays
+    // `running` forever"), not just the `pending` leg `mark_interrupted_runs`
+    // also sweeps.
+    store
+        .write(StoreWrite::RunStatus {
+            run: run.clone(),
+            status: RunStatus::Running,
+            ended_at_unix_ms: None,
+        })
+        .await
+        .expect("advance the run to running");
+
+    let before = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(before.status, RunStatus::Running);
+
+    let swept = store
+        .mark_interrupted_runs(1_700_000_900_000)
+        .await
+        .expect("mark_interrupted_runs");
+    assert_eq!(swept, 1);
+
+    let after = store
+        .get_run(&run)
+        .await
+        .expect("get_run")
+        .expect("run exists");
+    assert_eq!(
+        after.status,
+        RunStatus::Failed,
+        "the run's fate must say it is unknown, never silently succeeded"
+    );
+    assert_eq!(after.ended_at_unix_ms, Some(1_700_000_900_000));
+    let failure = after.failure.expect("a swept run carries a reason");
+    assert_eq!(
+        failure.get("reason").and_then(serde_json::Value::as_str),
+        Some("interrupted"),
+        "a human-readable reason, not a bare terminal status"
+    );
+
+    // The lead binding and member rows this packet's writers produced are
+    // untouched by the sweep — a restart must not also erase the identity a
+    // later review cycle needs.
+    let members = store
+        .list_run_members(&run)
+        .await
+        .expect("list_run_members");
+    assert_eq!(members.len(), 1);
 }

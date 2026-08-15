@@ -5,18 +5,21 @@
 
 use std::collections::BTreeMap;
 
+use surrealdb_types::SurrealValue;
+
 use crate::workflow::model::{
-    CheckpointKind, Demand, EdgeKind, Evidence, InstancePath, InterrogationId, KvdagVersionId,
-    NodeKey, NodeStatus, RestoredRef, RunEventKind, RunId, RunStatus, Succession, SummaryNodeLine,
-    WorkflowId,
+    Attention, CheckpointKind, Demand, EdgeKind, Evidence, InstancePath, InterrogationId,
+    InterviewMode, KvdagVersionId, NodeKey, NodeStatus, RestoredRef, ReviewCycleId,
+    ReviewCycleStatus, RunEventKind, RunId, RunStatus, Succession, SummaryNodeLine, WorkflowId,
 };
 use crate::workflow::tier::{NodeHistory, Tier};
 
 use super::records::{self, parse_record_id, record_id_to_string};
 use super::{
-    node_status_str, parse_demand, parse_edge_kind, parse_evidence, parse_node_status,
-    parse_run_status, parse_succession, query_error, run_status_str, StoreError, VersionOrigin,
-    WorkflowStore, TABLE_KVDAG_VERSION, TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
+    node_status_str, parse_attention, parse_demand, parse_edge_kind, parse_evidence,
+    parse_interview_mode, parse_node_status, parse_review_cycle_status, parse_run_status,
+    parse_succession, query_error, run_status_str, StoreError, VersionOrigin, WorkflowStore,
+    TABLE_KVDAG_VERSION, TABLE_REVIEW_CYCLE, TABLE_WORKFLOW, TABLE_WORKFLOW_RUN,
 };
 
 /// How many of a workflow's most recent closed runs
@@ -189,6 +192,11 @@ pub struct RunNodeRecord {
     /// A task the definition never planned. The drift is the record — §3.7's
     /// `workflow capture` promotes it back into a definition later.
     pub emergent: bool,
+    /// Karvex's own opinion that this node needs intervention (§3.6, D-10) —
+    /// never [`Self::status`] itself, which stays Claude Code's projected
+    /// fact. `None` means either "never evaluated" or "the watchdog saw it
+    /// moving again"; both read the same, honestly, as "nothing to surface".
+    pub attention: Option<Attention>,
 }
 
 /// One `run_member` row: a member of the run's Claude Code team as the
@@ -215,6 +223,14 @@ pub struct RunMemberRecord {
     pub cwd: Option<String>,
     pub first_seen_at_unix_ms: u64,
     pub last_seen_at_unix_ms: u64,
+    /// The member's own claude session id (§3.3, S1). `None` until the
+    /// bundled `SessionStart` hook's report lands, joined on `tmuxPaneId`.
+    pub session_id: Option<String>,
+    pub transcript_path: Option<String>,
+    /// The last observed pane agent state, free text — mirrors whatever
+    /// karvex's own detection reported.
+    pub last_state: Option<String>,
+    pub last_state_at_unix_ms: Option<u64>,
 }
 
 /// One `run_edge` relation, with both endpoints resolved to the instance paths
@@ -271,6 +287,68 @@ pub struct InterrogationRecord {
     pub note: String,
     pub started_at_unix_ms: u64,
     pub ended_at_unix_ms: Option<u64>,
+}
+
+/// One `review_cycle` row (`phase4-retarget-plan.md` §3.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCycleRecord {
+    pub id: ReviewCycleId,
+    pub run: RunId,
+    pub kvdag_version: KvdagVersionId,
+    pub status: ReviewCycleStatus,
+    pub started_at_unix_ms: u64,
+    pub ended_at_unix_ms: Option<u64>,
+    pub resulting_version: Option<KvdagVersionId>,
+    /// The interviews this cycle has conducted so far, oldest write order.
+    pub interviews: Vec<InterrogationId>,
+}
+
+/// One `review_finding` row (`phase4-retarget-plan.md` §3.5): one node's
+/// verdict out of a review cycle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewFindingRecord {
+    pub id: String,
+    pub cycle: ReviewCycleId,
+    pub run_node: Option<InstancePath>,
+    pub node_key: NodeKey,
+    pub interview: Option<InterrogationId>,
+    pub interview_mode: InterviewMode,
+    pub level: String,
+    pub verdict: String,
+    pub rationale: String,
+    pub evidence: serde_json::Value,
+    pub proposed_change: serde_json::Value,
+    pub replacement: Option<serde_json::Value>,
+    pub accepted: bool,
+    pub applied_in: Option<KvdagVersionId>,
+}
+
+/// One node's durable evidence for the review cycle
+/// (`phase4-retarget-plan.md` §2 WS-B). See [`WorkflowStore::node_evidence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEvidence {
+    pub watchdog_interventions: u32,
+    /// The highest `rung` ever journalled for this node under the four-step
+    /// ladder (§3.4), `0` if the watchdog never intervened — the same
+    /// reading `watchdog_interventions == 0` already gives, so the two fields
+    /// agree rather than one silently outranking the other.
+    pub rung_reached: u8,
+    /// How many `run_event` rows of `kind = "task"` this node has — a count,
+    /// not a parse of the payload, so this stays correct regardless of which
+    /// future packet's payload shape lands (§3.3, §3.4).
+    pub task_status_transitions: u32,
+    pub owner: String,
+    pub time_in_progress_ms: u64,
+    /// Summed `streak` (consecutive idle-while-`in_progress` watchdog
+    /// samples, §3.4) across every `watchdog` journal row whose `class` is
+    /// `"local_loop"`, times `watchdog_tick_secs`. An additive proxy over
+    /// every escalation window this node ever sat in, not a single window's
+    /// duration.
+    pub idle_while_in_progress_ms: u64,
+    pub tool_uses: u32,
+    pub tokens: u64,
+    pub emergent: bool,
+    pub blocked_by: Vec<InstancePath>,
 }
 
 /// One `node_checkpoint` row.
@@ -1167,6 +1245,222 @@ impl WorkflowStore {
             .collect()
     }
 
+    // ── the agent-teams rework: self-improvement review (`phase4-retarget-plan.md` P7) ──
+
+    /// The most recent `review_cycle` for a run, if one has ever started —
+    /// `None` for a run that has never been reviewed.
+    ///
+    /// "Most recent" rather than "the one" because a run can be reviewed more
+    /// than once over its retained lifetime (an `applied`/`declined`/`failed`
+    /// cycle does not block a later one; only a `running` cycle does, and
+    /// that precondition is the caller's, not this query's). Ordered by
+    /// `started_at` descending so the newest cycle wins ties from clock
+    /// coincidence the same way `started_at` already orders every other
+    /// journal-adjacent read in this file.
+    pub async fn get_review_cycle(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<ReviewCycleRecord>, StoreError> {
+        let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM review_cycle WHERE run = $run ORDER BY started_at DESC LIMIT 1")
+            .bind(("run", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::ReviewCycleRow> = response.take(0).map_err(query_error)?;
+        rows.into_iter().next().map(review_cycle_record).transpose()
+    }
+
+    /// Every `review_finding` a cycle produced, ordered by `node_key` so a
+    /// listing is stable across calls regardless of creation order (finding
+    /// ids are random, `CREATE review_finding` batches are not ordered by
+    /// anything meaningful on their own).
+    pub async fn list_review_findings(
+        &self,
+        cycle: &ReviewCycleId,
+    ) -> Result<Vec<ReviewFindingRecord>, StoreError> {
+        let id = parse_record_id(TABLE_REVIEW_CYCLE, cycle.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a review_cycle id: {cycle}")))?;
+        let mut response = self
+            .db
+            .query("SELECT * FROM review_finding WHERE cycle = $cycle ORDER BY node_key")
+            .bind(("cycle", id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::ReviewFindingRow> = response.take(0).map_err(query_error)?;
+
+        // `review_finding.run_node` addresses a `run_node` row, not an
+        // `InstancePath` directly — the same resolution `list_interrogations`
+        // does, and for the same reason (§4 D8's "not a run node itself" is
+        // about the *interview*; a finding's `run_node` still is one).
+        // Resolved through the cycle's own run rather than a second read per
+        // finding.
+        let node_ids: Vec<_> = rows.iter().filter_map(|row| row.run_node.clone()).collect();
+        let path_by_id = if node_ids.is_empty() {
+            BTreeMap::new()
+        } else {
+            let mut node_response = self
+                .db
+                .query("SELECT * FROM $ids")
+                .bind(("ids", node_ids))
+                .await
+                .map_err(query_error)?;
+            let node_rows: Vec<records::RunNodeRow> = node_response.take(0).map_err(query_error)?;
+            node_rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        record_id_to_string(&row.id),
+                        InstancePath::new(row.instance_path),
+                    )
+                })
+                .collect()
+        };
+
+        rows.into_iter()
+            .map(|row| review_finding_record(row, &path_by_id))
+            .collect()
+    }
+
+    /// One node's durable evidence for the review cycle
+    /// (`phase4-retarget-plan.md` §2 WS-B), re-targeted from `08`'s
+    /// engine-era shape (attempts/schema-failures/steers — none of which
+    /// exist without an engine) onto what the agent-teams projection actually
+    /// records: `run_node`'s own columns plus the `task`/`watchdog`
+    /// `run_event` kinds for this node.
+    ///
+    /// `now_unix_ms` and `watchdog_tick_secs` are caller-supplied rather than
+    /// read here, the same clock/config discipline `mark_interrupted_runs`
+    /// and `node_history` already follow (§4 D14): the store mints no clock
+    /// reading and holds no config of its own.
+    ///
+    /// Returns `None` if the node does not exist in this run.
+    pub async fn node_evidence(
+        &self,
+        run: &RunId,
+        path: &InstancePath,
+        now_unix_ms: u64,
+        watchdog_tick_secs: u32,
+    ) -> Result<Option<NodeEvidence>, StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let mut node_response = self
+            .db
+            .query("SELECT * FROM run_node WHERE run = $run AND instance_path = $path LIMIT 1")
+            .bind(("run", run_id.clone()))
+            .bind(("path", path.to_string()))
+            .await
+            .map_err(query_error)?;
+        let node_rows: Vec<records::RunNodeRow> = node_response.take(0).map_err(query_error)?;
+        let Some(node) = node_rows.into_iter().next() else {
+            return Ok(None);
+        };
+
+        // The active `blockedBy` set: `sequence` `run_edge` rows into this
+        // node with no authored `kvdag_edge` behind them are exactly the ones
+        // `project_blocked_by` materialises from the observed task's
+        // `blockedBy` list (`store/mod.rs`'s `write_run_task_projected` doc).
+        // Reading it from `run_edge` rather than re-deriving it from a
+        // journal payload is deliberate: `run_edge` is the one durable place
+        // this fact already lives, and inferring it from `task` journal
+        // payloads would assume an undocumented shape no producer has landed
+        // yet.
+        #[derive(Debug, SurrealValue)]
+        struct BlockerRow {
+            instance_path: String,
+        }
+        let mut edge_response = self
+            .db
+            .query(
+                "SELECT VALUE instance_path FROM (SELECT in.instance_path AS instance_path \
+                 FROM run_edge WHERE run = $run AND out = $node AND kind = \"sequence\" \
+                 AND kvdag_edge = NONE)",
+            )
+            .bind(("run", run_id))
+            .bind(("node", node.id.clone()))
+            .await
+            .map_err(query_error)?;
+        let blocked_by: Vec<String> = edge_response.take(0).map_err(query_error)?;
+
+        // `task`/`watchdog` journal rows for this node. Neither kind has a
+        // landed producer yet (`phase4-retarget-plan.md` P8/P9), so this
+        // reads whatever a hand-built journal or a future writer puts there;
+        // `task_status_transitions` only counts rows rather than parsing a
+        // payload shape this packet does not own, and the `watchdog` payload
+        // fields it does read (`class`, `rung`, `streak`) are the ones §3.4
+        // commits to by name.
+        #[derive(Debug, SurrealValue)]
+        struct JournalRow {
+            kind: String,
+            payload: serde_json::Value,
+        }
+        let mut journal_response = self
+            .db
+            .query(
+                "SELECT kind, payload FROM run_event \
+                 WHERE run_node = $node AND kind IN [\"task\", \"watchdog\"]",
+            )
+            .bind(("node", node.id))
+            .await
+            .map_err(query_error)?;
+        let journal_rows: Vec<JournalRow> = journal_response.take(0).map_err(query_error)?;
+
+        let mut task_status_transitions: u32 = 0;
+        let mut rung_reached: u8 = 0;
+        let mut idle_ticks: u64 = 0;
+        for row in &journal_rows {
+            match row.kind.as_str() {
+                "task" => task_status_transitions = task_status_transitions.saturating_add(1),
+                "watchdog" => {
+                    if let Some(rung) = row.payload.get("rung").and_then(serde_json::Value::as_u64)
+                    {
+                        rung_reached = rung_reached.max(rung.min(u64::from(u8::MAX)) as u8);
+                    }
+                    let is_local_loop =
+                        row.payload.get("class").and_then(serde_json::Value::as_str)
+                            == Some("local_loop");
+                    if is_local_loop {
+                        if let Some(streak) = row
+                            .payload
+                            .get("streak")
+                            .and_then(serde_json::Value::as_u64)
+                        {
+                            idle_ticks = idle_ticks.saturating_add(streak);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let started_at_unix_ms = node.started_at.as_ref().map(unix_ms);
+        let ended_at_unix_ms = node.ended_at.as_ref().map(unix_ms);
+        let time_in_progress_ms = started_at_unix_ms
+            .map(|started| {
+                ended_at_unix_ms
+                    .unwrap_or(now_unix_ms)
+                    .saturating_sub(started)
+            })
+            .unwrap_or(0);
+
+        Ok(Some(NodeEvidence {
+            watchdog_interventions: node.watchdog_interventions as u32,
+            rung_reached,
+            task_status_transitions,
+            owner: node.owner,
+            time_in_progress_ms,
+            idle_while_in_progress_ms: idle_ticks
+                .saturating_mul(u64::from(watchdog_tick_secs))
+                .saturating_mul(1000),
+            tool_uses: node.tool_uses as u32,
+            tokens: node.total_tokens as u64,
+            emergent: node.emergent,
+            blocked_by: blocked_by.into_iter().map(InstancePath::new).collect(),
+        }))
+    }
+
     /// The run's journalled growth limits (P2b). See [`StoredGrowthLimits`].
     pub async fn growth_limits(&self, run: &RunId) -> Result<StoredGrowthLimits, StoreError> {
         let id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
@@ -1466,6 +1760,7 @@ fn run_node_record(
         subject: row.subject,
         owner: row.owner,
         emergent: row.emergent,
+        attention: row.attention.as_deref().map(parse_attention).transpose()?,
     })
 }
 
@@ -1481,6 +1776,10 @@ fn run_member_record(row: records::RunMemberRow) -> RunMemberRecord {
         cwd: row.cwd,
         first_seen_at_unix_ms: unix_ms(&row.first_seen_at),
         last_seen_at_unix_ms: unix_ms(&row.last_seen_at),
+        session_id: row.session_id,
+        transcript_path: row.transcript_path,
+        last_state: row.last_state,
+        last_state_at_unix_ms: row.last_state_at.as_ref().map(unix_ms),
     }
 }
 
@@ -1544,6 +1843,69 @@ fn interrogation_record(
         note: row.note,
         started_at_unix_ms: unix_ms(&row.started_at),
         ended_at_unix_ms: row.ended_at.as_ref().map(unix_ms),
+    })
+}
+
+fn review_cycle_record(row: records::ReviewCycleRow) -> Result<ReviewCycleRecord, StoreError> {
+    Ok(ReviewCycleRecord {
+        id: ReviewCycleId::new(record_id_to_string(&row.id)),
+        run: RunId::new(record_id_to_string(&row.run)),
+        kvdag_version: KvdagVersionId::new(record_id_to_string(&row.kvdag_version)),
+        status: parse_review_cycle_status(&row.status)?,
+        started_at_unix_ms: unix_ms(&row.started_at),
+        ended_at_unix_ms: row.ended_at.as_ref().map(unix_ms),
+        resulting_version: row
+            .resulting_version
+            .as_ref()
+            .map(|id| KvdagVersionId::new(record_id_to_string(id))),
+        interviews: row
+            .interviews
+            .iter()
+            .map(|id| InterrogationId::new(record_id_to_string(id)))
+            .collect(),
+    })
+}
+
+fn review_finding_record(
+    row: records::ReviewFindingRow,
+    path_by_id: &BTreeMap<String, InstancePath>,
+) -> Result<ReviewFindingRecord, StoreError> {
+    let run_node = row
+        .run_node
+        .as_ref()
+        .map(|id| {
+            path_by_id
+                .get(&record_id_to_string(id))
+                .cloned()
+                .ok_or_else(|| {
+                    StoreError::Decode(format!(
+                        "review_finding {} references a run_node not in its cycle's run",
+                        record_id_to_string(&row.id)
+                    ))
+                })
+        })
+        .transpose()?;
+    Ok(ReviewFindingRecord {
+        id: record_id_to_string(&row.id),
+        cycle: ReviewCycleId::new(record_id_to_string(&row.cycle)),
+        run_node,
+        node_key: NodeKey::new(row.node_key),
+        interview: row
+            .interview
+            .as_ref()
+            .map(|id| InterrogationId::new(record_id_to_string(id))),
+        interview_mode: parse_interview_mode(&row.interview_mode)?,
+        level: row.level,
+        verdict: row.verdict,
+        rationale: row.rationale,
+        evidence: row.evidence,
+        proposed_change: row.proposed_change,
+        replacement: row.replacement,
+        accepted: row.accepted,
+        applied_in: row
+            .applied_in
+            .as_ref()
+            .map(|id| KvdagVersionId::new(record_id_to_string(id))),
     })
 }
 
