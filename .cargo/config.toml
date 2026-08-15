@@ -22,7 +22,8 @@ AWS_LC_SYS_PREBUILT_NASM = "1"
 # needs GCC >= 16.1 or clang with an ld.wild shim on PATH. Release artifacts
 # build against *-musl targets, which these sections do not match. CI runners
 # ship an older GCC, so the host-target test jobs override these rustflags
-# with CARGO_TARGET_*_RUSTFLAGS to use mold instead (env beats config).
+# with the env var `RUSTFLAGS`, which replaces target config rustflags (unlike
+# `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, which merges with them).
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=wild"]
 

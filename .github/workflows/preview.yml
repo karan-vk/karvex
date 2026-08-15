@@ -94,10 +94,10 @@ jobs:
         with:
           tool: just,cargo-nextest
 
-      - name: Install mold linker (overrides local wild config)
+      - name: Install mold linker (replaces local wild config)
         run: |
           sudo apt-get update && sudo apt-get install -y mold
-          echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
+          echo 'RUSTFLAGS=-C link-arg=-fuse-ld=mold' >> "$GITHUB_ENV"
 
       - name: Install Bun
         if: steps.plan.outputs.should_publish == 'true'
