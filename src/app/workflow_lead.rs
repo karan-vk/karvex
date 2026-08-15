@@ -668,12 +668,14 @@ impl crate::app::App {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     warn!(%error, "a run projection write was rejected by the store");
+                    self.mark_workflow_persistence_degraded();
                 }
                 Err(unavailable) => {
                     warn!(
                         ?unavailable,
                         "the workflow store is unavailable; a projection write was lost"
                     );
+                    self.mark_workflow_persistence_degraded();
                 }
             }
         }

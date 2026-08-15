@@ -166,9 +166,11 @@ pub struct App {
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
-    /// The workflow engine and everything the runtime needs to keep it fed.
-    /// Pure data; `src/app/workflow.rs` owns every transition on it.
-    pub(crate) workflow: workflow::WorkflowRuntimeState,
+    /// The app-enforced half of the `[workflow]` config block.
+    pub(crate) workflow_policy: workflow::WorkflowPolicy,
+    /// Whether a durable workflow write has already failed on this server, so
+    /// the degradation is surfaced once rather than once per write.
+    pub(crate) workflow_persistence_degraded: bool,
     /// The workflow database, opened lazily on first `workflow.*` use
     /// (`03-storage-schema.md` §2).
     #[cfg(feature = "workflow")]
@@ -190,8 +192,6 @@ pub(crate) enum LoopEvent {
     RawInput(crate::raw_input::RawInputEvent),
     InputClosed,
     RenderRequested,
-    /// The workflow engine's clock is due.
-    WorkflowTick,
 }
 
 struct SyncOutputGuard;
@@ -819,13 +819,8 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
-            workflow: {
-                // One reading of the environment for both halves (defect D-1,
-                // E-11): calling `engine_config` and `workflow_policy`
-                // separately would read `KARVEX_WORKFLOW_SUMMARY_COMMAND` twice.
-                let (engine, policy) = workflow::workflow_runtime_config(config);
-                workflow::WorkflowRuntimeState::new(engine, policy)
-            },
+            workflow_policy: workflow::workflow_policy(config),
+            workflow_persistence_degraded: false,
             #[cfg(feature = "workflow")]
             workflow_store: workflow_store::WorkflowStoreHandle::default(),
             workflow_lead: None,
@@ -1153,7 +1148,6 @@ impl App {
             }
 
             let next_deadline = self.next_loop_deadline(now, needs_render);
-            let workflow_tick_deadline = self.workflow_tick_deadline();
             let event = {
                 let input_rx = self.input_rx.as_mut();
                 tokio::select! {
@@ -1170,7 +1164,6 @@ impl App {
                         None => LoopEvent::InputClosed,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
-                    _ = sleep_until_or_pending(workflow_tick_deadline) => LoopEvent::WorkflowTick,
                     _ = self.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
@@ -1197,11 +1190,6 @@ impl App {
                 }
                 LoopEvent::RenderRequested => {
                     if self.render_dirty.is_pending() {
-                        needs_render = true;
-                    }
-                }
-                LoopEvent::WorkflowTick => {
-                    if self.tick_workflow_engine(Instant::now()) {
                         needs_render = true;
                     }
                 }

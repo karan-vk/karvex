@@ -10,7 +10,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::workflow::model::{Demand, NodeKey};
+use crate::workflow::model::{Demand, GrowthLimits, Kvdag, NodeAssignment, NodeKey};
 
 /// The run's cost/quality tier. `workflow_run.tier` persists these strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -335,9 +335,93 @@ fn resolve_auto(demand: Demand, history: Option<&NodeHistory>) -> Assignment {
     Assignment { model, effort }
 }
 
+/// Every kvdag node's `(model, effort, reason)`, resolved once at run start.
+///
+/// The **single** tier resolver for the whole subsystem (`06-phase2-plan.md`
+/// §4 D9). Before Phase 2 the pair was resolved in two places that agreed only
+/// because both passed `None` for history; with `auto` reading a node's
+/// measured record that coincidence would end, and a node's persisted row would
+/// start disagreeing with the DAG about which model it ran on.
+///
+/// **Templates are included on purpose.** A template a run instantiates later
+/// must resolve against the `HistoryIndex` the run started with; resolving
+/// every node up front, templates included, makes the table a closed,
+/// replayable record.
+///
+/// An absent history entry behaves like an all-zero record, which is what
+/// [`resolve`] already documents.
+pub fn resolve_assignments(
+    kvdag: &Kvdag,
+    tier: Tier,
+    history: &HistoryIndex,
+) -> BTreeMap<NodeKey, NodeAssignment> {
+    kvdag
+        .nodes
+        .iter()
+        .map(|node| {
+            let measured = history.get(&node.key);
+            let assignment = resolve(tier, node.demand, measured);
+            // A fixed tier's row *is* the explanation, so it carries no reason
+            // string (`NodeAssignment::reason`'s doc comment).
+            let reason = match tier {
+                Tier::Auto => auto_reason(node.demand, measured).to_string(),
+                Tier::Max | Tier::High | Tier::Medium | Tier::Low => String::new(),
+            };
+            (
+                node.key.clone(),
+                NodeAssignment::from_assignment(assignment, reason),
+            )
+        })
+        .collect()
+}
+
+/// The tier's growth influence is purely a narrowing one (§7.4), which is what
+/// keeps `workflow_run.max_nodes <= kvdag_version.max_nodes` a true invariant.
+/// `auto` starts from the `high` row (§7.3), so it narrows nothing.
+///
+/// **Idempotent**: `narrow_growth(narrow_growth(g, t), t) == narrow_growth(g, t)`,
+/// because every rule is a `min` against a constant. That is what lets the run
+/// start narrow once and every later reader re-narrow freely without a run's
+/// banner contradicting its own persisted row (`06-phase2-plan.md` §5 R-3).
+pub fn narrow_growth(growth: GrowthLimits, tier: Tier) -> GrowthLimits {
+    let ceiling = match tier {
+        Tier::Auto | Tier::Max | Tier::High => None,
+        Tier::Medium => Some(24),
+        Tier::Low => Some(12),
+    };
+    GrowthLimits {
+        max_depth: growth.max_depth,
+        max_nodes: ceiling.map_or(growth.max_nodes, |ceiling| growth.max_nodes.min(ceiling)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tier_narrows_growth_limits_but_never_widens_them() {
+        let version = GrowthLimits {
+            max_depth: 3,
+            max_nodes: 40,
+        };
+        assert_eq!(narrow_growth(version, Tier::Max).max_nodes, 40);
+        assert_eq!(narrow_growth(version, Tier::High).max_nodes, 40);
+        assert_eq!(narrow_growth(version, Tier::Auto).max_nodes, 40);
+        assert_eq!(narrow_growth(version, Tier::Medium).max_nodes, 24);
+        assert_eq!(narrow_growth(version, Tier::Low).max_nodes, 12);
+
+        let narrow = GrowthLimits {
+            max_depth: 2,
+            max_nodes: 6,
+        };
+        assert_eq!(
+            narrow_growth(narrow, Tier::Low).max_nodes,
+            6,
+            "a run never widens the version's ceiling"
+        );
+        assert_eq!(narrow_growth(narrow, Tier::Low).max_depth, 2);
+    }
 
     #[test]
     fn tier_strings_round_trip() {

@@ -390,46 +390,6 @@ fn worker_main(
     }
 }
 
-impl crate::app::App {
-    /// Hands the engine's queued durable writes to the store thread. Called
-    /// after every effect batch; a write that cannot be queued marks the run
-    /// persistence-degraded rather than failing it (`04` §9).
-    pub(crate) fn drain_workflow_store_writes(&mut self) {
-        // Opening the database from here would defeat the lazy-open rule of
-        // `03` §2 and would make an `AppState`-only unit test take the on-disk
-        // lock. A run always begins with a `workflow.*` call that opened the
-        // store, so the gate never costs a real run its journal.
-        if !self.workflow_store.is_open() {
-            return;
-        }
-        // A write that failed on the store thread degrades the run's
-        // persistence, which is surfaced — the journal is incomplete, but the
-        // in-memory graph is authoritative during a run, so nothing is failed
-        // over it (`04` §9).
-        if self.workflow_store.take_write_failures() > 0 {
-            self.mark_workflow_persistence_degraded();
-        }
-        if self.workflow.pending_write_count() == 0 {
-            return;
-        }
-        // Only as many as the store thread's queue has room for. The rest stay
-        // in the engine's own bounded queue, so a store thread that falls
-        // behind applies backpressure there instead of growing without limit.
-        let room = STORE_QUEUE_BUDGET.saturating_sub(self.workflow_store.in_flight());
-        if room == 0 {
-            return;
-        }
-        for write in self.workflow.take_pending_writes(room) {
-            let queued = self
-                .workflow_store
-                .submit(move |cx| cx.block_on(cx.store().write(write)));
-            if !queued {
-                self.mark_workflow_persistence_degraded();
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 
 use crate::detect::AgentState;
 use crate::terminal::TerminalId;
-use crate::workflow::engine::expand::{ExpandLimit, ExpandProposal};
 use crate::workflow::tier::{Assignment, Effort, ModelAlias, Tier};
 
 // ── identities ──────────────────────────────────────────────────────────────
@@ -1300,16 +1299,6 @@ pub struct ProgressTracker {
     pub interventions: u16,
 }
 
-/// One observation of material progress. Text output, liveness, and a redrawn
-/// screen are deliberately absent: they are not progress.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ProgressDelta {
-    pub tool_calls: u32,
-    pub tokens: u64,
-    pub artifact_changes: u32,
-    pub screen_digest: Option<String>,
-}
-
 /// A resolved `(model, effort)` **with the reason it was chosen**.
 ///
 /// [`crate::workflow::tier::Assignment`] carries the pair alone and stays as it
@@ -1480,6 +1469,24 @@ impl RunGraph {
                 .is_some_and(|binding| &binding.pane_id == pane)
         })
     }
+
+    /// Indices of the edges that terminate at `idx`.
+    pub fn inbound(&self, idx: RunNodeIdx) -> impl Iterator<Item = usize> + '_ {
+        self.edges
+            .iter()
+            .enumerate()
+            .filter(move |(_, edge)| edge.to == idx)
+            .map(|(index, _)| index)
+    }
+
+    /// Indices of the edges that originate at `idx`.
+    pub fn outbound(&self, idx: RunNodeIdx) -> impl Iterator<Item = usize> + '_ {
+        self.edges
+            .iter()
+            .enumerate()
+            .filter(move |(_, edge)| edge.from == idx)
+            .map(|(index, _)| index)
+    }
 }
 
 // ── journal vocabulary ──────────────────────────────────────────────────────
@@ -1564,32 +1571,6 @@ pub enum CheckpointKind {
 }
 
 // ── engine interface: pure state machine ────────────────────────────────────
-
-/// Parsed but not yet schema-validated node output.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RawJson(pub serde_json::Value);
-
-/// Everything the binder needs to put a node's process in a pane. Built by the
-/// engine, executed by `workflow::binding::spawn`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SpawnSpec {
-    pub run_id: RunId,
-    pub path: InstancePath,
-    pub label: String,
-    pub runner: Runner,
-    /// argv for `Runner::Command`; the `claude` argv is built by the binder for
-    /// `Runner::Agent`.
-    pub command: Option<Vec<String>>,
-    pub assignment: Assignment,
-    pub agent_session_id: String,
-    pub node_dir: PathBuf,
-    pub cwd: PathBuf,
-    pub isolation: Isolation,
-    /// kvdag contract plus the node's role; passed as `--append-system-prompt`.
-    pub contract: String,
-    pub seed_prompt: String,
-    pub token: NodeToken,
-}
 
 /// A durable write the engine wants made. Issued off the critical path: the
 /// in-memory [`RunGraph`] stays authoritative during a run.
@@ -1899,27 +1880,6 @@ pub enum WorkflowEvent {
         seq: u64,
         summary: String,
     },
-    /// A growth guardrail refused or truncated a proposal.
-    ///
-    /// The **only** new wire event in Phase 2 (`06-phase2-plan.md` §4 D5): an
-    /// expansion child is already announced by
-    /// [`WorkflowEvent::NodeCreated`], and `WorkflowRunNodeInfo` already
-    /// carries `parent_path`/`depth`, so a client can derive everything about
-    /// an *accepted* proposal. What no client can derive is the node that was
-    /// asked for and never created. `src/app/api/workflows.rs` widens the
-    /// counts to the wire's `u32`.
-    GrowthLimited {
-        run: RunId,
-        /// The proposing node.
-        path: InstancePath,
-        template: NodeKey,
-        limit: ExpandLimit,
-        /// The ceiling's value, so a reader does not have to look it up.
-        limit_value: u16,
-        requested: u16,
-        accepted: u16,
-        message: String,
-    },
     /// The epilogue's summary was accepted and enqueued.
     ///
     /// Carries the run and nothing else, deliberately: the app-side emitter
@@ -1969,95 +1929,6 @@ pub struct UserNotice {
     pub run: Option<RunId>,
     pub path: Option<InstancePath>,
     pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum EngineInput {
-    Start {
-        graph: Box<RunGraph>,
-    },
-    NodeSelfReport {
-        path: InstancePath,
-        token: NodeToken,
-        result: RawJson,
-    },
-    /// A node proposed new nodes. **A node cannot create nodes; it proposes,
-    /// and karvex decides** (`04-kvdag-and-execution.md` §3.4).
-    ///
-    /// Token-authenticated exactly like [`EngineInput::NodeSelfReport`] — an
-    /// expand proposal is a node speaking, not an operator — and reached by two
-    /// routes that converge here: the `workflow.node.expand` API verb, and the
-    /// top-level `expand` key lifted out of a node result *before* schema
-    /// validation (§4 D6). A rejected proposal is not an error: the run
-    /// continues and the rejection is reported.
-    ExpandProposed {
-        path: InstancePath,
-        token: NodeToken,
-        proposals: Vec<ExpandProposal>,
-    },
-    /// The Claude `stop` hook fired for this pane.
-    TurnEnded {
-        pane: PublicPaneId,
-    },
-    AgentStatus {
-        pane: PublicPaneId,
-        state: AgentState,
-        at: Instant,
-    },
-    ProgressObserved {
-        path: InstancePath,
-        delta: ProgressDelta,
-    },
-    PaneExited {
-        pane: PublicPaneId,
-        code: Option<i32>,
-    },
-    /// The runtime gave up putting an admitted node into a pane. The node never
-    /// acquired one, so there is no `PaneExited` to report; without this the
-    /// node would sit `Ready` forever and the run would never pause or finish
-    /// (`04` §9: every failure path has a node status).
-    SpawnFailed {
-        path: InstancePath,
-        reason: String,
-    },
-    Steer {
-        path: InstancePath,
-        text: String,
-    },
-    Interrupt {
-        path: InstancePath,
-    },
-    RestartNode {
-        path: InstancePath,
-    },
-    CancelRun,
-    Tick {
-        now: Instant,
-    },
-}
-
-/// `SpawnSpec` and `StoreWrite` are boxed: both dwarf every other variant, and
-/// effects are moved around in `Vec<RunEffect>` on every engine step.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RunEffect {
-    SpawnNode {
-        path: InstancePath,
-        spec: Box<SpawnSpec>,
-    },
-    PromptNode {
-        pane: PublicPaneId,
-        text: String,
-    },
-    SendKeys {
-        pane: PublicPaneId,
-        keys: Vec<String>,
-    },
-    ClosePane {
-        pane: PublicPaneId,
-    },
-    Persist(Box<StoreWrite>),
-    Emit(WorkflowEvent),
-    Notify(UserNotice),
 }
 
 #[cfg(test)]

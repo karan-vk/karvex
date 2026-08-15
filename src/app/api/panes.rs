@@ -1209,18 +1209,6 @@ impl App {
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
-        // §4 D6: the hook's `transcript_path` reaches karvex here, as
-        // `--agent-session-path`, and `session_ref_from_report` below
-        // deliberately keeps only the session id for claude — so this is the
-        // one place the reported path can be read back onto the node's binding.
-        // A no-op for every pane no run owns, and it does not reroute the
-        // session ref: it is a parallel consumer of the same report.
-        self.observe_workflow_transcript_path(
-            pane_id,
-            &params.source,
-            &agent_label,
-            params.agent_session_path.as_deref(),
-        );
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(
@@ -1250,15 +1238,6 @@ impl App {
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
-        // The `SessionStart` half of §4 D6's read-back — the report that
-        // actually carries the transcript path in practice. Same no-op rule as
-        // its sibling above.
-        self.observe_workflow_transcript_path(
-            pane_id,
-            &params.source,
-            &agent_label,
-            params.agent_session_path.as_deref(),
-        );
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(
@@ -1559,15 +1538,6 @@ impl App {
                 "closing this pane would close a worktree group",
             ));
         }
-        // §4.3 / H6: a pane that is *closed* rather than dying is just as fatal
-        // to the node running in it, but only `AppEvent::PaneDied` ever told
-        // the workflow engine, so a closed pane left its node `running`
-        // forever. This runs after the confirmation guard above — a close the
-        // user has not confirmed yet must not fail the node — and before the
-        // pane is removed, because that is what the node's public pane id is
-        // resolved from. One call covers the API verb and the TUI keybinding,
-        // which reaches here through `runtime_pane_close`.
-        self.observe_workflow_pane_exit(pane_id);
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         let should_close_workspace = {

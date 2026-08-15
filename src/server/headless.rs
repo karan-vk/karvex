@@ -129,10 +129,6 @@ enum LoopEvent {
     Api(Box<api::ApiRequestMessage>),
     ServerEvent(ServerEvent),
     RenderRequested,
-    /// The workflow engine's clock is due. Mirrors the TUI loop's arm in
-    /// `src/app/mod.rs`: workflow runs execute on the server, so the engine's
-    /// clock has to advance here too.
-    WorkflowTick,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -765,15 +761,6 @@ impl HeadlessServer {
                 .fold(next_deadline, |deadline, pending| {
                     Some(deadline.map_or(pending, |current| current.min(pending)))
                 });
-            // Workflow runs execute on the server, never in a client, so this
-            // is the only loop that can advance the engine's clock. Without
-            // this arm `EngineInput::Tick` never arrives and
-            // `sample_workflow_agent_states` never runs, so the detector-driven
-            // signals of `04-kvdag-and-execution.md` §4.3 — sustained idle
-            // above all — can never fire: a pane that settles at `Idle` and
-            // stays there produces exactly one state change, and the sustained
-            // rule counts detector *ticks*.
-            let workflow_tick_deadline = self.app.workflow_tick_deadline();
             let event = {
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
@@ -789,7 +776,6 @@ impl HeadlessServer {
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
-                    _ = sleep_until_or_pending(workflow_tick_deadline) => LoopEvent::WorkflowTick,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
@@ -848,12 +834,6 @@ impl HeadlessServer {
                 LoopEvent::RenderRequested => {
                     if self.app.render_dirty.is_pending() {
                         needs_render = true;
-                    }
-                }
-                LoopEvent::WorkflowTick => {
-                    if self.app.tick_workflow_engine(Instant::now()) {
-                        needs_render = true;
-                        needs_full_render = true;
                     }
                 }
             }

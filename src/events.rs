@@ -51,45 +51,6 @@ pub struct WorktreeRemoveResult {
     pub result: Result<(), String>,
 }
 
-/// Workflow-runtime facts that reach the main loop asynchronously: the engine
-/// clock, and the pane observations of
-/// `docs/design/workflow-builder/04-kvdag-and-execution.md` §4.3.
-/// `App::handle_workflow_app_event` maps each to an `EngineInput`. Pane ids are
-/// internal here and are resolved to the public API id at that boundary, so
-/// producers never have to know the public id scheme.
-///
-/// Not yet carried by [`AppEvent`]: `AppState::handle_app_event`
-/// (`src/app/actions.rs`) matches `AppEvent` exhaustively and belongs to another
-/// workstream, so promoting this to `AppEvent::Workflow(..)` needs a matching
-/// arm there. Producers inside the app call the `App` entry point directly
-/// until then.
-// The producers land one step later: the pane observers of
-// `src/workflow/binding/observe.rs` and, for `Tick`, the promotion described
-// above. Remove once both are wired.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
-pub enum WorkflowAppEvent {
-    /// The engine clock. `04` §6.3 pins the watchdog thresholds to a 20 s tick.
-    Tick,
-    /// A hook reported agent state for a node's pane. The bundled Claude
-    /// `stop` hook is the turn-end signal (§4.3 signal 2); every other reporter
-    /// is filtered out by `workflow::binding::observe`, not here.
-    NodeHookReported {
-        pane_id: PaneId,
-        source: String,
-        agent_label: String,
-        state: AgentState,
-    },
-    /// Detector or hook agent state for a node's pane (§4.3 signal 3).
-    NodeAgentStatus {
-        pane_id: PaneId,
-        state: AgentState,
-        observed_at: Instant,
-    },
-    /// A node's pane process exited; before a valid result this fails the node.
-    NodePaneExited { pane_id: PaneId, code: Option<i32> },
-}
-
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
