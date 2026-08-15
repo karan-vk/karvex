@@ -330,6 +330,17 @@ impl App {
         self.workflow_unavailable(id)
     }
 
+    pub(super) fn handle_workflow_node_interrogate(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkflowNodeInterrogateParams,
+    ) -> String {
+        if let Some(error) = require_interrogate_params(&id, &params) {
+            return error;
+        }
+        self.workflow_unavailable(id)
+    }
+
     pub(super) fn handle_workflow_summary_get(
         &mut self,
         id: String,
@@ -1284,6 +1295,25 @@ impl App {
         node_verb_retired(id, "expand a node")
     }
 
+    /// `workflow.node.interrogate` — no longer implementable.
+    ///
+    /// It forked or reconstructed a Claude session karvex's own engine owned
+    /// (`binding/interrogate.rs`), and 09 §3.6 makes its absence deliberate:
+    /// Phase E's interrogate resumes a *member's* session id out of the run
+    /// snapshot, which is a different mechanism. The method itself stays on the
+    /// wire until the protocol bump removes it, so it is answered here rather
+    /// than left to the dispatcher's `not_implemented` catch-all — a client
+    /// told "not implemented yet" would reasonably keep retrying.
+    pub(super) fn handle_workflow_node_interrogate(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkflowNodeInterrogateParams,
+    ) -> String {
+        if let Some(error) = require_interrogate_params(&id, &params) {
+            return error;
+        }
+        node_verb_retired(id, "interrogate a node")
+    }
 
     /// `workflow.summary.get` — the run's end-of-run summary, or `None`.
     ///
@@ -2442,6 +2472,14 @@ fn require_expand_params(id: &str, params: &WorkflowNodeExpandParams) -> Option<
         .or_else(|| require_non_empty(id, "template", &params.template))
 }
 
+fn require_interrogate_params(
+    id: &str,
+    params: &crate::api::schema::WorkflowNodeInterrogateParams,
+) -> Option<String> {
+    require_non_empty(id, "run_id", &params.run_id)
+        .or_else(|| require_non_empty(id, "path", &params.path))
+}
+
 /// One `run_member` row, as the wire sees it.
 #[cfg(feature = "workflow")]
 fn wire_run_member_record(
@@ -2615,7 +2653,7 @@ mod tests {
                 count: None,
             }),
             // Phase 3 additions (`07-phase3-plan.md` §WS-C, §WS-D).
-            Method::WorkflowNodeInterrogate(WorkflowNodeInterrogateParams {
+            Method::WorkflowNodeInterrogate(crate::api::schema::WorkflowNodeInterrogateParams {
                 run_id: "workflow_run:1".into(),
                 path: "plan".into(),
                 mode: crate::api::schema::WorkflowInterrogationMode::Resumed,
@@ -2690,7 +2728,7 @@ mod tests {
             // Phase 3 additions (`07-phase3-plan.md` §WS-D "Tested"): a
             // feature-off build must answer these with the documented code too,
             // not with the catch-all the sweep above only rules out.
-            Method::WorkflowNodeInterrogate(WorkflowNodeInterrogateParams {
+            Method::WorkflowNodeInterrogate(crate::api::schema::WorkflowNodeInterrogateParams {
                 run_id: "workflow_run:1".into(),
                 path: "plan".into(),
                 mode: crate::api::schema::WorkflowInterrogationMode::Resumed,

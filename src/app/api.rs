@@ -1224,6 +1224,9 @@ impl App {
             Method::WorkflowNodeExpand(params) => {
                 return self.handle_workflow_node_expand(request.id, params);
             }
+            Method::WorkflowNodeInterrogate(params) => {
+                return self.handle_workflow_node_interrogate(request.id, params);
+            }
             Method::WorkflowSummaryGet(target) => {
                 return self.handle_workflow_summary_get(request.id, target);
             }
