@@ -32,7 +32,20 @@ jobs:
 
       - name: Validate commit subjects
         if: github.event_name == 'push'
-        run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
+        env:
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          # A force-push leaves `before` pointing at an orphaned commit, and a
+          # branch creation reports it as all zeroes. Either way `before..after`
+          # is not a valid revision range here and git exits 128, failing the
+          # job for a reason that has nothing to do with the pushed subjects.
+          # Fall back to validating the pushed tip when the range is unusable.
+          if git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            python3 scripts/conventional_commits.py --range "$PUSH_BEFORE..$PUSH_AFTER"
+          else
+            python3 scripts/conventional_commits.py "$(git log -1 --pretty=format:%s "$PUSH_AFTER")"
+          fi
 
       - name: Validate PR title
         if: github.event_name == 'pull_request'
