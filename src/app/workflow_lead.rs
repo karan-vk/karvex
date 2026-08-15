@@ -105,6 +105,13 @@ pub(crate) struct LiveLeadRun {
     /// Set once `workflow.run.finish` or lead-exit has closed the run, so a
     /// late poll cannot reopen it.
     pub(crate) closed: bool,
+    /// The next `run_event.seq` this run will journal under.
+    ///
+    /// Per-run and monotonic, which is what the store's `(run, seq)` UNIQUE
+    /// index requires. In memory because the live run is: karvex runs one lead
+    /// at a time and nothing else writes this run's journal, so the counter
+    /// cannot collide with a writer it does not know about.
+    journal_seq: u64,
     next_poll_at: Option<Instant>,
 }
 
@@ -115,6 +122,13 @@ impl LiveLeadRun {
 
     fn rearm(&mut self, now: Instant) {
         self.next_poll_at = Some(now + RUN_PROJECTION_INTERVAL);
+    }
+
+    /// Takes the next journal sequence number for this run.
+    fn next_journal_seq(&mut self) -> u64 {
+        let seq = self.journal_seq;
+        self.journal_seq = self.journal_seq.saturating_add(1);
+        seq
     }
 
     pub(crate) fn next_poll_deadline(&self) -> Option<Instant> {
@@ -354,6 +368,7 @@ impl crate::app::App {
             seeded: false,
             seed_prompt: lead::lead_seed_prompt(&spec.prompt_path()),
             closed: false,
+            journal_seq: 0,
             next_poll_at: None,
         });
     }
@@ -697,12 +712,63 @@ impl crate::app::App {
             channel = channel.as_str(),
             "handed a message to a run session"
         );
+        self.journal_run_message(&run_id, &target, channel, priority, text);
         Ok(RunMessageReceipt {
             target: target.name.clone(),
             session_id: target.endpoint.session_id.clone(),
             pane_id: target.pane_id.clone(),
             channel,
         })
+    }
+
+    /// Records one handed-over message in the run's journal.
+    ///
+    /// Load-bearing rather than decorative, for a reason the messaging spike
+    /// pinned down: the two channels are not equivalent, and which one carried
+    /// a message is a fact that cannot be reconstructed afterwards. A
+    /// teammate's `CLAUDE_CODE_MESSAGING_TOKEN` exists only in that teammate's
+    /// own hook environment — teammates never register in `~/.claude/sessions`,
+    /// so there is no key file to read it back from — which means every
+    /// endpoint this server holds dies with this server, and a run that
+    /// outlives a karvex restart can only ever be reached by pane input. A
+    /// reader of the journal has to be able to tell "Claude Code delivered this
+    /// as a peer message, subject to the receiver's inbound controls" from
+    /// "karvex typed this into a terminal, indistinguishable from the user".
+    ///
+    /// The text is deliberately *not* journalled — only its size. The journal
+    /// is a record of what karvex did, the transcript is the record of what was
+    /// said, and copying steering prose into the store would put user content
+    /// in a place nothing prunes on content grounds.
+    fn journal_run_message(
+        &mut self,
+        run_id: &RunId,
+        target: &RunMessageTarget,
+        channel: messaging::DeliveryChannel,
+        priority: messaging::Priority,
+        text: &str,
+    ) {
+        let seq = match self.workflow_lead.as_mut() {
+            Some(run) => run.next_journal_seq(),
+            None => return,
+        };
+        self.persist_workflow_write(StoreWrite::RunEvent {
+            run: run_id.clone(),
+            seq,
+            kind: crate::workflow::model::RunEventKind::MessageDelivered,
+            // A run session is addressed by name, not by instance path: a
+            // teammate works on whatever tasks the lead gave it, and pinning
+            // the message to one node would invent a link karvex did not make.
+            path: None,
+            payload: serde_json::json!({
+                "target": target.name,
+                "session_id": target.endpoint.session_id,
+                "pane_id": target.pane_id,
+                "channel": channel.as_str(),
+                "priority": priority.as_str(),
+                "text_bytes": text.len(),
+            }),
+            at_unix_ms: crate::app::workflow::current_unix_ms(),
+        });
     }
 
     /// What the live run made of a session that just reported itself, read back
@@ -1739,6 +1805,23 @@ output_schema = { type = "object" }
         });
     }
 
+    fn journalled_messages(app: &mut crate::app::App, run: &RunId) -> Vec<serde_json::Value> {
+        let wanted = run.clone();
+        app.workflow_store
+            .call(move |cx| cx.block_on(cx.store().list_run_events(&wanted)))
+            .expect("the in-memory store is available")
+            .expect("the run's journal reads back")
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    crate::workflow::model::RunEventKind::MessageDelivered
+                )
+            })
+            .map(|event| event.payload)
+            .collect()
+    }
+
     /// S3's binding correction, at the two places a user could ever hear about
     /// it. A kill-switch variable only disables messaging on an account whose
     /// Claude Code feature flags have never been fetched, so karvex must not
@@ -1840,6 +1923,79 @@ output_schema = { type = "object" }
             matches!(error, RunMessageError::NoAddressableSessions),
             "{error}"
         );
+    }
+
+    /// The journal entry the watchdog ladder and any post-mortem depend on.
+    ///
+    /// Which channel carried a message cannot be reconstructed afterwards: an
+    /// inbox socket belongs to a live process, a teammate's token exists
+    /// nowhere but its own hook environment, and after a karvex restart pane
+    /// input is all that is left. So the channel is recorded per message, at
+    /// the moment karvex knows it.
+    // The inbox socket is a Unix domain socket; `write_inbox_frames` has no
+    // Windows implementation, and neither has this fixture.
+    #[cfg(unix)]
+    #[test]
+    fn every_delivered_message_records_the_channel_that_carried_it() {
+        let (mut app, run_id) = app_with_a_live_run();
+        let socket_dir = std::env::temp_dir().join(format!(
+            "karvex-inbox-{}-{}",
+            std::process::id(),
+            crate::app::workflow::current_unix_ms()
+        ));
+        std::fs::create_dir_all(&socket_dir).expect("a temp dir");
+        let socket = socket_dir.join("inbox.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("bind a stand-in inbox");
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut frames = String::new();
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read_to_string(&mut frames);
+            }
+            frames
+        });
+        lead_reports_itself(&mut app, socket.to_str());
+
+        let receipt = app
+            .message_run_session("team-lead", "rebase before you continue", Priority::Now)
+            .expect("the socket accepts the frames");
+        assert_eq!(receipt.channel, messaging::DeliveryChannel::InboxSocket);
+
+        let frames = reader.join().expect("the stand-in inbox read its frames");
+        assert!(frames.contains("\"type\":\"auth\""), "{frames}");
+        assert!(frames.contains("rebase before you continue"), "{frames}");
+
+        let journalled = journalled_messages(&mut app, &run_id);
+        assert_eq!(journalled.len(), 1, "one message, one journal entry");
+        let entry = &journalled[0];
+        assert_eq!(entry["channel"], "inbox_socket");
+        assert_eq!(entry["target"], "team-lead");
+        assert_eq!(entry["priority"], "now");
+        assert_eq!(entry["session_id"], "51ea857f-cb96-4372-ae75-bab1640c8428");
+        // The steering text itself stays out of the store: the journal records
+        // what karvex did, the transcript records what was said.
+        assert_eq!(entry["text_bytes"], "rebase before you continue".len());
+        assert!(
+            !entry.to_string().contains("rebase before you continue"),
+            "the journal must not carry the message text: {entry}"
+        );
+
+        let _ = std::fs::remove_dir_all(&socket_dir);
+    }
+
+    /// A refused message must leave no journal entry, because the journal is
+    /// the record of what actually crossed a channel.
+    #[test]
+    fn a_refused_message_is_not_journalled_as_a_delivery() {
+        let (mut app, run_id) = app_with_a_live_run();
+        lead_reports_itself(&mut app, Some("/nonexistent/karvex/inbox.sock"));
+
+        let error = app
+            .message_run_session("team-lead", "rebase first", Priority::Next)
+            .expect_err("there is no socket at that path");
+        assert!(matches!(error, RunMessageError::WriteFailed(_)), "{error}");
+        assert!(journalled_messages(&mut app, &run_id).is_empty());
     }
 
     /// The lead's self-report is what makes the run addressable at all, and the
