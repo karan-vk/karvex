@@ -38,11 +38,15 @@
 //! * **[`WatchdogVerdict::NotWatched`] touches nothing.** No attention write,
 //!   no journal entry, no event, no message — including the `attention` the row
 //!   already holds, which keeps whatever it held (P4's ruling).
-//! * **`attention` is written only when it changes.** It is re-evaluated every
-//!   tick and `None` means *clear*, not "leave it alone"; but a tick that
-//!   concludes what the row already says writes nothing, so
-//!   `run_node.watchdog_interventions` counts surfaced opinions rather than
-//!   polls.
+//! * **`attention` is written when it changes, or when the sample spent a
+//!   rung.** It is re-evaluated every tick and `None` means *clear*, not
+//!   "leave it alone", so a quiet tick that concludes what the row already
+//!   says writes nothing. But a `Say`/`Surface` write still lands even when
+//!   `attention` itself does not move — rungs 1–3 hold it at `None` by design
+//!   (P4) — because `run_node.watchdog_interventions` counts every rung
+//!   karvex actually spent, not just the ones that changed the column
+//!   (`phase4-retarget-plan.md` amendment log, WI-R5). The event and the
+//!   notice still ride the attention change alone.
 //! * **The ladder advances only through [`LadderState::after`].** Delivery
 //!   feeds it [`DeliveryOutcome`], and a rung whose message was refused is
 //!   retried verbatim on the next sample. A nudge nobody received must never
@@ -316,7 +320,14 @@ mod live {
             // A rung — delivered or not — is journalled. A `Hold` is not: the
             // watchdog samples forever, and an entry per quiet sample would
             // bury a run's real history under its own heartbeat.
-            if decision.rung().is_some() {
+            //
+            // Whether karvex *acted* this sample — spent a rung, delivered or
+            // not — is a fact independent of whether `attention` also moved:
+            // P4 holds `attention` at `None` through rungs 1–3 on purpose, so
+            // a rung that only ever talks to a member or the lead is still an
+            // intervention (WI-R5).
+            let intervened = decision.rung().is_some();
+            if intervened {
                 self.journal_watchdog_rung(
                     run_id,
                     &node.path,
@@ -326,11 +337,25 @@ mod live {
                 );
                 changed = true;
             }
-            if decision.attention != stored_attention {
-                self.write_watchdog_attention(run_id, &node.path, decision.attention, now_unix_ms);
+            let attention_changed = decision.attention != stored_attention;
+            // The attention column write (and the interventions counter riding
+            // it) fires on either signal; the event and the notice ride the
+            // attention *change* alone, exactly as their own docs promise —
+            // a Say that leaves `attention` untouched must not toast or
+            // re-publish a node nothing about visibly changed.
+            if attention_changed || intervened {
+                self.write_watchdog_attention(
+                    run_id,
+                    &node.path,
+                    decision.attention,
+                    intervened,
+                    now_unix_ms,
+                );
+                changed = true;
+            }
+            if attention_changed {
                 self.emit_watchdog_event(run_id, &node.path);
                 self.notice_for_watchdog(run_id, &node, &decision);
-                changed = true;
             }
             changed
         }
@@ -441,17 +466,27 @@ mod live {
         }
 
         /// Karvex's opinion about one node, in karvex's own column.
+        ///
+        /// `intervened` is `true` for a write that spends a rung — a `Say`
+        /// (rungs 1–3) or a `Surface` (rung 4), delivered or not — and
+        /// `false` for a write whose only news is `attention` itself moving
+        /// (`phase4-retarget-plan.md` amendment log, WI-R5). It rides straight
+        /// into `run_node.watchdog_interventions`, which is why the caller
+        /// passes it explicitly rather than the store re-deriving it from
+        /// `attention`.
         fn write_watchdog_attention(
             &mut self,
             run_id: &RunId,
             path: &InstancePath,
             attention: Option<Attention>,
+            intervened: bool,
             now_unix_ms: u64,
         ) {
             self.persist_workflow_write(StoreWrite::RunNodeAttention {
                 run: run_id.clone(),
                 path: path.clone(),
                 attention,
+                intervened,
                 observed_at_unix_ms: now_unix_ms,
             });
         }
@@ -1357,8 +1392,10 @@ output_schema = { type = "object" }
         );
         assert_eq!(lead_inbox.received().len(), 1, "one escalation to the lead");
 
-        // And only the last rung is an opinion. A node being talked to is not
-        // yet a node karvex has given up on.
+        // Only the last rung is an *opinion* — `attention` stays `None`
+        // through rungs 1-3, which is talking, not giving up. But every rung
+        // spent is an intervention (WI-R5), so the counter walks with the
+        // ladder, not with `attention`.
         let plan = node(&mut app, &run_id, PLAN_PATH);
         assert_eq!(plan.attention, Some(Attention::Stuck));
         assert_eq!(
@@ -1367,9 +1404,9 @@ output_schema = { type = "object" }
             "the projected status is Claude Code's and is never overwritten"
         );
         assert_eq!(
-            plan.watchdog_interventions, 1,
-            "the counter moves with the opinion, not with the message; the rung history \
-             is the journal's"
+            plan.watchdog_interventions, 4,
+            "every rung karvex actually spent counts, not only the one that changed the \
+             opinion; the rung history is the journal's"
         );
     }
 
@@ -1528,6 +1565,7 @@ output_schema = { type = "object" }
             run: run_id.clone(),
             path: InstancePath::new(PLAN_PATH),
             attention: Some(Attention::NeedsInput),
+            intervened: false,
             observed_at_unix_ms: now_unix_ms,
         });
         let before = node(&mut app, &run_id, PLAN_PATH);

@@ -142,10 +142,16 @@ struct InterviewPane {
     /// (S2 amendment, `binding::review::interview_seed_prompt`).
     seeded: bool,
     seed_prompt: String,
-    /// Whether the fork's own session id and transcript have been copied onto
-    /// the interrogation row yet. Polled rather than read at spawn, because
-    /// `transcript_path` does not exist until the fork's first turn (S2).
+    /// Whether the fork's own session id has been copied onto the
+    /// interrogation row yet. Polled rather than read at spawn, because the
+    /// fork's session id is a different id from the member's (S2).
     identity_recorded: bool,
+    /// Whether the fork's transcript path has been copied onto the
+    /// interrogation row yet. Tracked separately from `identity_recorded`:
+    /// `transcript_path` does not exist until the fork's first turn (S2), so
+    /// it routinely becomes knowable several polls after the session id does
+    /// (`phase4-retarget-plan.md` amendment log, WI-R7).
+    transcript_recorded: bool,
 }
 
 /// The synthesis pane. At most one is alive at a time; a failed attempt is
@@ -392,18 +398,33 @@ impl crate::app::App {
 
     /// Copies each fork's own identity onto its `interrogation` row.
     ///
-    /// S2: `transcript_path` does not exist until the fork's first turn, and the
-    /// fork's session id is a *different* id from the member's — so both are
-    /// polled here and written through [`StoreWrite::InterrogationUpdate`],
-    /// never read at spawn.
+    /// S2: the fork's session id is a *different* id from the member's, so it
+    /// is polled here and written through [`StoreWrite::InterrogationUpdate`],
+    /// never read at spawn. `transcript_path` is polled the same way, on its
+    /// own flag: it does not exist until the fork's first turn (S2), which
+    /// routinely lands several polls after the session id is already known,
+    /// so `identity_recorded` alone cannot gate it (WI-R7 in
+    /// `phase4-retarget-plan.md`'s amendment log). The interview pane's cwd is
+    /// the cycle dir (S2), never the member's project dir, which is what makes
+    /// the derivation here the same one [`crate::app::workflow_lead::derived_transcript_path`]
+    /// already does for `run_member` — one `stat` per unresolved pane per
+    /// poll, never a transcript read.
     fn record_interview_identities(&mut self, index: usize) -> bool {
-        let mut updates: Vec<(String, InterrogationId, String)> = Vec::new();
+        let claude_dir = crate::integration::claude_dir().ok();
+        struct Update {
+            member: String,
+            interrogation: InterrogationId,
+            forked_session_id: Option<String>,
+            transcript_path: Option<String>,
+        }
+        let mut updates: Vec<Update> = Vec::new();
         {
             let Some(cycle) = self.workflow_reviews.get(index) else {
                 return false;
             };
+            let cwd = cycle.cycle_dir.to_string_lossy().into_owned();
             for (member, pane) in &cycle.interviews {
-                if pane.identity_recorded {
+                if pane.identity_recorded && pane.transcript_recorded {
                     continue;
                 }
                 let Some(interrogation) = cycle.interrogations.get(member) else {
@@ -412,21 +433,47 @@ impl crate::app::App {
                 let Some(session_id) = self.pane_agent_session_id(&pane.terminal_id) else {
                     continue;
                 };
-                updates.push((member.clone(), interrogation.clone(), session_id));
+                let forked_session_id = (!pane.identity_recorded).then(|| session_id.clone());
+                let transcript_path = (!pane.transcript_recorded)
+                    .then(|| {
+                        claude_dir.as_deref().and_then(|dir| {
+                            super::workflow_lead::derived_transcript_path(
+                                dir,
+                                Some(cwd.as_str()),
+                                Some(session_id.as_str()),
+                            )
+                        })
+                    })
+                    .flatten();
+                if forked_session_id.is_none() && transcript_path.is_none() {
+                    continue;
+                }
+                updates.push(Update {
+                    member: member.clone(),
+                    interrogation: interrogation.clone(),
+                    forked_session_id,
+                    transcript_path,
+                });
             }
         }
         if updates.is_empty() {
             return false;
         }
-        for (member, interrogation, forked_session_id) in updates {
+        for update in updates {
             if let Some(cycle) = self.workflow_reviews.get_mut(index) {
-                if let Some(pane) = cycle.interviews.get_mut(&member) {
-                    pane.identity_recorded = true;
+                if let Some(pane) = cycle.interviews.get_mut(&update.member) {
+                    if update.forked_session_id.is_some() {
+                        pane.identity_recorded = true;
+                    }
+                    if update.transcript_path.is_some() {
+                        pane.transcript_recorded = true;
+                    }
                 }
             }
             self.persist_review_write(StoreWrite::InterrogationUpdate {
-                id: interrogation,
-                forked_session_id: Some(forked_session_id),
+                id: update.interrogation,
+                forked_session_id: update.forked_session_id,
+                transcript_path: update.transcript_path,
                 ended_at_unix_ms: None,
             });
         }
@@ -860,15 +907,14 @@ impl crate::app::App {
                     path,
                     source_session_id: session_id.clone(),
                     forked_session_id: None,
-                    // The fork's own transcript does not exist until its first
-                    // turn (S2), and `StoreWrite::InterrogationUpdate` — P1's
-                    // shape, frozen before this packet — carries only the
-                    // forked session id and an end stamp. So the column stays
-                    // `NONE` rather than being filled with the *source*
-                    // member's transcript, which would read as "this is the
-                    // interview's record" and is not. Reported as a plan gap:
-                    // `WorkflowReviewInfo.interview_paths` is empty until that
-                    // write can carry a path.
+                    // The fork's own transcript does not exist until its
+                    // first turn (S2), so this row is created with none —
+                    // `record_interview_identities` fills it in once the file
+                    // is actually there (WI-R7 in
+                    // `phase4-retarget-plan.md`'s amendment log). Never the
+                    // *source* member's transcript: that would read as "this
+                    // is the interview's own record", and it is not — the
+                    // refusal to fall back to it is deliberate and stands.
                     transcript_path: None,
                     cwd: cycle_dir.to_string_lossy().into_owned(),
                     pane_id: PublicPaneId::new(pane_id.clone()),
@@ -888,6 +934,7 @@ impl crate::app::App {
                     seeded: !managed,
                     seed_prompt: binding::interview_seed_prompt(&prompt_path),
                     identity_recorded: false,
+                    transcript_recorded: false,
                 },
             );
             spawned_plan.assignments.push(planned.clone());
@@ -1153,6 +1200,7 @@ impl crate::app::App {
             self.persist_review_write(StoreWrite::InterrogationUpdate {
                 id: interrogation,
                 forked_session_id: None,
+                transcript_path: None,
                 ended_at_unix_ms: Some(ended_at_unix_ms),
             });
         }
@@ -1366,14 +1414,16 @@ type RawReview = (
 
 /// Turns the store's rows into the pure core's [`RunEvidence`] and roster.
 ///
-/// Everything unmeasured stays empty rather than being guessed at: karvex has
-/// no durable record of task *reassignments* today (nothing journals an owner
-/// change), so `owner_changes` is empty and the interview document simply does
-/// not claim anything about who took what from whom.
+/// Everything unmeasured stays empty rather than being guessed at.
+/// `owner_changes` is the one exception worth naming: it is populated from
+/// the `task` journal's `owner_change` payload (WI-R6 in
+/// `phase4-retarget-plan.md`'s amendment log), which records only that a task
+/// changed hands, from whom, to whom, when — never why, because karvex cannot
+/// see the lead's reasoning and the interview prompt already says so.
 #[cfg(feature = "workflow")]
 fn build_review_inputs(raw: RawReview) -> ReviewInputs {
     use crate::workflow::review::{
-        InterventionEvidence, MemberEvidence, MemberIdentity, TaskEvidence,
+        InterventionEvidence, MemberEvidence, MemberIdentity, OwnerChange, TaskEvidence,
     };
 
     let (run, nodes, members, watchdog, summary, cycle, version, graph, evidence) = raw;
@@ -1428,7 +1478,19 @@ fn build_review_inputs(raw: RawReview) -> ReviewInputs {
             emergent: node.emergent,
             attention: node.attention,
             owner: Some(node.owner.clone()).filter(|owner| !owner.trim().is_empty()),
-            owner_changes: Vec::new(),
+            owner_changes: measured
+                .map(|measured| {
+                    measured
+                        .owner_changes
+                        .iter()
+                        .map(|change| OwnerChange {
+                            at_unix_ms: change.at_unix_ms,
+                            from: change.from.clone(),
+                            to: change.to.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             unresolved_blockers: measured
                 .map(|measured| {
                     measured

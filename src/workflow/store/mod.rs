@@ -1137,10 +1137,16 @@ impl WorkflowStore {
             StoreWrite::InterrogationUpdate {
                 id,
                 forked_session_id,
+                transcript_path,
                 ended_at_unix_ms,
             } => {
-                self.write_interrogation_update(id, forked_session_id, ended_at_unix_ms)
-                    .await
+                self.write_interrogation_update(
+                    id,
+                    forked_session_id,
+                    transcript_path,
+                    ended_at_unix_ms,
+                )
+                .await
             }
             StoreWrite::RunLeadPane {
                 run,
@@ -1234,8 +1240,12 @@ impl WorkflowStore {
                 run,
                 path,
                 attention,
+                intervened,
                 observed_at_unix_ms: _,
-            } => self.write_run_node_attention(run, path, attention).await,
+            } => {
+                self.write_run_node_attention(run, path, attention, intervened)
+                    .await
+            }
             StoreWrite::ReviewCycleStarted {
                 id,
                 run,
@@ -3165,6 +3175,7 @@ impl WorkflowStore {
         &self,
         id: InterrogationId,
         forked_session_id: Option<String>,
+        transcript_path: Option<String>,
         ended_at_unix_ms: Option<u64>,
     ) -> Result<(), StoreError> {
         let interrogation_id = parse_record_id(TABLE_INTERROGATION, id.as_str())
@@ -3175,11 +3186,14 @@ impl WorkflowStore {
                 "UPDATE $id SET \
                  forked_session_id = IF $forked_session_id = NONE THEN forked_session_id \
                                       ELSE $forked_session_id END, \
+                 transcript_path = IF $transcript_path = NONE THEN transcript_path \
+                                    ELSE $transcript_path END, \
                  ended_at = IF $ended_at_ms = NONE THEN ended_at \
                             ELSE time::from_millis($ended_at_ms) END",
             )
             .bind(("id", interrogation_id))
             .bind(("forked_session_id", forked_session_id))
+            .bind(("transcript_path", transcript_path))
             .bind(("ended_at_ms", ended_at_unix_ms.map(|ms| ms as i64)))
             .await
             .map_err(query_error)?;
@@ -3593,17 +3607,23 @@ impl WorkflowStore {
     /// needing attention.
     ///
     /// `watchdog_interventions` accumulates by exactly one on every write
-    /// that carries `Some(attention)` — the bind audit
-    /// `phase4-retarget-plan.md` P7 asks for first: before this write-arm
-    /// existed, nothing on this branch ever bound the column at all
-    /// (`write_run_node` never has), so every `run_node.watchdog_interventions`
-    /// value in the field today is a stale `0` from `DEFAULT 0`. Written here
-    /// rather than in `write_run_node` because attention and status are
-    /// evaluated on two different cadences (§3.1: a 20s watchdog sample over
-    /// the 2s projection poll) and must stay two independent writes. A write
-    /// that only clears attention (`None`) does not count as an
-    /// intervention — clearing is the watchdog observing the node moving
-    /// again, not karvex acting on it.
+    /// whose caller passes `intervened = true` — never on `attention` being
+    /// `Some` (`phase4-retarget-plan.md` amendment log, WI-R5). The two used
+    /// to be the same test, which undercounted: P4's ladder holds `attention`
+    /// at `None` through rungs 1–3 (`Say`) and only sets it once the class is
+    /// surfaced or a node is already `ExternalWait`/over budget, so a column
+    /// meant to count every rung karvex actually sent counted opinions
+    /// instead. The caller (the watchdog adapter) decides `intervened`;
+    /// before this write-arm existed, nothing on this branch ever bound the
+    /// column at all (`write_run_node` never has), so every
+    /// `run_node.watchdog_interventions` value in the field today is a stale
+    /// `0` from `DEFAULT 0`. Written here rather than in `write_run_node`
+    /// because attention and status are evaluated on two different cadences
+    /// (§3.1: a 20s watchdog sample over the 2s projection poll) and must
+    /// stay two independent writes. A write that only clears attention
+    /// (`None`) is never an intervention — clearing is the watchdog observing
+    /// the node moving again, not karvex acting on it — and the adapter never
+    /// sets `intervened` on one.
     ///
     /// `observed_at_unix_ms` is not persisted by this write: migration
     /// `0006` adds no timestamp column for `attention`, on purpose (§3.7:
@@ -3616,6 +3636,7 @@ impl WorkflowStore {
         run: RunId,
         path: InstancePath,
         attention: Option<Attention>,
+        intervened: bool,
     ) -> Result<(), StoreError> {
         let run_node_id = self.find_run_node_id(&run, &path).await?;
         let attention_str = attention.map(|value| value.as_str().to_string());
@@ -3623,11 +3644,12 @@ impl WorkflowStore {
             .db
             .query(
                 "UPDATE $id SET attention = $attention, \
-                 watchdog_interventions = IF $attention = NONE THEN watchdog_interventions \
-                                           ELSE watchdog_interventions + 1 END",
+                 watchdog_interventions = IF $intervened THEN watchdog_interventions + 1 \
+                                           ELSE watchdog_interventions END",
             )
             .bind(("id", run_node_id))
             .bind(("attention", attention_str))
+            .bind(("intervened", intervened))
             .await
             .map_err(query_error)?;
         response.check().map_err(query_error)?;
