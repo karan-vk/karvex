@@ -774,10 +774,17 @@ pub fn nudge_text(node: &ObservedNode, policy: &WatchdogPolicy) -> String {
         subject_clause(node),
         idle_clause(node, policy)
     ));
-    out.push_str(
-        "karvex is the terminal runtime around your session, not your human operator, and it \
-         cannot edit your task file or answer for you.\n",
-    );
+    if node.is_lead {
+        out.push_str(
+            "karvex is the terminal runtime around your session, not your human operator, and it \
+             cannot close this run or answer for you.\n",
+        );
+    } else {
+        out.push_str(
+            "karvex is the terminal runtime around your session, not your human operator, and it \
+             cannot edit your task file or answer for you.\n",
+        );
+    }
     out.push_str("Do one of these now, in this session:\n");
     if node.is_lead {
         out.push_str("- still leading: say what the next concrete step is, then take it;\n");
@@ -931,34 +938,43 @@ fn task_noun(node: &ObservedNode) -> String {
 /// `karvex has watched your pane %3 sit idle for 14 minutes (3 samples, one
 /// every 20s)`.
 fn idle_clause(node: &ObservedNode, policy: &WatchdogPolicy) -> String {
-    let samples = node.ladder.streak.saturating_add(1);
     match node.owner.pane() {
         Some(pane) => format!(
-            "karvex has watched your pane {} sit {} for {} ({} consecutive samples, one every {}s)",
+            "karvex has watched your pane {} sit {} for {} ({})",
             pane.pane_id,
             state_word(pane.state),
             human_ms(pane.state_age_ms),
-            samples,
-            policy.tick_secs
+            sample_clause(node, policy)
         ),
         None => format!(
-            "karvex has no pane to watch for it ({samples} consecutive samples, one every {}s)",
-            policy.tick_secs
+            "karvex has no pane it can watch for you ({})",
+            sample_clause(node, policy)
         ),
     }
+}
+
+/// `3 consecutive samples, one every 20s` — how karvex knows, not just what it
+/// concluded, so an agent can argue with the measurement.
+fn sample_clause(node: &ObservedNode, policy: &WatchdogPolicy) -> String {
+    let samples = u64::from(node.ladder.streak.saturating_add(1));
+    let counted = if samples == 1 {
+        "1 sample".to_string()
+    } else {
+        format!("{samples} consecutive samples")
+    };
+    format!("{counted}, one every {}s", policy.tick_secs)
 }
 
 /// The evidence sentence in the lead escalation: what karvex can and cannot
 /// see about the owner.
 fn visibility_clause(node: &ObservedNode, policy: &WatchdogPolicy) -> String {
-    let samples = node.ladder.streak.saturating_add(1);
     match &node.owner {
         OwnerState::Observed { pane, .. } => format!(
-            "its pane {} has been {} for {} ({samples} consecutive samples, one every {}s)",
+            "its pane {} has been {} for {} ({})",
             pane.pane_id,
             state_word(pane.state),
             human_ms(pane.state_age_ms),
-            policy.tick_secs
+            sample_clause(node, policy)
         ),
         OwnerState::NoPane { name } => format!(
             "{name} has no pane karvex can watch, so karvex cannot tell whether it is working"
@@ -1922,6 +1938,37 @@ mod tests {
                 "the lead has no task: {text}"
             );
         }
+    }
+
+    #[test]
+    fn the_sample_count_is_stated_in_the_singular_when_there_is_one_of_them() {
+        let policy = policy();
+        assert!(
+            nudge_text(&with_streak(0, None), &policy).contains("(1 sample, one every 20s)"),
+            "one sample is not \"1 consecutive samples\""
+        );
+        assert!(reprompt_text(&with_streak(2, None), &policy)
+            .contains("(3 consecutive samples, one every 20s)"));
+    }
+
+    #[test]
+    fn the_lead_is_never_told_it_owns_a_task_file() {
+        let lead = ObservedNode {
+            is_lead: true,
+            task_id: None,
+            owner: OwnerState::Observed {
+                name: "team-lead".into(),
+                pane: pane(AgentState::Idle, 9 * 60_000),
+            },
+            lead_pane: None,
+            ..node()
+        };
+        let text = nudge_text(&lead, &policy());
+        assert!(text.contains("cannot close this run"), "{text}");
+        assert!(
+            !text.contains("task file"),
+            "the lead has no task file: {text}"
+        );
     }
 
     #[test]
