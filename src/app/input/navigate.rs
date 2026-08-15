@@ -445,12 +445,15 @@ impl App {
                     leave_navigate_mode(&mut self.state);
                 }
             }
-            // No runtime call needed — P2 lands the overlay as an inert
-            // stub with no wire method behind it yet
-            // (`.local/prd/phase4-retarget-plan.md` §3.5), so opening it
-            // always succeeds, exactly like `open_workflow_review`.
+            // Real content since P13 (`.local/prd/phase4-retarget-plan.md`
+            // §3.5): `App::open_workflow_review` resolves which run to check
+            // (the DAG's open run, else the live lead run) and loads its
+            // cycle through `workflow.review.get`. Always opens, the way the
+            // P2 stub did, so a bound key never dead-ends — an honest "no
+            // review to show" message is what is left when there is nothing
+            // to check.
             NavigateAction::OpenWorkflowReview => {
-                super::modal::open_workflow_review(&mut self.state);
+                self.open_workflow_review();
             }
         }
 

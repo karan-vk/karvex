@@ -323,6 +323,13 @@ impl App {
             KeyCode::Char('I') => {
                 self.interrogate_workflow_dag_node(WorkflowInterrogationMode::Reconstructed)
             }
+            // The review ask's other half — a passive header segment plus
+            // this key, never a modal
+            // (`.local/prd/phase4-retarget-plan.md` §3.5, §6 D19). Deliberately
+            // not in `LEAD_FOOTER_HINTS`/`FOOTER_HINTS` (that array is frozen,
+            // packet P13's own contract) — the header segment is the
+            // discoverable half of the affordance.
+            KeyCode::Char('V') => self.handle_workflow_dag_review_key(),
             _ => {
                 if let Some(ModalAction::Close) = modal_action_from_key(&key, WORKFLOW_DAG_ACTIONS)
                 {
@@ -1626,6 +1633,8 @@ mod tests {
             agent_state: None,
             successors,
             predecessors,
+            attention: None,
+            watchdog_interventions: 0,
         }
     }
 
@@ -1702,6 +1711,8 @@ mod tests {
                 lead_pane_id: None,
                 projected: std::collections::BTreeMap::new(),
                 members: Vec::new(),
+                review: None,
+                review_findings: Vec::new(),
             }));
         app
     }

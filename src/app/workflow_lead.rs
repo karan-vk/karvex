@@ -1827,9 +1827,21 @@ impl crate::app::App {
     ///
     /// Node-level events do not come through here on purpose: several per node
     /// per run, and none of them can move a row in the run list.
+    ///
+    /// Also the one funnel every `workflow.review.*` event passes through
+    /// (`emit_review_event`/`emit_review_closed`), which is what makes it the
+    /// right seam for `App::refresh_open_dag_review`
+    /// (`.local/prd/phase4-retarget-plan.md` §5 packet P13's contract:
+    /// "refresh only on `workflow.review.*` ... events") — a review cycle
+    /// runs on a run that has already stopped polling, so nothing else
+    /// would ever tell an open DAG snapshot its review just moved.
     pub(crate) fn emit_workflow_run_event(&mut self, kind: EventKind, data: EventData) {
+        let review_run_id = review_event_run_id(kind, &data);
         self.emit_event(EventEnvelope { event: kind, data });
         self.refresh_workflow_runs_overlay(kind);
+        if let Some(run_id) = review_run_id {
+            self.refresh_open_dag_review(&run_id);
+        }
     }
 
     /// Opens the DAG overlay on the run a team lead is executing right now.
@@ -1874,6 +1886,23 @@ impl crate::app::App {
             .as_ref()
             .filter(|run| !run.closed)
             .map(|run| run.run_id.to_string())
+    }
+}
+
+/// The run id a `workflow.review.*` event is about, or `None` for every
+/// other event kind. `data` is matched by reference so
+/// `emit_workflow_run_event` can extract this before `data` is moved into
+/// the wire envelope — cloning the whole payload (findings and all) just to
+/// read one field back out would be wasteful for what is, on a busy server,
+/// a per-poll-tick check.
+fn review_event_run_id(kind: EventKind, data: &EventData) -> Option<String> {
+    match (kind, data) {
+        (EventKind::WorkflowReviewStarted, EventData::WorkflowReviewStarted { run_id, .. })
+        | (EventKind::WorkflowReviewReady, EventData::WorkflowReviewReady { run_id, .. })
+        | (EventKind::WorkflowReviewClosed, EventData::WorkflowReviewClosed { run_id, .. }) => {
+            Some(run_id.clone())
+        }
+        _ => None,
     }
 }
 
@@ -2139,6 +2168,94 @@ mod tests {
         assert!(read_tasks(Path::new("/nonexistent/karvex/tasks")).is_empty());
         assert!(read_team_configs(Path::new("/nonexistent/karvex/teams")).is_empty());
         assert!(read_team_config(Path::new("/nonexistent/karvex/config.json")).is_none());
+    }
+
+    /// The seam `App::refresh_open_dag_review` (packet P13) relies on:
+    /// exactly the three `workflow.review.*` event kinds carry a run id out
+    /// of `emit_workflow_run_event`, and nothing else does — a node-level or
+    /// run-level (non-review) event must never trigger a review refetch.
+    #[test]
+    fn only_review_events_carry_a_run_id_out_for_the_dag_refresh() {
+        let review = crate::api::schema::WorkflowReviewInfo {
+            id: "review_cycle:1".to_string(),
+            run_id: "workflow_run:1".to_string(),
+            workflow_id: "workflow:1".to_string(),
+            version_id: "kvdag_version:1".to_string(),
+            status: crate::api::schema::WorkflowReviewStatus::AwaitingUser,
+            started_at_unix_ms: 1,
+            ended_at_unix_ms: None,
+            resulting_version_id: None,
+            interview_paths: Vec::new(),
+            evidence_only_count: 0,
+        };
+
+        assert_eq!(
+            review_event_run_id(
+                EventKind::WorkflowReviewStarted,
+                &EventData::WorkflowReviewStarted {
+                    run_id: "workflow_run:1".to_string(),
+                    review: review.clone(),
+                },
+            ),
+            Some("workflow_run:1".to_string())
+        );
+        assert_eq!(
+            review_event_run_id(
+                EventKind::WorkflowReviewReady,
+                &EventData::WorkflowReviewReady {
+                    run_id: "workflow_run:1".to_string(),
+                    review: review.clone(),
+                },
+            ),
+            Some("workflow_run:1".to_string())
+        );
+        assert_eq!(
+            review_event_run_id(
+                EventKind::WorkflowReviewClosed,
+                &EventData::WorkflowReviewClosed {
+                    run_id: "workflow_run:1".to_string(),
+                    review,
+                },
+            ),
+            Some("workflow_run:1".to_string())
+        );
+
+        let run = crate::api::schema::WorkflowRunInfo {
+            run_id: "workflow_run:1".to_string(),
+            workflow_id: "workflow:1".to_string(),
+            version_id: "kvdag_version:1".to_string(),
+            tier: crate::api::schema::WorkflowTier::Auto,
+            status: crate::api::schema::WorkflowRunStatus::Succeeded,
+            args: Default::default(),
+            workspace_id: None,
+            tab_id: None,
+            started_at_unix_ms: 1,
+            ended_at_unix_ms: Some(2),
+            total_tokens: 0,
+            total_tool_uses: 0,
+            nodes_total: 0,
+            nodes_done: 0,
+            failure: None,
+            max_depth: 0,
+            max_nodes: 0,
+            nodes_live: 0,
+            growth_limited: None,
+            workflow_name: String::new(),
+            context_runs: Vec::new(),
+            restore_from_run: None,
+            lead_session_id: None,
+            team_name: None,
+            lead_pane_id: None,
+            lead_prompt_version: None,
+        };
+        assert_eq!(
+            review_event_run_id(
+                EventKind::WorkflowRunFinished,
+                &EventData::WorkflowRunFinished { run },
+            ),
+            None,
+            "a non-review run-level event must never trigger a review refetch"
+        );
     }
 }
 
