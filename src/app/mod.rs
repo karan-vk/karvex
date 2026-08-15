@@ -28,8 +28,10 @@ mod theme_sync;
 pub(crate) mod workflow;
 mod workflow_history;
 pub(crate) mod workflow_lead;
+pub(crate) mod workflow_review;
 #[cfg(feature = "workflow")]
 pub(crate) mod workflow_store;
+pub(crate) mod workflow_watchdog;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};

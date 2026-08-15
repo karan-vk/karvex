@@ -263,6 +263,15 @@ pub struct WorkflowRunReportSessionParams {
     pub run_id: String,
     /// The Claude Code session id, from the hook payload.
     pub session_id: String,
+    /// `transcript_path` from the same hook payload: where Claude Code is
+    /// writing this session's transcript. Optional because it is a foreign,
+    /// experimental payload, and because karvex can derive the same path from
+    /// the session id and cwd when it is missing — but the session's own answer
+    /// is the authority, and a review cycle cannot interview a member whose
+    /// transcript karvex never recorded
+    /// (`.local/prd/phase4-retarget-plan.md` §3.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     /// `KARVEX_PANE_ID`. The lead's pane binds the run; any other pane of this
     /// run is a split-pane teammate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -891,6 +900,38 @@ pub enum WorkflowMemberState {
     Idle,
     NeedsInput,
     Unknown,
+}
+
+impl WorkflowMemberState {
+    /// The stored spelling. `run_member.last_state` is a free-text column on
+    /// purpose (it mirrors whatever karvex's own detection reported), so this
+    /// enum is the one place the vocabulary is written down and the store round
+    /// trip goes through it in both directions.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::NeedsInput => "needs_input",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The inverse of [`Self::as_str`]. A value this karvex does not know reads
+    /// back as [`Self::Unknown`] rather than as nothing: the column recorded
+    /// *something*, and dropping it would claim the member was never observed.
+    ///
+    /// Its only caller is the `run_member` wire projection, which is compiled
+    /// out with the `workflow` feature — the schema itself is not, because the
+    /// wire vocabulary is the same on every build.
+    #[cfg_attr(not(feature = "workflow"), allow(dead_code))]
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "working" => Self::Working,
+            "idle" => Self::Idle,
+            "needs_input" => Self::NeedsInput,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

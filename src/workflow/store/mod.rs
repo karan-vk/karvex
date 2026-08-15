@@ -2455,8 +2455,16 @@ impl WorkflowStore {
             let response = self
                 .db
                 .query(
+                    // An empty transcript path is not a path: it is a node
+                    // whose session has not written one yet (the reserved
+                    // `.lead` node is the case that reaches this — a lead can
+                    // be identified a poll or two before its transcript
+                    // exists). Stored as `NONE` so a reader cannot mistake it
+                    // for a file it could open.
                     "UPDATE $id SET pane_id = $pane_id, terminal_id = $terminal_id, \
-                     agent_session_id = $agent_session_id, transcript_path = $transcript_path, \
+                     agent_session_id = $agent_session_id, \
+                     transcript_path = IF $transcript_path = \"\" THEN NONE \
+                                        ELSE $transcript_path END, \
                      node_dir = $node_dir, cwd = $cwd",
                 )
                 .bind(("id", run_node_id))
