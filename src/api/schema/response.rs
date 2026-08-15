@@ -20,9 +20,9 @@ use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workflows::{
     KvdagVersionDetail, KvdagVersionSummary, WorkflowDetail, WorkflowExpandRejection,
-    WorkflowInterrogationInfo, WorkflowRestoreReport, WorkflowRunGraph, WorkflowRunInfo,
-    WorkflowRunMessageReceipt, WorkflowRunNodeInfo, WorkflowRunSummaryInfo, WorkflowSessionRole,
-    WorkflowSummary,
+    WorkflowInterrogationInfo, WorkflowRestoreReport, WorkflowReviewFindingInfo,
+    WorkflowReviewInfo, WorkflowRunGraph, WorkflowRunInfo, WorkflowRunMessageReceipt,
+    WorkflowRunNodeInfo, WorkflowRunSummaryInfo, WorkflowSessionRole, WorkflowSummary,
 };
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
@@ -349,6 +349,38 @@ pub enum ResponseResult {
     },
     WorkflowSummaryList {
         summaries: Vec<WorkflowRunSummaryInfo>,
+    },
+    /// A review cycle was started (`workflow.review.start`).
+    WorkflowReviewStarted {
+        review: WorkflowReviewInfo,
+    },
+    /// `workflow.review.get`'s answer. `review: None` means this run has
+    /// never had a review cycle — a normal answer, not an error, matching
+    /// `WorkflowSummaryGet`'s precedent.
+    WorkflowReviewGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<WorkflowReviewInfo>,
+        #[serde(default)]
+        findings: Vec<WorkflowReviewFindingInfo>,
+    },
+    /// The human's per-finding accept (`workflow.review.apply`) was recorded.
+    /// `version_id` is set only when at least one accepted finding compiled
+    /// and minted a new `kvdag_version`; an all-declined apply is a
+    /// successful response with `version_id: None`.
+    WorkflowReviewApplied {
+        review: WorkflowReviewInfo,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version_id: Option<String>,
+    },
+    /// An interview pane's self-report was recorded
+    /// (`workflow.review.answer`).
+    WorkflowReviewAnswered {
+        review: WorkflowReviewInfo,
+    },
+    /// The synthesis pane's self-report was recorded
+    /// (`workflow.review.report`), moving the cycle to `awaiting_user`.
+    WorkflowReviewReported {
+        review: WorkflowReviewInfo,
     },
     Ok {},
 }

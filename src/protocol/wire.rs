@@ -13,7 +13,18 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 19;
+///
+/// 19 -> 20: Phase D (`docs/design/workflow-builder/09-agent-teams-rework.md`
+/// §2) deleted the custom execution engine and left six `workflow.node.*`
+/// verbs (`steer`, `interrupt`, `report`, `restart`, `expand`, `interrogate`)
+/// answering a documented refusal instead of doing what protocol 19 promised
+/// they did — an incompatible removal of behaviour, published in both the
+/// stable and preview channels at 19, so the bump was owed independent of
+/// this change. Phase 4 (`.local/prd/phase4-retarget-plan.md` §5 packet P3)
+/// rides the same bump to land its additive review/watchdog wire surface
+/// (`workflow.review.*`, `workflow.node.watchdog`, `workflow.review.{started,
+/// ready,closed}`) rather than spend a second one.
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.

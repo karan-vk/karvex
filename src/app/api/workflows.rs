@@ -2538,7 +2538,7 @@ pub(crate) fn wire_run_node_record(
         evidence: record.evidence.map(wire_evidence),
         succession: record.succession.as_ref().map(wire_succession),
         blocker: record.succession.as_ref().and_then(wire_blocker),
-        watchdog_interventions: 0,
+        watchdog_interventions: record.watchdog_interventions,
         // Written verbatim from the run's assignment table (§4 D9), so a
         // finished run can still explain why a node ran on the model it did.
         // Empty for a fixed tier, whose §7.1/§7.2 row *is* the explanation.
@@ -2568,6 +2568,11 @@ pub(crate) fn wire_run_node_record(
         subject: record.subject,
         owner: record.owner,
         emergent: record.emergent,
+        // Wave-0 shape only (`.local/prd/phase4-retarget-plan.md` §5 packet
+        // P3): `run_node.attention` has no store column and no writer yet, so
+        // this is honestly `None` rather than a guess. The watchdog packet
+        // (wave 2b) adds the column and starts writing it.
+        attention: None,
     }
 }
 
@@ -2672,6 +2677,12 @@ fn wire_run_member_record(
         cwd: record.cwd,
         first_seen_at_unix_ms: record.first_seen_at_unix_ms,
         last_seen_at_unix_ms: record.last_seen_at_unix_ms,
+        // Wave-0 shape only (`.local/prd/phase4-retarget-plan.md` §5 packet
+        // P3): `RunMemberRecord` carries neither field yet — P1's
+        // `RunMemberSnapshot` extension and P8's identity capture land them.
+        // Honestly `None` rather than a guess until then.
+        session_id: None,
+        last_state: None,
     }
 }
 
@@ -2843,6 +2854,32 @@ mod tests {
                 workflow_id: None,
                 limit: None,
             }),
+            // Phase 4 additions (`.local/prd/phase4-retarget-plan.md` §5
+            // packet P3): the review cycle's five methods. Stubs today
+            // (`workflow_review.rs`, `workflow_review_apply.rs`), but a stub
+            // answering `workflow_review_not_found` is still not
+            // `not_implemented`.
+            Method::WorkflowReviewStart(WorkflowRunTarget {
+                run_id: "workflow_run:1".into(),
+            }),
+            Method::WorkflowReviewGet(WorkflowRunTarget {
+                run_id: "workflow_run:1".into(),
+            }),
+            Method::WorkflowReviewApply(crate::api::schema::WorkflowReviewApplyParams {
+                run_id: "workflow_run:1".into(),
+                accept: Vec::new(),
+            }),
+            Method::WorkflowReviewAnswer(crate::api::schema::WorkflowReviewAnswerParams {
+                run_id: "workflow_run:1".into(),
+                member: "research".into(),
+                answer: Some(serde_json::json!({"account": "done"})),
+                answer_file: None,
+            }),
+            Method::WorkflowReviewReport(crate::api::schema::WorkflowReviewReportParams {
+                run_id: "workflow_run:1".into(),
+                findings: Some(serde_json::json!([])),
+                findings_file: None,
+            }),
         ];
 
         for method in methods {
@@ -2937,6 +2974,32 @@ mod tests {
                 target: "team-lead".into(),
                 text: "rebase before you continue".into(),
                 priority: None,
+            }),
+            // Phase 4 additions (`.local/prd/phase4-retarget-plan.md` §5
+            // packet P3): the review cycle's five methods answer
+            // `workflow_unavailable` with the feature off too, not
+            // `workflow_review_not_found` — that code is specific to the
+            // feature-on stub and would misreport why the request failed.
+            Method::WorkflowReviewStart(WorkflowRunTarget {
+                run_id: "workflow_run:1".into(),
+            }),
+            Method::WorkflowReviewGet(WorkflowRunTarget {
+                run_id: "workflow_run:1".into(),
+            }),
+            Method::WorkflowReviewApply(crate::api::schema::WorkflowReviewApplyParams {
+                run_id: "workflow_run:1".into(),
+                accept: Vec::new(),
+            }),
+            Method::WorkflowReviewAnswer(crate::api::schema::WorkflowReviewAnswerParams {
+                run_id: "workflow_run:1".into(),
+                member: "research".into(),
+                answer: Some(serde_json::json!({"account": "done"})),
+                answer_file: None,
+            }),
+            Method::WorkflowReviewReport(crate::api::schema::WorkflowReviewReportParams {
+                run_id: "workflow_run:1".into(),
+                findings: Some(serde_json::json!([])),
+                findings_file: None,
             }),
         ];
 
@@ -4061,6 +4124,7 @@ port = "summary"
             subject: String::new(),
             owner: String::new(),
             emergent: false,
+            watchdog_interventions: 4,
         };
 
         let limit = StoredGrowthLimit {
@@ -4082,6 +4146,14 @@ port = "summary"
             wired_node.parent_path,
             Some("root".to_string()),
             "spawn provenance survives the durable projection"
+        );
+        // Wire-honesty sweep (`.local/prd/phase4-retarget-plan.md` §5 packet
+        // P3): `watchdog_interventions` used to be hardcoded to `0` here
+        // regardless of what the row carried.
+        assert_eq!(
+            wired_node.watchdog_interventions, 4,
+            "watchdog_interventions survives the durable projection instead of \
+             being hardcoded to 0"
         );
         let node_limit = wired_node
             .growth_limited
@@ -4508,6 +4580,28 @@ port = "summary"
             ("node_verb_retired", NODE_VERB_RETIRED_CODE),
             ("store_error", WORKFLOW_STORE_ERROR_CODE),
             ("run_in_flight", WorkflowStartError::RunInFlight.code()),
+            // Phase 4 additions (`.local/prd/phase4-retarget-plan.md` §5
+            // packet P3): the review cycle's own failure domains. Handlers
+            // are wave-0 stubs today (`workflow_review.rs`,
+            // `workflow_review_apply.rs`); the codes are inventoried here
+            // ahead of wave 2b's real orchestration so the wire contract is
+            // frozen once, not amended alongside the behaviour.
+            (
+                "review_not_found",
+                crate::app::api::workflow_review::WORKFLOW_REVIEW_NOT_FOUND_CODE,
+            ),
+            (
+                "review_in_flight",
+                crate::app::api::workflow_review::WORKFLOW_REVIEW_IN_FLIGHT_CODE,
+            ),
+            (
+                "review_not_awaiting",
+                crate::app::api::workflow_review::WORKFLOW_REVIEW_NOT_AWAITING_CODE,
+            ),
+            (
+                "review_no_interviewable_members",
+                crate::app::api::workflow_review::WORKFLOW_REVIEW_NO_INTERVIEWABLE_MEMBERS_CODE,
+            ),
         ]
     }
 
@@ -4524,7 +4618,7 @@ port = "summary"
         let codes = all_workflow_error_codes();
         assert_eq!(
             codes.len(),
-            18,
+            22,
             "the inventory grew or shrank; update this count alongside the list itself"
         );
 

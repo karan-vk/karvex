@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 19,
+  "protocol": 20,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -953,6 +953,90 @@
                 "interrogation"
               ],
               "type": "object"
+            },
+            {
+              "description": "One watchdog rung fired against a node\n(`.local/prd/phase4-retarget-plan.md` §3.4). Carries the node as of\nthe intervention, so a subscriber sees `watchdog_interventions` and\n`attention` without a second `workflow.run.get` round trip.",
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/event/$defs/WorkflowRunNodeInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_node_watchdog",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A review cycle began (`workflow.review.start`).",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/event/$defs/WorkflowReviewInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_review_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "review"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A review cycle finished synthesis and is waiting on the human's\nper-finding accept.",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/event/$defs/WorkflowReviewInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_review_ready",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "review"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A review cycle reached a terminal status: `applied`, `declined`, or\n`failed`.",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/event/$defs/WorkflowReviewInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_review_closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "review"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -993,7 +1077,11 @@
             "workflow_growth_limited",
             "workflow_run_summarized",
             "workflow_interrogation_started",
-            "workflow_interrogation_ended"
+            "workflow_interrogation_ended",
+            "workflow_node_watchdog",
+            "workflow_review_started",
+            "workflow_review_ready",
+            "workflow_review_closed"
           ],
           "type": "string"
         },
@@ -1308,6 +1396,36 @@
           ],
           "type": "object"
         },
+        "WorkflowAttention": {
+          "description": "[`WorkflowRunNodeInfo::attention`]'s fixed vocabulary, mirroring the\n`run_node.attention` store ASSERT\n(`.local/prd/phase4-retarget-plan.md` §3.7).",
+          "oneOf": [
+            {
+              "const": "stuck",
+              "description": "The owner's pane has been idle for `stuck_threshold` samples while its\ntask stayed `in_progress`, and the watchdog ladder ran out of rungs.",
+              "type": "string"
+            },
+            {
+              "const": "budget_exceeded",
+              "description": "The node's authored `timeout_ms` was exceeded; jumps straight to\nsurfaced without walking the nudge/re-prompt rungs.",
+              "type": "string"
+            },
+            {
+              "const": "needs_input",
+              "description": "The owner's pane is `needs input`, or the task is `blockedBy` an\nunfinished task — a human, not a nudge, unblocks this.",
+              "type": "string"
+            },
+            {
+              "const": "lead_blocked",
+              "description": "The lead's own pane is `needs input`, which blocks the whole run.",
+              "type": "string"
+            },
+            {
+              "const": "unbound",
+              "description": "The run never bound a team within the bind deadline.",
+              "type": "string"
+            }
+          ]
+        },
         "WorkflowDemand": {
           "description": "How demanding a node's work is; drives the tier's model/effort mapping.",
           "enum": [
@@ -1497,6 +1615,81 @@
           ],
           "type": "object"
         },
+        "WorkflowReviewInfo": {
+          "description": "A run's self-improvement review cycle, as the wire sees it\n(`09-agent-teams-rework.md`, `.local/prd/phase4-retarget-plan.md` §3.5).",
+          "properties": {
+            "ended_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "evidence_only_count": {
+              "default": 0,
+              "description": "How many of this cycle's interviews degraded to `evidence_only`\nbecause no session could be resumed — surfaced so \"the review ran\"\nand \"the review heard from everyone\" are never conflated.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "interview_paths": {
+              "default": [],
+              "description": "One path per interview this cycle conducted (the interrogation's\ntranscript, source or forked as `interview_mode` says).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "resulting_version_id": {
+              "description": "Set once `workflow.review.apply` compiles and mints a new version.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "started_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "$ref": "#/schemas/event/$defs/WorkflowReviewStatus"
+            },
+            "version_id": {
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "run_id",
+            "workflow_id",
+            "version_id",
+            "status",
+            "started_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkflowReviewStatus": {
+          "description": "The self-improvement review cycle's status\n(`store/migrations/0001_init.surql`'s `review_cycle.status` ASSERT).",
+          "enum": [
+            "running",
+            "awaiting_user",
+            "applied",
+            "declined",
+            "failed"
+          ],
+          "type": "string"
+        },
         "WorkflowRunInfo": {
           "properties": {
             "args": {
@@ -1680,6 +1873,17 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "attention": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/WorkflowAttention"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "A karvex-owned verdict about why this node needs a human, distinct\nfrom Claude Code's own projected `status`\n(`.local/prd/phase4-retarget-plan.md` §6 D-10). `None` means the\nwatchdog has nothing to report, which includes both \"healthy\" and \"the\nwatchdog has not looked yet\".\n\nLanded as shape in wave 0 (packet P3) ahead of its store column and\nwriter, which the watchdog packet (wave 2b) adds — this field reads\n`None` on every run until then, honestly, because nothing sets it yet\nrather than because it is faked healthy."
             },
             "blocker": true,
             "cwd": {
@@ -5094,6 +5298,54 @@
                 "type"
               ],
               "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.node.watchdog",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.review.started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.review.ready",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workflow.review.closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -5376,6 +5628,73 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        },
+        "WorkflowReviewAnswerParams": {
+          "description": "One interview pane's self-report (`kvx workflow review answer`), from its\nown pane — authorised exactly like [`WorkflowRunFinishParams`]: possession\nof the run id plus `KARVEX_WORKFLOW_REVIEW_INTERVIEW`, the env var karvex\nexported into that specific interview pane, checked against `member` so a\npane can only ever answer for the interview it was spawned to conduct.",
+          "properties": {
+            "answer": {
+              "description": "The answer JSON itself. Exactly one of this and `answer_file` is\nrequired, the same split `WorkflowRunFinishParams` uses and for the\nsame reason: the interviewer writes JSON to\n`<cycle dir>/answers/<member>.json` and should not have to inline it\nthrough argv."
+            },
+            "answer_file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "member": {
+              "description": "The team-roster name this interview was conducted with.",
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "member"
+          ],
+          "type": "object"
+        },
+        "WorkflowReviewApplyParams": {
+          "description": "`workflow.review.start` / `workflow.review.get` share `WorkflowRunTarget`\n(reused, `run_id`) — there is at most one review cycle per run at a time.\n\n`workflow.review.apply` — everything not in `accept` is declined; an empty\n`accept` declines the whole cycle.",
+          "properties": {
+            "accept": {
+              "default": [],
+              "description": "Finding `node_key`s to accept. Every finding this cycle produced that\nis not named here is declined.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        },
+        "WorkflowReviewReportParams": {
+          "description": "The synthesis pane's self-report (`kvx workflow review report --file\nfindings.json`), authorised the same way\n[`WorkflowReviewAnswerParams`] is.",
+          "properties": {
+            "findings": {
+              "description": "The findings JSON itself. Exactly one of this and `findings_file` is\nrequired."
+            },
+            "findings_file": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "run_id": {
               "type": "string"
@@ -7719,6 +8038,86 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.review.start",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.review.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.review.apply",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowReviewApplyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.review.answer",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowReviewAnswerParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.review.report",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowReviewReportParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -9064,6 +9463,90 @@
                 "interrogation"
               ],
               "type": "object"
+            },
+            {
+              "description": "One watchdog rung fired against a node\n(`.local/prd/phase4-retarget-plan.md` §3.4). Carries the node as of\nthe intervention, so a subscriber sees `watchdog_interventions` and\n`attention` without a second `workflow.run.get` round trip.",
+              "properties": {
+                "node": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_node_watchdog",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "node"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A review cycle began (`workflow.review.start`).",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowReviewInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_review_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "review"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A review cycle finished synthesis and is waiting on the human's\nper-finding accept.",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowReviewInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_review_ready",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "review"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A review cycle reached a terminal status: `applied`, `declined`, or\n`failed`.",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowReviewInfo"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workflow_review_closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "review"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -9119,7 +9602,11 @@
             "workflow_growth_limited",
             "workflow_run_summarized",
             "workflow_interrogation_started",
-            "workflow_interrogation_ended"
+            "workflow_interrogation_ended",
+            "workflow_node_watchdog",
+            "workflow_review_started",
+            "workflow_review_ready",
+            "workflow_review_closed"
           ],
           "type": "string"
         },
@@ -12464,6 +12951,110 @@
               "type": "object"
             },
             {
+              "description": "A review cycle was started (`workflow.review.start`).",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowReviewInfo"
+                },
+                "type": {
+                  "const": "workflow_review_started",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "review"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "`workflow.review.get`'s answer. `review: None` means this run has\nnever had a review cycle — a normal answer, not an error, matching\n`WorkflowSummaryGet`'s precedent.",
+              "properties": {
+                "findings": {
+                  "default": [],
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/WorkflowReviewFindingInfo"
+                  },
+                  "type": "array"
+                },
+                "review": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/WorkflowReviewInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "workflow_review_get",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The human's per-finding accept (`workflow.review.apply`) was recorded.\n`version_id` is set only when at least one accepted finding compiled\nand minted a new `kvdag_version`; an all-declined apply is a\nsuccessful response with `version_id: None`.",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowReviewInfo"
+                },
+                "type": {
+                  "const": "workflow_review_applied",
+                  "type": "string"
+                },
+                "version_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "review"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "An interview pane's self-report was recorded\n(`workflow.review.answer`).",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowReviewInfo"
+                },
+                "type": {
+                  "const": "workflow_review_answered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "review"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The synthesis pane's self-report was recorded\n(`workflow.review.report`), moving the cycle to `awaiting_user`.",
+              "properties": {
+                "review": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowReviewInfo"
+                },
+                "type": {
+                  "const": "workflow_review_reported",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "review"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "type": {
                   "const": "ok",
@@ -12632,6 +13223,36 @@
             "name"
           ],
           "type": "object"
+        },
+        "WorkflowAttention": {
+          "description": "[`WorkflowRunNodeInfo::attention`]'s fixed vocabulary, mirroring the\n`run_node.attention` store ASSERT\n(`.local/prd/phase4-retarget-plan.md` §3.7).",
+          "oneOf": [
+            {
+              "const": "stuck",
+              "description": "The owner's pane has been idle for `stuck_threshold` samples while its\ntask stayed `in_progress`, and the watchdog ladder ran out of rungs.",
+              "type": "string"
+            },
+            {
+              "const": "budget_exceeded",
+              "description": "The node's authored `timeout_ms` was exceeded; jumps straight to\nsurfaced without walking the nudge/re-prompt rungs.",
+              "type": "string"
+            },
+            {
+              "const": "needs_input",
+              "description": "The owner's pane is `needs input`, or the task is `blockedBy` an\nunfinished task — a human, not a nudge, unblocks this.",
+              "type": "string"
+            },
+            {
+              "const": "lead_blocked",
+              "description": "The lead's own pane is `needs input`, which blocks the whole run.",
+              "type": "string"
+            },
+            {
+              "const": "unbound",
+              "description": "The run never bound a team within the bind deadline.",
+              "type": "string"
+            }
+          ]
         },
         "WorkflowDemand": {
           "description": "How demanding a node's work is; drives the tier's model/effort mapping.",
@@ -12930,6 +13551,16 @@
           ],
           "type": "string"
         },
+        "WorkflowMemberState": {
+          "description": "[`WorkflowRunMemberInfo::last_state`]'s vocabulary — deliberately its own\nenum rather than a shared \"pane state\" type (module doc: self-contained by\ndesign), and deliberately not [`WorkflowNodeStatus`]: a member's own agent\nstate and the task it owns are two different facts that can disagree,\nwhich is precisely what the watchdog's `LocalLoop` class detects.",
+          "enum": [
+            "working",
+            "idle",
+            "needs_input",
+            "unknown"
+          ],
+          "type": "string"
+        },
         "WorkflowNodeKind": {
           "description": "What a node *is*. Orthogonal to [`WorkflowRunner`], which selects how it\nis bound to a process.",
           "enum": [
@@ -13025,6 +13656,170 @@
             "checkpoint_seq"
           ],
           "type": "object"
+        },
+        "WorkflowReviewFindingInfo": {
+          "description": "One finding a review cycle produced, as the wire sees it. Findings are\nrecorded wholesale and applied selectively: `accepted` says what\n`workflow.review.apply` actually folded into the compiled version.",
+          "properties": {
+            "accepted": {
+              "default": false,
+              "type": "boolean"
+            },
+            "applied_in_version": {
+              "description": "Set once this finding's change is folded into a compiled version.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "evidence": {
+              "default": null,
+              "description": "Measured, not asserted: watchdog interventions, idle time, tokens,\ntool uses, duration, schema failures — the numbers put to the\nteammate, carried back so a reader can see what the verdict answers."
+            },
+            "interrogation_id": {
+              "description": "The `interrogation` row this finding came out of; absent only when the\ninterview was `evidence_only`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "interview_mode": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowReviewInterviewMode"
+            },
+            "level": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowReviewFindingLevel"
+            },
+            "node_key": {
+              "type": "string"
+            },
+            "proposed_change": {
+              "default": null,
+              "description": "The concrete change: a prompt rewrite, or a node-field delta."
+            },
+            "rationale": {
+              "type": "string"
+            },
+            "replacement": {
+              "description": "Mandatory when `verdict` is `replace`: a full replacement role\ndefinition."
+            },
+            "run_path": {
+              "description": "The run node this finding is about, when it is about one specific\ninstance rather than the run/lead as a whole.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verdict": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowReviewVerdict"
+            }
+          },
+          "required": [
+            "node_key",
+            "interview_mode",
+            "level",
+            "verdict",
+            "rationale"
+          ],
+          "type": "object"
+        },
+        "WorkflowReviewFindingLevel": {
+          "description": "Whether a finding is a prompt-level tweak or a structural change to the\nnode's own definition (`review_finding.level` ASSERT).",
+          "enum": [
+            "prompt",
+            "structural"
+          ],
+          "type": "string"
+        },
+        "WorkflowReviewInfo": {
+          "description": "A run's self-improvement review cycle, as the wire sees it\n(`09-agent-teams-rework.md`, `.local/prd/phase4-retarget-plan.md` §3.5).",
+          "properties": {
+            "ended_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "evidence_only_count": {
+              "default": 0,
+              "description": "How many of this cycle's interviews degraded to `evidence_only`\nbecause no session could be resumed — surfaced so \"the review ran\"\nand \"the review heard from everyone\" are never conflated.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "interview_paths": {
+              "default": [],
+              "description": "One path per interview this cycle conducted (the interrogation's\ntranscript, source or forked as `interview_mode` says).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "resulting_version_id": {
+              "description": "Set once `workflow.review.apply` compiles and mints a new version.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "started_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/WorkflowReviewStatus"
+            },
+            "version_id": {
+              "type": "string"
+            },
+            "workflow_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "run_id",
+            "workflow_id",
+            "version_id",
+            "status",
+            "started_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkflowReviewInterviewMode": {
+          "description": "Whether one finding came from the teammate's own forked-session account,\nor was inferred from evidence alone because no session could be resumed\n(`store/migrations/0001_init.surql`'s `review_finding.interview_mode`\nASSERT). The honesty rule survives verbatim from `08`: a finding never\nclaims a teammate's account it does not have.",
+          "enum": [
+            "resumed",
+            "evidence_only"
+          ],
+          "type": "string"
+        },
+        "WorkflowReviewStatus": {
+          "description": "The self-improvement review cycle's status\n(`store/migrations/0001_init.surql`'s `review_cycle.status` ASSERT).",
+          "enum": [
+            "running",
+            "awaiting_user",
+            "applied",
+            "declined",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "WorkflowReviewVerdict": {
+          "description": "The interviewer's verdict on one node's role (`review_finding.verdict`\nASSERT). `Replace` without a `replacement` is refused by the store\n(`0001_init.surql`'s `review_finding_replace_requires_replacement` event)\nand, ahead of that, by the handler.",
+          "enum": [
+            "keep",
+            "improve",
+            "replace"
+          ],
+          "type": "string"
         },
         "WorkflowRunEdgeInfo": {
           "properties": {
@@ -13290,6 +14085,17 @@
               "minimum": 0,
               "type": "integer"
             },
+            "last_state": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowMemberState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The last pane agent state karvex observed for this member's owner\npane, so a finished run can still say how long a teammate sat idle\nwhile its task stayed `in_progress`. `None` for the in-process lead\n(no pane) or before any state has been observed.\n\nLanded as shape in wave 0 (packet P3); populated starting with P8's\nmember-identity capture."
+            },
             "model": {
               "default": "",
               "type": "string"
@@ -13299,6 +14105,13 @@
             },
             "pane_id": {
               "description": "The member's karvex pane, for a split-pane teammate. Absent for the\nin-process lead, which is a session rather than a pane.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "description": "This member's own Claude Code session id, captured while the run was\nalive (`.local/prd/phase4-retarget-plan.md` §3.3) — `members[]` never\ncarries one, and the config dir it lived in can vanish once the\nsession ends. Absent means karvex never resolved one for this member,\nwhich makes that member `evidence_only` forever in a review — an\nhonest, visible outcome rather than a silent one.\n\nLanded as shape in wave 0 (packet P3); populated starting with P8's\nmember-identity capture.",
               "type": [
                 "string",
                 "null"
@@ -13427,6 +14240,17 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "attention": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowAttention"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "A karvex-owned verdict about why this node needs a human, distinct\nfrom Claude Code's own projected `status`\n(`.local/prd/phase4-retarget-plan.md` §6 D-10). `None` means the\nwatchdog has nothing to report, which includes both \"healthy\" and \"the\nwatchdog has not looked yet\".\n\nLanded as shape in wave 0 (packet P3) ahead of its store column and\nwriter, which the watchdog packet (wave 2b) adds — this field reads\n`None` on every run until then, honestly, because nothing sets it yet\nrather than because it is faked healthy."
             },
             "blocker": true,
             "cwd": {

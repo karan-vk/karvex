@@ -279,6 +279,21 @@ pub enum Method {
     WorkflowSummaryGet(WorkflowRunTarget),
     #[serde(rename = "workflow.summary.list")]
     WorkflowSummaryList(WorkflowSummaryListParams),
+    // Phase 4 additions (`.local/prd/phase4-retarget-plan.md` §5 packet P3):
+    // the self-improvement review cycle. `start`/`get` share `WorkflowRunTarget`;
+    // `apply` is the human's per-finding accept; `answer`/`report` are the two
+    // self-report methods an interview/synthesis pane calls on itself, exactly
+    // as `workflow.run.finish` already does for the lead.
+    #[serde(rename = "workflow.review.start")]
+    WorkflowReviewStart(WorkflowRunTarget),
+    #[serde(rename = "workflow.review.get")]
+    WorkflowReviewGet(WorkflowRunTarget),
+    #[serde(rename = "workflow.review.apply")]
+    WorkflowReviewApply(WorkflowReviewApplyParams),
+    #[serde(rename = "workflow.review.answer")]
+    WorkflowReviewAnswer(WorkflowReviewAnswerParams),
+    #[serde(rename = "workflow.review.report")]
+    WorkflowReviewReport(WorkflowReviewReportParams),
 }
 
 #[cfg(test)]

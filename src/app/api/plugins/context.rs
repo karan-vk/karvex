@@ -215,6 +215,17 @@ impl App {
                 .as_deref()
                 .and_then(|pane_id| self.plugin_context_for_public_pane_id(pane_id, correlation_id))
                 .unwrap_or_else(|| empty_plugin_context(correlation_id)),
+            // Phase 4 additions (`.local/prd/phase4-retarget-plan.md` §5
+            // packet P3). Also not yet in `PLUGIN_HOOK_EVENT_KINDS` — same
+            // reasoning as the Phase 1-3 arms above.
+            EventData::WorkflowNodeWatchdog { node, .. } => node
+                .pane_id
+                .as_deref()
+                .and_then(|pane_id| self.plugin_context_for_public_pane_id(pane_id, correlation_id))
+                .unwrap_or_else(|| empty_plugin_context(correlation_id)),
+            EventData::WorkflowReviewStarted { .. }
+            | EventData::WorkflowReviewReady { .. }
+            | EventData::WorkflowReviewClosed { .. } => empty_plugin_context(correlation_id),
         }
     }
 

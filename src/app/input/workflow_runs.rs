@@ -686,6 +686,8 @@ mod tests {
             cwd: None,
             first_seen_at_unix_ms: 1,
             last_seen_at_unix_ms: 2,
+            session_id: None,
+            last_state: None,
         };
         assert_eq!(member_label(&member), "research · sonnet · w1:p3");
 

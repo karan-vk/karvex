@@ -782,6 +782,39 @@ pub struct WorkflowRunNodeInfo {
     /// the contract, recorded.
     #[serde(default)]
     pub emergent: bool,
+    /// A karvex-owned verdict about why this node needs a human, distinct
+    /// from Claude Code's own projected `status`
+    /// (`.local/prd/phase4-retarget-plan.md` §6 D-10). `None` means the
+    /// watchdog has nothing to report, which includes both "healthy" and "the
+    /// watchdog has not looked yet".
+    ///
+    /// Landed as shape in wave 0 (packet P3) ahead of its store column and
+    /// writer, which the watchdog packet (wave 2b) adds — this field reads
+    /// `None` on every run until then, honestly, because nothing sets it yet
+    /// rather than because it is faked healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<WorkflowAttention>,
+}
+
+/// [`WorkflowRunNodeInfo::attention`]'s fixed vocabulary, mirroring the
+/// `run_node.attention` store ASSERT
+/// (`.local/prd/phase4-retarget-plan.md` §3.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAttention {
+    /// The owner's pane has been idle for `stuck_threshold` samples while its
+    /// task stayed `in_progress`, and the watchdog ladder ran out of rungs.
+    Stuck,
+    /// The node's authored `timeout_ms` was exceeded; jumps straight to
+    /// surfaced without walking the nudge/re-prompt rungs.
+    BudgetExceeded,
+    /// The owner's pane is `needs input`, or the task is `blockedBy` an
+    /// unfinished task — a human, not a nudge, unblocks this.
+    NeedsInput,
+    /// The lead's own pane is `needs input`, which blocks the whole run.
+    LeadBlocked,
+    /// The run never bound a team within the bind deadline.
+    Unbound,
 }
 
 fn default_attempt() -> u32 {
@@ -824,6 +857,40 @@ pub struct WorkflowRunMemberInfo {
     pub cwd: Option<String>,
     pub first_seen_at_unix_ms: u64,
     pub last_seen_at_unix_ms: u64,
+    /// This member's own Claude Code session id, captured while the run was
+    /// alive (`.local/prd/phase4-retarget-plan.md` §3.3) — `members[]` never
+    /// carries one, and the config dir it lived in can vanish once the
+    /// session ends. Absent means karvex never resolved one for this member,
+    /// which makes that member `evidence_only` forever in a review — an
+    /// honest, visible outcome rather than a silent one.
+    ///
+    /// Landed as shape in wave 0 (packet P3); populated starting with P8's
+    /// member-identity capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The last pane agent state karvex observed for this member's owner
+    /// pane, so a finished run can still say how long a teammate sat idle
+    /// while its task stayed `in_progress`. `None` for the in-process lead
+    /// (no pane) or before any state has been observed.
+    ///
+    /// Landed as shape in wave 0 (packet P3); populated starting with P8's
+    /// member-identity capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state: Option<WorkflowMemberState>,
+}
+
+/// [`WorkflowRunMemberInfo::last_state`]'s vocabulary — deliberately its own
+/// enum rather than a shared "pane state" type (module doc: self-contained by
+/// design), and deliberately not [`WorkflowNodeStatus`]: a member's own agent
+/// state and the task it owns are two different facts that can disagree,
+/// which is precisely what the watchdog's `LocalLoop` class detects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMemberState {
+    Working,
+    Idle,
+    NeedsInput,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1019,6 +1086,166 @@ pub struct WorkflowDetail {
     pub args: Vec<WorkflowArgSpec>,
     #[serde(default)]
     pub versions: Vec<KvdagVersionSummary>,
+}
+
+// ── Phase 4 additions: the anti-stuck watchdog + the self-improvement review
+//    cycle (`.local/prd/phase4-retarget-plan.md` §3, §5 packet P3) ──────────
+
+/// The self-improvement review cycle's status
+/// (`store/migrations/0001_init.surql`'s `review_cycle.status` ASSERT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowReviewStatus {
+    Running,
+    AwaitingUser,
+    Applied,
+    Declined,
+    Failed,
+}
+
+/// Whether one finding came from the teammate's own forked-session account,
+/// or was inferred from evidence alone because no session could be resumed
+/// (`store/migrations/0001_init.surql`'s `review_finding.interview_mode`
+/// ASSERT). The honesty rule survives verbatim from `08`: a finding never
+/// claims a teammate's account it does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowReviewInterviewMode {
+    Resumed,
+    EvidenceOnly,
+}
+
+/// Whether a finding is a prompt-level tweak or a structural change to the
+/// node's own definition (`review_finding.level` ASSERT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowReviewFindingLevel {
+    Prompt,
+    Structural,
+}
+
+/// The interviewer's verdict on one node's role (`review_finding.verdict`
+/// ASSERT). `Replace` without a `replacement` is refused by the store
+/// (`0001_init.surql`'s `review_finding_replace_requires_replacement` event)
+/// and, ahead of that, by the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowReviewVerdict {
+    Keep,
+    Improve,
+    Replace,
+}
+
+/// A run's self-improvement review cycle, as the wire sees it
+/// (`09-agent-teams-rework.md`, `.local/prd/phase4-retarget-plan.md` §3.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowReviewInfo {
+    pub id: String,
+    pub run_id: String,
+    pub workflow_id: String,
+    pub version_id: String,
+    pub status: WorkflowReviewStatus,
+    pub started_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_unix_ms: Option<u64>,
+    /// Set once `workflow.review.apply` compiles and mints a new version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_version_id: Option<String>,
+    /// One path per interview this cycle conducted (the interrogation's
+    /// transcript, source or forked as `interview_mode` says).
+    #[serde(default)]
+    pub interview_paths: Vec<String>,
+    /// How many of this cycle's interviews degraded to `evidence_only`
+    /// because no session could be resumed — surfaced so "the review ran"
+    /// and "the review heard from everyone" are never conflated.
+    #[serde(default)]
+    pub evidence_only_count: u32,
+}
+
+/// One finding a review cycle produced, as the wire sees it. Findings are
+/// recorded wholesale and applied selectively: `accepted` says what
+/// `workflow.review.apply` actually folded into the compiled version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowReviewFindingInfo {
+    pub node_key: String,
+    /// The run node this finding is about, when it is about one specific
+    /// instance rather than the run/lead as a whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_path: Option<String>,
+    /// The `interrogation` row this finding came out of; absent only when the
+    /// interview was `evidence_only`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrogation_id: Option<String>,
+    pub interview_mode: WorkflowReviewInterviewMode,
+    pub level: WorkflowReviewFindingLevel,
+    pub verdict: WorkflowReviewVerdict,
+    pub rationale: String,
+    /// Measured, not asserted: watchdog interventions, idle time, tokens,
+    /// tool uses, duration, schema failures — the numbers put to the
+    /// teammate, carried back so a reader can see what the verdict answers.
+    #[serde(default)]
+    pub evidence: serde_json::Value,
+    /// The concrete change: a prompt rewrite, or a node-field delta.
+    #[serde(default)]
+    pub proposed_change: serde_json::Value,
+    /// Mandatory when `verdict` is `replace`: a full replacement role
+    /// definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<serde_json::Value>,
+    #[serde(default)]
+    pub accepted: bool,
+    /// Set once this finding's change is folded into a compiled version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_in_version: Option<String>,
+}
+
+/// `workflow.review.start` / `workflow.review.get` share `WorkflowRunTarget`
+/// (reused, `run_id`) — there is at most one review cycle per run at a time.
+///
+/// `workflow.review.apply` — everything not in `accept` is declined; an empty
+/// `accept` declines the whole cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowReviewApplyParams {
+    pub run_id: String,
+    /// Finding `node_key`s to accept. Every finding this cycle produced that
+    /// is not named here is declined.
+    #[serde(default)]
+    pub accept: Vec<String>,
+}
+
+/// One interview pane's self-report (`kvx workflow review answer`), from its
+/// own pane — authorised exactly like [`WorkflowRunFinishParams`]: possession
+/// of the run id plus `KARVEX_WORKFLOW_REVIEW_INTERVIEW`, the env var karvex
+/// exported into that specific interview pane, checked against `member` so a
+/// pane can only ever answer for the interview it was spawned to conduct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowReviewAnswerParams {
+    pub run_id: String,
+    /// The team-roster name this interview was conducted with.
+    pub member: String,
+    /// The answer JSON itself. Exactly one of this and `answer_file` is
+    /// required, the same split `WorkflowRunFinishParams` uses and for the
+    /// same reason: the interviewer writes JSON to
+    /// `<cycle dir>/answers/<member>.json` and should not have to inline it
+    /// through argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_file: Option<String>,
+}
+
+/// The synthesis pane's self-report (`kvx workflow review report --file
+/// findings.json`), authorised the same way
+/// [`WorkflowReviewAnswerParams`] is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowReviewReportParams {
+    pub run_id: String,
+    /// The findings JSON itself. Exactly one of this and `findings_file` is
+    /// required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_file: Option<String>,
 }
 
 #[cfg(test)]
@@ -1312,6 +1539,7 @@ pub(crate) mod tests {
             subject: String::new(),
             owner: String::new(),
             emergent: false,
+            attention: None,
         }
     }
 
@@ -1354,6 +1582,8 @@ pub(crate) mod tests {
                 cwd: Some("/home/dev/project".into()),
                 first_seen_at_unix_ms: 1,
                 last_seen_at_unix_ms: 2,
+                session_id: None,
+                last_state: None,
             }],
             messaging: None,
         };
@@ -2303,6 +2533,72 @@ pub(crate) mod tests {
             "restore_from_run",
             "restored_from",
             "restore",
+            // Phase 4 additions (`.local/prd/phase4-retarget-plan.md` §5
+            // packet P3): the anti-stuck watchdog + the self-improvement
+            // review cycle.
+            "workflow.review.start",
+            "workflow.review.get",
+            "workflow.review.apply",
+            "workflow.review.answer",
+            "workflow.review.report",
+            "workflow.node.watchdog",
+            "workflow.review.started",
+            "workflow.review.ready",
+            "workflow.review.closed",
+            "WorkflowAttention",
+            "attention",
+            "stuck",
+            "budget_exceeded",
+            "needs_input",
+            "lead_blocked",
+            "unbound",
+            "WorkflowMemberState",
+            "working",
+            "idle",
+            "session_id",
+            "last_state",
+            "WorkflowReviewStatus",
+            "awaiting_user",
+            "applied",
+            "declined",
+            "WorkflowReviewInterviewMode",
+            "resumed",
+            "evidence_only",
+            "WorkflowReviewFindingLevel",
+            "prompt",
+            "structural",
+            "WorkflowReviewVerdict",
+            "keep",
+            "improve",
+            "replace",
+            "WorkflowReviewInfo",
+            "resulting_version_id",
+            "interview_paths",
+            "evidence_only_count",
+            "WorkflowReviewFindingInfo",
+            "run_path",
+            "interrogation_id",
+            "interview_mode",
+            "verdict",
+            "rationale",
+            "proposed_change",
+            "replacement",
+            "applied_in_version",
+            "WorkflowReviewApplyParams",
+            "accept",
+            "WorkflowReviewAnswerParams",
+            "member",
+            "answer",
+            "answer_file",
+            "WorkflowReviewReportParams",
+            "findings",
+            "findings_file",
+            "WorkflowReviewStarted",
+            "WorkflowReviewGet",
+            "WorkflowReviewApplied",
+            "WorkflowReviewAnswered",
+            "WorkflowReviewReported",
+            "review",
         ];
 
         let offenders: Vec<&str> = identifiers

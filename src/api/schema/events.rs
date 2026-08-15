@@ -6,8 +6,8 @@ use super::common::{AgentStatus, ReadSource};
 use super::panes::{PaneInfo, PaneReadResult, PaneScrollInfo};
 use super::tabs::TabInfo;
 use super::workflows::{
-    WorkflowGrowthLimitKind, WorkflowInterrogationInfo, WorkflowRunInfo, WorkflowRunNodeInfo,
-    WorkflowRunSummaryInfo,
+    WorkflowGrowthLimitKind, WorkflowInterrogationInfo, WorkflowReviewInfo, WorkflowRunInfo,
+    WorkflowRunNodeInfo, WorkflowRunSummaryInfo,
 };
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::WorktreeInfo;
@@ -106,6 +106,15 @@ pub enum Subscription {
     WorkflowInterrogationStarted {},
     #[serde(rename = "workflow.interrogation.ended")]
     WorkflowInterrogationEnded {},
+    // Phase 4 additions (`.local/prd/phase4-retarget-plan.md` §5 packet P3).
+    #[serde(rename = "workflow.node.watchdog")]
+    WorkflowNodeWatchdog {},
+    #[serde(rename = "workflow.review.started")]
+    WorkflowReviewStarted {},
+    #[serde(rename = "workflow.review.ready")]
+    WorkflowReviewReady {},
+    #[serde(rename = "workflow.review.closed")]
+    WorkflowReviewClosed {},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -252,6 +261,10 @@ pub enum EventKind {
     WorkflowRunSummarized,
     WorkflowInterrogationStarted,
     WorkflowInterrogationEnded,
+    WorkflowNodeWatchdog,
+    WorkflowReviewStarted,
+    WorkflowReviewReady,
+    WorkflowReviewClosed,
 }
 
 impl EventKind {
@@ -293,6 +306,10 @@ impl EventKind {
             EventKind::WorkflowRunSummarized => "workflow.run.summarized",
             EventKind::WorkflowInterrogationStarted => "workflow.interrogation.started",
             EventKind::WorkflowInterrogationEnded => "workflow.interrogation.ended",
+            EventKind::WorkflowNodeWatchdog => "workflow.node.watchdog",
+            EventKind::WorkflowReviewStarted => "workflow.review.started",
+            EventKind::WorkflowReviewReady => "workflow.review.ready",
+            EventKind::WorkflowReviewClosed => "workflow.review.closed",
         }
     }
 }
@@ -335,6 +352,10 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::WorkflowRunSummarized,
     EventKind::WorkflowInterrogationStarted,
     EventKind::WorkflowInterrogationEnded,
+    EventKind::WorkflowNodeWatchdog,
+    EventKind::WorkflowReviewStarted,
+    EventKind::WorkflowReviewReady,
+    EventKind::WorkflowReviewClosed,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -477,6 +498,7 @@ mod workflow_event_tests {
             succession: None,
             blocker: None,
             watchdog_interventions: 0,
+            attention: None,
             assignment_reason: String::new(),
             delivery_failure: None,
             growth_limited: None,
@@ -927,5 +949,30 @@ pub enum EventData {
     },
     WorkflowInterrogationEnded {
         interrogation: WorkflowInterrogationInfo,
+    },
+    /// One watchdog rung fired against a node
+    /// (`.local/prd/phase4-retarget-plan.md` §3.4). Carries the node as of
+    /// the intervention, so a subscriber sees `watchdog_interventions` and
+    /// `attention` without a second `workflow.run.get` round trip.
+    WorkflowNodeWatchdog {
+        run_id: String,
+        node: WorkflowRunNodeInfo,
+    },
+    /// A review cycle began (`workflow.review.start`).
+    WorkflowReviewStarted {
+        run_id: String,
+        review: WorkflowReviewInfo,
+    },
+    /// A review cycle finished synthesis and is waiting on the human's
+    /// per-finding accept.
+    WorkflowReviewReady {
+        run_id: String,
+        review: WorkflowReviewInfo,
+    },
+    /// A review cycle reached a terminal status: `applied`, `declined`, or
+    /// `failed`.
+    WorkflowReviewClosed {
+        run_id: String,
+        review: WorkflowReviewInfo,
     },
 }

@@ -17,7 +17,11 @@ static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".karvex-test-owner-pid";
-pub const CURRENT_PROTOCOL: u32 = 19;
+// Intentionally hardcoded, matching `tests/api_ping.rs`'s convention: a
+// manual protocol fixture used to simulate this binary's own protocol from
+// outside it (a real client/server pair), so a wire protocol bump has to
+// update this alongside `src/protocol/wire.rs::PROTOCOL_VERSION`.
+pub const CURRENT_PROTOCOL: u32 = 20;
 
 /// Config/state subdirectory the binary under test actually reads. Debug builds
 /// resolve to `karvex-dev`, so a test that writes `config.toml` under `karvex/`
