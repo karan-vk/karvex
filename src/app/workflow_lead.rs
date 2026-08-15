@@ -759,10 +759,18 @@ impl crate::app::App {
             .as_ref()
             .filter(|run| !run.closed && &run.run_id == run_id)?;
         let supported = run.messaging.is_available();
+        // `reason`/`detail` are keyed off `Available`, not off `supported`. A
+        // suspected kill switch *is* supported — karvex tries anyway, because
+        // the variable provably does nothing on an account whose Claude Code
+        // feature flags are cached — but it is still the one thing about this
+        // run's messaging a user might need to know, and gating the words on
+        // `supported` meant the only unverifiable case was also the only silent
+        // one.
+        let noteworthy = !matches!(run.messaging, MessagingSupport::Available);
         Some(crate::api::schema::WorkflowRunMessagingInfo {
             supported,
-            reason: (!supported).then(|| run.messaging.code().to_string()),
-            detail: (!supported).then(|| run.messaging.to_string()),
+            reason: noteworthy.then(|| run.messaging.code().to_string()),
+            detail: noteworthy.then(|| run.messaging.to_string()),
             targets: self
                 .run_message_targets()
                 .into_iter()
@@ -1651,5 +1659,212 @@ mod tests {
         assert!(read_tasks(Path::new("/nonexistent/karvex/tasks")).is_empty());
         assert!(read_team_configs(Path::new("/nonexistent/karvex/teams")).is_empty());
         assert!(read_team_config(Path::new("/nonexistent/karvex/config.json")).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "workflow"))]
+mod live_run_tests {
+    use super::*;
+    use crate::api::schema::Method;
+    use crate::workflow::binding::identity::SessionReport;
+    use crate::workflow::binding::messaging::{MessagingSupport, Priority};
+
+    fn test_app() -> crate::app::App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.workflow_store = crate::app::workflow_store::WorkflowStoreHandle::in_memory();
+        app
+    }
+
+    /// A live lead run with nothing reported yet: the state `workflow.run`
+    /// leaves behind the instant the lead's pane exists.
+    fn app_with_a_live_run() -> (crate::app::App, RunId) {
+        let mut app = test_app();
+        let response = app.dispatch_api_request(
+            "test.workflow.create",
+            Method::WorkflowCreate(crate::api::schema::WorkflowCreateParams {
+                definition: crate::api::schema::WorkflowDefinitionDocument {
+                    format: crate::api::schema::WorkflowDefinitionFormat::Toml,
+                    text: r#"
+name = "ship-it"
+description = "a test workflow"
+default_tier = "low"
+
+[[node]]
+key = "plan"
+label = "Plan"
+runner = "command"
+command = ["/bin/true"]
+prompt_template = "plan"
+output_schema = { type = "object" }
+"#
+                    .to_string(),
+                },
+            }),
+        );
+        let workflow_id = serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .and_then(|value| value["result"]["workflow"]["workflow_id"].as_str().map(str::to_string))
+            .unwrap_or_else(|| panic!("the workflow was created: {response}"));
+        let run_id = app.test_bind_a_live_lead_run(&workflow_id, "ship-it");
+        (app, run_id)
+    }
+
+    fn lead_reports_itself(app: &mut crate::app::App, socket: Option<&str>) {
+        let pane_id = app
+            .workflow_lead
+            .as_ref()
+            .map(|run| run.lead_pane_id.clone())
+            .expect("a live run");
+        let run_id = app
+            .workflow_lead
+            .as_ref()
+            .map(|run| run.run_id.to_string())
+            .expect("a live run");
+        app.record_run_session_report(&SessionReport {
+            run_id,
+            pane_id: Some(pane_id),
+            session_id: "51ea857f-cb96-4372-ae75-bab1640c8428".to_string(),
+            cwd: Some("/repo".to_string()),
+            source: Some("startup".to_string()),
+            messaging_socket: socket.map(str::to_string),
+            messaging_token: socket.map(|_| "50093985aaaabbbbccccddddeeeeffff".to_string()),
+            agent_id: None,
+        });
+    }
+
+    /// S3's binding correction, at the two places a user could ever hear about
+    /// it. A kill-switch variable only disables messaging on an account whose
+    /// Claude Code feature flags have never been fetched, so karvex must not
+    /// refuse over one — but it must still say what it saw, or the one case it
+    /// cannot verify is also the one case nobody is told about.
+    #[test]
+    fn a_suspected_kill_switch_is_reported_to_clients_and_still_lets_the_run_be_messaged() {
+        let (mut app, run_id) = app_with_a_live_run();
+        if let Some(run) = app.workflow_lead.as_mut() {
+            run.messaging = MessagingSupport::KillSwitchSuspected {
+                variable: "DISABLE_TELEMETRY".to_string(),
+                value: "1".to_string(),
+            };
+        }
+        lead_reports_itself(&mut app, None);
+
+        let info = app
+            .run_messaging_info(&run_id)
+            .expect("the live run publishes its messaging state");
+        assert!(
+            info.supported,
+            "a suspicion is not a refusal: probed live, the variable changed nothing on an \
+             account with cached feature flags"
+        );
+        assert_eq!(info.reason.as_deref(), Some("kill_switch_suspected"));
+        assert!(
+            info.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("DISABLE_TELEMETRY")),
+            "the client is told which variable: {:?}",
+            info.detail
+        );
+
+        // And the send is refused for the *honest* reason — that session came
+        // up without an inbox socket — never for the suspicion.
+        let error = app
+            .message_run_session("team-lead", "rebase first", Priority::Next)
+            .expect_err("the lead reported no socket, and no pane exists in this fixture");
+        assert!(
+            !matches!(error, RunMessageError::Unsupported(_)),
+            "a suspicion must never block a send: {error}"
+        );
+    }
+
+    /// The other half: the two facts karvex *can* check do refuse, and they say
+    /// so rather than letting the verb quietly do nothing.
+    #[test]
+    fn a_platform_without_cross_session_messaging_refuses_the_send_and_names_the_reason() {
+        let (mut app, run_id) = app_with_a_live_run();
+        if let Some(run) = app.workflow_lead.as_mut() {
+            run.messaging = MessagingSupport::UnsupportedPlatform {
+                platform: "native Windows",
+            };
+        }
+        lead_reports_itself(&mut app, Some("/run/user/1000/cc-socks/1.sock"));
+
+        let info = app.run_messaging_info(&run_id).expect("a live run");
+        assert!(!info.supported);
+        assert_eq!(info.reason.as_deref(), Some("unsupported_platform"));
+
+        let error = app
+            .message_run_session("team-lead", "rebase first", Priority::Next)
+            .expect_err("native Windows has no inbox socket to write to");
+        assert!(matches!(error, RunMessageError::Unsupported(_)), "{error}");
+        assert!(error.to_string().contains("Windows"), "{error}");
+    }
+
+    /// Naming a session that does not exist has to list the ones that do. An
+    /// unknown target is the most likely mistake a client or a lead can make,
+    /// and "no" without "here is what there is" would be unusable.
+    #[test]
+    fn an_unknown_target_is_refused_with_the_roster_that_does_exist() {
+        let (mut app, _run_id) = app_with_a_live_run();
+        lead_reports_itself(&mut app, Some("/run/user/1000/cc-socks/1.sock"));
+
+        let error = app
+            .message_run_session("backend", "rebase first", Priority::Next)
+            .expect_err("no session is called backend");
+        match &error {
+            RunMessageError::UnknownTarget { requested, known } => {
+                assert_eq!(requested, "backend");
+                assert_eq!(known, &vec![lead::LEAD_TARGET_NAME.to_string()]);
+            }
+            other => panic!("expected an unknown-target refusal, got {other}"),
+        }
+        assert!(error.to_string().contains("team-lead"), "{error}");
+    }
+
+    /// Nothing has identified itself yet, so there is no session to address —
+    /// and saying that is the whole point. The verb existing at all is only
+    /// defensible if it refuses out loud.
+    #[test]
+    fn a_run_whose_sessions_have_not_reported_refuses_rather_than_pretending() {
+        let (mut app, _run_id) = app_with_a_live_run();
+        let error = app
+            .message_run_session("team-lead", "rebase first", Priority::Next)
+            .expect_err("no session has reported");
+        assert!(
+            matches!(error, RunMessageError::NoAddressableSessions),
+            "{error}"
+        );
+    }
+
+    /// The lead's self-report is what makes the run addressable at all, and the
+    /// roster name is the one the API already publishes rather than a second
+    /// vocabulary.
+    #[test]
+    fn the_leads_own_report_is_what_makes_the_run_addressable() {
+        let (mut app, _run_id) = app_with_a_live_run();
+        assert!(
+            app.run_message_targets().is_empty(),
+            "nothing is addressable before anything reports"
+        );
+        lead_reports_itself(&mut app, Some("/run/user/1000/cc-socks/1.sock"));
+
+        let targets = app.run_message_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, lead::LEAD_TARGET_NAME);
+        assert_eq!(
+            targets[0].endpoint.messaging_socket.as_deref(),
+            Some("/run/user/1000/cc-socks/1.sock")
+        );
+        assert_eq!(
+            targets[0].endpoint.messaging_token.as_deref(),
+            Some("50093985aaaabbbbccccddddeeeeffff"),
+            "the token is captured when the hook fires; it exists nowhere else"
+        );
     }
 }

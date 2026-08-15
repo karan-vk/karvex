@@ -947,10 +947,19 @@ impl App {
         // kill switch is reported once, loudly, instead of turning the message
         // verb into a silent no-op (`09-agent-teams-rework.md` §3.5a).
         let messaging = self.preflight_messaging_for_lead();
-        if !messaging.is_available() {
+        // Keyed off `Available`, not off `is_available()`: a *suspected* kill
+        // switch counts as available on purpose (S3 proved the variable does
+        // nothing on an account whose feature flags are already cached), and
+        // gating the warning on availability meant the one case karvex cannot
+        // check was also the one case nobody was ever told about.
+        if !matches!(
+            messaging,
+            crate::workflow::binding::messaging::MessagingSupport::Available
+        ) {
             tracing::warn!(
                 run = %run_id,
                 reason = messaging.code(),
+                blocking = messaging.blocks_messaging(),
                 "{messaging}"
             );
         }

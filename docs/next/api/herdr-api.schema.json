@@ -13387,13 +13387,14 @@
               ]
             },
             "reason": {
-              "description": "A stable word for why not: `claude_too_old`, `unsupported_platform`,\n`kill_switch`. Absent when messaging is available.",
+              "description": "A stable word for what karvex noticed: `claude_too_old`,\n`unsupported_platform`, or `kill_switch_suspected`. Absent only when\nthere was nothing to report.",
               "type": [
                 "string",
                 "null"
               ]
             },
             "supported": {
+              "description": "Whether karvex expects a message to this run's sessions to arrive.\n\n`true` alongside a `reason` of `kill_switch_suspected` is a real\ncombination and not a contradiction: the variable that can disable\ncross-session messaging only does so on an account whose Claude Code\nfeature flags have never been fetched, which karvex cannot see from\nhere, so it tries anyway and says what it noticed.",
               "type": "boolean"
             },
             "targets": {

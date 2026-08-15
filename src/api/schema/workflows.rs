@@ -347,9 +347,17 @@ pub struct WorkflowRunMessageReceipt {
 /// offering a verb that silently does nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowRunMessagingInfo {
+    /// Whether karvex expects a message to this run's sessions to arrive.
+    ///
+    /// `true` alongside a `reason` of `kill_switch_suspected` is a real
+    /// combination and not a contradiction: the variable that can disable
+    /// cross-session messaging only does so on an account whose Claude Code
+    /// feature flags have never been fetched, which karvex cannot see from
+    /// here, so it tries anyway and says what it noticed.
     pub supported: bool,
-    /// A stable word for why not: `claude_too_old`, `unsupported_platform`,
-    /// `kill_switch`. Absent when messaging is available.
+    /// A stable word for what karvex noticed: `claude_too_old`,
+    /// `unsupported_platform`, or `kill_switch_suspected`. Absent only when
+    /// there was nothing to report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The same reason as a sentence, for a client that has nowhere to put a
