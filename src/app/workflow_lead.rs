@@ -488,6 +488,19 @@ impl crate::app::App {
     /// because the lead *is* the run: karvex never decided anything else about
     /// how it ended.
     fn close_lead_node(&mut self, run_id: &RunId, status: RunStatus, ended_at_unix_ms: u64) {
+        // Only the run this server launched has a `.lead` node — it is minted
+        // at spawn. `workflow.run.finish` is authorised by possession of a run
+        // id and nothing else, so it can name a stored run that was never live
+        // here; settling a row that does not exist would be reported as a store
+        // failure and would degrade persistence over a run that is simply not
+        // this server's.
+        if self
+            .workflow_lead
+            .as_ref()
+            .is_none_or(|run| &run.run_id != run_id)
+        {
+            return;
+        }
         let node_status = match status {
             RunStatus::Succeeded => NodeStatus::Succeeded,
             RunStatus::Cancelled => NodeStatus::Cancelled,
@@ -2509,6 +2522,18 @@ output_schema = { type = "object" }
              this rework exists to remove"
         );
         assert_eq!(node.ended_at_unix_ms, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn finishing_a_run_this_server_never_launched_does_not_degrade_persistence() {
+        let (mut app, run_id) = app_with_a_live_run();
+        // `workflow.run.finish` is authorised by possession of a run id alone,
+        // so it can name a run that has no `.lead` node — one from before this
+        // landed, or one another server launched. Settling a row that is not
+        // there must not be reported to the user as a lost durable write.
+        app.workflow_lead = None;
+        app.finish_lead_run(&run_id, 1_700_000_000_000);
+        assert!(!app.workflow_persistence_degraded);
     }
 
     #[test]
