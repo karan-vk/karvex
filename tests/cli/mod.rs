@@ -15,11 +15,11 @@ mod surface;
 // exports nothing and has no `tmux` symlink to build this suite around.
 #[cfg(unix)]
 mod tmux_compat;
-// The workflow subsystem — and with it `workflow.*` handlers — is gated
-// behind the `workflow` feature (on by default; off for the MSVC cross-lint
-// leg and slim source builds, `Cargo.toml`). A server built without it
-// answers every `workflow.*` request with `workflow_unavailable`, so this
-// suite would only ever exercise its own failure path there.
-#[cfg(feature = "workflow")]
-mod workflow;
+// `mod workflow` used to sit here. Every one of its six cases drove a
+// `runner = "command"` node calling `kvx workflow node complete`/`node
+// expand` on itself — the node contract, which went with the engine
+// (`09-agent-teams-rework.md` §2). The surviving halves are covered
+// elsewhere: the CLI's renderers and argument parsing by the 97 unit tests in
+// `src/cli/workflow.rs`, and the real binary against a real server by
+// `tests/workflow_lead_headless.rs`, which drives `kvx workflow run finish`.
 mod workspace;

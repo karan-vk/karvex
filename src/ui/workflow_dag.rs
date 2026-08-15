@@ -1879,8 +1879,7 @@ mod tests {
     }
 
     /// Regression for the retest P1: `fanout` proposes `worker`, and `collect`
-    /// sits downstream of `fanout` on a direct authored data edge
-    /// (`tests/fixtures/workflow/expand.toml`, mirroring
+    /// sits downstream of `fanout` on a direct authored data edge (mirroring
     /// `04-kvdag-and-execution.md` §3.4's fan-in inheritance — `collect` also
     /// inherits an edge from `worker`). `collect` is one authored hop from
     /// `fanout`, but two *rows* away once `worker` is materialised, because

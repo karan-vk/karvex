@@ -1,8 +1,8 @@
 //! Newline-delimited JSON client helpers for the API socket.
 //!
 //! `tests/api_ping.rs` grew a private copy of this shape first; it is lifted
-//! here so a second integration binary (`tests/workflow_headless.rs`) can drive
-//! requests, subscriptions, and the event stream without another copy.
+//! here so a second integration binary (`tests/workflow_lead_headless.rs`) can
+//! drive requests, subscriptions, and the event stream without another copy.
 
 #![allow(dead_code)]
 
