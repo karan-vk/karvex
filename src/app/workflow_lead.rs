@@ -59,8 +59,9 @@ pub(crate) struct LiveLeadRun {
     /// The lead's own pane, as a public id.
     pub(crate) lead_pane_id: String,
     pub(crate) lead_terminal_id: crate::terminal::TerminalId,
-    /// What the lead pane was started in — the cwd `match_team` recognises the
-    /// team by, since Claude Code does not let karvex assign the session id.
+    /// What the lead pane was started in — the cwd
+    /// [`identity::match_team_window`] recognises the team by when the lead's
+    /// own assertion never arrives.
     pub(crate) lead_cwd: PathBuf,
     pub(crate) spawned_at_unix_ms: u64,
     /// The team, once recognised. `None` while the lead is still starting.
@@ -542,7 +543,8 @@ impl crate::app::App {
                 run = %run_id,
                 team = %binding.team_name,
                 evidence = evidence.as_str(),
-                "the run's lead never identified itself; falling back to matching a team by                  spawn window and cwd"
+                "the run's lead never identified itself; falling back to matching a team by \
+                 spawn window and cwd"
             );
         } else {
             debug!(
@@ -1299,7 +1301,7 @@ impl crate::app::App {
     }
 
     /// Every public pane id this server currently knows about, for
-    /// `match_team`'s strong rule: a team holding one of these panes is
+    /// [`identity::match_team_window`]'s strong rule: a team holding one of these panes is
     /// provably this karvex's.
     fn public_pane_ids_for_projection(&self) -> Vec<String> {
         let mut ids = Vec::new();
@@ -1558,7 +1560,9 @@ impl std::fmt::Display for RunMessageError {
             Self::NoLiveRun => f.write_str("no workflow run is live on this server"),
             Self::Unsupported(support) => write!(f, "{support}"),
             Self::NoAddressableSessions => f.write_str(
-                "the run has not identified any session yet, so there is nothing to message.                  Its lead reports itself through a SessionStart hook a second or two after the                  pane starts.",
+                "the run has not identified any session yet, so there is nothing to message. \
+                 Its lead reports itself through a SessionStart hook a second or two after the \
+                 pane starts.",
             ),
             Self::UnknownTarget { requested, known } => write!(
                 f,
@@ -1571,7 +1575,8 @@ impl std::fmt::Display for RunMessageError {
             ),
             Self::TargetNotAddressable { name } => write!(
                 f,
-                "{name} identified itself without a messaging socket, so Claude Code's                  cross-session messaging was not on in that session"
+                "{name} identified itself without a messaging socket, so Claude Code's \
+                 cross-session messaging was not on in that session"
             ),
             Self::BadMessage(detail) => write!(f, "{detail}"),
             Self::WriteFailed(detail) => write!(

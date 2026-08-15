@@ -3117,7 +3117,9 @@ impl WorkflowStore {
         let response = self
             .db
             .query(
-                "UPDATE $run SET lead_pane_id = $lead_pane_id,                  lead_terminal_id = $lead_terminal_id,                  lead_prompt_version = $lead_prompt_version",
+                "UPDATE $run SET lead_pane_id = $lead_pane_id, \
+                 lead_terminal_id = $lead_terminal_id, \
+                 lead_prompt_version = $lead_prompt_version",
             )
             .bind(("run", run_id))
             .bind(("lead_pane_id", lead_pane_id))

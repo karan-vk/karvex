@@ -99,8 +99,9 @@ pub struct LeadSpawnSpec {
     pub workflow_name: String,
     /// The run directory, `KARVEX_WORKFLOW_RUNS_DIR/<run id>/`.
     pub run_dir: PathBuf,
-    /// Where the lead's pane starts, which is also what [`match_team`]
-    /// recognises the team by.
+    /// Where the lead's pane starts, which is also what
+    /// [`super::identity::match_team_window`] recognises the team by, for a lead
+    /// whose own `SessionStart` assertion never arrives.
     pub cwd: PathBuf,
     /// The lead's own model/effort, resolved from the run's tier.
     pub assignment: Assignment,
@@ -627,6 +628,66 @@ mod tests {
             &RunId::new("workflow_run:abc"),
         );
         assert!(nasty.starts_with(r#"'/home/o'"'"'brien/kvx'"#), "{nasty}");
+    }
+
+    /// The contract that makes the run-scoped hook safe to ship.
+    ///
+    /// Claude Code *adds* a `--settings` payload's hook entries to the ones in
+    /// the user's own settings rather than substituting for them — probed live
+    /// against 2.1.232, where karvex's hook ran as `sessionstart-hook-3.sh`,
+    /// third of the three registered, and the user's own karvex agent-state
+    /// hook kept working in the lead's pane.
+    ///
+    /// That behaviour is upstream's and cannot be asserted from here. What
+    /// *can* be pinned, and is the half karvex controls, is that this document
+    /// never asks for the other behaviour: it registers exactly one hook of its
+    /// own, carries no key that suppresses or replaces the user's, and touches
+    /// no hook event other than `SessionStart`. A future edit that added
+    /// `disableAllHooks` — or that replaced the whole `hooks` map with a
+    /// karvex-only one — would silently disarm every hook the user installed,
+    /// including karvex's own bundled agent-state hook, and the symptom would
+    /// be agent detection quietly going dead in one pane.
+    #[test]
+    fn the_settings_document_only_adds_to_the_users_own_hooks() {
+        let document = lead_settings_document("kvx report");
+        let object = document.as_object().expect("a settings object");
+        // Every key is one of the three §3.1a documents. A new one has to be
+        // justified here, because everything in this file reaches the user's
+        // session and their teammates.
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["crossSessionInbound", "hooks", "teammateMode"]);
+
+        let hooks = object["hooks"].as_object().expect("a hooks object");
+        assert_eq!(
+            hooks.keys().collect::<Vec<_>>(),
+            vec!["SessionStart"],
+            "karvex registers one hook event; anything else is a hook the user \
+             did not ask karvex to run"
+        );
+        let entries = hooks["SessionStart"].as_array().expect("an entry list");
+        assert_eq!(entries.len(), 1, "exactly one entry, appended to theirs");
+        assert_eq!(
+            entries[0]["hooks"].as_array().map(Vec::len),
+            Some(1),
+            "and exactly one command inside it"
+        );
+
+        // No spelling of "and turn theirs off". Checked against the whole
+        // serialised document rather than the keys, so a nested placement is
+        // caught too.
+        let serialised = document.to_string();
+        for suppressor in [
+            "disableAllHooks",
+            "disableHooks",
+            "replaceHooks",
+            "hooksMode",
+        ] {
+            assert!(
+                !serialised.contains(suppressor),
+                "{suppressor} would disarm the user's own hooks: {serialised}"
+            );
+        }
     }
 
     #[test]
