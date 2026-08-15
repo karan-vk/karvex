@@ -10,6 +10,7 @@ use crate::api::schema::{
     Method, Request, WorkflowCreateParams, WorkflowDefinitionDocument, WorkflowDefinitionFormat,
     WorkflowInterrogationMode, WorkflowNodeExpandParams, WorkflowNodeInterrogateParams,
     WorkflowNodeReportParams, WorkflowNodeSteerParams, WorkflowNodeTarget, WorkflowRestoreRequest,
+    WorkflowReviewAnswerParams, WorkflowReviewApplyParams, WorkflowReviewReportParams,
     WorkflowRunFinishParams, WorkflowRunListParams, WorkflowRunMessageParams, WorkflowRunParams,
     WorkflowRunReportSessionParams, WorkflowRunTarget, WorkflowSummaryListParams, WorkflowTarget,
     WorkflowTier, WorkflowVersionCreateParams, WorkflowVersionTarget,
@@ -23,6 +24,32 @@ const NODE_ENV_RUN_ID: &str = "KARVEX_WORKFLOW_RUN_ID";
 const NODE_ENV_NODE_PATH: &str = "KARVEX_WORKFLOW_NODE_PATH";
 const NODE_ENV_NODE_DIR: &str = "KARVEX_WORKFLOW_NODE_DIR";
 const NODE_ENV_NODE_TOKEN: &str = "KARVEX_WORKFLOW_NODE_TOKEN";
+
+/// Env karvex exports into a review interview pane
+/// (`crate::app::workflow_review::REVIEW_RUN_ID_ENV_VAR`, duplicated here as
+/// a literal the same way [`NODE_ENV_RUN_ID`] duplicates
+/// `binding::spawn::RUN_ID_ENV_VAR` above: that module is feature-gated
+/// behind `workflow` and this one has to build with
+/// `--no-default-features` too). **Not** [`NODE_ENV_RUN_ID`] — deliberately:
+/// an interview pane never carries `KARVEX_WORKFLOW_RUN_ID`, so it cannot
+/// close the very run it is reviewing
+/// (`.local/prd/phase4-retarget-plan.md`, amendment log). `pub(crate)` so
+/// `skill_parity.rs` can pin `SKILL.md`'s prose against the same literal.
+pub(crate) const REVIEW_RUN_ID_ENV_VAR: &str = "KARVEX_WORKFLOW_REVIEW_RUN_ID";
+/// The team-roster name an interview pane answers for
+/// (`crate::app::workflow_review::REVIEW_MEMBER_ENV_VAR`). Absent from a
+/// synthesis pane, which is what tells `kvx workflow review answer` from
+/// `report` apart at the env level, not just by which verb was typed.
+pub(crate) const REVIEW_MEMBER_ENV_VAR: &str = "KARVEX_WORKFLOW_REVIEW_MEMBER";
+// `KARVEX_WORKFLOW_REVIEW_CYCLE` (`crate::app::workflow_review::
+// REVIEW_CYCLE_ENV_VAR`) is exported into both interview and synthesis
+// panes too, but neither `WorkflowReviewAnswerParams` nor
+// `WorkflowReviewReportParams` carries a cycle field on the wire — P3 froze
+// `run_id` (`+ member`, for `answer`) as the whole self-report target, and a
+// run has at most one live review cycle at a time, so there is nothing here
+// to default with it. Not read, on purpose: inventing a required flag this
+// packet's own wire contract has no room for would be the same class of
+// dishonesty the packet exists to remove.
 
 /// Canonical `kvx workflow` verb paths. Hand-maintained alongside the match
 /// arms below and checked against the clap tree in `src/cli/spec.rs` by a
@@ -53,6 +80,11 @@ pub(super) const VERB_PATHS: &[&[&str]] = &[
     &["node", "interrogate"],
     &["summary", "show"],
     &["summary", "list"],
+    &["review", "start"],
+    &["review", "show"],
+    &["review", "apply"],
+    &["review", "answer"],
+    &["review", "report"],
 ];
 
 pub(super) fn run_workflow_command(args: &[String]) -> std::io::Result<i32> {
@@ -69,6 +101,7 @@ pub(super) fn run_workflow_command(args: &[String]) -> std::io::Result<i32> {
         "run" => run_workflow_run_command(&args[1..]),
         "node" => run_workflow_node_command(&args[1..]),
         "summary" => run_workflow_summary_command(&args[1..]),
+        "review" => run_workflow_review_command(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workflow_help();
             Ok(0)
@@ -145,6 +178,36 @@ fn run_workflow_summary_command(args: &[String]) -> std::io::Result<i32> {
         }
         _ => {
             print_workflow_summary_help();
+            Ok(2)
+        }
+    }
+}
+
+/// `kvx workflow review` (`.local/prd/phase4-retarget-plan.md` §5 packet
+/// **P12**). `start`/`show`/`apply` are the human's verbs; `answer`/`report`
+/// are an interview/synthesis pane's own self-report, matching the frozen
+/// `Bash(kvx workflow review answer:*)` / `Bash(kvx workflow review
+/// report:*)` `--allowedTools` prefixes exactly — see `spec.rs`'s
+/// `workflow_review_command` doc for why the verb/flag names here cannot
+/// drift from those.
+fn run_workflow_review_command(args: &[String]) -> std::io::Result<i32> {
+    let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
+        print_workflow_review_help();
+        return Ok(2);
+    };
+
+    match subcommand {
+        "start" => workflow_review_start(&args[1..]),
+        "show" => workflow_review_show(&args[1..]),
+        "apply" => workflow_review_apply(&args[1..]),
+        "answer" => workflow_review_answer(&args[1..]),
+        "report" => workflow_review_report(&args[1..]),
+        "help" | "--help" | "-h" => {
+            print_workflow_review_help();
+            Ok(0)
+        }
+        _ => {
+            print_workflow_review_help();
             Ok(2)
         }
     }
@@ -1889,6 +1952,360 @@ fn format_summary_list_row(summary: &serde_json::Value) -> String {
     format!("{run_id}  {workflow_name:<20} {outcome:<12} {created}{pruned}")
 }
 
+// ── workflow review ────────────────────────────────────────────────────
+
+/// `kvx workflow review start <run_id>` (§3.5): plan, spawn one interview
+/// pane per interviewable member, and answer with the cycle that is now
+/// running. Never automatic — this call, or the TUI's `V` ask, is the only
+/// trigger there is.
+fn workflow_review_start(args: &[String]) -> std::io::Result<i32> {
+    match parse_workflow_review_run_target_args(
+        args,
+        "usage: kvx workflow review start <run_id> [--json]",
+    ) {
+        Ok((target, json)) => send_workflow_mutation(
+            "cli:workflow:review:start",
+            Method::WorkflowReviewStart(target),
+            json,
+        ),
+        Err(message) => {
+            eprintln!("{message}");
+            Ok(2)
+        }
+    }
+}
+
+/// `kvx workflow review show <run_id>`: the cycle and the findings it
+/// produced, or an honest "no review cycle for this run yet" — a run that
+/// has never been reviewed is a normal answer, not an error
+/// (`WorkflowReviewGet`'s own doc, matching `workflow.summary.get`'s
+/// precedent).
+fn workflow_review_show(args: &[String]) -> std::io::Result<i32> {
+    let (target, json) = match parse_workflow_review_run_target_args(
+        args,
+        "usage: kvx workflow review show <run_id> [--json]",
+    ) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
+
+    let response = super::send_request(&Request {
+        id: "cli:workflow:review:show".into(),
+        method: Method::WorkflowReviewGet(target),
+    })?;
+    print_workflow_review_show_response(&response, json)
+}
+
+fn parse_workflow_review_run_target_args(
+    args: &[String],
+    usage: &str,
+) -> Result<(WorkflowRunTarget, bool), String> {
+    let Some(run_id) = args.first() else {
+        return Err(usage.into());
+    };
+    let json = match args.get(1..) {
+        Some([]) => false,
+        Some([flag]) if flag == "--json" => true,
+        _ => return Err(usage.into()),
+    };
+    Ok((
+        WorkflowRunTarget {
+            run_id: run_id.clone(),
+        },
+        json,
+    ))
+}
+
+/// `kvx workflow review apply <run_id> (--accept <node_key>... | --decline-all)`
+/// (§3.5, §5 packet P12): the human's per-finding accept, minting a new
+/// version. `accept` is repeatable and everything not named is declined; an
+/// explicit `--decline-all` sends the same empty `accept` the wire already
+/// treats as "decline the whole cycle" — but a bare `apply` with **neither**
+/// flag is refused locally, before any request is sent, because minting an
+/// immutable version is irreversible and an irreversible action must never
+/// default to anything.
+fn workflow_review_apply(args: &[String]) -> std::io::Result<i32> {
+    match parse_workflow_review_apply_args(args) {
+        Ok((params, json)) => send_workflow_mutation(
+            "cli:workflow:review:apply",
+            Method::WorkflowReviewApply(params),
+            json,
+        ),
+        Err(message) => {
+            eprintln!("{message}");
+            Ok(2)
+        }
+    }
+}
+
+fn parse_workflow_review_apply_args(
+    args: &[String],
+) -> Result<(WorkflowReviewApplyParams, bool), String> {
+    let usage = "usage: kvx workflow review apply <run_id> \
+                 (--accept <node_key>... | --decline-all) [--json]";
+    let Some(run_id) = args.first() else {
+        return Err(usage.into());
+    };
+    let run_id = run_id.clone();
+
+    let mut accept: Vec<String> = Vec::new();
+    let mut decline_all = false;
+    let mut json = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--accept" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!("missing value for --accept\n{usage}"));
+                };
+                accept.push(value.clone());
+                index += 2;
+            }
+            "--decline-all" => {
+                decline_all = true;
+                index += 1;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => return Err(format!("unknown option: {other}\n{usage}")),
+        }
+    }
+
+    if decline_all && !accept.is_empty() {
+        return Err(format!(
+            "pass either --accept or --decline-all, not both\n{usage}"
+        ));
+    }
+    if !decline_all && accept.is_empty() {
+        return Err(format!(
+            "an apply must say what to do: pass --accept <node_key> (repeatable) or \
+             --decline-all — minting a version is irreversible and never defaults\n{usage}"
+        ));
+    }
+
+    Ok((WorkflowReviewApplyParams { run_id, accept }, json))
+}
+
+/// `kvx workflow review answer --file <path>`: an interview pane's own
+/// self-report (§3.5). Run from inside that pane — the rendered interview
+/// prompt tells the agent to run exactly this — so `run_id`/`member` are
+/// never CLI flags, only [`REVIEW_RUN_ID_ENV_VAR`]/[`REVIEW_MEMBER_ENV_VAR`],
+/// which karvex itself exported into the pane. A parse refusal from the
+/// server is printed back verbatim and the interview stays open — that
+/// refusal *is* the corrective re-prompt.
+fn workflow_review_answer(args: &[String]) -> std::io::Result<i32> {
+    match parse_workflow_review_answer_args(
+        args,
+        std::env::var(REVIEW_RUN_ID_ENV_VAR).ok(),
+        std::env::var(REVIEW_MEMBER_ENV_VAR).ok(),
+    ) {
+        Ok((params, json)) => send_workflow_mutation(
+            "cli:workflow:review:answer",
+            Method::WorkflowReviewAnswer(params),
+            json,
+        ),
+        Err(message) => {
+            eprintln!("{message}");
+            Ok(2)
+        }
+    }
+}
+
+fn parse_workflow_review_answer_args(
+    args: &[String],
+    env_run_id: Option<String>,
+    env_member: Option<String>,
+) -> Result<(WorkflowReviewAnswerParams, bool), String> {
+    let usage = "usage: kvx workflow review answer --file <path> [--json]";
+    let mut file: Option<String> = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--file" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!("missing value for --file\n{usage}"));
+                };
+                file = Some(value.clone());
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => return Err(format!("unknown option: {other}\n{usage}")),
+        }
+    }
+    let Some(file) = file else {
+        return Err(format!(
+            "an answer file is required: pass --file <path>\n{usage}"
+        ));
+    };
+    let run_id = env_run_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "no run to answer for: run this from a review interview pane, where \
+                 {REVIEW_RUN_ID_ENV_VAR} is exported\n{usage}"
+            )
+        })?;
+    let member = env_member
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "no member to answer as: run this from a review interview pane, where \
+                 {REVIEW_MEMBER_ENV_VAR} is exported\n{usage}"
+            )
+        })?;
+
+    Ok((
+        WorkflowReviewAnswerParams {
+            run_id,
+            member,
+            answer: None,
+            answer_file: Some(file),
+        },
+        json,
+    ))
+}
+
+/// `kvx workflow review report --file <path>`: the synthesis pane's own
+/// self-report (§3.5), the [`workflow_review_answer`] precedent minus
+/// `member` — a findings document speaks for the whole cycle, not for one
+/// interview.
+fn workflow_review_report(args: &[String]) -> std::io::Result<i32> {
+    match parse_workflow_review_report_args(args, std::env::var(REVIEW_RUN_ID_ENV_VAR).ok()) {
+        Ok((params, json)) => send_workflow_mutation(
+            "cli:workflow:review:report",
+            Method::WorkflowReviewReport(params),
+            json,
+        ),
+        Err(message) => {
+            eprintln!("{message}");
+            Ok(2)
+        }
+    }
+}
+
+fn parse_workflow_review_report_args(
+    args: &[String],
+    env_run_id: Option<String>,
+) -> Result<(WorkflowReviewReportParams, bool), String> {
+    let usage = "usage: kvx workflow review report --file <path> [--json]";
+    let mut file: Option<String> = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--file" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!("missing value for --file\n{usage}"));
+                };
+                file = Some(value.clone());
+                index += 2;
+            }
+            "--json" => {
+                json = true;
+                index += 1;
+            }
+            other => return Err(format!("unknown option: {other}\n{usage}")),
+        }
+    }
+    let Some(file) = file else {
+        return Err(format!(
+            "a findings file is required: pass --file <path>\n{usage}"
+        ));
+    };
+    let run_id = env_run_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "no run to report for: run this from a review synthesis pane, where \
+                 {REVIEW_RUN_ID_ENV_VAR} is exported\n{usage}"
+            )
+        })?;
+
+    Ok((
+        WorkflowReviewReportParams {
+            run_id,
+            findings: None,
+            findings_file: Some(file),
+        },
+        json,
+    ))
+}
+
+/// `review show`'s human rendering: the cycle summary, then its findings —
+/// `run show`/`node show`'s prose precedent rather than the raw-envelope
+/// convention the other four review verbs use, because unlike a mutation this
+/// is a read with real content to lay out.
+fn print_workflow_review_show_response(
+    response: &serde_json::Value,
+    json: bool,
+) -> std::io::Result<i32> {
+    if json {
+        return super::print_response(response);
+    }
+    if let Some(code) = print_workflow_error(response) {
+        return Ok(code);
+    }
+    let review = &response["result"]["review"];
+    if review.is_null() {
+        println!("no review cycle for this run yet");
+        return Ok(0);
+    }
+    print_workflow_review_summary(review);
+
+    if let Some(findings) = response["result"]["findings"].as_array() {
+        if !findings.is_empty() {
+            println!();
+            println!("findings:");
+            for finding in findings {
+                println!("{}", format_review_finding_line(finding));
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn print_workflow_review_summary(review: &serde_json::Value) {
+    println!("id:      {}", review["id"].as_str().unwrap_or(""));
+    println!("run_id:  {}", review["run_id"].as_str().unwrap_or(""));
+    println!("status:  {}", review["status"].as_str().unwrap_or(""));
+    if let Some(at) = review["started_at_unix_ms"].as_u64() {
+        println!("started: {}", format_unix_ms(at));
+    }
+    if let Some(at) = review["ended_at_unix_ms"].as_u64() {
+        println!("ended:   {}", format_unix_ms(at));
+    }
+    if let Some(version) = review["resulting_version_id"].as_str() {
+        println!("version: {version}");
+    }
+    let evidence_only = review["evidence_only_count"].as_u64().unwrap_or(0);
+    if evidence_only > 0 {
+        println!("evidence_only: {evidence_only} interview(s) could not be attributed");
+    }
+}
+
+/// One finding's line under `review show`'s `findings:` heading.
+fn format_review_finding_line(finding: &serde_json::Value) -> String {
+    let node_key = finding["node_key"].as_str().unwrap_or("");
+    let level = finding["level"].as_str().unwrap_or("");
+    let verdict = finding["verdict"].as_str().unwrap_or("");
+    let mode = finding["interview_mode"].as_str().unwrap_or("");
+    let accepted = if finding["accepted"].as_bool().unwrap_or(false) {
+        "accepted"
+    } else {
+        "pending"
+    };
+    format!("  {node_key:<24} {level:<11} {verdict:<8} ({mode}, {accepted})")
+}
+
 // ── shared parsing / printing helpers ───────────────────────────────────
 
 fn parse_workflow_tier(value: &str) -> Result<WorkflowTier, String> {
@@ -2219,10 +2636,29 @@ fn print_workflow_node_response(response: &serde_json::Value, json: bool) -> std
         println!("label:   {label}");
     }
     println!("status:  {}", node["status"].as_str().unwrap_or(""));
+    // The watchdog's own verdict, surfaced right under status because it is a
+    // stronger claim than Claude Code's projected status: `None` means the
+    // watchdog has nothing to report, which includes both "healthy" and "the
+    // watchdog has not looked yet" (`.local/prd/phase4-retarget-plan.md` §6
+    // D-10), so it prints nothing rather than a fabricated "ok".
+    if let Some(attention) = node["attention"].as_str() {
+        println!("attention: {attention}");
+    }
     println!("model:   {}", node["model"].as_str().unwrap_or(""));
     println!("effort:  {}", node["effort"].as_str().unwrap_or(""));
     if let Some(pane_id) = node["pane_id"].as_str() {
         println!("pane_id: {pane_id}");
+    }
+    // `run_node.watchdog_interventions` (`app/workflow_watchdog.rs`'s own doc):
+    // counts SURFACED watchdog opinions, not every ladder rung it walked —
+    // WI-R5 (`.local/prd/phase4-retarget-plan.md` amendment log) names this a
+    // known undercount, still open. Printed verbatim rather than reworded into
+    // "interventions", which the column does not yet mean. Zero is the common
+    // case and is skipped, matching `growth_limited`/`delivery_failure` below.
+    if let Some(interventions) = node["watchdog_interventions"].as_u64() {
+        if interventions > 0 {
+            println!("interventions: {interventions}");
+        }
     }
     if let Some(reason) = node["blocker"]["reason"].as_str() {
         println!("blocker: {reason}");
@@ -2615,6 +3051,7 @@ fn print_workflow_help() {
     eprintln!("  kvx workflow run <subcommand> ...");
     eprintln!("  kvx workflow node <subcommand> ...");
     eprintln!("  kvx workflow summary <subcommand> ...");
+    eprintln!("  kvx workflow review <subcommand> ...");
 }
 
 fn print_workflow_run_help() {
@@ -2655,6 +3092,21 @@ fn print_workflow_summary_help() {
     eprintln!("kvx workflow summary commands:");
     eprintln!("  kvx workflow summary show <run_id> [--json]");
     eprintln!("  kvx workflow summary list [<workflow>] [--limit N] [--json]");
+}
+
+fn print_workflow_review_help() {
+    eprintln!("kvx workflow review commands:");
+    eprintln!("  kvx workflow review start <run_id> [--json]");
+    eprintln!("  kvx workflow review show <run_id> [--json]");
+    eprintln!(
+        "  kvx workflow review apply <run_id> (--accept <node_key>... | --decline-all) [--json]"
+    );
+    eprintln!(
+        "  kvx workflow review answer --file <path> [--json]   # run from an interview pane; reads KARVEX_WORKFLOW_REVIEW_RUN_ID/MEMBER"
+    );
+    eprintln!(
+        "  kvx workflow review report --file <path> [--json]   # run from the synthesis pane; reads KARVEX_WORKFLOW_REVIEW_RUN_ID"
+    );
 }
 
 #[cfg(test)]
@@ -3747,7 +4199,7 @@ mod tests {
                     "unexpected top-level verb {verb}"
                 ),
                 [group, verb] => assert!(
-                    matches!(*group, "run" | "node" | "summary"),
+                    matches!(*group, "run" | "node" | "summary" | "review"),
                     "unexpected verb group {group} for verb {verb}"
                 ),
                 other => panic!("unexpected verb path shape: {other:?}"),
@@ -3989,5 +4441,197 @@ mod tests {
         // 1_704_067_200 / 86_400 = 19_723, and format_unix_ms_renders_known_epoch_instants
         // independently confirms 1_704_067_200_000ms is 2024-01-01.
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+    }
+
+    // ── §5 packet P12: `kvx workflow review` ────────────────────────────
+
+    #[test]
+    fn workflow_review_start_and_show_parse_run_id_and_json() {
+        let (target, json) = parse_workflow_review_run_target_args(
+            &args(&["run-1"]),
+            "usage: kvx workflow review start <run_id> [--json]",
+        )
+        .unwrap();
+        assert_eq!(target.run_id, "run-1");
+        assert!(!json);
+
+        let (target, json) = parse_workflow_review_run_target_args(
+            &args(&["run-1", "--json"]),
+            "usage: kvx workflow review start <run_id> [--json]",
+        )
+        .unwrap();
+        assert_eq!(target.run_id, "run-1");
+        assert!(json);
+
+        assert!(parse_workflow_review_run_target_args(
+            &args(&[]),
+            "usage: kvx workflow review start <run_id> [--json]",
+        )
+        .is_err());
+    }
+
+    /// `--accept` is repeatable — the plan's own contract
+    /// (`.local/prd/phase4-retarget-plan.md` §5 packet P12: "`apply --accept
+    /// <node_key>...` repeatable").
+    #[test]
+    fn workflow_review_apply_accept_is_repeatable_and_deduplication_is_the_server_side() {
+        let (params, json) = parse_workflow_review_apply_args(&args(&[
+            "run-1", "--accept", "plan", "--accept", "lint",
+        ]))
+        .unwrap();
+        assert_eq!(params.run_id, "run-1");
+        assert_eq!(params.accept, vec!["plan".to_string(), "lint".to_string()]);
+        assert!(!json);
+    }
+
+    #[test]
+    fn workflow_review_apply_decline_all_sends_an_empty_accept() {
+        let (params, _json) =
+            parse_workflow_review_apply_args(&args(&["run-1", "--decline-all", "--json"])).unwrap();
+        assert_eq!(params.run_id, "run-1");
+        assert!(params.accept.is_empty());
+    }
+
+    /// The plan's own contract: "bare `apply` is an error because an
+    /// irreversible version mint never defaults."
+    #[test]
+    fn workflow_review_apply_bare_is_refused() {
+        let error = parse_workflow_review_apply_args(&args(&["run-1"])).unwrap_err();
+        assert!(
+            error.contains("--accept") && error.contains("--decline-all"),
+            "error should name both ways to decide: {error}"
+        );
+    }
+
+    /// "mutually exclusive" — the plan's own wording.
+    #[test]
+    fn workflow_review_apply_accept_and_decline_all_together_is_refused() {
+        let error = parse_workflow_review_apply_args(&args(&[
+            "run-1",
+            "--accept",
+            "plan",
+            "--decline-all",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("not both"), "error: {error}");
+    }
+
+    #[test]
+    fn workflow_review_answer_defaults_run_id_and_member_from_env() {
+        let (params, json) = parse_workflow_review_answer_args(
+            &args(&["--file", "/abs/answers/scout.json"]),
+            Some("run-1".to_string()),
+            Some("scout".to_string()),
+        )
+        .unwrap();
+        assert_eq!(params.run_id, "run-1");
+        assert_eq!(params.member, "scout");
+        assert_eq!(
+            params.answer_file.as_deref(),
+            Some("/abs/answers/scout.json")
+        );
+        assert_eq!(params.answer, None);
+        assert!(!json);
+    }
+
+    /// §5 packet P12 / amendment log: `answer` takes no positional (or flag)
+    /// run id or member — only the env karvex itself exported names them.
+    #[test]
+    fn workflow_review_answer_has_no_run_or_member_override_flag() {
+        let error = parse_workflow_review_answer_args(
+            &args(&["--file", "x.json", "--run", "run-1"]),
+            Some("run-1".to_string()),
+            Some("scout".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown option"), "error: {error}");
+    }
+
+    #[test]
+    fn workflow_review_answer_missing_run_id_env_is_refused() {
+        let error = parse_workflow_review_answer_args(
+            &args(&["--file", "x.json"]),
+            None,
+            Some("scout".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains(REVIEW_RUN_ID_ENV_VAR), "error: {error}");
+    }
+
+    #[test]
+    fn workflow_review_answer_missing_member_env_is_refused() {
+        let error = parse_workflow_review_answer_args(
+            &args(&["--file", "x.json"]),
+            Some("run-1".into()),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains(REVIEW_MEMBER_ENV_VAR), "error: {error}");
+    }
+
+    #[test]
+    fn workflow_review_answer_requires_a_file() {
+        let error = parse_workflow_review_answer_args(
+            &args(&[]),
+            Some("run-1".into()),
+            Some("scout".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("--file"), "error: {error}");
+    }
+
+    #[test]
+    fn workflow_review_report_defaults_run_id_from_env_and_carries_no_member() {
+        let (params, _json) = parse_workflow_review_report_args(
+            &args(&["--file", "/abs/findings.json"]),
+            Some("run-1".to_string()),
+        )
+        .unwrap();
+        assert_eq!(params.run_id, "run-1");
+        assert_eq!(params.findings_file.as_deref(), Some("/abs/findings.json"));
+        assert_eq!(params.findings, None);
+    }
+
+    #[test]
+    fn workflow_review_report_missing_run_id_env_is_refused() {
+        let error =
+            parse_workflow_review_report_args(&args(&["--file", "x.json"]), None).unwrap_err();
+        assert!(error.contains(REVIEW_RUN_ID_ENV_VAR), "error: {error}");
+    }
+
+    /// P11's own doc: its own code rather than `workflow_invalid_definition`,
+    /// because nothing was authored and the client's next move is "accept a
+    /// smaller set" — the CLI must never rename or reword that code away.
+    #[test]
+    fn workflow_review_compile_failed_code_surfaces_verbatim() {
+        let response = serde_json::json!({
+            "id": "cli:workflow:review:apply",
+            "error": {
+                "code": "workflow_review_compile_failed",
+                "message": "finding \"plan\" has no replacement, required for verdict replace"
+            }
+        });
+        let rendered =
+            format_workflow_error(&response).expect("an error envelope renders a message");
+        assert!(
+            rendered.contains("workflow_review_compile_failed"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("invalid_definition"),
+            "must not be relabelled as the authoring-error code: {rendered}"
+        );
+    }
+
+    /// The five review verbs are real, dispatched, verb paths — same shape as
+    /// `VERB_PATHS`'s own coverage test for `run`/`node`/`summary`.
+    #[test]
+    fn review_verb_paths_are_all_present() {
+        for verb in ["start", "show", "apply", "answer", "report"] {
+            assert!(
+                VERB_PATHS.contains(&["review", verb].as_slice()),
+                "review {verb} is missing from VERB_PATHS"
+            );
+        }
     }
 }

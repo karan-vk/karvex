@@ -906,6 +906,7 @@ fn workflow_command() -> Command {
         .subcommand(workflow_run_command())
         .subcommand(workflow_node_command())
         .subcommand(workflow_summary_command())
+        .subcommand(workflow_review_command())
 }
 
 fn workflow_run_command() -> Command {
@@ -1080,6 +1081,75 @@ fn workflow_node_command() -> Command {
                         .help("Seed a fresh session from the stored checkpoint instead of resuming the original transcript"),
                 )
                 .arg(option("note", "TEXT").help("A short note recorded on the interrogation"))
+                .arg(json_flag()),
+        )
+}
+
+/// `kvx workflow review` — the self-improvement review cycle
+/// (`.local/prd/phase4-retarget-plan.md` §3.5, §5 packet **P12**). `start`,
+/// `show`, and `apply` are the human's (or the TUI overlay's) verbs, run from
+/// anywhere with the run id in hand. `answer` and `report` are the two
+/// self-report verbs an interview/synthesis pane runs *on itself*: both take
+/// no `--run`/`--member` override of any kind and read their whole target
+/// from `KARVEX_WORKFLOW_REVIEW_RUN_ID` / `KARVEX_WORKFLOW_REVIEW_MEMBER`,
+/// which karvex — not the caller — exports into that pane. Frozen this way
+/// because both are also the exact `Bash(kvx workflow review answer:*)` /
+/// `Bash(kvx workflow review report:*)` `--allowedTools` prefixes P6/P10
+/// pinned into the rendered interview/synthesis prompts; renaming either verb
+/// or widening its flags would leave a real interview stalled on an
+/// unapproved permission dialog.
+fn workflow_review_command() -> Command {
+    Command::new("review")
+        .about("Manage a finished run's self-improvement review cycle")
+        .subcommand(
+            Command::new("start")
+                .about("Start a review cycle for a finished run")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("show")
+                .about("Show a run's review cycle and the findings it produced")
+                .arg(required("run_id", "RUN_ID"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("apply")
+                .about(
+                    "Accept some or all of a review cycle's findings, minting a new \
+                     workflow version — irreversible, so bare `apply` is refused",
+                )
+                .arg(required("run_id", "RUN_ID"))
+                .arg(repeatable_option("accept", "NODE_KEY").help(
+                    "A finding's node_key to accept (repeatable); everything else is declined",
+                ))
+                .arg(flag("decline-all").help("Decline every finding this cycle produced"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("answer")
+                .about(
+                    "An interview pane's own self-report — run from inside that pane, which \
+                     already carries its target in the environment",
+                )
+                .arg(
+                    path_option("file", "PATH")
+                        .required(true)
+                        .help("Path to the answer JSON the interview prompt told you to write"),
+                )
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("report")
+                .about(
+                    "The synthesis pane's own self-report — run from inside that pane, which \
+                     already carries its target in the environment",
+                )
+                .arg(
+                    path_option("file", "PATH")
+                        .required(true)
+                        .help("Path to the findings JSON the synthesis prompt told you to write"),
+                )
                 .arg(json_flag()),
         )
 }
@@ -1551,13 +1621,13 @@ mod tests {
 
         let mut spec_paths = Vec::new();
         collect_subcommand_paths(workflow, &mut Vec::new(), &mut spec_paths);
-        // Drop the "run"/"node"/"summary" namespace nodes themselves: they
-        // group verbs for help/completion but are not verbs `VERB_PATHS`
+        // Drop the "run"/"node"/"summary"/"review" namespace nodes themselves:
+        // they group verbs for help/completion but are not verbs `VERB_PATHS`
         // enumerates.
         let mut spec_leaf_paths: Vec<Vec<String>> = spec_paths
             .into_iter()
             .filter(|path| {
-                !matches!(path.as_slice(), [group] if group == "run" || group == "node" || group == "summary")
+                !matches!(path.as_slice(), [group] if group == "run" || group == "node" || group == "summary" || group == "review")
             })
             .collect();
         spec_leaf_paths.sort();

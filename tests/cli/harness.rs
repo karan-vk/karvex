@@ -168,6 +168,24 @@ pub(super) fn spawn_named_server(
     runtime_dir: &Path,
     session: &str,
 ) -> SpawnedServerProcess {
+    spawn_named_server_with_env(config_home, runtime_dir, session, &[])
+}
+
+/// [`spawn_named_server`], plus extra environment on the server process
+/// itself. Exists for a test that touches the workflow store: it lazily
+/// opens under `KARVEX_WORKFLOW_DB_PATH` (falling back to the real
+/// `state_dir()`/`workflow` if unset — `workflow/store/mod.rs`'s own
+/// `default_location`), so any workflow-touching test that does not
+/// redirect it collides with every other workflow test, in this suite or a
+/// concurrent one, over the *same developer machine's* real on-disk store
+/// (`store_locked`, `tests/workflow_lead_headless.rs`'s own precedent for
+/// why every such server sets this).
+pub(super) fn spawn_named_server_with_env(
+    config_home: &Path,
+    runtime_dir: &Path,
+    session: &str,
+    envs: &[(&str, &Path)],
+) -> SpawnedServerProcess {
     fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
@@ -188,6 +206,9 @@ pub(super) fn spawn_named_server(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
 
     let child = command.spawn().unwrap();
     register_spawned_karvex_pid(Some(child.id()));
