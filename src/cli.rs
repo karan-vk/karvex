@@ -19,6 +19,12 @@ mod protocol_guard;
 mod runtime;
 mod server;
 mod server_not_running;
+// Only the `SKILL.md` parity pin (`.local/prd/phase4-retarget-plan.md`
+// §5 packet P15) lives here; `just windows-lint` builds without
+// `--all-targets`, so an unconditional module with only `#[test]` items
+// would fail `-D warnings` there.
+#[cfg(test)]
+mod skill_parity;
 mod spec;
 mod status;
 mod tab;

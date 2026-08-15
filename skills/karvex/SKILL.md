@@ -238,7 +238,7 @@ If `KARVEX_NO_TMUX_COMPAT` is set, Claude Code falls back to its own non-tmux ba
 
 ## Run a multi-agent workflow
 
-A Karvex **workflow** is a stored, versioned plan: named nodes, their dependencies, and per-node model demands. Karvex does not execute it. `workflow run` launches one interactive Claude Code **team lead** in a pane, hands it the plan as a rendered prompt, and then only watches: the lead creates the shared task list, spawns teammates, and decides retries and completion. Every node that runs is a real Claude session in a real Karvex pane.
+A Karvex **workflow** is a stored, versioned plan: named nodes, their dependencies, and per-node model demands. A **run** of it is one interactive Claude Code **team lead** session in a Karvex pane, driving Agent Teams through the same tmux shim described above. `workflow run` launches that lead, hands it the plan as a rendered prompt, and then only watches: Karvex defines the plan, launches the lead, observes what the team does, and saves the result — it never executes a node itself. The lead creates the shared task list, spawns teammates, and decides retries and completion. Every node that runs is a real Claude session in a real Karvex pane.
 
 Use a workflow when the user wants a repeatable multi-step plan they can rerun, save, and inspect later. For one-off parallel work, split panes and `agent start` directly — a workflow is heavier and stores history.
 
@@ -295,9 +295,29 @@ Two conditions occur often enough to check for before reporting a run stuck:
 - **A permission prompt in the lead's pane blocks the whole run.** Teammate permission requests bubble up to the lead, and the lead waits. `kvx agent read <lead-pane>` shows the dialog; the user answers it, or you do only if the user has authorised that action. Pre-approving the run's expected tools avoids this.
 - **A teammate finishes its work but leaves its task `in_progress`.** This is a known Claude Code agent-teams limitation, not a Karvex fault. The node's pane state (`idle`) is the truth; the task file lags. Tell the lead to confirm the result and mark the task complete.
 
+If you remember `kvx workflow node steer`, `interrupt`, `restart`, `complete`, `expand`, or `interrogate` from an older Karvex, stop retrying them: each still parses, but the server now refuses every one of them, naming the pane affordance above instead of executing anything — the per-node engine that used to serve them is gone. `kvx workflow node show` is the one node verb that still answers with real, live data; use it to read a node's state, and use the pane itself to act on it.
+
+### Message a run session
+
+Reach a named session in the run directly, without hunting for its pane:
+
+```bash
+kvx workflow run message --to <name> --text "Also check the error paths."
+```
+
+`--to` takes the team-roster name (the lead is `team-lead`); pass `--text-file <path>` instead of `--text` for anything long. Called from the lead's own pane, `run message` needs no `--run` — same as `run finish` below. Delivery has two channels: if Karvex has already captured that session's messaging-socket endpoint from its own startup self-report, it hands the message over Claude Code's own peer-inbox socket, subject to that session's own inbound controls; otherwise it falls back to typing the text straight into that session's pane, the same as `agent prompt` would. A teammate's messaging token only ever exists in that teammate's own process environment, so Karvex cannot recover it after the fact — once this Karvex server restarts, the run it was tracking is no longer resident in memory at all, and `run message` refuses outright rather than silently degrading to pane input.
+
+### Watchdog messages
+
+Karvex separately watches for a task a teammate's own task list still marks `in_progress` while that teammate's pane has actually sat idle — Claude Code's own docs note teammates sometimes finish work and never mark the task complete, so a status by itself is never proof of anything. When the disagreement holds for long enough, Karvex says so directly in-session: a message framed `[karvex · watchdog]`, first nudging the idle owner, then re-prompting it more specifically if nothing moved, and — if a teammate still never answers — telling the **lead** instead, with what Karvex measured and the lead's own options (message the teammate, reassign the task, or respawn it; Karvex itself can do none of those three, only watch and report). A lead whose own pane goes idle gets the same nudge/re-prompt pair about the run as a whole, with no third rung, since escalating the lead to itself would be a message to nobody. Recognise the frame as the runtime talking, not the user, and act inside the affected session rather than replying to Karvex on its behalf.
+
+### Self-improvement review (not live yet)
+
+The workflow protocol already has review-cycle methods for turning accepted findings from a past run into a new workflow version, but there is no `kvx workflow review` command yet and no cycle you can start: every one of those methods still answers with a refusal today, because the orchestration that creates and drives a cycle has not shipped. If a user asks for a review cycle, or you remember one from a newer Karvex, say plainly that it is not available on this build rather than guessing at a command.
+
 ### Finish
 
-The lead closes its own run by calling `kvx workflow run finish --summary-file <path>` from its pane; Karvex never decides a run is done. Until that call, a run with every task complete is still `running`. The stored summary is then readable with:
+The lead's pane self-identifies: Karvex exports `KARVEX_WORKFLOW_RUN_ID` into it, so `kvx workflow run finish --summary-file <path>` needs no run id when called from that pane. The lead closes its own run this way; Karvex never decides a run is done. Until that call, a run with every task complete is still `running`. The stored summary is then readable with:
 
 ```bash
 kvx workflow summary list
