@@ -1763,9 +1763,6 @@ pub enum StoreWrite {
         forked_session_id: Option<String>,
         ended_at_unix_ms: Option<u64>,
     },
-    /// The run's lead binding, learned once the spawned `claude` pane registers
-    /// its session (`09-agent-teams-rework.md` §3.1 step 4).
-    ///
     /// Closes a run as `failed` with a machine-readable reason on the run row.
     ///
     /// `09-agent-teams-rework.md` §3.3 asks for this shape rather than a new
@@ -1779,6 +1776,30 @@ pub enum StoreWrite {
         ended_at_unix_ms: u64,
         failure: serde_json::Value,
     },
+    /// The pane karvex launched a run's team lead into, written the moment that
+    /// pane exists (`09-agent-teams-rework.md` §3.1a).
+    ///
+    /// Separate from, and always earlier than, [`StoreWrite::RunLeadBinding`],
+    /// because the two facts are known at different times and one of them is
+    /// not an inference at all: karvex *launched* this lead, so "a Claude Code
+    /// team lead is executing this run" is true from the first instant, while
+    /// the team name has to wait for the lead to say what its session id is.
+    /// Without this write the run row says nothing about its execution model
+    /// until binding, and every surface that asks — the DAG's verb set most
+    /// visibly — treats the unbound window as an engine-era run and offers
+    /// verbs the server then refuses.
+    RunLeadPane {
+        run: RunId,
+        lead_pane_id: String,
+        lead_terminal_id: String,
+        /// Which revision of the render contract (§3.2) produced the prompt
+        /// this lead was launched with. Written here rather than only at
+        /// binding so a run that never binds still records what it was given.
+        lead_prompt_version: u32,
+    },
+    /// The run's lead binding, learned once the spawned `claude` pane registers
+    /// its session (`09-agent-teams-rework.md` §3.1 step 4).
+    ///
     /// Not part of `create_run`: the run row exists before the pane does, and
     /// the session id only appears in `~/.claude/sessions/` after the lead has
     /// started. An `UPDATE`, and idempotent — the projection may re-learn the

@@ -340,6 +340,12 @@ impl crate::app::App {
     }
 
     /// Records the live lead run once its pane exists.
+    ///
+    /// Two things happen here, and only one of them is in memory. The
+    /// [`LiveLeadRun`] is the poller's own state, but the pane karvex just
+    /// launched is a durable fact about the run — it is what says a Claude Code
+    /// team lead is executing it, from the first instant rather than from
+    /// whenever that lead gets round to identifying itself.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_lead_run(
         &mut self,
@@ -352,9 +358,9 @@ impl crate::app::App {
         messaging: MessagingSupport,
     ) {
         self.workflow_lead = Some(LiveLeadRun {
-            run_id,
-            lead_pane_id,
-            lead_terminal_id,
+            run_id: run_id.clone(),
+            lead_pane_id: lead_pane_id.clone(),
+            lead_terminal_id: lead_terminal_id.clone(),
             lead_cwd: spec.cwd.clone(),
             spawned_at_unix_ms,
             binding: None,
@@ -370,6 +376,12 @@ impl crate::app::App {
             closed: false,
             journal_seq: 0,
             next_poll_at: None,
+        });
+        self.persist_workflow_write(StoreWrite::RunLeadPane {
+            run: run_id,
+            lead_pane_id,
+            lead_terminal_id: lead_terminal_id.to_string(),
+            lead_prompt_version: crate::workflow::lead_prompt::LEAD_PROMPT_VERSION,
         });
     }
 

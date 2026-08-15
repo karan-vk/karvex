@@ -1064,24 +1064,24 @@ output_schema = {{ type = "object" }}
         assert_ne!(empty.state.mode, Mode::WorkflowDag);
     }
 
-    /// **Known gap, not a passing test.** Between `workflow.run` spawning the
-    /// lead's pane and the projection recognising its team, nothing on the run
-    /// row says a team lead is executing it: `StoreWrite::RunLeadBinding` — the
-    /// only writer of `team_name` and `lead_pane_id` — is issued from
-    /// `bind_run_team`, which needs the team config to exist first
-    /// (`09-agent-teams-rework.md` §3.1 step 4). `HistoricalRunSnapshot::
-    /// is_lead_run` reads `team_name`, so for that window the overlay treats a
-    /// lead run as an engine-era run and offers `s`/`i`/`Shift+I`, which the
-    /// server then refuses as retired verbs.
+    /// The unbound window, which used to lie about what was executing the run.
     ///
-    /// Closing it means recording the pane karvex itself launched at spawn
-    /// time — karvex knows it launched a lead, it does not have to infer that —
-    /// which is a second, smaller `StoreWrite` and a widened `is_lead_run`. It
-    /// belongs with the bind-deadline work the rework audit files as WI-5,
-    /// because both are about the same unbound window.
+    /// Between `workflow.run` spawning the lead's pane and the lead identifying
+    /// itself, nothing on the run row said a team lead was executing it:
+    /// `StoreWrite::RunLeadBinding` was the only writer of `team_name` and
+    /// `lead_pane_id`, and it is issued from `bind_run_team` after the
+    /// assertion or the fallback match. `is_lead_run` read `team_name`, so for
+    /// that whole window — up to the bind deadline — the overlay treated a lead
+    /// run as an engine-era one and offered `s`/`i`/`Shift+I`, which the server
+    /// then refused as retired verbs.
+    ///
+    /// `StoreWrite::RunLeadPane` closes it by recording the pane karvex itself
+    /// launched, at spawn: karvex knows it launched a lead and does not have to
+    /// infer it. This fixture stops at exactly that point — it binds a live
+    /// lead run and never lets a projection poll run — so a regression that
+    /// moved the fact back to bind time would fail here.
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "gap: a lead run is only marked as one once its team binds, so the DAG offers retired verbs during the unbound window; needs the lead pane recorded at spawn (audit WI-5)"]
     fn a_lead_run_is_known_to_be_one_before_its_team_binds() {
         let mut app = test_app();
         let workflow_id = create_workflow(&mut app, "ship-feature");

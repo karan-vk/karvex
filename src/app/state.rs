@@ -2176,7 +2176,13 @@ impl HistoricalRunSnapshot {
     /// overlay branches on, so "which execution model produced this run" is
     /// asked in exactly one place.
     pub(crate) fn is_lead_run(&self) -> bool {
-        self.team_name.is_some()
+        // Either fact is proof, and the pane is the one karvex knows first.
+        // `team_name` only appears once the lead has identified itself and the
+        // run has bound to a team, so keying on it alone left the whole unbound
+        // window — up to the bind deadline — describing a lead run as an
+        // engine-era one, and the overlay offered the retired `s`/`i`/`Shift+I`
+        // verbs the server then refused.
+        self.team_name.is_some() || self.lead_pane_id.is_some()
     }
 }
 

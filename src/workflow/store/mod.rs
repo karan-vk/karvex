@@ -1128,6 +1128,15 @@ impl WorkflowStore {
                 self.write_interrogation_update(id, forked_session_id, ended_at_unix_ms)
                     .await
             }
+            StoreWrite::RunLeadPane {
+                run,
+                lead_pane_id,
+                lead_terminal_id,
+                lead_prompt_version,
+            } => {
+                self.write_run_lead_pane(run, lead_pane_id, lead_terminal_id, lead_prompt_version)
+                    .await
+            }
             StoreWrite::RunLeadBinding {
                 run,
                 lead_session_id,
@@ -2206,11 +2215,6 @@ impl WorkflowStore {
         Ok(())
     }
 
-    /// `ended_at_unix_ms` is the engine's own close stamp, which is also what
-    /// the live run reports — the journal and the live projection must not
-    /// describe the same run as ending at two different times. `time::now()`
-    /// stays as the fallback so a terminal status that somehow arrives without
-    /// a stamp still records *an* end time rather than none.
     /// Closes a run as `failed` and records *why* on the run row's `failure`
     /// column, which `workflow.run.get` already publishes.
     ///
@@ -2241,6 +2245,11 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// `ended_at_unix_ms` is the engine's own close stamp, which is also what
+    /// the live run reports — the journal and the live projection must not
+    /// describe the same run as ending at two different times. `time::now()`
+    /// stays as the fallback so a terminal status that somehow arrives without
+    /// a stamp still records *an* end time rather than none.
     async fn write_run_status(
         &self,
         run: RunId,
@@ -3085,6 +3094,40 @@ impl WorkflowStore {
     }
 
     // ── the agent-teams rework: lead binding and projection ──────────────
+
+    /// Records the pane karvex launched a run's team lead into, before that
+    /// lead has said anything about itself (§3.1a).
+    ///
+    /// Deliberately writes only the three columns karvex already knows and
+    /// leaves `lead_session_id` and `team_name` untouched: they are the lead's
+    /// to assert, and a placeholder in either would make an unbound run
+    /// indistinguishable from a bound one. The later
+    /// [`Self::write_run_lead_binding`] overwrites the same pane columns with
+    /// the identical values, which is why this one can be an unconditional
+    /// `UPDATE` too.
+    async fn write_run_lead_pane(
+        &self,
+        run: RunId,
+        lead_pane_id: String,
+        lead_terminal_id: String,
+        lead_prompt_version: u32,
+    ) -> Result<(), StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let response = self
+            .db
+            .query(
+                "UPDATE $run SET lead_pane_id = $lead_pane_id,                  lead_terminal_id = $lead_terminal_id,                  lead_prompt_version = $lead_prompt_version",
+            )
+            .bind(("run", run_id))
+            .bind(("lead_pane_id", lead_pane_id))
+            .bind(("lead_terminal_id", lead_terminal_id))
+            .bind(("lead_prompt_version", i64::from(lead_prompt_version)))
+            .await
+            .map_err(query_error)?;
+        response.check().map_err(query_error)?;
+        Ok(())
+    }
 
     /// Binds the run to the Claude Code team-lead session it spawned
     /// (`09-agent-teams-rework.md` §3.1 step 4).
