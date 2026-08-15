@@ -187,6 +187,14 @@ pub struct App {
     /// (`09-agent-teams-rework.md` §3.1). `None` until `workflow.run` spawns
     /// one, and again once the run closes.
     pub(crate) workflow_lead: Option<workflow_lead::LiveLeadRun>,
+    /// What the watchdog remembers between its samples of that run
+    /// (`.local/prd/phase4-retarget-plan.md` §3.4, P9): the per-node escalation
+    /// ladder and the member states the last sample was taken against. Nothing
+    /// durable — everything the watchdog *concludes* is written to the store —
+    /// and unconditional like `workflow_policy`, so `App`'s shape does not fork
+    /// between the two feature legs.
+    #[cfg_attr(not(feature = "workflow"), allow(dead_code))]
+    pub(crate) workflow_watchdog: workflow_watchdog::WatchdogState,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -833,6 +841,7 @@ impl App {
             #[cfg(feature = "workflow")]
             workflow_store: workflow_store::WorkflowStoreHandle::default(),
             workflow_lead: None,
+            workflow_watchdog: workflow_watchdog::WatchdogState::default(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }

@@ -71,6 +71,13 @@ pub(crate) struct WorkflowPolicy {
     /// lead prompt render as a concurrency hint instead of staying a value
     /// `config::model` parses and nothing else ever reads.
     pub(crate) max_parallel_nodes: usize,
+    /// The watchdog's half of `[workflow]` — `watchdog_enabled`,
+    /// `watchdog_tick_secs`, `stuck_threshold`, `drift_threshold`
+    /// (`.local/prd/phase4-retarget-plan.md` §3.4, D-8). Distilled here for the
+    /// same reason the two knobs above are: the poll that reads it runs every
+    /// two seconds and `App` holds no `Config`.
+    #[cfg_attr(not(feature = "workflow"), allow(dead_code))]
+    pub(crate) watchdog: crate::workflow::watchdog::WatchdogPolicy,
 }
 
 impl Default for WorkflowPolicy {
@@ -80,6 +87,9 @@ impl Default for WorkflowPolicy {
         Self {
             history_context_runs: 3,
             max_parallel_nodes: 4,
+            watchdog: crate::workflow::watchdog::WatchdogPolicy::from_config(
+                &crate::config::Config::default(),
+            ),
         }
     }
 }
@@ -88,6 +98,7 @@ pub(crate) fn workflow_policy(config: &crate::config::Config) -> WorkflowPolicy 
     WorkflowPolicy {
         history_context_runs: config.workflow.history_context_runs,
         max_parallel_nodes: config.workflow.max_parallel_nodes,
+        watchdog: crate::workflow::watchdog::WatchdogPolicy::from_config(config),
     }
 }
 
@@ -351,6 +362,7 @@ mod tests {
             WorkflowPolicy {
                 history_context_runs: config.workflow.history_context_runs,
                 max_parallel_nodes: config.workflow.max_parallel_nodes,
+                watchdog: crate::workflow::watchdog::WatchdogPolicy::from_config(&config),
             }
         );
         assert_eq!(workflow_policy(&config), WorkflowPolicy::default());
