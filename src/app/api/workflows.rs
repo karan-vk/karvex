@@ -2630,11 +2630,32 @@ pub(crate) fn wire_run_node_record(
         subject: record.subject,
         owner: record.owner,
         emergent: record.emergent,
-        // Wave-0 shape only (`.local/prd/phase4-retarget-plan.md` §5 packet
-        // P3): `run_node.attention` has no store column and no writer yet, so
-        // this is honestly `None` rather than a guess. The watchdog packet
-        // (wave 2b) adds the column and starts writing it.
-        attention: None,
+        // §3.6/D-10: karvex's own opinion about the node, in its own column,
+        // never the projected `status` beside it. Written by the watchdog
+        // adapter (packet P9) and read back verbatim here — the wave-0 shape
+        // this replaced reported `None` for every node because nothing wrote
+        // the column yet.
+        attention: record.attention.map(wire_attention),
+    }
+}
+
+/// `run_node.attention` on the wire.
+///
+/// A total match rather than a string passthrough, so a new [`Attention`]
+/// variant fails to compile here instead of reaching a client as a word its
+/// schema does not know.
+#[cfg(feature = "workflow")]
+fn wire_attention(
+    attention: crate::workflow::model::Attention,
+) -> crate::api::schema::WorkflowAttention {
+    use crate::api::schema::WorkflowAttention;
+    use crate::workflow::model::Attention;
+    match attention {
+        Attention::Stuck => WorkflowAttention::Stuck,
+        Attention::BudgetExceeded => WorkflowAttention::BudgetExceeded,
+        Attention::NeedsInput => WorkflowAttention::NeedsInput,
+        Attention::LeadBlocked => WorkflowAttention::LeadBlocked,
+        Attention::Unbound => WorkflowAttention::Unbound,
     }
 }
 

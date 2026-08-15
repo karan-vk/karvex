@@ -221,6 +221,10 @@ fn spawn_lead_server(label: &str) -> LeadServer {
     spawn_lead_server_with_env(label, &[])
 }
 
+fn spawn_lead_server_with_env(label: &str, extra_env: &[(&str, &str)]) -> LeadServer {
+    spawn_lead_server_with(label, extra_env, "")
+}
+
 /// Brings up a real headless server whose config, state, workflow database,
 /// run directories **and Claude Code config directory** all live inside the
 /// test's own base.
@@ -231,7 +235,11 @@ fn spawn_lead_server(label: &str) -> LeadServer {
 /// the stub writes where karvex will look. It also moves the folder-trust
 /// preflight's `.claude.json` lookup into the temp base, where no file exists —
 /// and an unreadable config counts as trusted, so the preflight passes.
-fn spawn_lead_server_with_env(label: &str, extra_env: &[(&str, &str)]) -> LeadServer {
+fn spawn_lead_server_with(
+    label: &str,
+    extra_env: &[(&str, &str)],
+    extra_config: &str,
+) -> LeadServer {
     let base = unique_base(label);
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -249,7 +257,7 @@ fn spawn_lead_server_with_env(label: &str, extra_env: &[(&str, &str)]) -> LeadSe
     register_runtime_dir(&runtime_dir);
     fs::write(
         config_home.join(app_dir_name()).join("config.toml"),
-        "onboarding = false\n",
+        format!("onboarding = false\n{extra_config}"),
     )
     .unwrap();
 
@@ -490,6 +498,7 @@ fn subscribe(socket: &Path) -> JsonLineReader {
                     { "type": "workflow.run.summarized" },
                     { "type": "workflow.node.created" },
                     { "type": "workflow.node.updated" },
+                    { "type": "workflow.node.watchdog" },
                     { "type": "pane.created" },
                 ]
             }),
@@ -1860,6 +1869,180 @@ fn a_run_whose_lead_never_identifies_itself_fails_with_a_reason_instead_of_wedgi
     // The point of failing at all: the guard lets go, so the next run starts.
     let second = start_run(&socket, &workflow_id, "and again");
     assert_ne!(second, run_id);
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// The watchdog ladder (`.local/prd/phase4-retarget-plan.md` §3.4, packet P9)
+// ---------------------------------------------------------------------------
+
+/// The `[workflow]` block that makes the ladder observable inside a test.
+///
+/// Production samples every 20 s and needs three consecutive no-progress
+/// samples before rung 1; at those numbers this scenario would take two
+/// minutes. The knobs are the published ones and the code path is identical —
+/// only the clock is impatient.
+const FAST_WATCHDOG: &str =
+    "\n[workflow]\nwatchdog_tick_secs = 1\nstuck_threshold = 1\ndrift_threshold = 1\n";
+
+/// The whole ladder, end to end, against a real idle `claude`-shaped process.
+///
+/// Two nodes of the same run take the two different routes through it at once,
+/// which is the point of asserting them together:
+///
+/// * The **lead** identified itself, so karvex holds its inbox socket. Its
+///   rungs are *delivered* — the frames arrive on the socket in Claude Code's
+///   own shape — and its ladder is the short one (1 → 2 → 4), because there is
+///   nobody above a lead to escalate to.
+/// * The **teammate** never identified itself, so karvex holds no endpoint for
+///   it at all. Its rung 1 is composed, refused, and composed again; only after
+///   the second failure does the ladder stop trying to talk and surface. That
+///   is the rule the whole feature rests on — a nudge nobody received must
+///   never look like a nudge that was ignored — and it is only reachable from
+///   outside, because "karvex has no endpoint for this session" is a fact about
+///   a live server's memory rather than about any file.
+///
+/// The two `pending` tasks are the control: `NotWatched` means *touch nothing*,
+/// so their `attention` must still be absent after the watched nodes have
+/// walked their ladders twice over.
+///
+/// What this scenario deliberately does not cover is attention *clearing*,
+/// which needs the owning pane to move from idle back to working — a transition
+/// a PTY fixture cannot stage without racing karvex's own screen detection. It
+/// is unit-tested against the store in `app::workflow_watchdog`
+/// (`attention_clears_when_the_node_moves_again`), where the pane state is an
+/// input rather than a thing to be provoked.
+#[test]
+fn a_stuck_run_walks_the_watchdog_ladder_and_leaves_unwatched_nodes_alone() {
+    let server = spawn_lead_server_with("watchdog", &[], FAST_WATCHDOG);
+    let socket = server.socket().to_path_buf();
+    let mut events = subscribe(&socket);
+    let (_workflow_id, run_id) = launch_lead_run(&server);
+    wait_for_team_binding(&socket, &run_id);
+
+    // The lead's own `SessionStart` hook, with the inbox socket that makes it
+    // addressable. Everything below hangs off this: without it the lead is a
+    // pane karvex can see and a session it cannot reach.
+    let inbox = FakeInbox::bind(&server.base);
+    let lead_pane = lead_pane_id(&socket);
+    let reported = report_session(
+        &socket,
+        &run_id,
+        json!({
+            "session_id": LEAD_SESSION_ID,
+            "pane_id": lead_pane,
+            "cwd": server.base.to_string_lossy(),
+            "source": "startup",
+            "messaging_socket": inbox.path.to_string_lossy(),
+            "messaging_token": "50093985aaaabbbbccccddddeeeeffff",
+        }),
+    );
+    assert_eq!(reported["role"], "lead", "{reported}");
+
+    // Rung 1 to the lead, on the documented channel, in Claude Code's frames.
+    let auth = inbox.next_line();
+    assert_eq!(auth["type"], "auth", "the auth frame comes first: {auth}");
+    let nudge = inbox.next_line();
+    assert_eq!(nudge["type"], "user", "{nudge}");
+    let text = nudge["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("[karvex · watchdog]"),
+        "the frame is what lets the lead tell runtime steering from its human: {nudge}"
+    );
+    assert!(
+        text.contains("kvx workflow run finish"),
+        "a lead is told the one thing only it can do: {nudge}"
+    );
+    assert_eq!(
+        nudge["session_id"], LEAD_SESSION_ID,
+        "addressed, so a recycled socket cannot misdeliver: {nudge}"
+    );
+    assert_eq!(nudge["priority"], "next", "a nudge waits for the next turn");
+
+    // Rung 2 follows on the same channel, and says so.
+    let _auth = inbox.next_line();
+    let reprompt = inbox.next_line();
+    let text = reprompt["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("Second notice"),
+        "rung 2 is a different sentence, not the same one again: {reprompt}"
+    );
+
+    // Rung 4 has no message at all, so it is only visible as an opinion.
+    let surfaced = wait_for_run(
+        &socket,
+        &run_id,
+        "the watchdog to surface both the lead and the teammate's task",
+        |response| {
+            let nodes = response["graph"]["nodes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let lead = nodes.iter().find(|node| node["path"] == ".lead");
+            let plan = nodes.iter().find(|node| node["path"] == "plan");
+            lead.is_some_and(|node| node["attention"] == "stuck")
+                && plan.is_some_and(|node| node["attention"] == "stuck")
+        },
+    );
+    let nodes: BTreeMap<String, Value> = surfaced["graph"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|node| Some((node["path"].as_str()?.to_string(), node)))
+        .collect();
+
+    let lead = &nodes[".lead"];
+    assert!(
+        lead["watchdog_interventions"].as_u64().unwrap_or_default() >= 1,
+        "the surfaced opinion is counted on the row: {lead}"
+    );
+    assert_eq!(
+        lead["status"], "running",
+        "the run keeps going: rung 4 surfaces, it does not kill anything ({lead})"
+    );
+
+    // The teammate never reported, so karvex could not reach it — and the task
+    // is surfaced rather than nudged twice more.
+    let plan = &nodes["plan"];
+    assert_eq!(plan["attention"], "stuck", "{plan}");
+    assert_eq!(
+        plan["status"], "running",
+        "and its projected status is still Claude Code's ({plan})"
+    );
+
+    // The control: two tasks nobody has started. `NotWatched` writes nothing,
+    // and "wrote nothing" is only observable as an absence.
+    for path in ["build", EMERGENT_PATH] {
+        let node = nodes
+            .get(path)
+            .unwrap_or_else(|| panic!("the run has a node at {path}: {surfaced}"));
+        assert!(
+            node["attention"].is_null(),
+            "a pending task is out of scope and must not be touched at all: {node}"
+        );
+        assert_eq!(
+            node["watchdog_interventions"].as_u64().unwrap_or_default(),
+            0,
+            "nor counted: {node}"
+        );
+    }
+
+    // And a client that never polls still hears about it.
+    let mut seen = Vec::new();
+    let event = wait_for_event_matching(
+        &mut events,
+        &mut seen,
+        "workflow_node_watchdog",
+        SETTLE,
+        |event| event["data"]["node"]["path"] == ".lead",
+    );
+    assert_eq!(
+        event["data"]["node"]["attention"], "stuck",
+        "the event carries the same opinion the row does: {event}"
+    );
+    assert_eq!(event["data"]["run_id"], run_id, "{event}");
 
     server.shutdown();
 }
