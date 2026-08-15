@@ -363,6 +363,11 @@ pub struct Keybinds {
     /// Opens the run browser (`07-phase3-plan.md` §WS-F): a list-and-detail
     /// overlay over past and pruned runs, and restore-all.
     pub open_workflow_runs: ActionKeybinds,
+    /// Opens the workflow review overlay
+    /// (`.local/prd/phase4-retarget-plan.md` §3.5): forked-session
+    /// interviews and findings over a terminal run. Landed as an inert
+    /// stub by packet P2; review behaviour lands with P10/P13.
+    pub open_workflow_review: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
 }
 
@@ -528,6 +533,7 @@ impl Config {
             open_workflow_dag: empty_action!(),
             open_workflow_launcher: empty_action!(),
             open_workflow_runs: empty_action!(),
+            open_workflow_review: empty_action!(),
             custom_commands: Vec::new(),
         };
 
@@ -676,6 +682,7 @@ impl Config {
                 source
             );
             apply_action!(keybinds.open_workflow_runs, open_workflow_runs, source);
+            apply_action!(keybinds.open_workflow_review, open_workflow_review, source);
 
             if source == field_source!(indexed) {
                 append_legacy_indexed_bindings(
@@ -1696,6 +1703,50 @@ open_workflow_runs = "prefix+ctrl+h"
             binding_triggers(&config.keybinds().open_workflow_runs),
             vec![BindingTrigger::Prefix((
                 KeyCode::Char('h'),
+                KeyModifiers::CONTROL
+            ))]
+        );
+    }
+
+    /// The review overlay (`.local/prd/phase4-retarget-plan.md` §3.5,
+    /// packet P2) sits beside its three siblings on the
+    /// `prefix+shift+<letter>` family; `b` is already `open_workflow_runs`.
+    #[test]
+    fn open_workflow_review_defaults_to_prefix_shift_v_and_is_rebindable() {
+        let kb = Config::default().keybinds();
+        assert_eq!(
+            binding_triggers(&kb.open_workflow_review),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('v'),
+                KeyModifiers::SHIFT
+            ))]
+        );
+        for other in [
+            binding_triggers(&kb.open_workflow_dag),
+            binding_triggers(&kb.open_workflow_launcher),
+            binding_triggers(&kb.open_workflow_runs),
+            binding_triggers(&kb.split_vertical),
+            binding_triggers(&kb.reload_config),
+            binding_triggers(&kb.toggle_sidebar),
+        ] {
+            assert_ne!(
+                binding_triggers(&kb.open_workflow_review),
+                other,
+                "the review overlay binding must not collide with an existing default"
+            );
+        }
+
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+open_workflow_review = "prefix+ctrl+g"
+"#,
+        )
+        .expect("the key parses");
+        assert_eq!(
+            binding_triggers(&config.keybinds().open_workflow_review),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('g'),
                 KeyModifiers::CONTROL
             ))]
         );

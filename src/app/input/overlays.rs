@@ -256,6 +256,12 @@ impl App {
             return self.handle_workflow_runs_mouse(mouse);
         }
 
+        if self.state.mode == Mode::WorkflowReview {
+            // Same rule as every other overlay here; delegates to P2's stub
+            // handler (`.local/prd/phase4-retarget-plan.md` §3.5).
+            return self.handle_workflow_review_mouse(mouse);
+        }
+
         if self.state.mode == Mode::KeybindHelp {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)

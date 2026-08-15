@@ -548,6 +548,12 @@
           "description": "Open the run browser: a list-and-detail overlay over past and pruned runs."
         },
         {
+          "key": "keys.open_workflow_review",
+          "type": "keybinding",
+          "default": "\"prefix+shift+v\"",
+          "description": "Open the workflow review overlay: forked-session interviews and findings over a terminal run."
+        },
+        {
           "key": "keys.indexed.tabs",
           "type": "string",
           "default": "unset",

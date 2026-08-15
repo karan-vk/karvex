@@ -172,6 +172,18 @@ pub(super) fn open_workflow_dag(state: &mut AppState) -> bool {
     true
 }
 
+/// Opens the review overlay (`.local/prd/phase4-retarget-plan.md` §3.5,
+/// packet P2). Unlike the DAG view there is no live-run gate: this packet
+/// lands the mode as an inert stub, with no `workflow.review.*` wire method
+/// yet to decide whether a review is actually available — that decision
+/// belongs to the packet that wires the method (P10/P13). So the keybind is
+/// always reachable, and the stub renders its own honest "not available yet"
+/// state instead of refusing to open.
+pub(super) fn open_workflow_review(state: &mut AppState) {
+    state.view.workflow_review = crate::app::state::WorkflowReviewState::default();
+    state.mode = Mode::WorkflowReview;
+}
+
 pub(crate) fn handle_global_menu_key(state: &mut AppState, key: KeyEvent) {
     let actions = global_menu_actions(state);
     match key.code {
@@ -531,6 +543,15 @@ pub(super) const WORKFLOW_RUNS_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
         bindings: &[ModalKeyBinding::Esc],
     },
 ];
+
+/// The review overlay's stub action row: `Esc` closes through the same
+/// `leave_modal` path as every other overlay
+/// (`.local/prd/phase4-retarget-plan.md` §3.5, packet P2) — never an input
+/// trap, even before there is anything behind it to accept or decline.
+pub(super) const WORKFLOW_REVIEW_ACTIONS: &[ModalActionSpec<ModalAction>] = &[ModalActionSpec {
+    action: ModalAction::Close,
+    bindings: &[ModalKeyBinding::Esc],
+}];
 
 pub(super) const RENAME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
     ModalActionSpec {

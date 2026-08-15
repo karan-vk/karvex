@@ -24,6 +24,7 @@ mod text;
 mod widgets;
 mod workflow_dag;
 mod workflow_launch;
+mod workflow_review;
 mod workflow_runs;
 
 use self::dialogs::{
@@ -75,6 +76,7 @@ use self::workflow_launch::{compute_workflow_launch_view, render_workflow_launch
 pub(crate) use self::workflow_launch::{
     workflow_launch_contains, workflow_launch_target_at, WorkflowLaunchTarget, LAUNCH_TIERS,
 };
+use self::workflow_review::{compute_workflow_review_view, render_workflow_review};
 use self::workflow_runs::{compute_workflow_runs_view, render_workflow_runs};
 pub(crate) use self::{
     dialogs::{
@@ -329,6 +331,8 @@ fn compute_view_internal(
     let workflow_launch = compute_workflow_launch_view(app, area, carried_launch);
     let carried_runs = std::mem::take(&mut app.view.workflow_runs);
     let workflow_runs = compute_workflow_runs_view(app, area, carried_runs);
+    let carried_review = std::mem::take(&mut app.view.workflow_review);
+    let workflow_review = compute_workflow_review_view(app, area, carried_review);
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
@@ -348,6 +352,7 @@ fn compute_view_internal(
         dag,
         workflow_launch,
         workflow_runs,
+        workflow_review,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -407,6 +412,8 @@ fn compute_mobile_view(
     let workflow_launch = compute_workflow_launch_view(app, area, carried_launch);
     let carried_runs = std::mem::take(&mut app.view.workflow_runs);
     let workflow_runs = compute_workflow_runs_view(app, area, carried_runs);
+    let carried_review = std::mem::take(&mut app.view.workflow_review);
+    let workflow_review = compute_workflow_review_view(app, area, carried_review);
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
@@ -426,6 +433,7 @@ fn compute_mobile_view(
         dag,
         workflow_launch,
         workflow_runs,
+        workflow_review,
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -504,6 +512,7 @@ pub fn render_with_runtime_registry(
         Mode::WorkflowDag => render_workflow_dag(app, frame, frame.area()),
         Mode::WorkflowLaunch => render_workflow_launch(app, frame, frame.area()),
         Mode::WorkflowRuns => render_workflow_runs(app, frame, frame.area()),
+        Mode::WorkflowReview => render_workflow_review(app, frame, frame.area()),
         Mode::Terminal => {}
     }
 }

@@ -48,6 +48,7 @@ mod settings;
 mod sidebar;
 mod terminal;
 mod workflow_launch;
+mod workflow_review;
 mod workflow_runs;
 
 pub(crate) use self::{
@@ -125,6 +126,7 @@ impl App {
                 Mode::WorkflowDag => self.handle_workflow_dag_key(key_event),
                 Mode::WorkflowLaunch => self.handle_workflow_launch_key(key_event),
                 Mode::WorkflowRuns => self.handle_workflow_runs_key(key_event),
+                Mode::WorkflowReview => self.handle_workflow_review_key(key_event),
                 Mode::Terminal => unreachable!(),
             },
         }
@@ -262,6 +264,9 @@ impl App {
                 workflow_launch::insert_workflow_launch_text(&mut self.state, text)
             }
             Mode::WorkflowRuns => workflow_runs::insert_workflow_runs_text(&mut self.state, text),
+            Mode::WorkflowReview => {
+                workflow_review::insert_workflow_review_text(&mut self.state, text)
+            }
             Mode::Copy => {
                 let Some(prompt) = self
                     .state
@@ -1172,6 +1177,8 @@ pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
         ),
         // See the matching arm in `paste_into_active_text_input`.
         Mode::WorkflowRuns => false,
+        // Same reason: the stub has no focused text field yet.
+        Mode::WorkflowReview => false,
         Mode::Copy => state
             .copy_mode
             .as_ref()
