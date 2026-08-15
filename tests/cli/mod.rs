@@ -15,5 +15,11 @@ mod surface;
 // exports nothing and has no `tmux` symlink to build this suite around.
 #[cfg(unix)]
 mod tmux_compat;
+// `kvx workflow review` does not exist at all without the `workflow`
+// feature (`--no-default-features` answers `workflow_unavailable` before any
+// of these refusal codes can be reached, the same reason
+// `tests/workflow_lead_headless.rs` carries `required-features = ["workflow"]`
+// in `Cargo.toml` instead of a runtime skip).
+#[cfg(feature = "workflow")]
 mod workflow;
 mod workspace;
