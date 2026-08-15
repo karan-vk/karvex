@@ -4792,6 +4792,26 @@ port = "summary"
                 "review_compile_failed",
                 crate::app::api::workflow_review_apply::WORKFLOW_REVIEW_COMPILE_FAILED_CODE,
             ),
+            // Wave 2b (packet P10) added four more domains once the
+            // orchestration existed to produce them: the run is not over yet,
+            // an interview's answer or the synthesis document did not parse,
+            // and an answer arrived for an interview karvex had already closed.
+            (
+                "review_run_not_terminal",
+                crate::app::api::workflow_review::WORKFLOW_REVIEW_RUN_NOT_TERMINAL_CODE,
+            ),
+            (
+                "review_answer_refused",
+                crate::app::api::workflow_review::WORKFLOW_REVIEW_ANSWER_REFUSED_CODE,
+            ),
+            (
+                "review_report_refused",
+                crate::app::api::workflow_review::WORKFLOW_REVIEW_REPORT_REFUSED_CODE,
+            ),
+            (
+                "review_interview_closed",
+                crate::app::api::workflow_review::WORKFLOW_REVIEW_INTERVIEW_CLOSED_CODE,
+            ),
         ]
     }
 
@@ -4808,7 +4828,7 @@ port = "summary"
         let codes = all_workflow_error_codes();
         assert_eq!(
             codes.len(),
-            23,
+            27,
             "the inventory grew or shrank; update this count alongside the list itself"
         );
 

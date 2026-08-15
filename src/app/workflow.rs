@@ -78,6 +78,9 @@ pub(crate) struct WorkflowPolicy {
     /// two seconds and `App` holds no `Config`.
     #[cfg_attr(not(feature = "workflow"), allow(dead_code))]
     pub(crate) watchdog: crate::workflow::watchdog::WatchdogPolicy,
+    /// `workflow.review_max_interviews` (§3.5): the cap on how many members one
+    /// review cycle interviews.
+    pub(crate) review_max_interviews: usize,
 }
 
 impl Default for WorkflowPolicy {
@@ -90,6 +93,7 @@ impl Default for WorkflowPolicy {
             watchdog: crate::workflow::watchdog::WatchdogPolicy::from_config(
                 &crate::config::Config::default(),
             ),
+            review_max_interviews: 6,
         }
     }
 }
@@ -99,6 +103,7 @@ pub(crate) fn workflow_policy(config: &crate::config::Config) -> WorkflowPolicy 
         history_context_runs: config.workflow.history_context_runs,
         max_parallel_nodes: config.workflow.max_parallel_nodes,
         watchdog: crate::workflow::watchdog::WatchdogPolicy::from_config(config),
+        review_max_interviews: config.workflow.review_max_interviews,
     }
 }
 
@@ -363,6 +368,7 @@ mod tests {
                 history_context_runs: config.workflow.history_context_runs,
                 max_parallel_nodes: config.workflow.max_parallel_nodes,
                 watchdog: crate::workflow::watchdog::WatchdogPolicy::from_config(&config),
+                review_max_interviews: config.workflow.review_max_interviews,
             }
         );
         assert_eq!(workflow_policy(&config), WorkflowPolicy::default());

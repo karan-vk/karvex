@@ -195,6 +195,13 @@ pub struct App {
     /// between the two feature legs.
     #[cfg_attr(not(feature = "workflow"), allow(dead_code))]
     pub(crate) workflow_watchdog: workflow_watchdog::WatchdogState,
+    /// The self-improvement review cycles this server is running
+    /// (`.local/prd/phase4-retarget-plan.md` §3.5). Unlike
+    /// [`Self::workflow_lead`] this is a list and is **not** bounded by the
+    /// single-live-run guard: a review interviews a run that has already
+    /// ended, and a running cycle must never block a new run (§6 D-4).
+    #[cfg(feature = "workflow")]
+    pub(crate) workflow_reviews: Vec<workflow_review::LiveReviewCycle>,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -842,6 +849,8 @@ impl App {
             workflow_store: workflow_store::WorkflowStoreHandle::default(),
             workflow_lead: None,
             workflow_watchdog: workflow_watchdog::WatchdogState::default(),
+            #[cfg(feature = "workflow")]
+            workflow_reviews: Vec::new(),
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }

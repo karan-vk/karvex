@@ -38,8 +38,8 @@ pub use error::StoreError;
 pub use queries::{
     CheckpointRecord, InterrogationRecord, NodeEvidence, RestorableCheckpoint, ReviewCycleRecord,
     ReviewFindingRecord, RunEdgeRecord, RunEventRecord, RunMemberRecord, RunNodeRecord, RunRecord,
-    RunSummaryRecord, StoredGrowthLimit, StoredGrowthLimits, VersionRecord, WorkflowSummary,
-    DEFAULT_NODE_HISTORY_RUNS,
+    RunSummaryRecord, StoredGrowthLimit, StoredGrowthLimits, VersionRecord, WatchdogJournalEntry,
+    WorkflowSummary, DEFAULT_NODE_HISTORY_RUNS,
 };
 use sha2::{Digest, Sha256};
 use surrealdb::engine::local::{Db, Mem, SurrealKv};
