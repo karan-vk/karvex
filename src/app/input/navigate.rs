@@ -423,7 +423,10 @@ impl App {
             // (`06-phase2-plan.md` §4 D18); the notice is what is left when
             // there is nothing to launch either.
             NavigateAction::OpenWorkflowDag => {
-                if !super::modal::open_workflow_dag(&mut self.state)
+                // A live team lead first: it has no mirrored graph, so the
+                // `AppState`-only opener below cannot see it.
+                if !self.open_workflow_dag_on_the_live_run()
+                    && !super::modal::open_workflow_dag(&mut self.state)
                     && !self.open_workflow_launcher()
                 {
                     self.notify_no_workflow_run();

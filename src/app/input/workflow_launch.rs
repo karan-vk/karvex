@@ -496,10 +496,12 @@ impl App {
             return;
         }
 
-        // A started run has a graph to watch, and the overlay is where the user
-        // watches it. Falling back to `leave_modal` keeps the exit honest when
-        // the run produced no mirrored graph.
-        if self.state.workflow_run_graph().is_some() {
+        // A started run is one the user wants to watch, and the overlay is
+        // where they watch it. A lead run is loaded from the store (it has no
+        // mirrored graph); an engine-era mirror still wins if one is somehow
+        // there. Falling back to `leave_modal` keeps the exit honest when there
+        // is nothing to show.
+        if self.open_workflow_dag_on_the_live_run() || self.state.workflow_run_graph().is_some() {
             self.state.mode = Mode::WorkflowDag;
         } else {
             leave_modal(&mut self.state);

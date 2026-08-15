@@ -640,14 +640,68 @@ impl crate::app::App {
             "the run's team lead exited without reporting; closing the run with its last snapshot"
         );
         self.persist_workflow_write(StoreWrite::RunStatus {
-            run: run_id,
+            run: run_id.clone(),
             status: RunStatus::Failed,
             ended_at_unix_ms: Some(ended_at_unix_ms),
         });
         if let Some(run) = self.workflow_lead.as_mut() {
             run.closed = true;
         }
+        // Terminal, so it is a `run.finished` like any other close. Nothing
+        // asked for this one, which is exactly why it has to be announced: the
+        // run browser and every subscriber would otherwise show it as live
+        // until something else happened to move them.
+        if let Some(run) = self.stored_run_info_for_events(&run_id) {
+            self.emit_workflow_run_event(
+                EventKind::WorkflowRunFinished,
+                EventData::WorkflowRunFinished { run },
+            );
+        }
         true
+    }
+
+    /// The run's wire record, for a lead-path event payload.
+    ///
+    /// Read back rather than synthesised, for the same reason
+    /// [`Self::stored_run_nodes_for_events`] is: the row is what
+    /// `workflow.run.get` would answer, and an event that disagreed with the
+    /// record would be worse than no event.
+    #[cfg(feature = "workflow")]
+    fn stored_run_info_for_events(
+        &mut self,
+        run: &RunId,
+    ) -> Option<crate::api::schema::WorkflowRunInfo> {
+        let wanted = run.clone();
+        let loaded = self.workflow_store.call(move |cx| {
+            let record = cx.block_on(cx.store().get_run(&wanted))?;
+            let limits = cx.block_on(cx.store().growth_limits(&wanted))?;
+            Ok::<_, crate::workflow::store::StoreError>((record, limits))
+        });
+        match loaded {
+            Ok(Ok((Some(record), limits))) => {
+                Some(crate::app::api::workflows::wire_run_record(record, &limits))
+            }
+            Ok(Ok((None, _))) => None,
+            Ok(Err(error)) => {
+                warn!(%error, "the closed run could not be read back for its event");
+                None
+            }
+            Err(unavailable) => {
+                warn!(
+                    ?unavailable,
+                    "the workflow store is unavailable; no run event"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "workflow"))]
+    fn stored_run_info_for_events(
+        &mut self,
+        _run: &RunId,
+    ) -> Option<crate::api::schema::WorkflowRunInfo> {
+        None
     }
 
     // ── store and layout plumbing ──────────────────────────────────────────
@@ -776,6 +830,133 @@ impl crate::app::App {
         }
         let _ = self.runtime_pane_close("workflow.lead.close", lead_pane_id);
         true
+    }
+
+    /// Test-only: the state `workflow.run` leaves behind once the lead's pane
+    /// exists — without the pane.
+    ///
+    /// `workflow.run` execs a real `claude` and preflights its version (§3.1
+    /// step 3), so no in-crate test can drive that handler end to end;
+    /// `tests/workflow_lead_headless.rs` owns the launch with a stub on `PATH`.
+    /// Everything the handlers and the overlays do *around* a live run still
+    /// has to be testable, so this performs exactly the two steps the handler
+    /// takes once the pane is up — `create_run` and [`Self::bind_lead_run`] —
+    /// and nothing else. It is the replacement for the engine-era fixtures that
+    /// bound a node and minted it a result token.
+    #[cfg(all(test, feature = "workflow"))]
+    pub(crate) fn test_bind_a_live_lead_run(
+        &mut self,
+        workflow_id: &str,
+        workflow_name: &str,
+    ) -> RunId {
+        use crate::workflow::model::{Demand, WorkflowId};
+        use crate::workflow::store::NewRun;
+        use crate::workflow::tier::{resolve_assignments, HistoryIndex, Tier};
+
+        let wanted = WorkflowId::new(workflow_id.to_string());
+        let (version_id, kvdag) = self
+            .workflow_store
+            .call(move |cx| {
+                let summary = cx
+                    .block_on(cx.store().get_workflow(&wanted))?
+                    .expect("the workflow row exists");
+                let version_id = summary
+                    .head_version
+                    .expect("a created workflow has a head version");
+                let kvdag = cx.block_on(cx.store().load_version(&version_id))?;
+                Ok::<_, crate::workflow::store::StoreError>((version_id, kvdag))
+            })
+            .expect("the in-memory store is available")
+            .expect("the head version loads");
+
+        let started_at_unix_ms = crate::app::workflow::current_unix_ms();
+        let assignments = resolve_assignments(&kvdag, Tier::Auto, &HistoryIndex::new());
+        let run_id = self
+            .workflow_store
+            .call({
+                let workflow = kvdag.workflow_id.clone();
+                let growth = kvdag.growth;
+                move |cx| {
+                    cx.block_on(cx.store().create_run(NewRun {
+                        workflow,
+                        version: version_id,
+                        tier: Tier::Auto,
+                        args: std::collections::BTreeMap::new(),
+                        growth,
+                        started_at_unix_ms,
+                        assignments,
+                        context_runs: Vec::new(),
+                        workspace_id: None,
+                        restore_from: None,
+                        restored: Vec::new(),
+                    }))
+                }
+            })
+            .expect("the in-memory store is available")
+            .expect("the run row is created");
+
+        let spec = LeadSpawnSpec {
+            run_id: run_id.clone(),
+            workflow_name: workflow_name.to_string(),
+            run_dir: PathBuf::from("/runs").join(workflow_name),
+            cwd: PathBuf::from("/repo"),
+            assignment: crate::workflow::tier::resolve(Tier::Auto, Demand::Critical, None),
+        };
+        self.bind_lead_run(
+            run_id.clone(),
+            &kvdag,
+            &spec,
+            "w1:p1".to_string(),
+            crate::terminal::TerminalId::alloc(),
+            started_at_unix_ms,
+        );
+        self.mark_lead_run_running(&run_id);
+        run_id
+    }
+
+    /// Publishes one **run-level** workflow event and refreshes any surface
+    /// that lists runs.
+    ///
+    /// The engine's `emit_workflow_event` used to be the single funnel for
+    /// this: it published the wire envelope and, for the four run-level kinds,
+    /// re-read the run browser's rows (`07-phase3-plan.md` §A7). The engine
+    /// went and took the funnel with it, leaving `workflow.run.started` and
+    /// `workflow.run.updated` with no producer at all and the browser stale for
+    /// the whole life of a run. This is the replacement, and it is deliberately
+    /// the *only* way a lead run publishes a run-level event, so the two can
+    /// never drift apart again.
+    ///
+    /// Node-level events do not come through here on purpose: several per node
+    /// per run, and none of them can move a row in the run list.
+    pub(crate) fn emit_workflow_run_event(&mut self, kind: EventKind, data: EventData) {
+        self.emit_event(EventEnvelope { event: kind, data });
+        self.refresh_workflow_runs_overlay(kind);
+    }
+
+    /// Opens the DAG overlay on the run a team lead is executing right now.
+    ///
+    /// The same path the run browser's `Enter` takes: a lead run has no
+    /// in-memory graph to mirror (`AppState::set_workflow_run_graph`), so the
+    /// overlay is loaded from the store through `workflow.run.get` and kept
+    /// current by `reload_open_lead_run` on every projection tick. Returns
+    /// whether it opened, so the caller can fall through to whatever it did
+    /// before.
+    ///
+    /// Phase C re-pointed the run browser at this and left the *other* entry
+    /// points asking the engine's mirror, which nothing writes any more — so
+    /// `keys.open_workflow_dag` fell through to the launcher and the launcher
+    /// closed itself instead of showing the run it had just started.
+    pub(crate) fn open_workflow_dag_on_the_live_run(&mut self) -> bool {
+        let Some(run_id) = self.live_lead_run_id() else {
+            return false;
+        };
+        match self.load_historical_run(&run_id) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::debug!(%error, run = %run_id, "could not open the live run in the DAG");
+                false
+            }
+        }
     }
 
     /// Whether this run is the live lead run.

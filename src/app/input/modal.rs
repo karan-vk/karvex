@@ -1625,6 +1625,32 @@ mod tests {
         assert_eq!(state.mode, Mode::WorkflowDag);
     }
 
+    /// **Known gap, not a passing test.** The global menu's DAG entry is
+    /// offered on the engine's mirrored run graph, which nothing has written
+    /// since the engine was removed (`AppState::set_workflow_run_graph`), so a
+    /// user with a live team lead is not offered the overlay here at all. The
+    /// keybinding and the launcher were re-pointed at
+    /// `App::open_workflow_dag_on_the_live_run`; this path cannot be, because
+    /// the menu is dispatched from `&mut AppState` and loading a lead run needs
+    /// the runtime to dispatch `workflow.run.get`.
+    ///
+    /// Closing it means giving `AppState` a mirror of "a run is live" — one
+    /// field, set and cleared by `src/app/workflow_lead.rs` — and a way for a
+    /// pure-state path to ask the runtime to load it. That is a design call
+    /// about the client/runtime boundary, so it is named here rather than
+    /// guessed at.
+    #[test]
+    #[ignore = "gap: the global menu reads the engine's run-graph mirror, which the lead path does not write; needs a live-run mirror on AppState plus a runtime load request"]
+    fn the_global_menu_offers_the_dag_while_a_lead_run_is_live() {
+        let state = state_with_workspaces(&["test"]);
+        // Stands in for "a team lead is executing a run on this server". There
+        // is no way to say that in `AppState` today, which is the gap.
+        assert!(
+            global_menu_actions(&state).contains(&GlobalMenuAction::WorkflowDag),
+            "a live lead run must be openable from the global menu"
+        );
+    }
+
     #[test]
     fn global_menu_whats_new_opens_saved_release_notes() {
         let _guard = config_env_lock().lock().unwrap();

@@ -949,13 +949,22 @@ impl App {
         self.mark_lead_run_running(&run_id);
 
         match self.stored_run(&run_id) {
-            Ok(Some((run, _graph))) => encode_success(
-                id,
-                ResponseResult::WorkflowRunStarted {
-                    run,
-                    restore: restore.map(|plan| plan.report),
-                },
-            ),
+            Ok(Some((run, _graph))) => {
+                // The run exists and is `running`; say so to whoever subscribed
+                // (§3.6 keeps `workflow.run.started` on the wire) and to the run
+                // browser if it is open.
+                self.emit_workflow_run_event(
+                    crate::api::schema::EventKind::WorkflowRunStarted,
+                    crate::api::schema::EventData::WorkflowRunStarted { run: run.clone() },
+                );
+                encode_success(
+                    id,
+                    ResponseResult::WorkflowRunStarted {
+                        run,
+                        restore: restore.map(|plan| plan.report),
+                    },
+                )
+            }
             Ok(None) => encode_error(
                 id,
                 NOT_FOUND_CODE,
@@ -1052,19 +1061,19 @@ impl App {
                 )
             }
         };
-        self.emit_event(crate::api::schema::EventEnvelope {
-            event: crate::api::schema::EventKind::WorkflowRunSummarized,
-            data: crate::api::schema::EventData::WorkflowRunSummarized {
+        self.emit_workflow_run_event(
+            crate::api::schema::EventKind::WorkflowRunSummarized,
+            crate::api::schema::EventData::WorkflowRunSummarized {
                 run_id: run_id.to_string(),
                 summary: summary.clone(),
             },
-        });
+        );
         match self.stored_run(&run_id) {
             Ok(Some((run, _graph))) => {
-                self.emit_event(crate::api::schema::EventEnvelope {
-                    event: crate::api::schema::EventKind::WorkflowRunFinished,
-                    data: crate::api::schema::EventData::WorkflowRunFinished { run: run.clone() },
-                });
+                self.emit_workflow_run_event(
+                    crate::api::schema::EventKind::WorkflowRunFinished,
+                    crate::api::schema::EventData::WorkflowRunFinished { run: run.clone() },
+                );
                 encode_success(id, ResponseResult::WorkflowRunFinished { run, summary })
             }
             Ok(None) => encode_error(id, NOT_FOUND_CODE, format!("no run {run_id}")),

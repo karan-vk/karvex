@@ -2092,6 +2092,12 @@ pub struct AppState {
     /// the DAG overlay can be computed and drawn from `AppState` alone. Boxed
     /// because it is `None` for every karvex that never runs a workflow, and
     /// `AppState` is moved on handoff.
+    ///
+    /// **No production writer since the engine was removed** — see
+    /// [`AppState::set_workflow_run_graph`]. A lead run reaches the same
+    /// overlay through [`Self::historical_run`], loaded from the store by
+    /// `App::open_workflow_dag_on_the_live_run` and refreshed on every
+    /// projection tick by `App::reload_open_lead_run`.
     pub(crate) run_graph: Option<Box<crate::workflow::model::RunGraph>>,
     /// Authored, human-readable facts about the active run that the run graph
     /// itself does not carry: the workflow's name and each node's kvdag
@@ -2345,8 +2351,30 @@ impl AppState {
         self.run_graph.as_deref()
     }
 
-    /// Replaces the mirrored run graph. Only `src/app/workflow.rs` calls this,
-    /// immediately after the engine produced a batch of effects.
+    /// Replaces the mirrored run graph.
+    ///
+    /// **Nothing in production calls this.** It was written once per effect
+    /// batch by the engine's `mirror_workflow_run_graph`, which went with the
+    /// engine (`09-agent-teams-rework.md` §2). A lead run reaches the same
+    /// overlay through the store-backed snapshot in
+    /// `src/app/workflow_history.rs` instead, and that is the whole point of
+    /// §3.4: one projection, served by `workflow.run.get`, rather than a live
+    /// in-memory copy racing a durable one.
+    ///
+    /// So the mirror is *not* a missing feed for the graph itself. The one
+    /// user-visible thing its absence still costs is the global menu's DAG
+    /// entry, which is offered from a pure `&mut AppState` path that cannot ask
+    /// the runtime to load a run; `the_global_menu_offers_the_dag_while_a_lead
+    /// _run_is_live` in `src/app/input/modal.rs` is the ignored test naming it.
+    /// The keybinding and the launcher were re-pointed at
+    /// `App::open_workflow_dag_on_the_live_run`.
+    ///
+    /// Kept rather than deleted because it is the seam a re-added engine (the
+    /// staged-`D1` option in the rework audit) would write to, and because its
+    /// readers in `src/ui/workflow_dag.rs` are the overlay's whole live-run
+    /// branch — removing them is a product call about what a re-added engine
+    /// may show, not a lint fix.
+    #[allow(dead_code)] // see above: the engine's mirror, kept as a seam
     pub(crate) fn set_workflow_run_graph(
         &mut self,
         graph: Option<crate::workflow::model::RunGraph>,
@@ -2390,6 +2418,13 @@ impl AppState {
 
     /// Records the kvdag `label` of every node in the active definition.
     /// Mirrored with the run graph, which carries only node keys.
+    ///
+    /// Unwritten, and redundant rather than missing: `run_node.label` is
+    /// durable — `materialise_run_nodes` writes a planned node's authored
+    /// label at `create_run`, and the projection writes an emergent task's
+    /// subject as its label — and `project_node` reads it as the rung below
+    /// this map. A lead run's boxes are named correctly without it.
+    #[allow(dead_code)] // see `set_workflow_run_graph`: the engine's mirror
     pub(crate) fn set_workflow_node_labels(
         &mut self,
         labels: std::collections::HashMap<String, String>,
@@ -2399,6 +2434,12 @@ impl AppState {
 
     /// Records the outstanding pane-delivery failures, keyed by node instance
     /// path. Mirrored with the run graph; an empty map clears the markers.
+    ///
+    /// Unwritten, and nothing is missing: a refused delivery was an engine
+    /// fact, and the verbs that produced one are retired
+    /// (`09-agent-teams-rework.md` §3.5). Kept with the rest of the seam so the
+    /// mirror is removed or restored as one piece.
+    #[allow(dead_code)] // see `set_workflow_run_graph`: the engine's mirror
     pub(crate) fn set_workflow_delivery_failures(
         &mut self,
         failures: std::collections::HashMap<String, String>,
@@ -2409,6 +2450,11 @@ impl AppState {
     /// Records the run's growth guardrail breaches for the DAG overlay: one
     /// banner line for the run and one notice per proposing node. Mirrored with
     /// the run graph; `None` plus an empty map clears both.
+    ///
+    /// Unwritten, and nothing is missing: growth guardrails were the engine's
+    /// judgment, and the lead creates tasks freely while karvex records
+    /// emergent nodes (§2). Kept with the rest of the seam for the same reason.
+    #[allow(dead_code)] // see `set_workflow_run_graph`: the engine's mirror
     pub(crate) fn set_workflow_growth(
         &mut self,
         banner: Option<String>,

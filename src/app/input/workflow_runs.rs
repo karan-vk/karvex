@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 
 use super::modal::{leave_modal, modal_action_from_key, ModalAction, WORKFLOW_RUNS_ACTIONS};
 use crate::api::schema::{
-    ErrorResponse, Method, ResponseResult, SuccessResponse, WorkflowRestoreRequest,
+    ErrorResponse, EventKind, Method, ResponseResult, SuccessResponse, WorkflowRestoreRequest,
     WorkflowRunInfo, WorkflowRunListParams, WorkflowRunParams, WorkflowRunStatus,
     WorkflowRunSummaryInfo, WorkflowSummaryListParams, WorkflowTier,
 };
@@ -25,7 +25,7 @@ use crate::app::state::{
     WorkflowRunsRunEntry, WorkflowRunsState,
 };
 use crate::app::App;
-use crate::workflow::model::{NoticeLevel, RunId, RunStatus, UserNotice, WorkflowEvent};
+use crate::workflow::model::{NoticeLevel, RunId, RunStatus, UserNotice};
 use crate::workflow::tier::Tier;
 
 /// Inserts typed or pasted text into whatever text field the run browser
@@ -311,28 +311,34 @@ impl App {
 
     /// Re-loads the browser's row set after a run-level event arrives while
     /// it is open (`07-phase3-plan.md` §A7, C-4). Called from
-    /// `app/workflow.rs`'s `emit_workflow_event` — the one place every
-    /// workflow event already flows through — rather than from a dedicated
-    /// subscription of the browser's own: `compute_workflow_runs_view` stays
-    /// pure, and this is a runtime-half method exactly like the key/mouse
-    /// handlers, just triggered by an event arrival instead of a keypress.
+    /// `App::emit_workflow_run_event` — the one place every run-level workflow
+    /// event flows through — rather than from a dedicated subscription of the
+    /// browser's own: `compute_workflow_runs_view` stays pure, and this is a
+    /// runtime-half method exactly like the key/mouse handlers, just triggered
+    /// by an event arrival instead of a keypress.
+    ///
+    /// It takes the **wire** `EventKind` now. The trigger used to sit in the
+    /// engine's `emit_workflow_event`, which fanned the engine-side
+    /// `WorkflowEvent` out to both the wire and here; the engine went, and with
+    /// it the only producer of that enum (`09-agent-teams-rework.md` §2). The
+    /// lead path publishes wire envelopes directly, so this reads the same kind
+    /// a subscribed client would.
     ///
     /// No-ops outside `Mode::WorkflowRuns`, and for every event kind that
-    /// cannot change a list row: node-level events, and interrogation events
-    /// (the browser shows interrogations only through the historical DAG,
-    /// WS-H — never through the list). Re-anchors the selection by run id
-    /// rather than by index, since a reload can reorder or add rows out from
+    /// cannot change a list row: node-level events above all (several per node
+    /// per run, and none of them moves a row). Re-anchors the selection by run
+    /// id rather than by index, since a reload can reorder or add rows out from
     /// under a fixed index.
-    pub(crate) fn refresh_workflow_runs_overlay(&mut self, event: &WorkflowEvent) {
+    pub(crate) fn refresh_workflow_runs_overlay(&mut self, event: EventKind) {
         if self.state.mode != Mode::WorkflowRuns {
             return;
         }
         let is_run_level = matches!(
             event,
-            WorkflowEvent::RunStarted { .. }
-                | WorkflowEvent::RunUpdated { .. }
-                | WorkflowEvent::RunFinished { .. }
-                | WorkflowEvent::RunSummarized { .. }
+            EventKind::WorkflowRunStarted
+                | EventKind::WorkflowRunUpdated
+                | EventKind::WorkflowRunFinished
+                | EventKind::WorkflowRunSummarized
         );
         if !is_run_level {
             return;
@@ -537,7 +543,9 @@ impl App {
             self.dispatch_runtime_mutation("tui.workflow.run", Method::WorkflowRun(params));
         match success_result(&response) {
             Some(ResponseResult::WorkflowRunStarted { .. }) => {
-                if self.state.workflow_run_graph().is_some() {
+                if self.open_workflow_dag_on_the_live_run()
+                    || self.state.workflow_run_graph().is_some()
+                {
                     self.state.mode = Mode::WorkflowDag;
                 }
             }
@@ -957,30 +965,16 @@ output_schema = {{ type = "object" }}
         workflow.workflow_id
     }
 
+    /// The browser lists a live lead run, not just closed ones. It reads
+    /// `workflow.run.list`, which is store-backed, so the run row `workflow.run`
+    /// writes is all it needs — there is no in-memory engine projection behind
+    /// it any more.
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
-    fn the_browser_lists_a_started_run() {
+    fn the_browser_lists_a_live_lead_run() {
         let mut app = test_app();
         let workflow_id = create_workflow(&mut app, "ship-feature");
-        let response = app.dispatch_runtime_mutation(
-            "test.workflow.run",
-            Method::WorkflowRun(WorkflowRunParams {
-                workflow_id,
-                version: None,
-                tier: None,
-                args: HashMap::new(),
-                restore_from: None,
-                include_prior_summaries: None,
-            }),
-        );
-        assert!(
-            matches!(
-                success_result(&response),
-                Some(ResponseResult::WorkflowRunStarted { .. })
-            ),
-            "{response}"
-        );
+        app.test_bind_a_live_lead_run(&workflow_id, "ship-feature");
 
         assert!(app.open_workflow_runs());
         assert_eq!(app.state.view.workflow_runs.entries.len(), 1);
@@ -988,6 +982,7 @@ output_schema = {{ type = "object" }}
             panic!("expected a run row");
         };
         assert_eq!(run.workflow_name, "ship-feature");
+        assert_eq!(run.status, RunStatus::Running);
     }
 
     #[test]
@@ -996,9 +991,7 @@ output_schema = {{ type = "object" }}
         app.state.mode = Mode::WorkflowDag;
         let before = app.state.view.workflow_runs.clone();
 
-        app.refresh_workflow_runs_overlay(&WorkflowEvent::RunStarted {
-            run: RunId::new("workflow_run:1"),
-        });
+        app.refresh_workflow_runs_overlay(EventKind::WorkflowRunStarted);
         assert_eq!(app.state.view.workflow_runs, before);
         assert_eq!(app.state.mode, Mode::WorkflowDag);
     }
@@ -1010,10 +1003,7 @@ output_schema = {{ type = "object" }}
         app.state.view.workflow_runs = state_with_geometry(vec![run_row("run:1")]);
         let before = app.state.view.workflow_runs.clone();
 
-        app.refresh_workflow_runs_overlay(&WorkflowEvent::NodeCreated {
-            run: RunId::new("workflow_run:1"),
-            path: crate::workflow::model::InstancePath::new("root"),
-        });
+        app.refresh_workflow_runs_overlay(EventKind::WorkflowNodeCreated);
         assert_eq!(
             app.state.view.workflow_runs, before,
             "a node-level event cannot change a run-list row"
@@ -1022,32 +1012,15 @@ output_schema = {{ type = "object" }}
 
     #[cfg(feature = "workflow")]
     #[test]
-    #[ignore = "drives the retired engine launch path: `workflow.run` now spawns a Claude Code team lead (09-agent-teams-rework.md §3.1). Reshaped in phase D."]
     fn refresh_on_a_run_level_event_reloads_and_reanchors_selection_by_run_id() {
         let mut app = test_app();
-        let first = create_workflow(&mut app, "first");
-        let response = app.dispatch_runtime_mutation(
-            "test.workflow.run",
-            Method::WorkflowRun(WorkflowRunParams {
-                workflow_id: first,
-                version: None,
-                tier: None,
-                args: HashMap::new(),
-                restore_from: None,
-                include_prior_summaries: None,
-            }),
-        );
-        let Some(ResponseResult::WorkflowRunStarted { run, .. }) = success_result(&response) else {
-            panic!("the run started: {response}");
-        };
+        let workflow_id = create_workflow(&mut app, "first");
+        app.test_bind_a_live_lead_run(&workflow_id, "first");
 
         assert!(app.open_workflow_runs());
         assert_eq!(app.state.view.workflow_runs.selected, 0);
 
-        app.refresh_workflow_runs_overlay(&WorkflowEvent::RunUpdated {
-            run: RunId::new(run.run_id.clone()),
-            status: RunStatus::Running,
-        });
+        app.refresh_workflow_runs_overlay(EventKind::WorkflowRunUpdated);
         assert_eq!(
             app.state.view.workflow_runs.entries.len(),
             1,
@@ -1057,5 +1030,112 @@ output_schema = {{ type = "object" }}
             app.state.view.workflow_runs.selected, 0,
             "the only run stays selected across the reload"
         );
+    }
+
+    /// The wiring phase C left undone: the DAG keybinding and the launcher's
+    /// "watch what you just started" jump both asked the engine's mirrored run
+    /// graph, which the lead path does not write, so both dead-ended while a
+    /// team lead was live. They go through the store-backed snapshot now, the
+    /// same one the run browser opens.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn the_dag_opens_on_a_live_lead_run_through_the_stored_snapshot() {
+        let mut app = test_app();
+        let workflow_id = create_workflow(&mut app, "ship-feature");
+        let run_id = app.test_bind_a_live_lead_run(&workflow_id, "ship-feature");
+
+        assert!(
+            app.state.workflow_run_graph().is_none(),
+            "a lead run has no mirrored graph — that is what this covers"
+        );
+        assert!(app.open_workflow_dag_on_the_live_run());
+        assert_eq!(app.state.mode, Mode::WorkflowDag);
+        let snapshot = app
+            .state
+            .historical_run()
+            .expect("the overlay is showing the live run");
+        assert_eq!(snapshot.graph.run_id.as_str(), run_id.as_str());
+
+        // With no lead live it answers `false` rather than opening an empty
+        // overlay, which is what lets the keybinding fall through to the
+        // launcher exactly as it did before.
+        let mut empty = test_app();
+        assert!(!empty.open_workflow_dag_on_the_live_run());
+        assert_ne!(empty.state.mode, Mode::WorkflowDag);
+    }
+
+    /// **Known gap, not a passing test.** Between `workflow.run` spawning the
+    /// lead's pane and the projection recognising its team, nothing on the run
+    /// row says a team lead is executing it: `StoreWrite::RunLeadBinding` — the
+    /// only writer of `team_name` and `lead_pane_id` — is issued from
+    /// `bind_run_team`, which needs the team config to exist first
+    /// (`09-agent-teams-rework.md` §3.1 step 4). `HistoricalRunSnapshot::
+    /// is_lead_run` reads `team_name`, so for that window the overlay treats a
+    /// lead run as an engine-era run and offers `s`/`i`/`Shift+I`, which the
+    /// server then refuses as retired verbs.
+    ///
+    /// Closing it means recording the pane karvex itself launched at spawn
+    /// time — karvex knows it launched a lead, it does not have to infer that —
+    /// which is a second, smaller `StoreWrite` and a widened `is_lead_run`. It
+    /// belongs with the bind-deadline work the rework audit files as WI-5,
+    /// because both are about the same unbound window.
+    #[cfg(feature = "workflow")]
+    #[test]
+    #[ignore = "gap: a lead run is only marked as one once its team binds, so the DAG offers retired verbs during the unbound window; needs the lead pane recorded at spawn (audit WI-5)"]
+    fn a_lead_run_is_known_to_be_one_before_its_team_binds() {
+        let mut app = test_app();
+        let workflow_id = create_workflow(&mut app, "ship-feature");
+        app.test_bind_a_live_lead_run(&workflow_id, "ship-feature");
+        assert!(app.open_workflow_dag_on_the_live_run());
+
+        let snapshot = app
+            .state
+            .historical_run()
+            .expect("the overlay is showing the live run");
+        assert!(
+            snapshot.is_lead_run(),
+            "karvex launched this lead itself; the record has to say so before \
+             the team config shows up"
+        );
+    }
+
+    /// The wiring the engine's removal broke: nothing published a run-level
+    /// event any more, so the browser sat on whatever rows it had loaded for
+    /// the whole life of a run. Cancelling is the cheapest run-level change to
+    /// drive from a unit test, and it goes through the same
+    /// `emit_workflow_run_event` funnel every other one does.
+    #[cfg(feature = "workflow")]
+    #[test]
+    fn a_run_level_change_refreshes_the_open_browser_without_being_asked() {
+        let mut app = test_app();
+        let workflow_id = create_workflow(&mut app, "ship-feature");
+        let run_id = app.test_bind_a_live_lead_run(&workflow_id, "ship-feature");
+
+        assert!(app.open_workflow_runs());
+        assert_eq!(
+            entry_status(&app.state.view.workflow_runs.entries[0]),
+            Some(RunStatus::Running)
+        );
+
+        app.dispatch_runtime_mutation(
+            "test.workflow.run.cancel",
+            Method::WorkflowRunCancel(crate::api::schema::WorkflowRunTarget {
+                run_id: run_id.to_string(),
+            }),
+        );
+
+        assert_eq!(
+            entry_status(&app.state.view.workflow_runs.entries[0]),
+            Some(RunStatus::Cancelled),
+            "the open browser must show the cancel it was not told to re-read"
+        );
+    }
+
+    #[cfg(feature = "workflow")]
+    fn entry_status(entry: &WorkflowRunsEntry) -> Option<RunStatus> {
+        match entry {
+            WorkflowRunsEntry::Run(run) => Some(run.status),
+            WorkflowRunsEntry::PrunedSummary(_) => None,
+        }
     }
 }
