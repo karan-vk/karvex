@@ -137,7 +137,7 @@ impl LiveLeadRun {
     }
 
     /// Takes the next journal sequence number for this run.
-    fn next_journal_seq(&mut self) -> u64 {
+    pub(crate) fn next_journal_seq(&mut self) -> u64 {
         let seq = self.journal_seq;
         self.journal_seq = self.journal_seq.saturating_add(1);
         seq
@@ -1606,7 +1606,7 @@ impl crate::app::App {
     /// projection is not an engine effect and must not be dropped by that
     /// queue's budget, and a poll that produced a write has already decided
     /// the write is worth making.
-    fn persist_workflow_write(&mut self, write: StoreWrite) {
+    pub(crate) fn persist_workflow_write(&mut self, write: StoreWrite) {
         #[cfg(feature = "workflow")]
         {
             match self
@@ -1634,7 +1634,7 @@ impl crate::app::App {
     /// Reads back this run's `run_node` rows as wire records, for the event
     /// payloads.
     #[cfg(feature = "workflow")]
-    fn stored_run_nodes_for_events(
+    pub(crate) fn stored_run_nodes_for_events(
         &mut self,
         run: &RunId,
     ) -> Option<Vec<crate::api::schema::WorkflowRunNodeInfo>> {
@@ -1666,7 +1666,7 @@ impl crate::app::App {
     }
 
     #[cfg(not(feature = "workflow"))]
-    fn stored_run_nodes_for_events(
+    pub(crate) fn stored_run_nodes_for_events(
         &mut self,
         _run: &RunId,
     ) -> Option<Vec<crate::api::schema::WorkflowRunNodeInfo>> {
