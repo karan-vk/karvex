@@ -1718,7 +1718,11 @@ fn a_lead_that_identifies_itself_binds_the_run_without_any_team_config_on_disk()
         "the bound session must be the one that identified itself: {bound}"
     );
     assert!(
-        !server.claude_home.join("teams").join(ASSERTED_TEAM).exists(),
+        !server
+            .claude_home
+            .join("teams")
+            .join(ASSERTED_TEAM)
+            .exists(),
         "nothing on disk named this team; the binding can only have come from the assertion"
     );
 
