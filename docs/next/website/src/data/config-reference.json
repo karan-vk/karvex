@@ -1193,13 +1193,31 @@
           "key": "workflow.stuck_threshold",
           "type": "integer",
           "default": "3",
-          "description": "Consecutive anti-stuck watchdog ticks with no material progress on a node before it is escalated as a local loop."
+          "description": "Consecutive watchdog samples with no material progress on a node before it is escalated to rung 1 of the intervention ladder."
         },
         {
           "key": "workflow.drift_threshold",
           "type": "integer",
           "default": "5",
-          "description": "Anti-stuck watchdog ticks with progress observed but no movement toward the output schema before a node is re-prompted for goal drift."
+          "description": "Consecutive watchdog samples a Claude Code task may stay in_progress after its owning teammate's pane went idle before the rung-2 re-prompt."
+        },
+        {
+          "key": "workflow.watchdog_enabled",
+          "type": "boolean",
+          "default": "true",
+          "description": "Kill switch for the agent-teams watchdog. Off means no attention classification, no intervention ladder, and no run_node.attention writes at all."
+        },
+        {
+          "key": "workflow.watchdog_tick_secs",
+          "type": "integer",
+          "default": "20",
+          "description": "Watchdog sample cadence in seconds. stuck_threshold and drift_threshold are dimensioned for this interval."
+        },
+        {
+          "key": "workflow.review_max_interviews",
+          "type": "integer",
+          "default": "6",
+          "description": "Cap on how many teammates one self-improvement review cycle interviews."
         },
         {
           "key": "workflow.history_context_runs",

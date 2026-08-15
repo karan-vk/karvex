@@ -1014,11 +1014,16 @@ pub struct WorkflowConfig {
     /// Number of most recent runs kept per workflow; older runs are pruned
     /// whole. Default: 50.
     pub retention_runs: usize,
-    /// Consecutive anti-stuck watchdog ticks with no material progress on a
-    /// node before it is escalated as a local loop. Default: 3.
+    /// Consecutive watchdog samples (`watchdog_tick_secs` apart) with no
+    /// material progress on a node before it is escalated to rung 1 of the
+    /// intervention ladder. Same name and default as the phase-1 anti-stuck
+    /// knob this re-targets onto the agent-teams watchdog
+    /// (`phase4-retarget-plan.md` D-8, §3.7). Default: 3.
     pub stuck_threshold: usize,
-    /// Anti-stuck watchdog ticks with progress observed but no movement
-    /// toward the output schema before a node is re-prompted for goal drift.
+    /// Consecutive watchdog samples a Claude Code task may stay `in_progress`
+    /// after its owning teammate's pane went idle, before the rung-2
+    /// re-prompt — the documented task-status-lag window. Same name and
+    /// default as the phase-1 anti-drift knob this re-targets (D-8, §3.7).
     /// Default: 5.
     pub drift_threshold: usize,
     /// How many of a workflow's most recent run summaries a new run is given as
@@ -1029,6 +1034,18 @@ pub struct WorkflowConfig {
     /// summariser node. Off means no summariser node is created at all, not one
     /// that runs and discards its output. Default: true.
     pub summary_enabled: bool,
+    /// Kill switch for the watchdog: off means no attention classification,
+    /// no intervention ladder, and no `run_node.attention` writes at all —
+    /// the same `summary_enabled` precedent for a brand-new intervention
+    /// system shipping with an off switch (§3.7). Default: true.
+    pub watchdog_enabled: bool,
+    /// Watchdog sample cadence in seconds; `stuck_threshold`/`drift_threshold`
+    /// are dimensioned for this interval (§3.7). Default: 20.
+    pub watchdog_tick_secs: u64,
+    /// Cap on how many teammates one self-improvement review cycle interviews.
+    /// "Interview everyone" is a config change, not the default (§3.7).
+    /// Default: 6.
+    pub review_max_interviews: usize,
 }
 
 impl Default for KeysConfig {
@@ -1235,6 +1252,9 @@ impl Default for WorkflowConfig {
             drift_threshold: 5,
             history_context_runs: 3,
             summary_enabled: true,
+            watchdog_enabled: true,
+            watchdog_tick_secs: 20,
+            review_max_interviews: 6,
         }
     }
 }
@@ -2006,6 +2026,9 @@ scrollback_lines = 12345
         assert_eq!(config.workflow.retention_runs, 50);
         assert_eq!(config.workflow.stuck_threshold, 3);
         assert_eq!(config.workflow.drift_threshold, 5);
+        assert!(config.workflow.watchdog_enabled);
+        assert_eq!(config.workflow.watchdog_tick_secs, 20);
+        assert_eq!(config.workflow.review_max_interviews, 6);
     }
 
     #[test]
@@ -2016,11 +2039,17 @@ max_parallel_nodes = 8
 retention_runs = 100
 stuck_threshold = 6
 drift_threshold = 10
+watchdog_enabled = false
+watchdog_tick_secs = 30
+review_max_interviews = 3
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.workflow.max_parallel_nodes, 8);
         assert_eq!(config.workflow.retention_runs, 100);
         assert_eq!(config.workflow.stuck_threshold, 6);
         assert_eq!(config.workflow.drift_threshold, 10);
+        assert!(!config.workflow.watchdog_enabled);
+        assert_eq!(config.workflow.watchdog_tick_secs, 30);
+        assert_eq!(config.workflow.review_max_interviews, 3);
     }
 }
