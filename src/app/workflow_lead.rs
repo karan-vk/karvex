@@ -1793,7 +1793,11 @@ output_schema = { type = "object" }
         );
         let workflow_id = serde_json::from_str::<serde_json::Value>(&response)
             .ok()
-            .and_then(|value| value["result"]["workflow"]["workflow_id"].as_str().map(str::to_string))
+            .and_then(|value| {
+                value["result"]["workflow"]["workflow_id"]
+                    .as_str()
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| panic!("the workflow was created: {response}"));
         let run_id = app.test_bind_a_live_lead_run(&workflow_id, "ship-it");
         (app, run_id)
