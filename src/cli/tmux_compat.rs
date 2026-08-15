@@ -1968,6 +1968,93 @@ mod tests {
         assert_eq!(plan_respawn_pane(&strings(&["-t"])).command, None);
     }
 
+    // -- upstream's real two-step teammate-spawn shape (Spike S1) ----------
+    //
+    // Evidence: `.local/prd/spike-S1-findings.md` (E1), Claude Code 2.1.233,
+    // captured live. Pins the exact argv upstream sends, at the pure
+    // plan-builder level, so a refactor of any one `plan_*` function cannot
+    // silently stop understanding this shape even if the process-level
+    // characterization test (`tests/cli/tmux_compat.rs`) is skipped.
+
+    #[test]
+    fn plan_split_window_matches_upstreams_claude_teammate_spawn_argv() {
+        let args = strings(&[
+            "-d",
+            "-t",
+            "%0",
+            "-h",
+            "-l",
+            "70%",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "--",
+            "cat",
+        ]);
+        let plan = plan_split_window(&args);
+        assert_eq!(plan.target.as_deref(), Some("%0"));
+        assert_eq!(plan.direction, SplitDirection::Right);
+        let ratio = plan.ratio.expect("ratio parsed");
+        assert!(
+            (ratio - 0.30).abs() <= f32::EPSILON * 4.0,
+            "unexpected ratio {ratio}"
+        );
+        assert!(!plan.focus, "claude always passes -d");
+        assert!(plan.print_pane_id);
+        // The placeholder command is recognised as trailing input, even
+        // though `Shim::split_window` deliberately never runs it (a karvex
+        // pane keeps its own live shell instead).
+        assert_eq!(trailing_command(&args).as_deref(), Some("cat"));
+    }
+
+    #[test]
+    fn plan_set_option_matches_upstreams_remain_on_exit_argv() {
+        let plan = plan_set_option(&strings(&["-p", "-t", "%1", "remain-on-exit", "failed"]));
+        assert_eq!(plan.target.as_deref(), Some("%1"));
+        assert_eq!(plan.option.as_deref(), Some("remain-on-exit"));
+        assert_eq!(plan.value.as_deref(), Some("failed"));
+        // TRUTH pinned here: this is accepted (`Shim::set_option` always
+        // returns `Ok` for a non-accent option) but deliberately IGNORED —
+        // `remain-on-exit` never reaches `pane.report_metadata` because it
+        // is not one of the three accent-carrying style options.
+        assert_eq!(
+            plan_accent(
+                plan.option.as_deref().unwrap(),
+                plan.value.as_deref().unwrap()
+            ),
+            AccentPlan::NotAccent
+        );
+    }
+
+    #[test]
+    fn plan_respawn_pane_matches_upstreams_claude_teammate_respawn_argv() {
+        // The exact composed command shape from spike S1 E1, upstream's real
+        // teammate respawn — `--settings <path>` is copied verbatim onto the
+        // teammate's argv, which is how a run-scoped identity/messaging hook
+        // (teams-contract) reaches a split-pane teammate at all.
+        let real_command = "cd /var/tmp/s1-probe/work && env CLAUDECODE=1 \
+CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+/home/karan/.local/share/claude/versions/2.1.233 \
+--agent-id probe1@session-da88bb06 --agent-name probe1 \
+--team-name session-da88bb06 --agent-color blue \
+--parent-session-id da88bb06-d7e1-42ce-97aa-bda4a3284bcc --effort high \
+--settings /var/tmp/s1-probe/settings.json --model haiku";
+        let plan = plan_respawn_pane(&strings(&["-k", "-t", "%1", "--", real_command]));
+        assert_eq!(plan.target.as_deref(), Some("%1"));
+        assert_eq!(
+            plan.command.as_deref(),
+            Some(real_command),
+            "the full teammate command must survive the shim byte-for-byte"
+        );
+        assert!(
+            plan.command
+                .as_deref()
+                .unwrap()
+                .contains("--settings /var/tmp/s1-probe/settings.json"),
+            "--settings <path> must be present verbatim on the respawned argv"
+        );
+    }
+
     #[test]
     fn shell_readiness_requires_two_stable_non_empty_samples() {
         assert!(!shell_looks_ready("", ""));

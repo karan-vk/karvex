@@ -99,6 +99,19 @@ fn pane_count(socket_path: &Path) -> usize {
         .len()
 }
 
+/// The pane's recent-scrollback text with hard terminal line-wraps removed.
+/// A narrow test pane wraps a long single input line across several rows
+/// with no inserted whitespace at the break, so a plain substring search for
+/// a long token (like `--settings <path>`) is flaky against the wrapped
+/// form; joining rows back together recovers the original logical text.
+fn pane_recent_text_dewrapped(socket_path: &Path, pane_id: &str) -> String {
+    let output = run_cli(
+        socket_path,
+        &["pane", "read", pane_id, "--source", "recent"],
+    );
+    String::from_utf8_lossy(&output.stdout).replace('\n', "")
+}
+
 // ---------------------------------------------------------------------------
 // Flagship: a full Claude Agent Teams-style lifecycle through the real shim
 // ---------------------------------------------------------------------------
@@ -316,6 +329,310 @@ fn tmux_shim_fakes_a_claude_teammate_lifecycle() {
         }),
         "kill-pane must close the teammate pane"
     );
+
+    cleanup_spawned_karvex(karvex, base);
+}
+
+// ---------------------------------------------------------------------------
+// Claude's real Agent Teams teammate spawn: the two-step shape (Spike S1)
+// ---------------------------------------------------------------------------
+//
+// Evidence: `.local/prd/spike-S1-findings.md` (E1), captured live against
+// Claude Code 2.1.233. Claude never spawns a teammate with one `tmux` call;
+// it always issues this exact sequence, and karvex must keep servicing all
+// three steps *as a sequence* (`split-window -- cat` leaves a placeholder
+// alive, `set-option` between the two is not decorative to Claude even though
+// karvex drops it, `respawn-pane -k` is what actually starts the teammate):
+//
+//   split-window -d -t %0 -h -l 70% -P -F '#{pane_id}' -- cat
+//   set-option -p -t %1 remain-on-exit failed
+//   respawn-pane -k -t %1 -- "cd <cwd> && env CLAUDECODE=1 \
+//     CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 <claude> --agent-id <n>@<team> \
+//     --agent-name <n> --team-name <team> --agent-color blue \
+//     --parent-session-id <sid> --effort high --settings <path> --model haiku"
+//
+// `--settings <path>` on the respawn argv is what carries a run-scoped hook
+// (identity/messaging) onto a teammate — load-bearing for `feat/agent-teams-contract`
+// — so this test asserts it survives the shim byte-for-byte, not just that
+// *some* command ran.
+
+#[test]
+fn tmux_shim_services_claudes_real_two_step_teammate_spawn_sequence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("karvex.sock");
+    let shim_dir = base.join("shim");
+
+    let karvex = spawn_karvex(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let leader_pane = root_pane_id(&created);
+
+    let tmux = install_tmux_symlink(&shim_dir);
+    let tmux_env = format!("{},{},0", socket_path.display(), std::process::id());
+    let socket_str = socket_path.to_str().unwrap();
+
+    // A stand-in for the real `claude` teammate binary that echoes its own
+    // argv, so the pane's own output proves exactly what the shim delivered
+    // — including that `--settings <path>` made it through unmangled.
+    let fake_claude = base.join("fake-claude");
+    fs::write(&fake_claude, "#!/bin/sh\necho TEAMMATE-ARGV: $@\n")
+        .expect("write fake claude binary");
+    let mut perms = fs::metadata(&fake_claude).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake_claude, perms).unwrap();
+    let settings_path = base.join("settings.json");
+    fs::write(&settings_path, "{}").expect("write settings file");
+
+    // -- step 1: `split-window -d -t %0 -h -l 70% -P -F '#{pane_id}' -- cat` --
+    //
+    // Exact upstream flags, including the trailing `-- cat` placeholder.
+    let split = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args([
+            "-S",
+            socket_str,
+            "split-window",
+            "-d",
+            "-t",
+            &leader_pane,
+            "-h",
+            "-l",
+            "70%",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "--",
+            "cat",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        split.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&split.stderr)
+    );
+    // The exact stdout contract: stdout is nothing but the new pane id plus a
+    // trailing newline. This is what upstream stores verbatim as
+    // `tmuxPaneId` in the team config and what karvex later joins members to
+    // panes by — any extra text on this stream would corrupt that join.
+    let new_pane = String::from_utf8_lossy(&split.stdout).trim().to_string();
+    assert!(!new_pane.is_empty(), "split-window -P must print a pane id");
+    assert_ne!(new_pane, leader_pane);
+    assert_eq!(
+        String::from_utf8_lossy(&split.stdout),
+        format!(
+            "{new_pane}
+"
+        ),
+        "stdout must be exactly the pane id claude parses as tmuxPaneId"
+    );
+
+    // -- step 2: `set-option -p -t %1 remain-on-exit failed` --
+    //
+    // TRUTH, pinned here: karvex accepts this (exit 0) but deliberately
+    // ignores it. `Shim::set_option` only turns three specific style options
+    // into a `pane.report_metadata` write (the D8 teammate-accent-colour
+    // path); `remain-on-exit` is not one of them, so it falls through to
+    // `AccentPlan::NotAccent` / accept-and-drop (see
+    // `set_option_unknown_option_is_accepted_without_metadata` in this
+    // file's unit tests). There is nothing to honour: a karvex pane's shell
+    // survives its foreground process exiting regardless of this option, so
+    // "keep the pane around after the respawned process fails" is already
+    // the pane's default behaviour, not something remain-on-exit turns on.
+    let before = run_cli_json(&socket_path, &["pane", "get", &new_pane]);
+    let set_remain = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args([
+            "-S",
+            socket_str,
+            "set-option",
+            "-p",
+            "-t",
+            &new_pane,
+            "remain-on-exit",
+            "failed",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        set_remain.status.success(),
+        "remain-on-exit must be ACCEPTED, not rejected — stderr: {}",
+        String::from_utf8_lossy(&set_remain.stderr)
+    );
+    assert!(set_remain.stdout.is_empty());
+    assert!(set_remain.stderr.is_empty());
+    let after = run_cli_json(&socket_path, &["pane", "get", &new_pane]);
+    assert_eq!(
+        before["result"]["pane"]["tokens"], after["result"]["pane"]["tokens"],
+        "remain-on-exit must not be mistaken for the accent-colour path and          must not write any pane metadata token"
+    );
+
+    // -- step 3: `respawn-pane -k -t %1 -- "<real teammate argv>"` --
+    //
+    // The exact composed command upstream sends: `cd && env ... <claude>
+    // --agent-id ... --settings <path> --model haiku`, with the real
+    // `claude` binary swapped for `fake-claude` so the test can observe argv
+    // without spending a live token.
+    let real_command = format!(
+        "cd {cwd} && env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 {claude}          --agent-id probe1@session-3bab3c35 --agent-name probe1          --team-name session-3bab3c35 --agent-color blue          --parent-session-id 3bab3c35-292c-4b52-99fb-c82657a78cb2 --effort high          --settings {settings} --model haiku",
+        cwd = base.display(),
+        claude = fake_claude.display(),
+        settings = settings_path.display(),
+    );
+    let respawn = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args([
+            "-S",
+            socket_str,
+            "respawn-pane",
+            "-k",
+            "-t",
+            &new_pane,
+            "--",
+            &real_command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        respawn.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&respawn.stderr)
+    );
+
+    // The pane must have run fake-claude, not `cat`: if the `-- cat`
+    // placeholder from step 1 had actually been left running as the pane's
+    // foreground process, this whole command line would have been consumed
+    // as *input to `cat`* (echoed back verbatim) instead of being executed
+    // by the shell, and `fake-claude` would never have run — so seeing its
+    // marker proves both that the placeholder never ran and that
+    // `respawn-pane -k` correctly replaced it with the real command.
+    assert!(
+        wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+            pane_read_recent_contains(&socket_path, &new_pane, "TEAMMATE-ARGV:")
+        }),
+        "respawn-pane must replace the `cat` placeholder with the real teammate command"
+    );
+    // `--settings <path>` must reach the teammate's argv byte-for-byte: this
+    // is the load-bearing detail for teams-contract's run-scoped hook. A
+    // narrow test pane hard-wraps this long input line with no whitespace at
+    // the break, so the dewrapped form (`pane_recent_text_dewrapped`) is what
+    // is searched, not a raw substring of the wrapped read.
+    let settings_flag = format!("--settings {}", settings_path.display());
+    assert!(
+        wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+            pane_recent_text_dewrapped(&socket_path, &new_pane).contains(&settings_flag)
+        }),
+        "the respawned teammate argv must re-emit --settings <path> verbatim"
+    );
+
+    // The pane must survive `-k`: it keeps taking input after the respawn,
+    // rather than the `-k` ("kill the running command first") flag tearing
+    // the pane down. Karvex accepts `-k` and ignores it — a karvex pane
+    // always keeps its own shell alive — so a follow-up command must still
+    // land normally.
+    let alive = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .args([
+            "-S",
+            socket_str,
+            "send-keys",
+            "-t",
+            &new_pane,
+            "echo",
+            "pane-survived-respawn-k",
+            "Enter",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        alive.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&alive.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+            pane_read_recent_contains(&socket_path, &new_pane, "pane-survived-respawn-k")
+        }),
+        "the pane must still be alive and taking input after respawn-pane -k"
+    );
+
+    cleanup_spawned_karvex(karvex, base);
+}
+
+// ---------------------------------------------------------------------------
+// Honesty gate: a verb outside the serviced subset must fail loudly, never
+// silently pretend success (this is what distinguishes the shim from a
+// no-op tmux stand-in for anything Claude's Agent Teams flow does not use).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tmux_shim_unserviced_verb_fails_honestly_instead_of_pretending_success() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("karvex.sock");
+    let shim_dir = base.join("shim");
+    let empty_path_dir = base.join("empty-path");
+    fs::create_dir_all(&empty_path_dir).unwrap();
+
+    let karvex = spawn_karvex(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", base.to_str().unwrap()],
+    );
+    let leader_pane = root_pane_id(&created);
+
+    let tmux = install_tmux_symlink(&shim_dir);
+    let tmux_env = format!("{},{},0", socket_path.display(), std::process::id());
+    let socket_str = socket_path.to_str().unwrap();
+
+    // `new-window` is a real tmux verb, matches this shim's own socket
+    // exactly (unlike the `-L`/mismatched-socket passthrough tests
+    // elsewhere in this file), and is simply outside `SERVICED`. `PATH` is
+    // pinned to a directory with no real tmux so the "no real tmux either"
+    // branch of `passthrough` is deterministic.
+    let output = shim_command(&tmux)
+        .env("TMUX", &tmux_env)
+        .env("TMUX_PANE", &leader_pane)
+        .env("PATH", &empty_path_dir)
+        .args(["-S", socket_str, "new-window", "-t", &leader_pane])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an unserviced verb must fail, not exit 0"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "must never print a fabricated success payload on stdout"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no server running") && stderr.contains("outside the serviced"),
+        "must say honestly that this is outside what it services: {stderr}"
+    );
+    assert!(
+        !stderr.contains('{') && !stderr.contains('}'),
+        "no JSON envelope on stderr: {stderr}"
+    );
+
+    // Proof the API was never touched by a verb the shim has no business
+    // acting on: still exactly the leader pane.
+    assert_eq!(pane_count(&socket_path), 1);
 
     cleanup_spawned_karvex(karvex, base);
 }
