@@ -1569,3 +1569,293 @@ fn a_lead_pane_closed_without_finishing_closes_the_run_and_keeps_its_snapshot() 
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// 7. Identity and messaging (§3.1a, §3.5a)
+// ---------------------------------------------------------------------------
+
+/// The session id the fake `SessionStart` hook asserts. Deliberately *not*
+/// [`LEAD_SESSION_ID`]: the assertion has to be observable as having beaten the
+/// inference, and the only way to see that is for the two to name different
+/// teams.
+const ASSERTED_SESSION_ID: &str = "51ea857f-cb96-4372-ae75-bab1640c8428";
+const ASSERTED_TEAM: &str = "session-51ea857f";
+
+/// A stand-in for a Claude Code session's inbox socket: binds a Unix socket,
+/// accepts one connection, and hands back every line it was sent.
+///
+/// The point of the test it serves is that karvex writes *Claude Code's own
+/// frames* to *the path the session reported*, so the assertion has to be made
+/// on bytes that crossed a real socket. Anything less would be asserting that
+/// karvex called its own encoder.
+struct FakeInbox {
+    path: PathBuf,
+    lines: std::sync::mpsc::Receiver<String>,
+    _thread: thread::JoinHandle<()>,
+}
+
+impl FakeInbox {
+    fn bind(dir: &Path) -> Self {
+        use std::io::BufRead;
+
+        let path = dir.join("inbox.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let thread = thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let reader = std::io::BufReader::new(stream);
+                for line in reader.lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Self {
+            path,
+            lines,
+            _thread: thread,
+        }
+    }
+
+    fn next_line(&self) -> Value {
+        let line = self
+            .lines
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a frame to arrive on the session's inbox socket");
+        serde_json::from_str(&line).unwrap_or_else(|error| {
+            panic!("the inbox frame must be one JSON object per line: {error}: {line}")
+        })
+    }
+}
+
+/// The pane karvex split the lead into, by the manual label `pane_title` gives
+/// it. Named rather than positional: "the newest pane" is true today and would
+/// silently pick the wrong one the moment a scenario spawns a second.
+fn lead_pane_id(socket: &Path) -> String {
+    let result = request_ok(socket, &request("req_pane_list", "pane.list", json!({})));
+    result["panes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|pane| {
+            pane["label"]
+                .as_str()
+                .or_else(|| pane["title"].as_str())
+                .is_some_and(|label| label.starts_with("lead: "))
+        })
+        .and_then(|pane| pane["pane_id"].as_str().map(str::to_string))
+        .expect("the lead's pane is in pane.list")
+}
+
+/// Posts what the run's `SessionStart` hook posts.
+fn report_session(socket: &Path, run_id: &str, params: Value) -> Value {
+    let mut body = json!({ "run_id": run_id });
+    for (key, value) in params.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    request_ok(
+        socket,
+        &request("req_report_session", "workflow.run.report_session", body),
+    )
+}
+
+/// §3.1a end to end: the lead's own self-report binds the run, and nothing on
+/// disk is consulted to do it.
+///
+/// The stub runs with `LEAD_STUB_NO_TEAM=1`, so there is no team config
+/// anywhere — the old `createdAt`-plus-cwd inference has nothing to match and
+/// the run would poll until the deadline. The only thing that can bind it is
+/// the assertion, and the team it binds to is derived from the asserted session
+/// id by Claude Code's documented `session-` + first-eight rule. That is the
+/// whole difference between identity and inference, made observable.
+///
+/// The messaging half rides along because it is the same assertion: the socket
+/// and token arrive in the same report, and a target that karvex cannot address
+/// is a report it recorded without acting on.
+#[test]
+fn a_lead_that_identifies_itself_binds_the_run_without_any_team_config_on_disk() {
+    let server = spawn_lead_server_with_env("identity", &[("LEAD_STUB_NO_TEAM", "1")]);
+    let socket = server.socket().to_path_buf();
+    let (_workflow_id, run_id) = launch_lead_run(&server);
+
+    // The lead's pane id is read from `pane.list` rather than from the run row:
+    // the run row only learns it at *bind* time, and binding is exactly what
+    // this test is about to make happen. This is also what the real hook does —
+    // it reads `KARVEX_PANE_ID` out of its own environment.
+    let lead_pane_id = lead_pane_id(&socket);
+
+    let inbox = FakeInbox::bind(&server.base);
+    let reported = report_session(
+        &socket,
+        &run_id,
+        json!({
+            "session_id": ASSERTED_SESSION_ID,
+            "pane_id": lead_pane_id,
+            "cwd": server.base.to_string_lossy(),
+            "source": "startup",
+            "messaging_socket": inbox.path.to_string_lossy(),
+            "messaging_token": "50093985aaaabbbbccccddddeeeeffff",
+        }),
+    );
+    assert_eq!(
+        reported["role"], "lead",
+        "the report came from the lead's own pane: {reported}"
+    );
+    assert_eq!(reported["team_name"], ASSERTED_TEAM, "{reported}");
+    assert_eq!(reported["addressable"], true, "{reported}");
+
+    let bound = wait_for_run(
+        &socket,
+        &run_id,
+        "the run to bind to the team its lead asserted",
+        |response| response["run"]["team_name"] == ASSERTED_TEAM,
+    );
+    assert_eq!(
+        bound["run"]["lead_session_id"], ASSERTED_SESSION_ID,
+        "the bound session must be the one that identified itself: {bound}"
+    );
+    assert!(
+        !server.claude_home.join("teams").join(ASSERTED_TEAM).exists(),
+        "nothing on disk named this team; the binding can only have come from the assertion"
+    );
+
+    // The run now publishes an addressable target under the roster name a
+    // client would use.
+    let messaging = &bound["graph"]["messaging"];
+    assert_eq!(messaging["supported"], true, "{messaging}");
+    let target = messaging["targets"]
+        .as_array()
+        .and_then(|targets| targets.first())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(target["name"], "team-lead", "{messaging}");
+    assert_eq!(target["session_id"], ASSERTED_SESSION_ID, "{messaging}");
+    assert_eq!(target["addressable"], true, "{messaging}");
+    assert_eq!(target["channel"], "inbox_socket", "{messaging}");
+
+    // And a message actually crosses the socket, in Claude Code's own frames.
+    let receipt = request_ok(
+        &socket,
+        &request(
+            "req_run_message",
+            "workflow.run.message",
+            json!({
+                "run_id": run_id,
+                "target": "team-lead",
+                "text": "the parser landed; rebase before you continue",
+                "priority": "now",
+            }),
+        ),
+    );
+    assert_eq!(receipt["receipt"]["channel"], "inbox_socket", "{receipt}");
+    assert_eq!(receipt["receipt"]["target"], "team-lead", "{receipt}");
+
+    let auth = inbox.next_line();
+    assert_eq!(auth["type"], "auth", "the auth frame comes first: {auth}");
+    assert_eq!(auth["token"], "50093985aaaabbbbccccddddeeeeffff", "{auth}");
+    let message = inbox.next_line();
+    assert_eq!(message["type"], "user", "{message}");
+    assert_eq!(message["message"]["role"], "user", "{message}");
+    assert_eq!(
+        message["message"]["content"], "the parser landed; rebase before you continue",
+        "{message}"
+    );
+    // Addressed, so a socket path recycled to another session drops it rather
+    // than steering a stranger — verified live against 2.1.232.
+    assert_eq!(message["session_id"], ASSERTED_SESSION_ID, "{message}");
+    assert_eq!(message["priority"], "now", "{message}");
+
+    server.shutdown();
+}
+
+/// A report from a pane that is not this run's must not bind anything.
+///
+/// The same hook runs in every session that inherits the run's `--settings`,
+/// which after a teammate spawn includes sessions karvex did not launch the
+/// lead into. Accepting one of those as the lead would bind the run to the
+/// wrong team — the exact class of mistake the assertion exists to remove — so
+/// the pane id karvex minted itself is checked, and a mismatch is a *successful*
+/// response that changed nothing.
+#[test]
+fn a_report_from_another_pane_is_recorded_as_a_member_and_never_binds_the_run() {
+    let server = spawn_lead_server_with_env("identity-other", &[("LEAD_STUB_NO_TEAM", "1")]);
+    let socket = server.socket().to_path_buf();
+    let (_workflow_id, run_id) = launch_lead_run(&server);
+
+    let reported = report_session(
+        &socket,
+        &run_id,
+        json!({
+            "session_id": ASSERTED_SESSION_ID,
+            "pane_id": "w9:p99",
+            "source": "startup",
+        }),
+    );
+    assert_eq!(
+        reported["role"], "member",
+        "a pane that is not the lead's is a teammate, not the lead: {reported}"
+    );
+    assert_eq!(
+        reported["addressable"], false,
+        "it reported no inbox socket: {reported}"
+    );
+
+    // Give the projection a couple of polls to prove the absence.
+    thread::sleep(Duration::from_secs(5));
+    let response = run_get(&socket, &run_id);
+    assert!(
+        response["run"]["team_name"].is_null(),
+        "a teammate's report must not bind the run: {response}"
+    );
+    assert_eq!(
+        run_status(&socket, &run_id),
+        "running",
+        "and the run is still waiting, not failed"
+    );
+
+    server.shutdown();
+}
+
+/// The audit's other half of 4.2, end to end: a run whose team never appears
+/// must fail with a reason instead of staying `running` forever.
+///
+/// That is not a cosmetic difference. karvex runs one lead at a time, so a run
+/// wedged at `running` does not merely look wrong — it refuses every later run
+/// for the rest of the server's life. The deadline is shortened through
+/// `KARVEX_WORKFLOW_BIND_DEADLINE_MS` so the test costs seconds rather than the
+/// production two minutes.
+#[test]
+fn a_run_whose_lead_never_identifies_itself_fails_with_a_reason_instead_of_wedging() {
+    let server = spawn_lead_server_with_env(
+        "identity-deadline",
+        &[
+            ("LEAD_STUB_NO_TEAM", "1"),
+            ("KARVEX_WORKFLOW_BIND_DEADLINE_MS", "3000"),
+        ],
+    );
+    let socket = server.socket().to_path_buf();
+    let (workflow_id, run_id) = launch_lead_run(&server);
+
+    let failed = wait_for_status(&socket, &run_id, "failed");
+    let failure = &failed["run"]["failure"];
+    assert_eq!(
+        failure["kind"], "lead_unbound",
+        "the failure must name the reason a client can act on: {failed}"
+    );
+    assert!(
+        failure["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("never identified itself"),
+        "{failed}"
+    );
+
+    // The point of failing at all: the guard lets go, so the next run starts.
+    let second = start_run(&socket, &workflow_id, "and again");
+    assert_ne!(second, run_id);
+
+    server.shutdown();
+}

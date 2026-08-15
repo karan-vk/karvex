@@ -496,6 +496,7 @@ impl crate::app::App {
             teams: &teams,
             spawned_at_unix_ms: spawned_at,
             now_unix_ms: crate::app::workflow::current_unix_ms(),
+            deadline: bind_deadline(),
             lead_cwd: &lead_cwd,
             own_pane_ids: &own_panes,
             bound_elsewhere: &[],
@@ -1576,6 +1577,22 @@ fn read_tasks(dir: &Path) -> Vec<ObservedTask> {
 fn read_team_config(path: &Path) -> Option<ObservedTeam> {
     let bytes = std::fs::read(path).ok()?;
     projection::parse_team_config(&bytes).ok()
+}
+
+/// How long a run may stay unbound before it is failed.
+///
+/// [`identity::BIND_DEADLINE`] unless `KARVEX_WORKFLOW_BIND_DEADLINE_MS`
+/// overrides it. The override is a support and test hatch, not a setting: a
+/// machine where `claude` reliably takes longer than two minutes to reach its
+/// `SessionStart` hook has a different problem, and the headless tests need to
+/// exercise the expiry in seconds rather than minutes. An unparseable or zero
+/// value falls back to the default rather than failing every run instantly.
+fn bind_deadline() -> Duration {
+    std::env::var("KARVEX_WORKFLOW_BIND_DEADLINE_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(identity::BIND_DEADLINE, Duration::from_millis)
 }
 
 /// The `kvx` binary the run's hook should call back into.

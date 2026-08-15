@@ -5438,6 +5438,34 @@
           },
           "type": "object"
         },
+        "WorkflowRunMessageParams": {
+          "description": "Sending text into one of a live run's Claude Code sessions\n(`09-agent-teams-rework.md` §3.5a).\n\nA runtime capability, not a UI feature: the target is named by the same\nroster `workflow.run.get` publishes, and the transport is Claude Code's own\ndocumented per-session inbox socket.",
+          "properties": {
+            "priority": {
+              "description": "`now`, `next` (the default), or `later` — Claude Code's own queue\nvocabulary for when the receiving session reads the message.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "target": {
+              "description": "The session to reach, by team-roster name. `team-lead` is the run's lead.",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "target",
+            "text"
+          ],
+          "type": "object"
+        },
         "WorkflowRunParams": {
           "properties": {
             "args": {
@@ -5491,6 +5519,64 @@
           },
           "required": [
             "workflow_id"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunReportSessionParams": {
+          "description": "One of a run's Claude Code sessions identifying itself\n(`09-agent-teams-rework.md` §3.1a).\n\nPosted by the `SessionStart` hook karvex puts in the run's `--settings`, so\nthe run's team is an assertion from the session rather than something karvex\ninfers from file timestamps. Authorised the same way\n[`WorkflowRunFinishParams`] is — possession of the run id, which karvex bakes\ninto the hook command — and checked against the pane id karvex itself put in\nthe pane's environment.",
+          "properties": {
+            "agent_id": {
+              "description": "Set when the hook ran for an in-process subagent rather than for the\nsession itself, which is never an identity assertion.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "messaging_socket": {
+              "description": "`CLAUDE_CODE_MESSAGING_SOCKET`, the session's inbox. Absent when the\nmessaging feature flag had not resolved by the time the hook ran.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "messaging_token": {
+              "description": "`CLAUDE_CODE_MESSAGING_TOKEN`, the session's own child token.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "description": "`KARVEX_PANE_ID`. The lead's pane binds the run; any other pane of this\nrun is a split-pane teammate.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "description": "The Claude Code session id, from the hook payload.",
+              "type": "string"
+            },
+            "source": {
+              "description": "Claude Code's own word for why the session started: `startup`, `resume`,\n`clear`, …",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "run_id",
+            "session_id"
           ],
           "type": "object"
         },
@@ -7450,6 +7536,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorkflowRunFinishParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.run.report_session",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunReportSessionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workflow.run.message",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkflowRunMessageParams"
             }
           },
           "required": [
@@ -12130,6 +12248,56 @@
               "type": "object"
             },
             {
+              "description": "A run session's self-report was recorded (`09-agent-teams-rework.md`\n§3.1a). `role` says what the report was taken to be; an `Ignored` report\nis a successful response, because a hook that fires for somebody else's\nsession is normal traffic rather than an error.",
+              "properties": {
+                "addressable": {
+                  "description": "Whether the session reported a usable inbox socket.",
+                  "type": "boolean"
+                },
+                "role": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowSessionRole"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "team_name": {
+                  "description": "The team the reporting lead's session id names, so a caller can see\nthe derivation karvex applied.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "workflow_run_session_reported",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run_id",
+                "role",
+                "addressable"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A message was written into a run session's inbox\n(`09-agent-teams-rework.md` §3.5a).",
+              "properties": {
+                "receipt": {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunMessageReceipt"
+                },
+                "type": {
+                  "const": "workflow_run_messaged",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "receipt"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "node": {
                   "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
@@ -12902,6 +13070,17 @@
               },
               "type": "array"
             },
+            "messaging": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkflowRunMessagingInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Whether the run's sessions can be messaged, and which of them have\nidentified themselves. Present only for the run that is live on this\nserver: a messaging socket belongs to a running process, so a stored run\nhas nothing to report here."
+            },
             "nodes": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/WorkflowRunNodeInfo"
@@ -13130,6 +13309,102 @@
             "name",
             "first_seen_at_unix_ms",
             "last_seen_at_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunMessageReceipt": {
+          "description": "What karvex knows after handing a message to a session's inbox.\n\nDeliberately not \"delivered\": the receiving session's inbound controls\ndecide between delivered, held, and refused *after* the write, and that\nverdict travels back only to another Claude Code session's reply address.",
+          "properties": {
+            "channel": {
+              "description": "`inbox_socket` for Claude Code's own peer channel, `pane_input` when\nkarvex typed it into the session's pane instead. Not equivalent: an\ninbox message arrives labelled as another session's and is subject to\nthe receiver's inbound controls, while pane input is indistinguishable\nfrom the user typing. Pane input is the fallback for a session whose\nmessaging token karvex does not hold — including every session of a run\nthat outlived a karvex restart, because a teammate's token exists\nnowhere but that teammate's own hook environment.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "target",
+            "session_id",
+            "channel"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunMessageTargetInfo": {
+          "description": "One session of a live run that karvex can address.",
+          "properties": {
+            "addressable": {
+              "description": "Whether the session reported an inbox socket, and therefore whether a\nmessage to it travels over Claude Code's own peer channel. A session can\nidentify itself without one — the messaging feature flag had not\nresolved when its hook ran — and is then reached by pane input instead.",
+              "type": "boolean"
+            },
+            "channel": {
+              "default": "",
+              "description": "Which channel a message to this target would use today: `inbox_socket`\nor `pane_input`.",
+              "type": "string"
+            },
+            "name": {
+              "description": "The team-roster name, which is what `workflow.run.message` takes.",
+              "type": "string"
+            },
+            "pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "session_id",
+            "addressable"
+          ],
+          "type": "object"
+        },
+        "WorkflowRunMessagingInfo": {
+          "description": "Whether this run's sessions can be messaged at all, and who is reachable.\n\nReported rather than assumed, because upstream is explicit that a kill\nswitch leaves cross-session messaging off with no visible difference in the\nsession — so a client that showed a message affordance regardless would be\noffering a verb that silently does nothing.",
+          "properties": {
+            "detail": {
+              "description": "The same reason as a sentence, for a client that has nowhere to put a\ncode.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "description": "A stable word for why not: `claude_too_old`, `unsupported_platform`,\n`kill_switch`. Absent when messaging is available.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "supported": {
+              "type": "boolean"
+            },
+            "targets": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkflowRunMessageTargetInfo"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "supported"
           ],
           "type": "object"
         },
@@ -13435,6 +13710,26 @@
             "command"
           ],
           "type": "string"
+        },
+        "WorkflowSessionRole": {
+          "description": "What a session's self-report was taken to mean.",
+          "oneOf": [
+            {
+              "const": "lead",
+              "description": "The run's team lead. Binds the run.",
+              "type": "string"
+            },
+            {
+              "const": "member",
+              "description": "Another session of the same run, in one of its panes.",
+              "type": "string"
+            },
+            {
+              "const": "ignored",
+              "description": "Not this run's, or not a session.",
+              "type": "string"
+            }
+          ]
         },
         "WorkflowSuccession": {
           "description": "Every closing node records exactly one of these\n(`docs/design/workflow-builder/04-kvdag-and-execution.md` §3.3).",

@@ -2637,7 +2637,7 @@ fn wire_run_member_record(
     }
 }
 
-#[cfg(all(test, feature = "__broken_engine_tests"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::schema::{Method, WorkflowDefinitionDocument, WorkflowDefinitionFormat};

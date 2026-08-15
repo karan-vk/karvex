@@ -359,6 +359,10 @@ pub struct BindInputs<'a> {
     pub spawned_at_unix_ms: u64,
     /// Now, on the same clock.
     pub now_unix_ms: u64,
+    /// How long the run may stay unbound. [`BIND_DEADLINE`] in production; a
+    /// parameter rather than a constant read inside so the expiry rule is
+    /// testable in milliseconds instead of minutes.
+    pub deadline: Duration,
     pub lead_cwd: &'a Path,
     /// Public pane ids this server currently owns.
     pub own_pane_ids: &'a [String],
@@ -397,11 +401,17 @@ pub fn decide_binding(inputs: &BindInputs<'_>) -> BindDecision {
     }
 
     let waited_ms = inputs.now_unix_ms.saturating_sub(inputs.spawned_at_unix_ms);
-    if waited_ms >= BIND_DEADLINE.as_millis() as u64 {
+    if waited_ms >= deadline_ms(inputs.deadline) {
         BindDecision::Expired { waited_ms }
     } else {
         BindDecision::Waiting
     }
+}
+
+/// The deadline in milliseconds, saturating rather than wrapping on an absurd
+/// override.
+fn deadline_ms(deadline: Duration) -> u64 {
+    u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The fallback rule: recognise the team a freshly spawned lead created, from
@@ -681,6 +691,7 @@ mod tests {
             teams,
             spawned_at_unix_ms: 1_000_000,
             now_unix_ms: now,
+            deadline: BIND_DEADLINE,
             lead_cwd: Path::new("/home/dev/project"),
             own_pane_ids: &[],
             bound_elsewhere: &[],
@@ -929,6 +940,21 @@ mod tests {
                 waited_ms: BIND_DEADLINE.as_millis() as u64
             }
         );
+    }
+
+    /// The deadline is a parameter so the expiry rule can be exercised in
+    /// milliseconds, and so a support hatch can shorten it without a rebuild.
+    #[test]
+    fn the_deadline_is_an_input_rather_than_a_hardcoded_two_minutes() {
+        let mut short = inputs(None, &[], 1_000_500);
+        short.deadline = Duration::from_millis(400);
+        assert_eq!(
+            decide_binding(&short),
+            BindDecision::Expired { waited_ms: 500 }
+        );
+        let mut long = inputs(None, &[], 1_000_500);
+        long.deadline = Duration::from_secs(3600);
+        assert_eq!(decide_binding(&long), BindDecision::Waiting);
     }
 
     #[test]
