@@ -331,6 +331,18 @@ pub struct ReviewFindingRecord {
     pub applied_in: Option<KvdagVersionId>,
 }
 
+/// One `watchdog` journal row, resolved for the review cycle. See
+/// [`WorkflowStore::watchdog_journal`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchdogJournalEntry {
+    pub path: InstancePath,
+    pub at_unix_ms: u64,
+    /// Verbatim `run_event.payload`. Its shape belongs to the watchdog adapter
+    /// that wrote it (§3.4: `{class, rung, streak, delivery}`), so this query
+    /// neither validates nor reshapes it.
+    pub payload: serde_json::Value,
+}
+
 /// One node's durable evidence for the review cycle
 /// (`phase4-retarget-plan.md` §2 WS-B). See [`WorkflowStore::node_evidence`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1330,6 +1342,64 @@ impl WorkflowStore {
         rows.into_iter()
             .map(|row| review_finding_record(row, &path_by_id))
             .collect()
+    }
+
+    /// Every `watchdog` journal row this run recorded, resolved to the node's
+    /// instance path and to a unix timestamp.
+    ///
+    /// The review cycle's one journal read (`phase4-retarget-plan.md` §3.5,
+    /// packet P10): §3.5 puts every watchdog rung a teammate received — and
+    /// whether it was actually *delivered* — to that teammate verbatim, and
+    /// [`RunEventRecord`] cannot answer either question on its own. It carries
+    /// `run_node` as an opaque row id, and `at` as an already-formatted string
+    /// this crate has no date parser for. Both are resolved here, once, rather
+    /// than by every caller guessing.
+    ///
+    /// Rows whose `run_node` no longer resolves within the run are dropped:
+    /// an intervention karvex cannot attribute to a node is not evidence about
+    /// that node. The payload is returned verbatim — its shape is the watchdog
+    /// adapter's (P9), not this query's.
+    pub async fn watchdog_journal(
+        &self,
+        run: &RunId,
+    ) -> Result<Vec<WatchdogJournalEntry>, StoreError> {
+        let run_id = parse_record_id(TABLE_WORKFLOW_RUN, run.as_str())
+            .ok_or_else(|| StoreError::Decode(format!("not a workflow_run id: {run}")))?;
+        let mut node_response = self
+            .db
+            .query("SELECT * FROM run_node WHERE run = $run")
+            .bind(("run", run_id.clone()))
+            .await
+            .map_err(query_error)?;
+        let node_rows: Vec<records::RunNodeRow> = node_response.take(0).map_err(query_error)?;
+        let path_by_id: BTreeMap<String, InstancePath> = node_rows
+            .iter()
+            .map(|row| {
+                (
+                    record_id_to_string(&row.id),
+                    InstancePath::new(row.instance_path.clone()),
+                )
+            })
+            .collect();
+
+        let mut response = self
+            .db
+            .query("SELECT * FROM run_event WHERE run = $run AND kind = \"watchdog\" ORDER BY seq")
+            .bind(("run", run_id))
+            .await
+            .map_err(query_error)?;
+        let rows: Vec<records::RunEventRow> = response.take(0).map_err(query_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let path = path_by_id.get(&record_id_to_string(row.run_node.as_ref()?))?;
+                Some(WatchdogJournalEntry {
+                    path: path.clone(),
+                    at_unix_ms: unix_ms(&row.at),
+                    payload: row.payload,
+                })
+            })
+            .collect())
     }
 
     /// One node's durable evidence for the review cycle

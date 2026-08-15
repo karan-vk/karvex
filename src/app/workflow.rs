@@ -71,6 +71,15 @@ pub(crate) struct WorkflowPolicy {
     /// lead prompt render as a concurrency hint instead of staying a value
     /// `config::model` parses and nothing else ever reads.
     pub(crate) max_parallel_nodes: usize,
+    /// `workflow.watchdog_tick_secs` (§3.4): the watchdog's sample cadence, and
+    /// with it the unit `WorkflowStore::node_evidence` multiplies an idle
+    /// streak by to answer "how long did this node sit idle while in
+    /// progress". Read here rather than from a second config handle so the
+    /// review's numbers and the watchdog's are the same number.
+    pub(crate) watchdog_tick_secs: u32,
+    /// `workflow.review_max_interviews` (§3.5): the cap on how many members one
+    /// review cycle interviews.
+    pub(crate) review_max_interviews: usize,
 }
 
 impl Default for WorkflowPolicy {
@@ -80,6 +89,8 @@ impl Default for WorkflowPolicy {
         Self {
             history_context_runs: 3,
             max_parallel_nodes: 4,
+            watchdog_tick_secs: 20,
+            review_max_interviews: 6,
         }
     }
 }
@@ -88,6 +99,8 @@ pub(crate) fn workflow_policy(config: &crate::config::Config) -> WorkflowPolicy 
     WorkflowPolicy {
         history_context_runs: config.workflow.history_context_runs,
         max_parallel_nodes: config.workflow.max_parallel_nodes,
+        watchdog_tick_secs: u32::try_from(config.workflow.watchdog_tick_secs).unwrap_or(u32::MAX),
+        review_max_interviews: config.workflow.review_max_interviews,
     }
 }
 
@@ -351,6 +364,9 @@ mod tests {
             WorkflowPolicy {
                 history_context_runs: config.workflow.history_context_runs,
                 max_parallel_nodes: config.workflow.max_parallel_nodes,
+                watchdog_tick_secs: u32::try_from(config.workflow.watchdog_tick_secs)
+                    .unwrap_or(u32::MAX),
+                review_max_interviews: config.workflow.review_max_interviews,
             }
         );
         assert_eq!(workflow_policy(&config), WorkflowPolicy::default());
