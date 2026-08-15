@@ -1863,12 +1863,19 @@ pub enum StoreWrite {
         note: String,
         started_at_unix_ms: u64,
     },
-    /// The two things learned about an interrogation after its record exists:
-    /// the forked session id, and the moment its pane went away. One shape for
-    /// both, because either can be the only thing that ever changes (§4 D7).
+    /// What is learned about an interrogation after its record exists: the
+    /// forked session id, its transcript path once the fork's first turn
+    /// creates the file, and the moment its pane went away. One shape for all
+    /// three, because any of them can be the only thing that ever changes
+    /// (§4 D7). `transcript_path` joined this write in
+    /// `phase4-retarget-plan.md`'s amendment log (WI-R7); it is never
+    /// resolved to the *source* member's transcript — only the fork's own,
+    /// once the file actually exists — because that would read as the
+    /// interview's own record and it is not.
     InterrogationUpdate {
         id: InterrogationId,
         forked_session_id: Option<String>,
+        transcript_path: Option<String>,
         ended_at_unix_ms: Option<u64>,
     },
     /// Closes a run as `failed` with a machine-readable reason on the run row.
@@ -2003,6 +2010,19 @@ pub enum StoreWrite {
         run: RunId,
         path: InstancePath,
         attention: Option<Attention>,
+        /// Whether *this write* is karvex acting on the node — a rung's
+        /// message sent (or attempted; §3.4 counts an undelivered rung the
+        /// same as a delivered one, because "we tried" is still an
+        /// intervention) or a rung 4 surfaced — rather than merely a change in
+        /// the `attention` column (`phase4-retarget-plan.md` amendment log,
+        /// WI-R5). `run_node.watchdog_interventions` accumulates on this flag,
+        /// not on `attention.is_some()`: the ladder's rungs 1–3 (`Say`) leave
+        /// `attention` at `None` by design (P4), so counting `Some(_)` writes
+        /// undercounted every nudge and re-prompt the watchdog ever sent.
+        /// Clearing `attention` back to `None` is the watchdog observing the
+        /// node moving again, never an intervention, so it is always `false`
+        /// on a clearing write.
+        intervened: bool,
         observed_at_unix_ms: u64,
     },
     /// A past run's self-improvement review cycle began.
@@ -2893,6 +2913,7 @@ mod tests {
             run: run.clone(),
             path: path.clone(),
             attention: Some(Attention::Stuck),
+            intervened: true,
             observed_at_unix_ms: 1,
         };
         assert!(matches!(

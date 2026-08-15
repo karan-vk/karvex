@@ -369,6 +369,21 @@ pub struct NodeEvidence {
     pub tokens: u64,
     pub emergent: bool,
     pub blocked_by: Vec<InstancePath>,
+    /// Every reassignment the `task` journal recorded for this node
+    /// (`phase4-retarget-plan.md` amendment log, WI-R6), oldest first.
+    pub owner_changes: Vec<OwnerChangeRecord>,
+}
+
+/// One journalled task reassignment: which task (the caller already knows,
+/// this is per-node), from whom, to whom, when. Karvex records only what it
+/// can see happened, never why (WI-R6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerChangeRecord {
+    pub at_unix_ms: u64,
+    /// `None` on either side means *unclaimed*, matching `run_node.owner`
+    /// itself.
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 /// One `node_checkpoint` row.
@@ -1462,23 +1477,27 @@ impl WorkflowStore {
             .map_err(query_error)?;
         let blocked_by: Vec<String> = edge_response.take(0).map_err(query_error)?;
 
-        // `task`/`watchdog` journal rows for this node. Neither kind has a
-        // landed producer yet (`phase4-retarget-plan.md` P8/P9), so this
-        // reads whatever a hand-built journal or a future writer puts there;
-        // `task_status_transitions` only counts rows rather than parsing a
-        // payload shape this packet does not own, and the `watchdog` payload
-        // fields it does read (`class`, `rung`, `streak`) are the ones §3.4
-        // commits to by name.
+        // `task`/`watchdog` journal rows for this node. `watchdog` has had a
+        // landed producer since P9; `task` since P8 (WI-R6, owner changes
+        // only) — this still reads whatever payload shape shows up rather
+        // than assuming a producer, the same discipline `task_status_transitions`
+        // already followed as a plain count. `ORDER BY seq` keeps
+        // `owner_changes` in the order the reassignments actually happened,
+        // which is what the interview document quotes.
         #[derive(Debug, SurrealValue)]
         struct JournalRow {
             kind: String,
             payload: serde_json::Value,
+            at: surrealdb_types::Datetime,
+            #[allow(dead_code)] // selected only so `ORDER BY seq` is legal
+            seq: i64,
         }
         let mut journal_response = self
             .db
             .query(
-                "SELECT kind, payload FROM run_event \
-                 WHERE run_node = $node AND kind IN [\"task\", \"watchdog\"]",
+                "SELECT kind, payload, at, seq FROM run_event \
+                 WHERE run_node = $node AND kind IN [\"task\", \"watchdog\"] \
+                 ORDER BY seq",
             )
             .bind(("node", node.id))
             .await
@@ -1488,9 +1507,28 @@ impl WorkflowStore {
         let mut task_status_transitions: u32 = 0;
         let mut rung_reached: u8 = 0;
         let mut idle_ticks: u64 = 0;
+        let mut owner_changes: Vec<OwnerChangeRecord> = Vec::new();
         for row in &journal_rows {
             match row.kind.as_str() {
-                "task" => task_status_transitions = task_status_transitions.saturating_add(1),
+                "task" => {
+                    task_status_transitions = task_status_transitions.saturating_add(1);
+                    // Only shape `task` carries today (WI-R6). A future
+                    // producer of some other `task` payload is still counted
+                    // above and simply contributes nothing here.
+                    if let Some(change) = row.payload.get("owner_change") {
+                        owner_changes.push(OwnerChangeRecord {
+                            at_unix_ms: unix_ms(&row.at),
+                            from: change
+                                .get("from")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                            to: change
+                                .get("to")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                        });
+                    }
+                }
                 "watchdog" => {
                     if let Some(rung) = row.payload.get("rung").and_then(serde_json::Value::as_u64)
                     {
@@ -1536,6 +1574,7 @@ impl WorkflowStore {
             tokens: node.total_tokens as u64,
             emergent: node.emergent,
             blocked_by: blocked_by.into_iter().map(InstancePath::new).collect(),
+            owner_changes,
         }))
     }
 

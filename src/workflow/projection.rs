@@ -338,6 +338,22 @@ pub struct TaskProjection {
     /// `blockedBy` resolved from Claude Code task ids to instance paths,
     /// dropping ids that name no observed task.
     pub blocked_by: Vec<InstancePath>,
+    /// Set when `task.owner` differs from what karvex last recorded for this
+    /// same task id — never on the task's first observation, which is an
+    /// initial claim, not a reassignment (`phase4-retarget-plan.md` amendment
+    /// log, WI-R6). The caller journals this as the fact it is: which task,
+    /// from whom, to whom. Karvex can see that ownership moved; it cannot see
+    /// why, so that is all this carries.
+    pub owner_change: Option<ObservedOwnerChange>,
+}
+
+/// A task's `owner` moved between members (or in or out of being unclaimed)
+/// since the last poll. `None` on either side means *unclaimed*, matching
+/// `ObservedTask::owner` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedOwnerChange {
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 /// What karvex's own per-pane knowledge adds to a team member, as one poll
@@ -575,9 +591,21 @@ impl ProjectionSnapshot {
                 status: task.status.clone(),
                 blocked_by: blocked_by.clone(),
             };
-            if self.tasks.get(&task.id) == Some(&fingerprint) {
+            let known = self.tasks.get(&task.id).cloned();
+            if known.as_ref() == Some(&fingerprint) {
                 continue;
             }
+            // Only a task karvex has already fingerprinted can have been
+            // *reassigned* — the first sighting of a task is an initial
+            // claim, not a change of hands, even when it already carries an
+            // owner.
+            let owner_change = known
+                .as_ref()
+                .filter(|previous| previous.owner != fingerprint.owner)
+                .map(|previous| ObservedOwnerChange {
+                    from: previous.owner.clone(),
+                    to: fingerprint.owner.clone(),
+                });
             self.tasks.insert(task.id.clone(), fingerprint);
             delta.tasks.push(TaskProjection {
                 task: task.clone(),
@@ -585,6 +613,7 @@ impl ProjectionSnapshot {
                 node_key,
                 path,
                 blocked_by,
+                owner_change,
             });
         }
 
@@ -1038,6 +1067,56 @@ mod tests {
         let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
         assert_eq!(delta.tasks.len(), 1);
         assert_eq!(delta.tasks[0].task.owner.as_deref(), Some("cleanup"));
+        // Karvex already fingerprinted this task as unclaimed on the first
+        // poll, so this second poll's claim is itself an observed change of
+        // hands (from nobody to `cleanup`) — WI-R6 wants exactly this
+        // journalled, not just reassignments between two named members.
+        let change = delta.tasks[0]
+            .owner_change
+            .as_ref()
+            .expect("an owner appearing after karvex already saw it unclaimed is a change");
+        assert_eq!(change.from, None);
+        assert_eq!(change.to.as_deref(), Some("cleanup"));
+    }
+
+    #[test]
+    fn absorb_reports_an_owner_change_when_a_task_moves_hands() {
+        let mut tasks = vec![task(TASK_CLAIMED)];
+        let mut snapshot = ProjectionSnapshot::new();
+        let first = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
+        assert_eq!(
+            first.tasks[0].owner_change, None,
+            "a task's very first observation is never a reassignment, even \
+             though it already carries an owner"
+        );
+        let original_owner = tasks[0].owner.clone();
+
+        tasks[0].owner = Some("someone-else".to_string());
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
+        assert_eq!(delta.tasks.len(), 1);
+        let change = delta.tasks[0]
+            .owner_change
+            .as_ref()
+            .expect("the owner moved between two named members");
+        assert_eq!(change.from, original_owner);
+        assert_eq!(change.to.as_deref(), Some("someone-else"));
+    }
+
+    #[test]
+    fn absorb_reports_an_owner_change_when_a_task_becomes_unclaimed_again() {
+        let mut tasks = vec![task(TASK_CLAIMED)];
+        let mut snapshot = ProjectionSnapshot::new();
+        let original_owner = tasks[0].owner.clone();
+        snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
+
+        tasks[0].owner = None;
+        let delta = snapshot.absorb(&tasks, None, &keys(), &BTreeMap::new(), 0);
+        let change = delta.tasks[0]
+            .owner_change
+            .as_ref()
+            .expect("dropping an owner is still a change of hands");
+        assert_eq!(change.from, original_owner);
+        assert_eq!(change.to, None, "unclaimed is `None`, not an empty string");
     }
 
     #[test]

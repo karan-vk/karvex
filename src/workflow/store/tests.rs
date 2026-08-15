@@ -2978,6 +2978,7 @@ async fn an_interrogation_round_trips_every_field_through_the_production_read_pa
         .write(StoreWrite::InterrogationUpdate {
             id: id.clone(),
             forked_session_id: Some("sess-fork-1".to_string()),
+            transcript_path: None,
             ended_at_unix_ms: Some(1_700_000_060_000),
         })
         .await
@@ -2997,6 +2998,41 @@ async fn an_interrogation_round_trips_every_field_through_the_production_read_pa
     assert_eq!(
         record.started_at_unix_ms, 1_700_000_000_000,
         "an update never rewrites the start stamp"
+    );
+    assert_eq!(
+        record.transcript_path,
+        Some("/tmp/sess.jsonl".to_string()),
+        "a `None` transcript_path on an update leaves the column alone, same as \
+         forked_session_id"
+    );
+
+    // WI-R7 in `phase4-retarget-plan.md`'s amendment log: the fork's own
+    // transcript, once its first turn creates the file, lands through this
+    // same write.
+    store
+        .write(StoreWrite::InterrogationUpdate {
+            id: id.clone(),
+            forked_session_id: None,
+            transcript_path: Some("/tmp/fork-1.jsonl".to_string()),
+            ended_at_unix_ms: None,
+        })
+        .await
+        .expect("write_interrogation_update carries the fork's transcript");
+
+    let updated = store
+        .list_interrogations(&run)
+        .await
+        .expect("list_interrogations");
+    let record = &updated[0];
+    assert_eq!(
+        record.transcript_path,
+        Some("/tmp/fork-1.jsonl".to_string()),
+        "the fork's own transcript path lands once it exists"
+    );
+    assert_eq!(
+        record.forked_session_id,
+        Some("sess-fork-1".to_string()),
+        "a `None` forked_session_id on this update leaves the column alone"
     );
 }
 
@@ -4517,6 +4553,7 @@ async fn migration_0006_applies_over_a_0001_to_0005_database() {
             run: run.clone(),
             path: InstancePath::new("solo"),
             attention: Some(Attention::Stuck),
+            intervened: false,
             observed_at_unix_ms: 1_700_000_500_000,
         })
         .await
@@ -4597,6 +4634,7 @@ async fn an_on_disk_store_applies_migration_0006_over_close_and_reopen() {
             run: run.clone(),
             path: InstancePath::new("solo"),
             attention: Some(Attention::NeedsInput),
+            intervened: false,
             observed_at_unix_ms: 1_700_000_500_000,
         })
         .await
@@ -4691,7 +4729,11 @@ async fn run_member_identity_columns_round_trip_through_the_production_writer() 
 }
 
 #[tokio::test]
-async fn run_node_attention_round_trips_and_watchdog_interventions_accumulate_monotonically() {
+async fn run_node_attention_round_trips_and_watchdog_interventions_count_the_intervened_flag() {
+    // WI-R5 (`phase4-retarget-plan.md` amendment log): the counter must track
+    // the caller's explicit `intervened` flag, not whether `attention` itself
+    // carries `Some(_)` — the ladder holds `attention` at `None` through
+    // rungs 1-3 by design, so those two used to disagree.
     let store = open_mem_store().await;
     let (_, _, run) = setup_run(&store).await;
     let path = InstancePath::new("solo");
@@ -4702,43 +4744,87 @@ async fn run_node_attention_round_trips_and_watchdog_interventions_accumulate_mo
         "a node has no attention before the watchdog ever evaluates it"
     );
 
+    async fn interventions(store: &crate::workflow::store::WorkflowStore, run: &RunId) -> i64 {
+        let mut response = store
+            .db
+            .query("SELECT VALUE watchdog_interventions FROM run_node WHERE run = $run")
+            .bind((
+                "run",
+                parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id"),
+            ))
+            .await
+            .expect("select watchdog_interventions");
+        let rows: Vec<i64> = response.take(0).expect("decode watchdog_interventions");
+        rows[0]
+    }
+
+    // Rungs 1-3: `intervened = true` while `attention` stays `None`, exactly
+    // the shape P4's ladder produces for a `Say`. Each still counts.
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: path.clone(),
+            attention: None,
+            intervened: true,
+            observed_at_unix_ms: 1_700_000_000_000,
+        })
+        .await
+        .expect("nudge rung, no attention yet");
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(
+        nodes[0].attention, None,
+        "a Say rung does not set attention on its own"
+    );
+    assert_eq!(interventions(&store, &run).await, 1);
+
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: path.clone(),
+            attention: None,
+            intervened: true,
+            observed_at_unix_ms: 1_700_000_020_000,
+        })
+        .await
+        .expect("reprompt rung, still no attention");
+    assert_eq!(interventions(&store, &run).await, 2);
+
+    // A write that changes `attention` but is NOT an intervention (an
+    // `ExternalWait` classification surfacing on its own, before any rung
+    // fired) must not move the counter.
+    store
+        .write(StoreWrite::RunNodeAttention {
+            run: run.clone(),
+            path: path.clone(),
+            attention: Some(Attention::NeedsInput),
+            intervened: false,
+            observed_at_unix_ms: 1_700_000_030_000,
+        })
+        .await
+        .expect("attention alone, not an intervention");
+    let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
+    assert_eq!(nodes[0].attention, Some(Attention::NeedsInput));
+    assert_eq!(
+        interventions(&store, &run).await,
+        2,
+        "attention changing on its own is not karvex acting"
+    );
+
+    // Rung 4: `Surface`, `intervened = true`, and `attention` becomes `Some`
+    // together. Counts, same as any other rung.
     store
         .write(StoreWrite::RunNodeAttention {
             run: run.clone(),
             path: path.clone(),
             attention: Some(Attention::Stuck),
-            observed_at_unix_ms: 1_700_000_000_000,
+            intervened: true,
+            observed_at_unix_ms: 1_700_000_040_000,
         })
         .await
-        .expect("first attention write");
+        .expect("surface rung");
     let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
     assert_eq!(nodes[0].attention, Some(Attention::Stuck));
-
-    store
-        .write(StoreWrite::RunNodeAttention {
-            run: run.clone(),
-            path: path.clone(),
-            attention: Some(Attention::BudgetExceeded),
-            observed_at_unix_ms: 1_700_000_020_000,
-        })
-        .await
-        .expect("second attention write");
-
-    let mut response = store
-        .db
-        .query("SELECT VALUE watchdog_interventions FROM run_node WHERE run = $run")
-        .bind((
-            "run",
-            parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id"),
-        ))
-        .await
-        .expect("select watchdog_interventions");
-    let interventions: Vec<i64> = response.take(0).expect("decode watchdog_interventions");
-    assert_eq!(
-        interventions,
-        vec![2],
-        "two Some(_) writes accumulate to two interventions"
-    );
+    assert_eq!(interventions(&store, &run).await, 3);
 
     // Clearing attention is the watchdog observing the node moving again, not
     // an intervention: the counter must not move.
@@ -4747,26 +4833,16 @@ async fn run_node_attention_round_trips_and_watchdog_interventions_accumulate_mo
             run: run.clone(),
             path: path.clone(),
             attention: None,
-            observed_at_unix_ms: 1_700_000_040_000,
+            intervened: false,
+            observed_at_unix_ms: 1_700_000_060_000,
         })
         .await
         .expect("clearing write");
     let nodes = store.list_run_nodes(&run).await.expect("list_run_nodes");
     assert_eq!(nodes[0].attention, None, "None clears a prior attention");
-
-    let mut response = store
-        .db
-        .query("SELECT VALUE watchdog_interventions FROM run_node WHERE run = $run")
-        .bind((
-            "run",
-            parse_record_id(TABLE_WORKFLOW_RUN, run.as_str()).expect("run id"),
-        ))
-        .await
-        .expect("select watchdog_interventions");
-    let interventions: Vec<i64> = response.take(0).expect("decode watchdog_interventions");
     assert_eq!(
-        interventions,
-        vec![2],
+        interventions(&store, &run).await,
+        3,
         "a clearing write is not itself an intervention"
     );
 }
@@ -5204,6 +5280,7 @@ async fn node_evidence_matches_a_hand_built_journal() {
             run: run.clone(),
             path: InstancePath::new("child0"),
             attention: Some(Attention::Stuck),
+            intervened: true,
             observed_at_unix_ms: 1_700_000_020_000,
         })
         .await
@@ -5213,6 +5290,7 @@ async fn node_evidence_matches_a_hand_built_journal() {
             run: run.clone(),
             path: InstancePath::new("child0"),
             attention: Some(Attention::Stuck),
+            intervened: true,
             observed_at_unix_ms: 1_700_000_040_000,
         })
         .await

@@ -985,6 +985,37 @@ impl crate::app::App {
         });
     }
 
+    /// The `kind: "task"` journal entry for a reassignment (§3.4's "claimed",
+    /// WI-R6 in `phase4-retarget-plan.md`'s amendment log): which task, from
+    /// whom, to whom, when. Karvex can see that ownership moved; it cannot see
+    /// why the lead did it, and the interview prompt already says so — so
+    /// nothing beyond these four facts is recorded.
+    fn journal_task_owner_change(
+        &mut self,
+        run_id: &RunId,
+        path: &crate::workflow::model::InstancePath,
+        owner_change: &crate::workflow::projection::ObservedOwnerChange,
+        observed_at_unix_ms: u64,
+    ) {
+        let seq = match self.workflow_lead.as_mut() {
+            Some(run) => run.next_journal_seq(),
+            None => return,
+        };
+        self.persist_workflow_write(StoreWrite::RunEvent {
+            run: run_id.clone(),
+            seq,
+            kind: crate::workflow::model::RunEventKind::Task,
+            path: Some(path.clone()),
+            payload: serde_json::json!({
+                "owner_change": {
+                    "from": owner_change.from,
+                    "to": owner_change.to,
+                },
+            }),
+            at_unix_ms: observed_at_unix_ms,
+        });
+    }
+
     /// What the live run made of a session that just reported itself, read back
     /// from the run rather than re-derived, so a response cannot claim a role
     /// the server did not record.
@@ -1330,6 +1361,7 @@ impl crate::app::App {
             if task.emergent {
                 created_paths.push(task.path.clone());
             }
+            let observed_at_unix_ms = crate::app::workflow::current_unix_ms();
             self.persist_workflow_write(StoreWrite::RunTaskProjected {
                 run: run_id.clone(),
                 path: task.path.clone(),
@@ -1343,8 +1375,16 @@ impl crate::app::App {
                 status: node_status_for(&task.task.status),
                 emergent: task.emergent,
                 blocked_by: task.blocked_by.clone(),
-                observed_at_unix_ms: crate::app::workflow::current_unix_ms(),
+                observed_at_unix_ms,
             });
+            if let Some(owner_change) = &task.owner_change {
+                self.journal_task_owner_change(
+                    &run_id,
+                    &task.path,
+                    owner_change,
+                    observed_at_unix_ms,
+                );
+            }
         }
         for projected in &delta.members {
             let member = &projected.member;
@@ -2053,7 +2093,7 @@ fn read_tasks(dir: &Path) -> Vec<ObservedTask> {
 /// `stat` per unresolved member per poll, which is what keeps the 2 s
 /// projection tick as cheap as it was (§5 P8's contract: `stat`-bounded, no
 /// transcript reads).
-fn derived_transcript_path(
+pub(super) fn derived_transcript_path(
     claude_dir: &Path,
     cwd: Option<&str>,
     session_id: Option<&str>,
